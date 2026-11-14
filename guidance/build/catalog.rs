@@ -1728,11 +1728,10 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("CANCELLED_BY_USER")),
             ("title", Value::Str("You stopped this run.")),
-            ("why", Value::Str("The app ended training when you selected Stop.")),
+            ("why", Value::Str("The app ended training when you selected Stop. You lose progress made after the last checkpoint.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Start the run again to continue from the last checkpoint."),
-                    Value::Str("You lose progress made after the last checkpoint."),
                 ])),
             ])),
         ]),
@@ -2069,11 +2068,10 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("MRL-CAP-021")),
             ("title", Value::Str("This engine can't pause.")),
-            ("why", Value::Str("This engine can only stop. It saves progress at checkpoints instead.")),
+            ("why", Value::Str("This engine can only stop, and it saves progress only at checkpoints. Stopping loses progress since the last one.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Stop the run instead, and resume it later from the last checkpoint."),
-                    Value::Str("You lose progress made since the last checkpoint."),
                 ])),
             ])),
         ]),
@@ -2548,11 +2546,10 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("PREEMPTED")),
             ("title", Value::Str("The app paused the run to free this machine.")),
-            ("why", Value::Str("A job with higher priority needed the machine.")),
+            ("why", Value::Str("A job with higher priority needed the machine. You may lose progress made since the last checkpoint.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("You don't need to do anything. The run resumes from its last checkpoint when the machine is free."),
-                    Value::Str("You may lose progress made since the last checkpoint."),
                 ])),
             ])),
         ]),

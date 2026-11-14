@@ -80,19 +80,17 @@ errors:
 
   - code: PREEMPTED
     title: The app paused the run to free this machine.
-    why: A job with higher priority needed the machine.
+    why: A job with higher priority needed the machine. You may lose progress made since the last checkpoint.
     what_to_do:
       steps:
         - You don't need to do anything. The run resumes from its last checkpoint when the machine is free.
-        - You may lose progress made since the last checkpoint.
 
   - code: CANCELLED_BY_USER
     title: You stopped this run.
-    why: The app ended training when you selected Stop.
+    why: The app ended training when you selected Stop. You lose progress made after the last checkpoint.
     what_to_do:
       steps:
         - Start the run again to continue from the last checkpoint.
-        - You lose progress made after the last checkpoint.
 
   - code: VERIFICATION_FAILED
     title: The trained model did not pass its final checks.
@@ -458,11 +456,10 @@ errors:
 
   - code: MRL-CAP-021
     title: This engine can't pause.
-    why: This engine can only stop. It saves progress at checkpoints instead.
+    why: This engine can only stop, and it saves progress only at checkpoints. Stopping loses progress since the last one.
     what_to_do:
       steps:
         - Stop the run instead, and resume it later from the last checkpoint.
-        - You lose progress made since the last checkpoint.
 
   - code: MRL-CAP-022
     title: This method is experimental and turned off.
