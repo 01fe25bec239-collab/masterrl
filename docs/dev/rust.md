@@ -31,7 +31,7 @@ cargo run -p mrl-server -- --version
 ## Pinned versions (`[workspace.dependencies]`)
 - async/web: tokio 1.54.1, axum 0.8.9, tower 0.5.3, tower-http 0.7.1, hyper 1.12.0
 - RPC: tonic 0.14.9, prost 0.14.6
-- database: sqlx 0.9.0 (postgres, runtime-tokio, tls-rustls, uuid, time, json, migrate, macros)
+- database: sqlx 0.9.0 (postgres, runtime-tokio, tls-rustls-ring-native-roots, uuid, time, json, migrate, macros)
 - serialization/errors: serde 1.0.229, serde_json 1.0.154, thiserror 2.0.21, anyhow 1.0.104
 - observability: tracing 0.1.44, tracing-subscriber 0.3.23, opentelemetry 0.33.1, opentelemetry-otlp 0.33.1
 - IDs/time: uuid 1.29.2 (v7), time 0.3.55
@@ -47,4 +47,4 @@ cargo run -p mrl-server -- --version
 ## Targets and CI
 
 - Targets: macOS (`aarch64-apple-darwin`, `x86_64-apple-darwin`), Windows (`x86_64-pc-windows-msvc`), Linux (`x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`; the agent's x86_64 build runs inside WSL2).
-- CI: Linux on every PR; macOS and Windows on pushes to `main` and manual runs.
+- CI: Linux on every PR (also type-checks the other four targets); macOS and Windows on pushes to `main` and manual runs.

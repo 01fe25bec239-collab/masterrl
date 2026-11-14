@@ -6,7 +6,15 @@ all-features = true
 [advisories]
 version = 2
 yanked = "deny"
-ignore = []
+# The ignores below are for pins later parts will use, so "not encountered" is expected today.
+unused-ignored-advisory = "allow"
+# Pinned crates with no fixed release yet. Remove each entry once upstream ships a fix.
+ignore = [
+    { id = "RUSTSEC-2023-0071", reason = "rsa (via russh): Marvin timing attack, no fixed rsa release; needed for users' existing RSA SSH keys" },
+    { id = "RUSTSEC-2026-0370", reason = "zbus_names (via keyring on Linux): unmaintained, merged into zbus 6; not a vulnerability" },
+    { id = "RUSTSEC-2026-0371", reason = "zvariant (via keyring on Linux): unmaintained, merged into zbus 6; not a vulnerability" },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive (via keyring on Linux): unmaintained, merged into zbus 6; not a vulnerability" },
+]
 
 [licenses]
 version = 2

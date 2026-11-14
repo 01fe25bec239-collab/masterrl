@@ -76,3 +76,11 @@ jobs:
 
       - name: release build
         run: cargo build --workspace --release --locked
+
+      # Type-checks the targets this runner does not build itself (the desktop app ships all of them).
+      - name: cross-target check
+        if: runner.os == 'Linux'
+        run: |
+          targets="aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc"
+          rustup target add $targets
+          cargo check --workspace --all-targets --locked $(printf -- '--target %s ' $targets)
