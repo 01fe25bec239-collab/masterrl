@@ -21,7 +21,7 @@ describe('resolveAppFile', () => {
     'app://other/index.html',
     'file:///etc/passwd',
     'not a url',
-  ])('refuses %s', (url) => {
+  ])('keeps %s inside the renderer folder', (url) => {
     const file = resolveAppFile(root, url);
     expect(file === null || file.startsWith(root + path.sep)).toBe(true);
   });
