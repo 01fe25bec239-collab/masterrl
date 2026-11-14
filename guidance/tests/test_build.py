@@ -40,7 +40,7 @@ class BuildTest(unittest.TestCase):
         uv = shutil.which("uv")
         self.assertIsNotNone(uv, "uv must be installed to run the build tests")
         cmd = [uv, "run", "--quiet", "--script", str(BUILD), "--root", str(self.root), *args]
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=300, check=False)
 
     def plant(self, folder: str, text: str, name: str = "p99.yaml") -> None:
         (self.root / "fragments" / folder / name).write_text(text, encoding="utf-8")
@@ -77,19 +77,27 @@ class BuildTest(unittest.TestCase):
 
     def test_component_text_is_checked(self):
         bad = " ".join(["word"] * 25) + "."
-        self.plant("requirements", textwrap.dedent(f"""\
+        self.plant(
+            "requirements",
+            textwrap.dedent(f"""\
             components:
               - {{ id: extra, name: Extra tool, summary: "{bad}", download_gb: {{ cpu: {{ min: 0.1, max: 0.2 }} }}, estimated: true }}
             requirements: []
-            """))
+            """),
+        )
         self.assert_fails("sentence has 25 words (max 20)")
 
     def test_long_why_fails(self):
-        self.plant("errors", entry("MRL-TEST-001", "Stopped.", "One reason. Two reasons. Three reasons."))
+        self.plant(
+            "errors", entry("MRL-TEST-001", "Stopped.", "One reason. Two reasons. Three reasons.")
+        )
         self.assert_fails("why must be one or two sentences")
 
     def test_missing_why_fails(self):
-        self.plant("errors", "errors:\n  - code: MRL-TEST-001\n    title: Stopped.\n    what_to_do: {steps: [Retry.]}\n")
+        self.plant(
+            "errors",
+            "errors:\n  - code: MRL-TEST-001\n    title: Stopped.\n    what_to_do: {steps: [Retry.]}\n",
+        )
         self.assert_fails("'why' is a required property")
 
     def test_fragment_name_and_keys_are_checked(self):
@@ -101,7 +109,9 @@ class BuildTest(unittest.TestCase):
 
     def test_good_fragments_merge(self):
         self.plant("errors", entry("MRL-TEST-001", "The test service stopped."))
-        self.plant("glossary", "terms:\n  - term: XYZ\n    plain: A made-up service used in this test.\n")
+        self.plant(
+            "glossary", "terms:\n  - term: XYZ\n    plain: A made-up service used in this test.\n"
+        )
         stale = self.run_build("--check")
         self.assertIn("out of date", stale.stderr)
         result = self.run_build()

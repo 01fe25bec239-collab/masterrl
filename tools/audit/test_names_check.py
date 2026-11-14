@@ -38,10 +38,13 @@ class NamesCheckTest(unittest.TestCase):
     def test_unfrozen_table_and_command_are_flagged(self):
         plan = "Adds the `run_attempt` table.\nok line\nNew command `StartJob`.\n"
         problems = names_check.check(main_folder(self, plan))
-        self.assertEqual(problems, [
-            "docs/implementation/wave-01.md:1: table `run_attempt` is not frozen",
-            "docs/implementation/wave-01.md:3: command `StartJob` is not frozen",
-        ])
+        self.assertEqual(
+            problems,
+            [
+                "docs/implementation/wave-01.md:1: table `run_attempt` is not frozen",
+                "docs/implementation/wave-01.md:3: command `StartJob` is not frozen",
+            ],
+        )
         self.assertEqual(names_check.main([str(main_folder(self, plan))]), 1)
 
     def test_names_without_table_or_command_context_are_ignored(self):

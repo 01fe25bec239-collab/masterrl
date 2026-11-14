@@ -16,6 +16,7 @@ Usage: ownership.py PART=P04 [BASE=ref] [--plan DIR]
 BASE defaults to the latest wave-*-done tag reachable from HEAD.
 """
 
+import itertools
 import re
 import subprocess
 import sys
@@ -56,7 +57,7 @@ def expand_braces(pattern: str) -> list[str]:
         return [pattern]
     cuts.append(end)
     head, tail = pattern[:start], pattern[end + 1 :]
-    options = [pattern[a + 1 : b] for a, b in zip(cuts, cuts[1:])]
+    options = [pattern[a + 1 : b] for a, b in itertools.pairwise(cuts)]
     return [x for opt in options for x in expand_braces(head + opt + tail)]
 
 
@@ -90,14 +91,14 @@ def split_top_commas(chunk: str) -> list[str]:
         if c == "," and depth == 0:
             items.append(chunk[start:i])
             start = i + 1
-    return items + [chunk[start:]]
+    return [*items, chunk[start:]]
 
 
 def backticked_paths(text: str) -> list[str]:
     paths = []
     for chunk in re.findall(r"`([^`]+)`", text):
-        for item in split_top_commas(chunk):
-            item = item.strip()
+        for raw in split_top_commas(chunk):
+            item = raw.strip()
             if item and " " not in item:
                 paths.append(item)
     return paths
@@ -107,7 +108,9 @@ def section(text: str, heading: re.Pattern[str]) -> str:
     lines = text.splitlines()
     for i, line in enumerate(lines):
         if heading.match(line):
-            end = next((j for j in range(i + 1, len(lines)) if lines[j].startswith("## ")), len(lines))
+            end = next(
+                (j for j in range(i + 1, len(lines)) if lines[j].startswith("## ")), len(lines)
+            )
             return "\n".join(lines[i:end])
     return ""
 

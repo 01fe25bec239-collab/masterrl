@@ -1,6 +1,6 @@
 target-version = "py312"
 line-length = 100
-extend-exclude = ["tests/fixtures/models/.cache"]
+extend-exclude = ["tests/fixtures/models/.cache", "guidance/build"] # guidance/build is generated
 
 [lint]
 select = ["E", "W", "F", "I", "B", "UP", "N", "SIM", "PTH", "RUF", "PL", "C4", "PIE", "PT", "RET", "TID"]
@@ -8,3 +8,10 @@ ignore = ["PLR2004"] # magic numbers are fine in tests and fixtures
 
 [lint.isort]
 known-first-party = ["mrl_runtime", "mrl_rewards", "mrl_sdk", "mrl_adapter_trl", "mrl_adapter_lmeval", "mrl_adapter_mlx"]
+
+[lint.per-file-ignores]
+# Standalone stdlib tools (run with `uv run --script` / `python -m unittest`) use unittest style by design.
+"tools/audit/**" = ["PT"]
+"tools/traceability/**" = ["PT"]
+"guidance/tests/**/*.py" = ["PT", "E501"]  # long lines are YAML test data inside strings
+"guidance/tools/build.py" = ["E501", "PLR0911", "PLR0912", "PLR0915"]  # code templates for generated loaders; one long validator

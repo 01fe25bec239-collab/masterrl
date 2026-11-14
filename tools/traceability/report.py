@@ -71,7 +71,9 @@ def render(registry: list[dict], tags: dict[str, list[str]]) -> str:
     ]
     for r in registry:
         tests = ", ".join(f"`{t}`" for t in tags.get(r["id"], [])) or "—"
-        lines.append(f"| **{r['id']}** {cell(r.get('text'))} | {cell(r.get('release'))} | {tests} |")
+        lines.append(
+            f"| **{r['id']}** {cell(r.get('text'))} | {cell(r.get('release'))} | {tests} |"
+        )
     unknown = sorted(set(tags) - known)
     if unknown:
         lines += ["", "## Tagged in tests but not in the registry", ""]

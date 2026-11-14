@@ -8,8 +8,8 @@
 # ///
 """Merge guidance data + fragments, validate them, and write guidance/build/.
 
-    uv run --script guidance/tools/build.py          # write build outputs
-    uv run --script guidance/tools/build.py --check  # validate; fail if outputs are stale
+uv run --script guidance/tools/build.py          # write build outputs
+uv run --script guidance/tools/build.py --check  # validate; fail if outputs are stale
 """
 
 from __future__ import annotations
@@ -37,9 +37,24 @@ FRAGMENT_NAME = re.compile(r"^p\d{2}\.yaml$")
 
 # Keys whose string (or list-of-string) values are ids, enums or links, not user-facing text.
 NON_TEXT_KEYS = {
-    "id", "code", "aliases", "learn_more", "docs_link", "profile", "platform", "task", "family",
-    "method", "peft", "precision", "dataset_schema", "reward_type", "recipes", "components",
-    "support", "memory_kind",
+    "id",
+    "code",
+    "aliases",
+    "learn_more",
+    "docs_link",
+    "profile",
+    "platform",
+    "task",
+    "family",
+    "method",
+    "peft",
+    "precision",
+    "dataset_schema",
+    "reward_type",
+    "recipes",
+    "components",
+    "support",
+    "memory_kind",
 }
 MAX_WORDS = 20
 SENTENCE_END = re.compile(r"(?<=[.!?])\s+")
@@ -78,7 +93,9 @@ def texts(node, path: str):
     """Yield (path, string) for every user-facing string."""
     if isinstance(node, dict):
         for key, value in node.items():
-            is_ids = isinstance(value, str) or (isinstance(value, list) and all(isinstance(v, str) for v in value))
+            is_ids = isinstance(value, str) or (
+                isinstance(value, list) and all(isinstance(v, str) for v in value)
+            )
             if not (key in NON_TEXT_KEYS and is_ids):
                 yield from texts(value, f"{path}.{key}")
     elif isinstance(node, list):
@@ -122,7 +139,9 @@ def collect(root: Path, problems: list[str]) -> dict[str, list[tuple[str, dict]]
                 continue
             doc = load_yaml(path, validator, problems, rel)
             for key in set(doc) - set(fragment_keys):
-                problems.append(f"{rel(path)}: fragments can't set {key!r}, only {list(fragment_keys)}")
+                problems.append(
+                    f"{rel(path)}: fragments can't set {key!r}, only {list(fragment_keys)}"
+                )
             docs[stem].append((rel(path), doc))
     return docs
 
@@ -163,11 +182,22 @@ def build(root: Path) -> tuple[dict, list[str]]:
 
     # Duplicates
     by_id = lambda item: [item["id"]]  # noqa: E731
-    for items, what in [(goals, "goal"), (recipes, "recipe"), (families, "family"),
-                        (profiles, "profile"), (components, "component"), (platforms, "platform")]:
+    for items, what in [
+        (goals, "goal"),
+        (recipes, "recipe"),
+        (families, "family"),
+        (profiles, "profile"),
+        (components, "component"),
+        (platforms, "platform"),
+    ]:
         unique(items, by_id, f"{what} id", problems)
     unique(errors, lambda e: [e["code"]], "error code", problems)
-    unique(terms, lambda t: [n.lower() for n in [t["term"], *t.get("aliases", [])]], "glossary term", problems)
+    unique(
+        terms,
+        lambda t: [n.lower() for n in [t["term"], *t.get("aliases", [])]],
+        "glossary term",
+        problems,
+    )
     unique(rows, lambda r: [(r["task"], r["platform"])], "requirement", problems)
 
     # Cross-references
@@ -183,16 +213,26 @@ def build(root: Path) -> tuple[dict, list[str]]:
                 problems.append(f"{src}: goal {goal['id']!r} names unknown recipe {rid!r}")
     for src, profile in profiles:
         if profile["family"] not in family_ids:
-            problems.append(f"{src}: profile {profile['id']!r} has unknown family {profile['family']!r}")
+            problems.append(
+                f"{src}: profile {profile['id']!r} has unknown family {profile['family']!r}"
+            )
     for src, recipe in recipes:
-        unique([(src, p) for p in recipe["profiles"]], lambda p: [p["profile"]],
-               f"profile in recipe {recipe['id']!r}", problems)
+        unique(
+            [(src, p) for p in recipe["profiles"]],
+            lambda p: [p["profile"]],
+            f"profile in recipe {recipe['id']!r}",
+            problems,
+        )
         for p in recipe["profiles"]:
             if p["profile"] not in profile_ids:
-                problems.append(f"{src}: recipe {recipe['id']!r} names unknown profile {p['profile']!r}")
+                problems.append(
+                    f"{src}: recipe {recipe['id']!r} names unknown profile {p['profile']!r}"
+                )
             for name in ("model_params_b", "minutes_per_1k_samples"):
                 if p[name]["min"] > p[name]["max"]:
-                    problems.append(f"{src}: recipe {recipe['id']!r} {p['profile']}: {name} min > max")
+                    problems.append(
+                        f"{src}: recipe {recipe['id']!r} {p['profile']}: {name} min > max"
+                    )
     for src, error in errors:
         parent = error["code"].split("/")[0]
         if "/" in error["code"] and parent not in error_codes:
@@ -200,7 +240,9 @@ def build(root: Path) -> tuple[dict, list[str]]:
     for src, comp in components:
         for platform, size in comp["download_gb"].items():
             if platform not in platform_ids:
-                problems.append(f"{src}: component {comp['id']!r} names unknown platform {platform!r}")
+                problems.append(
+                    f"{src}: component {comp['id']!r} names unknown platform {platform!r}"
+                )
             if size["min"] > size["max"]:
                 problems.append(f"{src}: component {comp['id']!r} {platform}: min > max")
     for src, row in rows:
@@ -224,7 +266,9 @@ def build(root: Path) -> tuple[dict, list[str]]:
         if len(sentences(term["plain"])) != 1:
             problems.append(f"{src}: glossary {term['term']!r}: plain must be exactly one sentence")
     fallback = base["errors"].get("fallback")
-    for src, error in errors + ([(docs["errors"][0][0], {"code": "fallback", **fallback})] if fallback else []):
+    for src, error in errors + (
+        [(docs["errors"][0][0], {"code": "fallback", **fallback})] if fallback else []
+    ):
         if len(sentences(error["title"])) != 1:
             problems.append(f"{src}: error {error['code']!r}: title must be one sentence")
         if len(sentences(error["why"])) > 2:
@@ -264,7 +308,9 @@ def build(root: Path) -> tuple[dict, list[str]]:
 
 # ---------- Generated loaders ----------
 
-HEADER = "@generated by guidance/tools/build.py from guidance/data and guidance/fragments. Do not edit."
+HEADER = (
+    "@generated by guidance/tools/build.py from guidance/data and guidance/fragments. Do not edit."
+)
 
 JS = """// {header}
 // Dependency-free loader for the guidance catalog.
@@ -585,16 +631,26 @@ def outputs(catalog: dict) -> dict[str, str]:
         "catalog.json": as_json + "\n",
         "index.js": JS.format(header=HEADER, data=as_json),
         "index.d.ts": DTS.format(header=HEADER),
-        "catalog.py": PY.format(header=HEADER, data=pprint.pformat(catalog, width=100, sort_dicts=False)),
+        "catalog.py": PY.format(
+            header=HEADER, data=pprint.pformat(catalog, width=100, sort_dicts=False)
+        ),
         "catalog.rs": RS.format(header=HEADER, data=rust_value(catalog)),
     }
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--check", action="store_true", help="validate and fail if build outputs are stale")
-    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1],
-                        help="the guidance folder (default: the one holding this script)")
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument(
+        "--check", action="store_true", help="validate and fail if build outputs are stale"
+    )
+    parser.add_argument(
+        "--root",
+        type=Path,
+        default=Path(__file__).resolve().parents[1],
+        help="the guidance folder (default: the one holding this script)",
+    )
     args = parser.parse_args()
     root = args.root.resolve()
 

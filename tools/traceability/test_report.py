@@ -44,15 +44,21 @@ class ReportTest(unittest.TestCase):
         return code, out.getvalue()
 
     def test_collects_all_three_tag_styles(self):
-        root = repo(self, {
-            "tests/test_a.py": f"# {REQ} FR-RUN-1\n{MARK}(\"NFR-1\", \"FR-X-9\")\n",
-            "crates/x/src/lib.rs": f"fn a() {{}}\n// {REQ} FR-RUN-1, NFR-1\n",
-        })
-        self.assertEqual(report.collect_tags(root), {
-            "FR-RUN-1": ["crates/x/src/lib.rs:2", "tests/test_a.py:1"],
-            "NFR-1": ["crates/x/src/lib.rs:2", "tests/test_a.py:2"],
-            "FR-X-9": ["tests/test_a.py:2"],
-        })
+        root = repo(
+            self,
+            {
+                "tests/test_a.py": f'# {REQ} FR-RUN-1\n{MARK}("NFR-1", "FR-X-9")\n',
+                "crates/x/src/lib.rs": f"fn a() {{}}\n// {REQ} FR-RUN-1, NFR-1\n",
+            },
+        )
+        self.assertEqual(
+            report.collect_tags(root),
+            {
+                "FR-RUN-1": ["crates/x/src/lib.rs:2", "tests/test_a.py:1"],
+                "NFR-1": ["crates/x/src/lib.rs:2", "tests/test_a.py:2"],
+                "FR-X-9": ["tests/test_a.py:2"],
+            },
+        )
 
     def test_report_lists_coverage_and_unknown_ids(self):
         root = repo(self, {"t.py": f"# {REQ} FR-RUN-1\n# {REQ} FR-NOPE-3\n"})

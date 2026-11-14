@@ -35,13 +35,16 @@ class PlaceholdersTest(unittest.TestCase):
             self.assertEqual(placeholders.main([str(root)]), 1)
 
     def test_skips_root_tests_and_docs_and_any_testkit(self):
-        root = repo(self, {
-            "tests/a.rs": TODO,
-            "testkit/b.rs": TODO,
-            "crates/x/testkit/c.rs": TODO,
-            "crates/x/src/testkit/d.rs": TODO,
-            "docs/e.md": TODO,
-        })
+        root = repo(
+            self,
+            {
+                "tests/a.rs": TODO,
+                "testkit/b.rs": TODO,
+                "crates/x/testkit/c.rs": TODO,
+                "crates/x/src/testkit/d.rs": TODO,
+                "docs/e.md": TODO,
+            },
+        )
         self.assertEqual(placeholders.scan(root), [])
 
     def test_nested_tests_and_docs_are_scanned(self):

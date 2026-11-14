@@ -28,7 +28,9 @@ COMMAND_WORD = re.compile(r"\bcommands?\b", re.IGNORECASE)
 def main_folder() -> Path:
     common = subprocess.run(
         ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
-        check=True, capture_output=True, text=True,
+        check=True,
+        capture_output=True,
+        text=True,
     ).stdout.strip()
     return Path(common).parent
 
@@ -46,9 +48,17 @@ def check(main: Path) -> list[str]:
         for n, line in enumerate(doc.read_text().splitlines(), 1):
             where = f"{doc.relative_to(main)}:{n}"
             if TABLE_WORD.search(line):
-                problems += [f"{where}: table `{t}` is not frozen" for t in SNAKE.findall(line) if t not in tables]
+                problems += [
+                    f"{where}: table `{t}` is not frozen"
+                    for t in SNAKE.findall(line)
+                    if t not in tables
+                ]
             if COMMAND_WORD.search(line):
-                problems += [f"{where}: command `{c}` is not frozen" for c in PASCAL.findall(line) if c not in commands]
+                problems += [
+                    f"{where}: command `{c}` is not frozen"
+                    for c in PASCAL.findall(line)
+                    if c not in commands
+                ]
     return problems
 
 

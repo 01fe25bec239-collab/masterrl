@@ -59,7 +59,7 @@ class OwnershipTest(unittest.TestCase):
         self.plan = temp_dir(self)
         (self.plan / "README.md").write_text(README)
         (self.plan / "wave-01.md").write_text(WAVE)
-        self.cwd = os.getcwd()
+        self.cwd = Path.cwd()
         os.chdir(self.root)
 
     def tearDown(self):
@@ -72,11 +72,20 @@ class OwnershipTest(unittest.TestCase):
         return code, out.getvalue()
 
     def test_owned_paths_pass(self):
-        commit(self.root, [
-            "justfile", "tools/audit/x.py", ".gitattributes", "deploy/local/compose.yaml",
-            "deploy/local/otel/config.yaml", "crates/b/Cargo.toml", "crates/a/src/main.rs",
-            "python/mrl-sdk/src/x.py",
-        ], "owned")
+        commit(
+            self.root,
+            [
+                "justfile",
+                "tools/audit/x.py",
+                ".gitattributes",
+                "deploy/local/compose.yaml",
+                "deploy/local/otel/config.yaml",
+                "crates/b/Cargo.toml",
+                "crates/a/src/main.rs",
+                "python/mrl-sdk/src/x.py",
+            ],
+            "owned",
+        )
         self.assertEqual(self.run_tool("PART=P09")[0], 0)
 
     def test_unowned_edit_is_reported(self):
@@ -111,7 +120,9 @@ class OwnershipTest(unittest.TestCase):
             ownership.parse_args(["PART=nope"])
 
     def test_expansion(self):
-        self.assertEqual(ownership.expand_braces("a/{b,c/{d,e}}.x"), ["a/b.x", "a/c/d.x", "a/c/e.x"])
+        self.assertEqual(
+            ownership.expand_braces("a/{b,c/{d,e}}.x"), ["a/b.x", "a/c/d.x", "a/c/e.x"]
+        )
         self.assertEqual(ownership.expand_bars("s/lib.rs|main.rs"), ["s/lib.rs", "s/main.rs"])
         rx = ownership.to_regex("a/**/z.md")
         self.assertTrue(rx.fullmatch("a/z.md") and rx.fullmatch("a/b/c/z.md"))
