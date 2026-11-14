@@ -1154,8 +1154,8 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                             'windows': ['Open Windows Security > Firewall & network protection > '
                                         'Allow an app through firewall.'],
                             'macos': ['Open System Settings > Network > Firewall > Options.'],
-                            'linux': ['If you use ufw, run `sudo ufw allow PORT/tcp` for each port '
-                                      'in Details.']}},
+                            'linux': ['If you use the ufw firewall, run `sudo ufw allow PORT/tcp` '
+                                      'for each port in Details.']}},
             {'code': 'MRL-LINK-005',
              'title': "The clocks on these machines don't match.",
              'why': 'Machines in one job need clocks that match within the limit shown in Details. '
@@ -1170,8 +1170,7 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'title': 'A machine in this group is low on disk space.',
              'why': 'Each machine stores model files and checkpoints for the job.',
              'what_to_do': {'steps': ['Free up space on the machine named in Details.',
-                                      'Give each machine about as much free space as a '
-                                      'single-machine run needs.']}},
+                                      'Keep about 10–50 GB free on each machine.']}},
             {'code': 'MRL-MODEL-001',
              'title': "The app did not load this model's files, to keep your computer safe.",
              'why': 'The weights use the pickle format, which can run hidden code. The app allows '

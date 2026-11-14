@@ -2312,7 +2312,7 @@ export const catalog = deepFreeze({
           "Open System Settings > Network > Firewall > Options."
         ],
         "linux": [
-          "If you use ufw, run `sudo ufw allow PORT/tcp` for each port in Details."
+          "If you use the ufw firewall, run `sudo ufw allow PORT/tcp` for each port in Details."
         ]
       }
     },
@@ -2342,7 +2342,7 @@ export const catalog = deepFreeze({
       "what_to_do": {
         "steps": [
           "Free up space on the machine named in Details.",
-          "Give each machine about as much free space as a single-machine run needs."
+          "Keep about 10–50 GB free on each machine."
         ]
       }
     },

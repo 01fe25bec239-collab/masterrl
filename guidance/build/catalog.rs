@@ -2360,7 +2360,7 @@ pub static CATALOG: Value = Value::Map(&[
                     Value::Str("Open System Settings > Network > Firewall > Options."),
                 ])),
                 ("linux", Value::List(&[
-                    Value::Str("If you use ufw, run `sudo ufw allow PORT/tcp` for each port in Details."),
+                    Value::Str("If you use the ufw firewall, run `sudo ufw allow PORT/tcp` for each port in Details."),
                 ])),
             ])),
         ]),
@@ -2390,7 +2390,7 @@ pub static CATALOG: Value = Value::Map(&[
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Free up space on the machine named in Details."),
-                    Value::Str("Give each machine about as much free space as a single-machine run needs."),
+                    Value::Str("Keep about 10–50 GB free on each machine."),
                 ])),
             ])),
         ]),
