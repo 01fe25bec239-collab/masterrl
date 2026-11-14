@@ -3,7 +3,7 @@ goals:
   - id: answer-from-documents
     title: Answer questions about my documents or data
     summary: >-
-      The model learns to answer in the way your documents need.
+      The model learns to answer questions about your documents the way you want.
       Fine-tuning teaches style and format best, so keep facts that change often in your documents.
     recipes: [sft-lora, sft-qlora]
     dataset_schema: question-answer

@@ -8,9 +8,9 @@ from typing import Any
 CATALOG: dict[str, Any] = {'schema_version': 1,
  'goals': [{'id': 'answer-from-documents',
             'title': 'Answer questions about my documents or data',
-            'summary': 'The model learns to answer in the way your documents need. Fine-tuning '
-                       'teaches style and format best, so keep facts that change often in your '
-                       'documents.',
+            'summary': 'The model learns to answer questions about your documents the way you '
+                       'want. Fine-tuning teaches style and format best, so keep facts that change '
+                       'often in your documents.',
             'recipes': ['sft-lora', 'sft-qlora'],
             'dataset_schema': 'question-answer',
             'reward_type': 'none'},
@@ -442,8 +442,8 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                             'memory_kind': 'gpu',
                             'memory_gb': {'min': 32, 'max': 80},
                             'verified': False,
-                            'summary': 'Fits large models of about 7–70 billion parameters, '
-                                       'depending on the method.'},
+                            'summary': 'Fits models of about 14–70 billion parameters with QLoRA, '
+                                       'or 7–32 billion with LoRA.'},
                            {'id': 'apple-16gb',
                             'family': 'apple-silicon',
                             'name': 'Mac with 16 GB',
@@ -923,9 +923,9 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                                       'Or use full fine-tuning if you need reference syncing.']}},
             {'code': 'MRL-CAP-007',
              'title': 'The app trains the output head fully instead of with LoRA.',
-             'why': "DPO, KTO and logit distillation can't use LoRA on the output head.",
-             'what_to_do': {'steps': ["You don't need to do anything. Training uses a bit more "
-                                      'memory.',
+             'why': "DPO, KTO and logit distillation can't use LoRA on the output head. Training "
+                    'uses a bit more memory.',
+             'what_to_do': {'steps': ["You don't need to do anything.",
                                       'If memory is tight, remove the output head from the LoRA '
                                       'targets.']}},
             {'code': 'MRL-CAP-008',
@@ -1063,11 +1063,11 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                                       'the CPU.']}},
             {'code': 'MRL-ENV-006',
              'title': 'The NVIDIA driver or CUDA version is too old.',
-             'why': 'The training engines need a recent driver to use the GPU.',
+             'why': 'The training engines need a recent driver to use the GPU. On Windows, WSL2 '
+                    'uses the Windows driver.',
              'what_to_do': {'steps': ['Install the driver version shown in Details, then restart '
                                       'your computer.'],
-                            'windows': ['Install the driver in Windows, not inside WSL2. WSL2 uses '
-                                        'the Windows driver.'],
+                            'windows': ['Install the driver in Windows, not inside WSL2.'],
                             'linux': ['Run `nvidia-smi` to see your driver and CUDA versions.']},
              'docs_link': 'https://www.nvidia.com/en-us/drivers/'},
             {'code': 'MRL-ENV-007',
@@ -1089,7 +1089,7 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                                         'Run `wsl --shutdown`, then open WSL2 again.']},
              'docs_link': 'https://learn.microsoft.com/en-us/windows/wsl/networking#mirrored-mode-networking'},
             {'code': 'MRL-ENV-009',
-             'title': "This Mac's chip or memory is not enough for training.",
+             'title': 'This Mac can train only tiny models.',
              'why': 'Training on a Mac needs Apple Silicon (M1 or later) and at least 16 GB of '
                     'memory.',
              'what_to_do': {'steps': ['Use tiny models to learn on this Mac.',
@@ -1133,7 +1133,7 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': 'They use different kinds of chips, like a Mac and an NVIDIA computer. One job '
                     'needs one kind.',
              'what_to_do': {'steps': ['Pick machines with the same kind of GPU for this job.',
-                                      'You can still use the other machine for its own runs or the '
+                                      'Use the other machine for its own runs or the '
                                       'Playground.']}},
             {'code': 'MRL-LINK-002',
              'title': 'The machines run different driver, CUDA or engine versions.',
@@ -1143,10 +1143,9 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
             {'code': 'MRL-LINK-003',
              'title': 'The connection between the machines is slow.',
              'why': 'Training across machines sends a lot of data. Wi-Fi is often too slow or '
-                    'unsteady.',
+                    'unsteady, so training can run slower than on one machine.',
              'what_to_do': {'steps': ['Connect the machines with network cables instead of Wi-Fi.',
-                                      'Or train on one machine. Training across slow links can be '
-                                      'slower than one machine.']}},
+                                      'Or train on one machine instead.']}},
             {'code': 'MRL-LINK-004',
              'title': 'A firewall is blocking the machines from talking.',
              'why': 'The machines need some network ports open to reach each other.',
@@ -1252,10 +1251,9 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                                       'shared memory, like `--shm-size=8g`.']}},
             {'code': 'PREEMPTED',
              'title': 'The app paused the run to free this machine.',
-             'why': 'A job with higher priority needed the machine. You may lose progress made '
-                    'since the last checkpoint.',
-             'what_to_do': {'steps': ["You don't need to do anything. The run resumes from its "
-                                      'last checkpoint when the machine is free.']}},
+             'why': 'A job with higher priority needed the machine. The run resumes from its last '
+                    'checkpoint when the machine is free. You may lose progress made since then.',
+             'what_to_do': {'steps': ["You don't need to do anything."]}},
             {'code': 'REWARD_INFRA',
              'title': 'The service that scores answers is not working.',
              'why': 'The app could not reach the reward service, or it did not answer in time.',

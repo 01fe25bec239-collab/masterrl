@@ -15,7 +15,7 @@ export const catalog = deepFreeze({
     {
       "id": "answer-from-documents",
       "title": "Answer questions about my documents or data",
-      "summary": "The model learns to answer in the way your documents need. Fine-tuning teaches style and format best, so keep facts that change often in your documents.",
+      "summary": "The model learns to answer questions about your documents the way you want. Fine-tuning teaches style and format best, so keep facts that change often in your documents.",
       "recipes": [
         "sft-lora",
         "sft-qlora"
@@ -1010,7 +1010,7 @@ export const catalog = deepFreeze({
           "max": 80
         },
         "verified": false,
-        "summary": "Fits large models of about 7–70 billion parameters, depending on the method."
+        "summary": "Fits models of about 14–70 billion parameters with QLoRA, or 7–32 billion with LoRA."
       },
       {
         "id": "apple-16gb",
@@ -1870,10 +1870,10 @@ export const catalog = deepFreeze({
     {
       "code": "MRL-CAP-007",
       "title": "The app trains the output head fully instead of with LoRA.",
-      "why": "DPO, KTO and logit distillation can't use LoRA on the output head.",
+      "why": "DPO, KTO and logit distillation can't use LoRA on the output head. Training uses a bit more memory.",
       "what_to_do": {
         "steps": [
-          "You don't need to do anything. Training uses a bit more memory.",
+          "You don't need to do anything.",
           "If memory is tight, remove the output head from the LoRA targets."
         ]
       }
@@ -2143,13 +2143,13 @@ export const catalog = deepFreeze({
     {
       "code": "MRL-ENV-006",
       "title": "The NVIDIA driver or CUDA version is too old.",
-      "why": "The training engines need a recent driver to use the GPU.",
+      "why": "The training engines need a recent driver to use the GPU. On Windows, WSL2 uses the Windows driver.",
       "what_to_do": {
         "steps": [
           "Install the driver version shown in Details, then restart your computer."
         ],
         "windows": [
-          "Install the driver in Windows, not inside WSL2. WSL2 uses the Windows driver."
+          "Install the driver in Windows, not inside WSL2."
         ],
         "linux": [
           "Run `nvidia-smi` to see your driver and CUDA versions."
@@ -2189,7 +2189,7 @@ export const catalog = deepFreeze({
     },
     {
       "code": "MRL-ENV-009",
-      "title": "This Mac's chip or memory is not enough for training.",
+      "title": "This Mac can train only tiny models.",
       "why": "Training on a Mac needs Apple Silicon (M1 or later) and at least 16 GB of memory.",
       "what_to_do": {
         "steps": [
@@ -2271,7 +2271,7 @@ export const catalog = deepFreeze({
       "what_to_do": {
         "steps": [
           "Pick machines with the same kind of GPU for this job.",
-          "You can still use the other machine for its own runs or the Playground."
+          "Use the other machine for its own runs or the Playground."
         ]
       }
     },
@@ -2289,11 +2289,11 @@ export const catalog = deepFreeze({
     {
       "code": "MRL-LINK-003",
       "title": "The connection between the machines is slow.",
-      "why": "Training across machines sends a lot of data. Wi-Fi is often too slow or unsteady.",
+      "why": "Training across machines sends a lot of data. Wi-Fi is often too slow or unsteady, so training can run slower than on one machine.",
       "what_to_do": {
         "steps": [
           "Connect the machines with network cables instead of Wi-Fi.",
-          "Or train on one machine. Training across slow links can be slower than one machine."
+          "Or train on one machine instead."
         ]
       }
     },
@@ -2498,10 +2498,10 @@ export const catalog = deepFreeze({
     {
       "code": "PREEMPTED",
       "title": "The app paused the run to free this machine.",
-      "why": "A job with higher priority needed the machine. You may lose progress made since the last checkpoint.",
+      "why": "A job with higher priority needed the machine. The run resumes from its last checkpoint when the machine is free. You may lose progress made since then.",
       "what_to_do": {
         "steps": [
-          "You don't need to do anything. The run resumes from its last checkpoint when the machine is free."
+          "You don't need to do anything."
         ]
       }
     },

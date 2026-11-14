@@ -29,7 +29,7 @@ profiles:
   - { id: nvidia-24gb, family: nvidia, name: NVIDIA GPU with 24 GB, memory_kind: gpu, memory_gb: { min: 24, max: 24 }, verified: false,
       summary: "Fits models of about 7–14 billion parameters with QLoRA, or 3–8 billion with LoRA." }
   - { id: nvidia-32-80gb, family: nvidia, name: NVIDIA GPU with 32–80 GB, memory_kind: gpu, memory_gb: { min: 32, max: 80 }, verified: false,
-      summary: "Fits large models of about 7–70 billion parameters, depending on the method." }
+      summary: "Fits models of about 14–70 billion parameters with QLoRA, or 7–32 billion with LoRA." }
   - { id: apple-16gb, family: apple-silicon, name: Mac with 16 GB, memory_kind: unified, memory_gb: { min: 16, max: 16 }, verified: false,
       summary: "Fits small models of about 1–7 billion parameters with 4-bit MLX." }
   - { id: apple-24gb, family: apple-silicon, name: Mac with 24 GB, memory_kind: unified, memory_gb: { min: 24, max: 24 }, verified: false,

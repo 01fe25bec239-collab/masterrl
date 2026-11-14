@@ -63,7 +63,7 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("id", Value::Str("answer-from-documents")),
             ("title", Value::Str("Answer questions about my documents or data")),
-            ("summary", Value::Str("The model learns to answer in the way your documents need. Fine-tuning teaches style and format best, so keep facts that change often in your documents.")),
+            ("summary", Value::Str("The model learns to answer questions about your documents the way you want. Fine-tuning teaches style and format best, so keep facts that change often in your documents.")),
             ("recipes", Value::List(&[
                 Value::Str("sft-lora"),
                 Value::Str("sft-qlora"),
@@ -1058,7 +1058,7 @@ pub static CATALOG: Value = Value::Map(&[
                     ("max", Value::Num(80.0)),
                 ])),
                 ("verified", Value::Bool(false)),
-                ("summary", Value::Str("Fits large models of about 7–70 billion parameters, depending on the method.")),
+                ("summary", Value::Str("Fits models of about 14–70 billion parameters with QLoRA, or 7–32 billion with LoRA.")),
             ]),
             Value::Map(&[
                 ("id", Value::Str("apple-16gb")),
@@ -1918,10 +1918,10 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("MRL-CAP-007")),
             ("title", Value::Str("The app trains the output head fully instead of with LoRA.")),
-            ("why", Value::Str("DPO, KTO and logit distillation can't use LoRA on the output head.")),
+            ("why", Value::Str("DPO, KTO and logit distillation can't use LoRA on the output head. Training uses a bit more memory.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
-                    Value::Str("You don't need to do anything. Training uses a bit more memory."),
+                    Value::Str("You don't need to do anything."),
                     Value::Str("If memory is tight, remove the output head from the LoRA targets."),
                 ])),
             ])),
@@ -2191,13 +2191,13 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("MRL-ENV-006")),
             ("title", Value::Str("The NVIDIA driver or CUDA version is too old.")),
-            ("why", Value::Str("The training engines need a recent driver to use the GPU.")),
+            ("why", Value::Str("The training engines need a recent driver to use the GPU. On Windows, WSL2 uses the Windows driver.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Install the driver version shown in Details, then restart your computer."),
                 ])),
                 ("windows", Value::List(&[
-                    Value::Str("Install the driver in Windows, not inside WSL2. WSL2 uses the Windows driver."),
+                    Value::Str("Install the driver in Windows, not inside WSL2."),
                 ])),
                 ("linux", Value::List(&[
                     Value::Str("Run `nvidia-smi` to see your driver and CUDA versions."),
@@ -2237,7 +2237,7 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("code", Value::Str("MRL-ENV-009")),
-            ("title", Value::Str("This Mac's chip or memory is not enough for training.")),
+            ("title", Value::Str("This Mac can train only tiny models.")),
             ("why", Value::Str("Training on a Mac needs Apple Silicon (M1 or later) and at least 16 GB of memory.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
@@ -2319,7 +2319,7 @@ pub static CATALOG: Value = Value::Map(&[
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Pick machines with the same kind of GPU for this job."),
-                    Value::Str("You can still use the other machine for its own runs or the Playground."),
+                    Value::Str("Use the other machine for its own runs or the Playground."),
                 ])),
             ])),
         ]),
@@ -2337,11 +2337,11 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("MRL-LINK-003")),
             ("title", Value::Str("The connection between the machines is slow.")),
-            ("why", Value::Str("Training across machines sends a lot of data. Wi-Fi is often too slow or unsteady.")),
+            ("why", Value::Str("Training across machines sends a lot of data. Wi-Fi is often too slow or unsteady, so training can run slower than on one machine.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Connect the machines with network cables instead of Wi-Fi."),
-                    Value::Str("Or train on one machine. Training across slow links can be slower than one machine."),
+                    Value::Str("Or train on one machine instead."),
                 ])),
             ])),
         ]),
@@ -2546,10 +2546,10 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("PREEMPTED")),
             ("title", Value::Str("The app paused the run to free this machine.")),
-            ("why", Value::Str("A job with higher priority needed the machine. You may lose progress made since the last checkpoint.")),
+            ("why", Value::Str("A job with higher priority needed the machine. The run resumes from its last checkpoint when the machine is free. You may lose progress made since then.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
-                    Value::Str("You don't need to do anything. The run resumes from its last checkpoint when the machine is free."),
+                    Value::Str("You don't need to do anything."),
                 ])),
             ])),
         ]),
