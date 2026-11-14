@@ -1,0 +1,9 @@
+{
+  "identities": [
+    {
+      "name": "mrl-dev",
+      "credentials": [{ "accessKey": "mrl-dev", "secretKey": "mrl-dev-only" }],
+      "actions": ["Admin", "Read", "Write", "List", "Tagging"]
+    }
+  ]
+}

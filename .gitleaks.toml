@@ -1,0 +1,17 @@
+# Secret scanning for CI (ci-security.yml) and local runs:
+#   gitleaks git --config .gitleaks.toml --redact .
+# Uses gitleaks' default rules. The dev-only passwords for the local stack
+# (deploy/local/) are low-entropy on purpose and are not flagged.
+title = "MasterRL"
+
+[extend]
+useDefault = true
+
+# Fixture manifests record file checksums keyed by names such as
+# "tokenizer.json", which the generic-api-key rule mistakes for keys.
+# Only that rule, and only values that are exactly a sha256 hex digest.
+[[allowlists]]
+description = "sha256 checksums in fixture manifests"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = ['''^[0-9a-f]{64}$''']
