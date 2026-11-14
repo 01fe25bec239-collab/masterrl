@@ -974,7 +974,7 @@ export const catalog = deepFreeze({
           "max": 12
         },
         "verified": false,
-        "summary": "Fits models of about 3–8 billion parameters, and small reinforcement learning runs."
+        "summary": "Fits models of about 3–8 billion parameters with QLoRA, and small reinforcement learning runs."
       },
       {
         "id": "nvidia-16gb",
@@ -1022,7 +1022,7 @@ export const catalog = deepFreeze({
           "max": 16
         },
         "verified": false,
-        "summary": "Fits small models of about 1–7 billion parameters with MLX."
+        "summary": "Fits small models of about 1–7 billion parameters with 4-bit MLX."
       },
       {
         "id": "apple-24gb",
@@ -1034,7 +1034,7 @@ export const catalog = deepFreeze({
           "max": 24
         },
         "verified": false,
-        "summary": "Fits models of about 3–8 billion parameters with MLX."
+        "summary": "Fits models of about 3–8 billion parameters with 4-bit MLX."
       },
       {
         "id": "apple-32gb",
@@ -1046,7 +1046,7 @@ export const catalog = deepFreeze({
           "max": 32
         },
         "verified": false,
-        "summary": "Fits models of about 7–14 billion parameters with MLX."
+        "summary": "Fits models of about 7–14 billion parameters with 4-bit MLX."
       },
       {
         "id": "apple-64gb",
@@ -1058,7 +1058,7 @@ export const catalog = deepFreeze({
           "max": 64
         },
         "verified": false,
-        "summary": "Fits models of about 14–32 billion parameters with MLX."
+        "summary": "Fits models of about 14–32 billion parameters with 4-bit MLX."
       },
       {
         "id": "apple-128gb",
@@ -1070,7 +1070,7 @@ export const catalog = deepFreeze({
           "max": 128
         },
         "verified": false,
-        "summary": "Fits large models of about 32–70 billion parameters with MLX."
+        "summary": "Fits large models of about 32–70 billion parameters with 4-bit MLX."
       },
       {
         "id": "apple-192gb",
@@ -1082,7 +1082,7 @@ export const catalog = deepFreeze({
           "max": 192
         },
         "verified": false,
-        "summary": "Fits large models of about 32–70 billion parameters with MLX, with room to spare."
+        "summary": "Fits large models of about 32–70 billion parameters with 4-bit MLX, with room to spare."
       },
       {
         "id": "cpu",
@@ -2177,10 +2177,10 @@ export const catalog = deepFreeze({
     {
       "code": "MRL-ENV-008",
       "title": "WSL2 mirrored networking is off.",
-      "why": "Training across several machines needs WSL2 to share your computer's network address.",
+      "why": "Training across several machines needs WSL2 to share your computer's network address. One machine doesn't need it.",
       "what_to_do": {
         "steps": [
-          "You need this only to train across several machines."
+          "Turn on mirrored networking in WSL2, then run the Link Doctor again."
         ],
         "windows": [
           "Add `networkingMode=mirrored` under `[wsl2]` in the `.wslconfig` file in your user folder.",

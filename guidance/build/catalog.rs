@@ -1022,7 +1022,7 @@ pub static CATALOG: Value = Value::Map(&[
                     ("max", Value::Num(12.0)),
                 ])),
                 ("verified", Value::Bool(false)),
-                ("summary", Value::Str("Fits models of about 3–8 billion parameters, and small reinforcement learning runs.")),
+                ("summary", Value::Str("Fits models of about 3–8 billion parameters with QLoRA, and small reinforcement learning runs.")),
             ]),
             Value::Map(&[
                 ("id", Value::Str("nvidia-16gb")),
@@ -1070,7 +1070,7 @@ pub static CATALOG: Value = Value::Map(&[
                     ("max", Value::Num(16.0)),
                 ])),
                 ("verified", Value::Bool(false)),
-                ("summary", Value::Str("Fits small models of about 1–7 billion parameters with MLX.")),
+                ("summary", Value::Str("Fits small models of about 1–7 billion parameters with 4-bit MLX.")),
             ]),
             Value::Map(&[
                 ("id", Value::Str("apple-24gb")),
@@ -1082,7 +1082,7 @@ pub static CATALOG: Value = Value::Map(&[
                     ("max", Value::Num(24.0)),
                 ])),
                 ("verified", Value::Bool(false)),
-                ("summary", Value::Str("Fits models of about 3–8 billion parameters with MLX.")),
+                ("summary", Value::Str("Fits models of about 3–8 billion parameters with 4-bit MLX.")),
             ]),
             Value::Map(&[
                 ("id", Value::Str("apple-32gb")),
@@ -1094,7 +1094,7 @@ pub static CATALOG: Value = Value::Map(&[
                     ("max", Value::Num(32.0)),
                 ])),
                 ("verified", Value::Bool(false)),
-                ("summary", Value::Str("Fits models of about 7–14 billion parameters with MLX.")),
+                ("summary", Value::Str("Fits models of about 7–14 billion parameters with 4-bit MLX.")),
             ]),
             Value::Map(&[
                 ("id", Value::Str("apple-64gb")),
@@ -1106,7 +1106,7 @@ pub static CATALOG: Value = Value::Map(&[
                     ("max", Value::Num(64.0)),
                 ])),
                 ("verified", Value::Bool(false)),
-                ("summary", Value::Str("Fits models of about 14–32 billion parameters with MLX.")),
+                ("summary", Value::Str("Fits models of about 14–32 billion parameters with 4-bit MLX.")),
             ]),
             Value::Map(&[
                 ("id", Value::Str("apple-128gb")),
@@ -1118,7 +1118,7 @@ pub static CATALOG: Value = Value::Map(&[
                     ("max", Value::Num(128.0)),
                 ])),
                 ("verified", Value::Bool(false)),
-                ("summary", Value::Str("Fits large models of about 32–70 billion parameters with MLX.")),
+                ("summary", Value::Str("Fits large models of about 32–70 billion parameters with 4-bit MLX.")),
             ]),
             Value::Map(&[
                 ("id", Value::Str("apple-192gb")),
@@ -1130,7 +1130,7 @@ pub static CATALOG: Value = Value::Map(&[
                     ("max", Value::Num(192.0)),
                 ])),
                 ("verified", Value::Bool(false)),
-                ("summary", Value::Str("Fits large models of about 32–70 billion parameters with MLX, with room to spare.")),
+                ("summary", Value::Str("Fits large models of about 32–70 billion parameters with 4-bit MLX, with room to spare.")),
             ]),
             Value::Map(&[
                 ("id", Value::Str("cpu")),
@@ -2225,10 +2225,10 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("MRL-ENV-008")),
             ("title", Value::Str("WSL2 mirrored networking is off.")),
-            ("why", Value::Str("Training across several machines needs WSL2 to share your computer's network address.")),
+            ("why", Value::Str("Training across several machines needs WSL2 to share your computer's network address. One machine doesn't need it.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
-                    Value::Str("You need this only to train across several machines."),
+                    Value::Str("Turn on mirrored networking in WSL2, then run the Link Doctor again."),
                 ])),
                 ("windows", Value::List(&[
                     Value::Str("Add `networkingMode=mirrored` under `[wsl2]` in the `.wslconfig` file in your user folder."),

@@ -555,10 +555,10 @@ errors:
 
   - code: MRL-ENV-008
     title: WSL2 mirrored networking is off.
-    why: Training across several machines needs WSL2 to share your computer's network address.
+    why: Training across several machines needs WSL2 to share your computer's network address. One machine doesn't need it.
     what_to_do:
       steps:
-        - You need this only to train across several machines.
+        - Turn on mirrored networking in WSL2, then run the Link Doctor again.
       windows:
         - Add `networkingMode=mirrored` under `[wsl2]` in the `.wslconfig` file in your user folder.
         - Run `wsl --shutdown`, then open WSL2 again.
