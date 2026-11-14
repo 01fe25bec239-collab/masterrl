@@ -29,7 +29,8 @@ pnpm --filter desktop test:smoke   # Playwright opens the packaged app (build fi
 
 ## Security rules
 
-`contextIsolation`, `sandbox` and `webSecurity` stay on; `nodeIntegration` stays off; the CSP allows
-no remote or inline scripts. Navigation and `window.open` are blocked; allow-listed https links open
+`contextIsolation`, `sandbox` and `webSecurity` stay on; `nodeIntegration` stays off. The packaged
+CSP allows no remote or inline scripts; dev mode allows inline scripts and styles only for Vite hot
+reload. Navigation and `window.open` are blocked; allow-listed https links open
 in the system browser. `node scripts/check-security.ts` (part of `pnpm lint`) fails if any of
 this is weakened.
