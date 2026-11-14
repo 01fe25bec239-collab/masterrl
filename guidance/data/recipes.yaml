@@ -43,12 +43,12 @@ recipes:
       - { profile: nvidia-16gb, model_params_b: { min: 7, max: 14 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 20, max: 80 } }
       - { profile: nvidia-24gb, model_params_b: { min: 7, max: 14 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 15, max: 60 } }
       - { profile: nvidia-32-80gb, model_params_b: { min: 14, max: 70 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 15, max: 120 } }
-      - { profile: apple-16gb, model_params_b: { min: 1, max: 7 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 15, max: 80 } }
-      - { profile: apple-24gb, model_params_b: { min: 3, max: 8 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 15, max: 70 } }
-      - { profile: apple-32gb, model_params_b: { min: 7, max: 14 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 15, max: 80 } }
-      - { profile: apple-64gb, model_params_b: { min: 14, max: 32 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 20, max: 100 } }
-      - { profile: apple-128gb, model_params_b: { min: 32, max: 70 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 30, max: 150 } }
-      - { profile: apple-192gb, model_params_b: { min: 32, max: 70 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 25, max: 140 } }
+      - { profile: apple-16gb, model_params_b: { min: 1, max: 7 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 15, max: 80 }, precision: mlx-q4-bf16 }
+      - { profile: apple-24gb, model_params_b: { min: 3, max: 8 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 15, max: 70 }, precision: mlx-q4-bf16 }
+      - { profile: apple-32gb, model_params_b: { min: 7, max: 14 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 15, max: 80 }, precision: mlx-q4-bf16 }
+      - { profile: apple-64gb, model_params_b: { min: 14, max: 32 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 20, max: 100 }, precision: mlx-q4-bf16 }
+      - { profile: apple-128gb, model_params_b: { min: 32, max: 70 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 30, max: 150 }, precision: mlx-q4-bf16 }
+      - { profile: apple-192gb, model_params_b: { min: 32, max: 70 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 25, max: 140 }, precision: mlx-q4-bf16 }
 
   - id: sft-full
     name: Teach by example, training every weight

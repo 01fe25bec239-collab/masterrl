@@ -49,7 +49,7 @@
     }
   },
   "$defs": {
-    "precision": { "enum": ["bf16", "fp32", "nf4-bf16"] },
+    "precision": { "enum": ["bf16", "fp32", "nf4-bf16", "mlx-q4-bf16"] },
     "range": {
       "type": "object",
       "additionalProperties": false,

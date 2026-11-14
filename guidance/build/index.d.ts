@@ -13,7 +13,7 @@ export interface Goal {
   dataset_schema: "chat" | "question-answer" | "preference-pairs" | "prompt-with-answer" | "prompts";
   reward_type: "none" | "preference" | "verifiable" | "teacher";
 }
-export type Precision = "bf16" | "fp32" | "nf4-bf16";
+export type Precision = "bf16" | "fp32" | "nf4-bf16" | "mlx-q4-bf16";
 export interface RecipeProfile {
   profile: string;
   model_params_b: Range;

@@ -425,6 +425,7 @@ pub static CATALOG: Value = Value::Map(&[
                         ("min", Value::Num(15.0)),
                         ("max", Value::Num(80.0)),
                     ])),
+                    ("precision", Value::Str("mlx-q4-bf16")),
                 ]),
                 Value::Map(&[
                     ("profile", Value::Str("apple-24gb")),
@@ -437,6 +438,7 @@ pub static CATALOG: Value = Value::Map(&[
                         ("min", Value::Num(15.0)),
                         ("max", Value::Num(70.0)),
                     ])),
+                    ("precision", Value::Str("mlx-q4-bf16")),
                 ]),
                 Value::Map(&[
                     ("profile", Value::Str("apple-32gb")),
@@ -449,6 +451,7 @@ pub static CATALOG: Value = Value::Map(&[
                         ("min", Value::Num(15.0)),
                         ("max", Value::Num(80.0)),
                     ])),
+                    ("precision", Value::Str("mlx-q4-bf16")),
                 ]),
                 Value::Map(&[
                     ("profile", Value::Str("apple-64gb")),
@@ -461,6 +464,7 @@ pub static CATALOG: Value = Value::Map(&[
                         ("min", Value::Num(20.0)),
                         ("max", Value::Num(100.0)),
                     ])),
+                    ("precision", Value::Str("mlx-q4-bf16")),
                 ]),
                 Value::Map(&[
                     ("profile", Value::Str("apple-128gb")),
@@ -473,6 +477,7 @@ pub static CATALOG: Value = Value::Map(&[
                         ("min", Value::Num(30.0)),
                         ("max", Value::Num(150.0)),
                     ])),
+                    ("precision", Value::Str("mlx-q4-bf16")),
                 ]),
                 Value::Map(&[
                     ("profile", Value::Str("apple-192gb")),
@@ -485,6 +490,7 @@ pub static CATALOG: Value = Value::Map(&[
                         ("min", Value::Num(25.0)),
                         ("max", Value::Num(140.0)),
                     ])),
+                    ("precision", Value::Str("mlx-q4-bf16")),
                 ]),
             ])),
         ]),
@@ -1726,7 +1732,7 @@ pub static CATALOG: Value = Value::Map(&[
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Start the run again to continue from the last checkpoint."),
-                    Value::Str("Progress made after the last checkpoint is not saved."),
+                    Value::Str("You lose progress made after the last checkpoint."),
                 ])),
             ])),
         ]),
@@ -1912,7 +1918,7 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("code", Value::Str("MRL-CAP-007")),
-            ("title", Value::Str("The output head will be fully trained instead of using LoRA.")),
+            ("title", Value::Str("The app trains the output head fully instead of with LoRA.")),
             ("why", Value::Str("DPO, KTO and logit distillation can't use LoRA on the output head. The app trains the head fully instead.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
@@ -2116,7 +2122,7 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("code", Value::Str("MRL-ENV-001")),
-            ("title", Value::Str("This version of your operating system is not supported.")),
+            ("title", Value::Str("The app doesn't support this version of your operating system.")),
             ("why", Value::Str("The training tools need a newer version of your OS.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
@@ -2415,7 +2421,7 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("code", Value::Str("MRL-MODEL-003")),
-            ("title", Value::Str("This model's license has not been accepted yet.")),
+            ("title", Value::Str("You haven't accepted this model's license yet.")),
             ("why", Value::Str("The model's owner asks you to accept its license before you download it.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
@@ -2542,7 +2548,7 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("code", Value::Str("PREEMPTED")),
-            ("title", Value::Str("The run was paused to free this machine.")),
+            ("title", Value::Str("The app paused the run to free this machine.")),
             ("why", Value::Str("A job with higher priority needed the machine.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
@@ -2554,7 +2560,7 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("REWARD_INFRA")),
             ("title", Value::Str("The service that scores answers is not working.")),
-            ("why", Value::Str("The reward service could not be reached, or it did not answer in time.")),
+            ("why", Value::Str("The app could not reach the reward service, or it did not answer in time.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Check that the reward service is running."),
@@ -2575,7 +2581,7 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("code", Value::Str("SANDBOX_VIOLATION")),
-            ("title", Value::Str("Reward code was stopped for safety.")),
+            ("title", Value::Str("The sandbox stopped the reward code for safety.")),
             ("why", Value::Str("Code that scores answers tried something the sandbox does not allow, like using the network.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
@@ -2946,13 +2952,13 @@ pub static CATALOG: Value = Value::Map(&[
                 ("task", Value::Str("mlx-sft")),
                 ("platform", Value::Str("cpu")),
                 ("supported", Value::Bool(false)),
-                ("note", Value::Str("MLX runs only on Apple Silicon Macs. Use sft-lora here instead.")),
+                ("note", Value::Str("MLX runs only on Apple Silicon Macs. Pick \"Teach by example with LoRA\" instead.")),
             ]),
             Value::Map(&[
                 ("task", Value::Str("mlx-sft")),
                 ("platform", Value::Str("linux-nvidia")),
                 ("supported", Value::Bool(false)),
-                ("note", Value::Str("MLX runs only on Apple Silicon Macs. Use sft-lora here instead.")),
+                ("note", Value::Str("MLX runs only on Apple Silicon Macs. Pick \"Teach by example with LoRA\" instead.")),
             ]),
             Value::Map(&[
                 ("task", Value::Str("mlx-sft")),
@@ -2972,7 +2978,7 @@ pub static CATALOG: Value = Value::Map(&[
                 ("task", Value::Str("mlx-sft")),
                 ("platform", Value::Str("windows-wsl2-nvidia")),
                 ("supported", Value::Bool(false)),
-                ("note", Value::Str("MLX runs only on Apple Silicon Macs. Use sft-lora here instead.")),
+                ("note", Value::Str("MLX runs only on Apple Silicon Macs. Pick \"Teach by example with LoRA\" instead.")),
             ]),
             Value::Map(&[
                 ("task", Value::Str("playground")),
@@ -3179,7 +3185,7 @@ pub static CATALOG: Value = Value::Map(&[
                 ("task", Value::Str("sft-qlora")),
                 ("platform", Value::Str("cpu")),
                 ("supported", Value::Bool(false)),
-                ("note", Value::Str("QLoRA needs a GPU. Use sft-lora with a tiny model instead.")),
+                ("note", Value::Str("QLoRA needs a GPU. Pick \"Teach by example with LoRA\" with a tiny model instead.")),
             ]),
             Value::Map(&[
                 ("task", Value::Str("sft-qlora")),

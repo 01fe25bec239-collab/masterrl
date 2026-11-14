@@ -376,7 +376,8 @@ export const catalog = deepFreeze({
           "minutes_per_1k_samples": {
             "min": 15,
             "max": 80
-          }
+          },
+          "precision": "mlx-q4-bf16"
         },
         {
           "profile": "apple-24gb",
@@ -388,7 +389,8 @@ export const catalog = deepFreeze({
           "minutes_per_1k_samples": {
             "min": 15,
             "max": 70
-          }
+          },
+          "precision": "mlx-q4-bf16"
         },
         {
           "profile": "apple-32gb",
@@ -400,7 +402,8 @@ export const catalog = deepFreeze({
           "minutes_per_1k_samples": {
             "min": 15,
             "max": 80
-          }
+          },
+          "precision": "mlx-q4-bf16"
         },
         {
           "profile": "apple-64gb",
@@ -412,7 +415,8 @@ export const catalog = deepFreeze({
           "minutes_per_1k_samples": {
             "min": 20,
             "max": 100
-          }
+          },
+          "precision": "mlx-q4-bf16"
         },
         {
           "profile": "apple-128gb",
@@ -424,7 +428,8 @@ export const catalog = deepFreeze({
           "minutes_per_1k_samples": {
             "min": 30,
             "max": 150
-          }
+          },
+          "precision": "mlx-q4-bf16"
         },
         {
           "profile": "apple-192gb",
@@ -436,7 +441,8 @@ export const catalog = deepFreeze({
           "minutes_per_1k_samples": {
             "min": 25,
             "max": 140
-          }
+          },
+          "precision": "mlx-q4-bf16"
         }
       ]
     },
@@ -1678,7 +1684,7 @@ export const catalog = deepFreeze({
       "what_to_do": {
         "steps": [
           "Start the run again to continue from the last checkpoint.",
-          "Progress made after the last checkpoint is not saved."
+          "You lose progress made after the last checkpoint."
         ]
       }
     },
@@ -1864,7 +1870,7 @@ export const catalog = deepFreeze({
     },
     {
       "code": "MRL-CAP-007",
-      "title": "The output head will be fully trained instead of using LoRA.",
+      "title": "The app trains the output head fully instead of with LoRA.",
       "why": "DPO, KTO and logit distillation can't use LoRA on the output head. The app trains the head fully instead.",
       "what_to_do": {
         "steps": [
@@ -2068,7 +2074,7 @@ export const catalog = deepFreeze({
     },
     {
       "code": "MRL-ENV-001",
-      "title": "This version of your operating system is not supported.",
+      "title": "The app doesn't support this version of your operating system.",
       "why": "The training tools need a newer version of your OS.",
       "what_to_do": {
         "steps": [
@@ -2367,7 +2373,7 @@ export const catalog = deepFreeze({
     },
     {
       "code": "MRL-MODEL-003",
-      "title": "This model's license has not been accepted yet.",
+      "title": "You haven't accepted this model's license yet.",
       "why": "The model's owner asks you to accept its license before you download it.",
       "what_to_do": {
         "steps": [
@@ -2494,7 +2500,7 @@ export const catalog = deepFreeze({
     },
     {
       "code": "PREEMPTED",
-      "title": "The run was paused to free this machine.",
+      "title": "The app paused the run to free this machine.",
       "why": "A job with higher priority needed the machine.",
       "what_to_do": {
         "steps": [
@@ -2506,7 +2512,7 @@ export const catalog = deepFreeze({
     {
       "code": "REWARD_INFRA",
       "title": "The service that scores answers is not working.",
-      "why": "The reward service could not be reached, or it did not answer in time.",
+      "why": "The app could not reach the reward service, or it did not answer in time.",
       "what_to_do": {
         "steps": [
           "Check that the reward service is running.",
@@ -2527,7 +2533,7 @@ export const catalog = deepFreeze({
     },
     {
       "code": "SANDBOX_VIOLATION",
-      "title": "Reward code was stopped for safety.",
+      "title": "The sandbox stopped the reward code for safety.",
       "why": "Code that scores answers tried something the sandbox does not allow, like using the network.",
       "what_to_do": {
         "steps": [
@@ -2898,13 +2904,13 @@ export const catalog = deepFreeze({
         "task": "mlx-sft",
         "platform": "cpu",
         "supported": false,
-        "note": "MLX runs only on Apple Silicon Macs. Use sft-lora here instead."
+        "note": "MLX runs only on Apple Silicon Macs. Pick \"Teach by example with LoRA\" instead."
       },
       {
         "task": "mlx-sft",
         "platform": "linux-nvidia",
         "supported": false,
-        "note": "MLX runs only on Apple Silicon Macs. Use sft-lora here instead."
+        "note": "MLX runs only on Apple Silicon Macs. Pick \"Teach by example with LoRA\" instead."
       },
       {
         "task": "mlx-sft",
@@ -2924,7 +2930,7 @@ export const catalog = deepFreeze({
         "task": "mlx-sft",
         "platform": "windows-wsl2-nvidia",
         "supported": false,
-        "note": "MLX runs only on Apple Silicon Macs. Use sft-lora here instead."
+        "note": "MLX runs only on Apple Silicon Macs. Pick \"Teach by example with LoRA\" instead."
       },
       {
         "task": "playground",
@@ -3131,7 +3137,7 @@ export const catalog = deepFreeze({
         "task": "sft-qlora",
         "platform": "cpu",
         "supported": false,
-        "note": "QLoRA needs a GPU. Use sft-lora with a tiny model instead."
+        "note": "QLoRA needs a GPU. Pick \"Teach by example with LoRA\" with a tiny model instead."
       },
       {
         "task": "sft-qlora",

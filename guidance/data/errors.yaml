@@ -71,7 +71,7 @@ errors:
         - If it fails again, try another engine or report it with the diagnostics.
 
   - code: SANDBOX_VIOLATION
-    title: Reward code was stopped for safety.
+    title: The sandbox stopped the reward code for safety.
     why: Code that scores answers tried something the sandbox does not allow, like using the network.
     what_to_do:
       steps:
@@ -79,7 +79,7 @@ errors:
         - Change the reward code so it does not need that action, then start again.
 
   - code: PREEMPTED
-    title: The run was paused to free this machine.
+    title: The app paused the run to free this machine.
     why: A job with higher priority needed the machine.
     what_to_do:
       steps:
@@ -92,7 +92,7 @@ errors:
     what_to_do:
       steps:
         - Start the run again to continue from the last checkpoint.
-        - Progress made after the last checkpoint is not saved.
+        - You lose progress made after the last checkpoint.
 
   - code: VERIFICATION_FAILED
     title: The trained model did not pass its final checks.
@@ -104,7 +104,7 @@ errors:
 
   - code: REWARD_INFRA
     title: The service that scores answers is not working.
-    why: The reward service could not be reached, or it did not answer in time.
+    why: The app could not reach the reward service, or it did not answer in time.
     what_to_do:
       steps:
         - Check that the reward service is running.
@@ -293,7 +293,7 @@ errors:
         - Or pick a model that works without custom code.
 
   - code: MRL-MODEL-003
-    title: This model's license has not been accepted yet.
+    title: You haven't accepted this model's license yet.
     why: The model's owner asks you to accept its license before you download it.
     what_to_do:
       steps:
@@ -349,7 +349,7 @@ errors:
         - Or use full fine-tuning if you need reference syncing.
 
   - code: MRL-CAP-007
-    title: The output head will be fully trained instead of using LoRA.
+    title: The app trains the output head fully instead of with LoRA.
     why: DPO, KTO and logit distillation can't use LoRA on the output head. The app trains the head fully instead.
     what_to_do:
       steps:
@@ -482,7 +482,7 @@ errors:
 
   # ---------- Environment Doctor ----------
   - code: MRL-ENV-001
-    title: This version of your operating system is not supported.
+    title: The app doesn't support this version of your operating system.
     why: The training tools need a newer version of your OS.
     what_to_do:
       steps:
