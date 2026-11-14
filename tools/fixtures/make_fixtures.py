@@ -5,17 +5,20 @@
 
 Models go to tests/fixtures/models/.cache/ (never committed):
   tiny-llama/         random-init Llama, safetensors, BPE tokenizer, chat template
-  tiny-llama-pickle/  same weights as a pickle `pytorch_model.bin`, for refusal tests
+  tiny-llama-pickle/  same weights as `pytorch_model.bin` in torch.save's zip+pickle
+                      layout (written without torch), for pickle refusal tests
 Datasets go to tests/fixtures/datasets/ (committed) and must match the generator.
 """
 
 import argparse
 import hashlib
+import io
 import json
-import pickle
 import platform
+import struct
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -146,6 +149,43 @@ def build_weights() -> dict[str, np.ndarray]:
     return weights
 
 
+def _pickle_str(text: str) -> bytes:
+    data = text.encode()
+    return b"X" + struct.pack("<I", len(data)) + data  # BINUNICODE
+
+
+def _pickle_int(n: int) -> bytes:
+    return b"J" + struct.pack("<i", n)  # BININT
+
+
+def _pickle_tuple(items: list[int]) -> bytes:
+    return b"(" + b"".join(_pickle_int(i) for i in items) + b"t"  # MARK ... TUPLE
+
+
+def torch_pickle_bytes(weights: dict[str, np.ndarray]) -> bytes:
+    """Same bytes layout as torch.save(state_dict): a zip holding data.pkl + raw storages.
+
+    data.pkl is written opcode by opcode (protocol 2) so torch is not needed here.
+    """
+    pkl = b"\x80\x02}("  # PROTO 2, EMPTY_DICT, MARK
+    for key, (name, w) in enumerate(weights.items()):
+        strides = [s // w.itemsize for s in w.strides]
+        pkl += _pickle_str(name) + b"ctorch._utils\n_rebuild_tensor_v2\n("
+        pkl += b"(" + _pickle_str("storage") + b"ctorch\nFloatStorage\n"
+        pkl += _pickle_str(str(key)) + _pickle_str("cpu") + _pickle_int(w.size) + b"tQ"
+        pkl += _pickle_int(0) + _pickle_tuple(list(w.shape)) + _pickle_tuple(strides)
+        pkl += b"\x89ccollections\nOrderedDict\n)RtR"  # requires_grad=False, hooks={}
+    pkl += b"u."  # SETITEMS, STOP
+    entries = {"data.pkl": pkl, "byteorder": b"little"}
+    entries |= {f"data/{i}": w.tobytes() for i, w in enumerate(weights.values())}
+    entries["version"] = b"3\n"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_STORED) as zf:
+        for name, data in entries.items():
+            zf.writestr(zipfile.ZipInfo(f"pytorch_model/{name}", (1980, 1, 1, 0, 0, 0)), data)
+    return buf.getvalue()
+
+
 def build_models(out: Path) -> dict[str, Any]:
     """Write both model folders under `out`; return the facts GOLDEN.json pins."""
     text = {
@@ -161,7 +201,7 @@ def build_models(out: Path) -> dict[str, Any]:
         for name, data in text.items():
             (d / name).write_bytes(data)
     save_file(weights, str(safe_dir / "model.safetensors"), metadata={"format": "pt"})
-    (pickle_dir / "pytorch_model.bin").write_bytes(pickle.dumps(weights, protocol=4))
+    (pickle_dir / "pytorch_model.bin").write_bytes(torch_pickle_bytes(weights))
     return {
         "model": "tiny-llama",
         "architecture": CONFIG["architectures"][0],

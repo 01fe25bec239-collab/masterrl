@@ -68,7 +68,8 @@ def main() -> int:
         for problem in problems:
             print(f"error: {model['repo']}: {problem}", file=sys.stderr)
         if problems:
-            print(f"Delete {folder} and run again to re-download.", file=sys.stderr)
+            # Snapshot files are symlinks into the repo cache; delete that to re-download.
+            print(f"Delete {folder.parents[1]} and run again to re-download.", file=sys.stderr)
         else:
             print(f"{model['level']} {model['repo']}@{model['revision'][:12]} ok: {folder}")
         failed |= bool(problems)

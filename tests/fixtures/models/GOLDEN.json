@@ -16,7 +16,7 @@
   "weights_sha256": {
     "darwin-arm64": {
       "model.safetensors": "1acb5b90d99c6bf5149c0c13a4a88d15a41858750a307890324634a848b6fbbe",
-      "pytorch_model.bin": "d4cfacb974fda3d04707e5ad9c4ed7d54061efef62a8a3244f0ae648ca048a97"
+      "pytorch_model.bin": "d5e10ec8c9b79956a3a532bb600d65ec1a4acf781cc951506b08268658cf4278"
     }
   }
 }
