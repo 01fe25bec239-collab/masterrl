@@ -1,0 +1,56 @@
+{
+  "name": "desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "MasterRL desktop app",
+  "type": "module",
+  "main": "dist/main/index.cjs",
+  "scripts": {
+    "build:main": "esbuild src/main/index.ts src/preload/index.ts --bundle --platform=node --format=cjs --target=node22 --external:electron --outbase=src --outdir=dist --out-extension:.js=.cjs",
+    "build": "pnpm run build:main && electron-builder --dir",
+    "dev": "pnpm run build:main && node scripts/dev.ts",
+    "lint": "eslint . && prettier --check . --ignore-path ../../.gitignore && node scripts/check-security.ts",
+    "typecheck": "tsc",
+    "test": "vitest run",
+    "test:smoke": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.64.1",
+    "@types/node": "24.19.2",
+    "electron": "45.2.0",
+    "electron-builder": "26.18.0",
+    "esbuild": "0.28.2",
+    "vite": "8.3.5",
+    "vitest": "5.0.5",
+    "web": "workspace:*",
+    "zod": "4.6.7"
+  },
+  "build": {
+    "appId": "dev.masterrl.desktop",
+    "productName": "MasterRL",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/main/**",
+      "dist/preload/**"
+    ],
+    "extraResources": [
+      {
+        "from": "../web/dist",
+        "to": "renderer"
+      }
+    ],
+    "mac": {
+      "target": "dir",
+      "identity": null
+    },
+    "win": {
+      "target": "dir"
+    },
+    "linux": {
+      "target": "dir",
+      "executableName": "masterrl"
+    }
+  }
+}

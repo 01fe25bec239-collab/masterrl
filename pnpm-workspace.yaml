@@ -1,0 +1,12 @@
+packages:
+  - apps/*
+  - packages/*
+
+# Install scripts allowed: Electron fetches its binary, esbuild picks its native build.
+allowBuilds:
+  electron: true
+  esbuild: true
+  electron-winstaller: false
+
+saveExact: true
+engineStrict: true

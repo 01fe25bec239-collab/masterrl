@@ -1,0 +1,45 @@
+name: ci-desktop
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  desktop:
+    # Linux on every PR; macOS and Windows only on main and manual runs (they cost more minutes).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["ubuntu-24.04","macos-15","windows-2025"]') }}
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter desktop lint
+      - run: pnpm --filter desktop typecheck
+      - run: pnpm --filter desktop test
+      # Builds the web renderer first, then an unsigned electron-builder directory build.
+      - run: pnpm --filter 'desktop...' -r build
+      - name: Smoke test (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # Ubuntu 24.04 blocks the user namespaces Chromium's sandbox needs; allow them for this runner.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          xvfb-run -a pnpm --filter desktop test:smoke
+      - name: Smoke test
+        if: runner.os != 'Linux'
+        run: pnpm --filter desktop test:smoke

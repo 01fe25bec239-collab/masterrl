@@ -1,0 +1,14 @@
+/* Tailwind v4 preset: only MasterRL tokens are available as colors (e.g. `bg-surface text-fg`). */
+@import './tokens.css';
+
+@theme inline {
+  --color-*: initial;
+  --color-bg: var(--mrl-color-bg);
+  --color-surface: var(--mrl-color-surface);
+  --color-fg: var(--mrl-color-fg);
+  --color-fg-muted: var(--mrl-color-fg-muted);
+  --color-border: var(--mrl-color-border);
+  --color-accent: var(--mrl-color-accent);
+  --color-accent-fg: var(--mrl-color-accent-fg);
+  --color-danger: var(--mrl-color-danger);
+}
