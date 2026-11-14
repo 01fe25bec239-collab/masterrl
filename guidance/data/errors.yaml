@@ -1,0 +1,665 @@
+# Error explanations: title (what happened), why, what_to_do (steps, plus optional per-OS steps).
+# Later parts add codes in guidance/fragments/errors/pNN.yaml, never here.
+
+fallback:
+  title: Something went wrong.
+  why: The app hit a problem it has no explanation for yet.
+  what_to_do:
+    steps:
+      - Copy the diagnostics from Details.
+      - Try the action again.
+      - If it keeps happening, report it with the diagnostics.
+
+errors:
+  # ---------- Failure classes ----------
+  - code: USER_CONFIG
+    title: The run stopped because a setting needs a change.
+    why: Some of the settings for this run don't work together.
+    what_to_do:
+      steps:
+        - Open the run settings and look for the highlighted field.
+        - Change the value, then start the run again.
+
+  - code: DATA
+    title: The run stopped because of a problem in your dataset.
+    why: Some rows are missing fields or don't match the format this method needs.
+    what_to_do:
+      steps:
+        - Open the dataset report to see which rows need a fix.
+        - Fix or remove those rows, then start the run again.
+
+  - code: OOM
+    title: The run stopped because memory ran out.
+    why: This model with these settings needs more memory than this machine has free.
+    what_to_do:
+      steps:
+        - Resume with memory-saving settings.
+        - Pick a smaller model, or lower the batch size.
+        - Close other apps that use a lot of memory.
+
+  - code: NODE_LOST
+    title: The app lost contact with a machine in this run.
+    why: The machine may have shut down, gone to sleep or dropped off the network.
+    what_to_do:
+      steps:
+        - Check that the machine is on and connected.
+        - Resume from the last checkpoint once it is back.
+
+  - code: HARDWARE
+    title: The run stopped because of a hardware problem.
+    why: A GPU or another part reported an error it could not recover from.
+    what_to_do:
+      steps:
+        - Restart the machine, then resume from the last checkpoint.
+        - If it happens again, run the Environment Doctor.
+
+  - code: INFRA_TRANSIENT
+    title: The run hit a short system problem.
+    why: Something outside training, like the network or storage, failed for a moment.
+    what_to_do:
+      steps:
+        - Wait about 1–2 minutes, then resume the run.
+        - If it keeps happening, check your network and free disk space.
+
+  - code: ENGINE_ERROR
+    title: The training engine stopped with an error.
+    why: The software that runs training hit a problem it could not handle.
+    what_to_do:
+      steps:
+        - Copy the diagnostics from Details.
+        - Resume from the last checkpoint.
+        - If it fails again, try another engine or report it with the diagnostics.
+
+  - code: SANDBOX_VIOLATION
+    title: Reward code was stopped for safety.
+    why: Code that scores answers tried something the sandbox does not allow, like using the network.
+    what_to_do:
+      steps:
+        - Open Details to see the blocked action.
+        - Change the reward code so it does not need that action, then start again.
+
+  - code: PREEMPTED
+    title: The run was paused to free this machine.
+    why: A job with higher priority needed the machine.
+    what_to_do:
+      steps:
+        - You don't need to do anything. The run resumes from its last checkpoint when the machine is free.
+        - You may lose progress made since the last checkpoint.
+
+  - code: CANCELLED_BY_USER
+    title: You stopped this run.
+    why: The app ended training because Stop was selected.
+    what_to_do:
+      steps:
+        - Start the run again to continue from the last checkpoint.
+        - Progress made after the last checkpoint is not saved.
+
+  - code: VERIFICATION_FAILED
+    title: The trained model did not pass its final checks.
+    why: A check after training found a problem, like a broken file or a score below the limit.
+    what_to_do:
+      steps:
+        - Open the check report to see which check failed.
+        - Retrain with the suggested settings, or use an earlier checkpoint.
+
+  - code: REWARD_INFRA
+    title: The service that scores answers is not working.
+    why: The reward service could not be reached, or it did not answer in time.
+    what_to_do:
+      steps:
+        - Check that the reward service is running.
+        - Resume the run once it answers again.
+
+  - code: DEPENDENCY_ENV
+    title: Some software this run needs is missing or out of date.
+    why: The run needs certain versions of tools, like PyTorch or the GPU driver.
+    what_to_do:
+      steps:
+        - Run the Environment Doctor to see what to install.
+        - Install or update the listed items, then start the run again.
+
+  - code: MODEL_INCOMPATIBLE
+    title: This model can't be used with this method.
+    why: The model's type or files don't match what this method needs.
+    what_to_do:
+      steps:
+        - Pick a model marked as compatible in the model list.
+        - Or pick a different method for this model.
+
+  - code: NUMERIC_DIVERGENCE
+    title: Training stopped because its numbers went out of range.
+    why: The loss grew too large or stopped being a number. A learning rate that is too high often causes this.
+    what_to_do:
+      steps:
+        - Resume from an earlier checkpoint with a lower learning rate.
+        - If you used fp16, switch to bf16.
+
+  - code: STALLED
+    title: The run stopped making progress.
+    why: No training step finished for a long time.
+    what_to_do:
+      steps:
+        - Check that the machine is awake and not overloaded.
+        - Resume the run.
+        - If it stalls again, copy the diagnostics and report it.
+
+  - code: HARNESS_ERROR
+    title: The app had an internal problem running this job.
+    why: This is a problem in the app, not in your data or settings.
+    what_to_do:
+      steps:
+        - Resume the run.
+        - If it happens again, copy the diagnostics and report it.
+
+  - code: SAFETY_HALT
+    title: A safety rule stopped the run.
+    why: A safety check found that the model or its answers crossed a set limit.
+    what_to_do:
+      steps:
+        - Open Details to see which rule stopped the run.
+        - Change the data or settings, then start again.
+
+  # ---------- Sub-codes ----------
+  - code: OOM/OOM_GPU
+    title: "Training paused: the GPU ran out of memory."
+    why: This model with these settings needs more GPU memory than is free.
+    what_to_do:
+      steps:
+        - Resume with memory-saving settings.
+        - Use a smaller model, or switch from LoRA to QLoRA.
+        - Lower the batch size to 1 or 2.
+
+  - code: OOM/OOM_HOST
+    title: "Training paused: the computer ran out of memory."
+    why: System memory (RAM) filled up. Loading the model and data can use a lot of it.
+    what_to_do:
+      steps:
+        - Close other apps that use a lot of memory.
+        - Lower the number of data loading workers.
+        - Use a smaller model.
+
+  - code: OOM/SHM_EXHAUSTED
+    title: "Training paused: shared memory ran out."
+    why: Data loading workers pass data through shared memory, and it filled up.
+    what_to_do:
+      steps:
+        - Lower the number of data loading workers to 0 or 1, then resume.
+      linux:
+        - If training runs in Docker, start the container with more shared memory, like `--shm-size=8g`.
+
+  - code: INFRA_TRANSIENT/DISK_FULL
+    title: "Training paused: the disk is full."
+    why: Checkpoints and downloads need free disk space, and none is left.
+    what_to_do:
+      steps:
+        - Free up space, or delete old checkpoints you don't need.
+        - Resume the run once you have about 20 GB or more free.
+      windows:
+        - Open Settings > System > Storage to see what uses space.
+      macos:
+        - Open System Settings > General > Storage to see what uses space.
+      linux:
+        - Run `df -h` to see free space on each disk.
+
+  - code: HARDWARE/GPU_CONTENDED
+    title: Another program is using the GPU.
+    why: This run can't get the GPU memory or time it needs while another program uses it.
+    what_to_do:
+      steps:
+        - Close other apps that use the GPU, like games or other training jobs.
+        - Resume the run.
+      windows:
+        - Run `nvidia-smi` to see which programs use the GPU.
+      linux:
+        - Run `nvidia-smi` to see which programs use the GPU.
+
+  - code: NODE_LOST/NODE_REBOOTED
+    title: A machine in this run restarted.
+    why: The machine rebooted, maybe after an update or a power cut.
+    what_to_do:
+      steps:
+        - Wait for the machine to come back online.
+        - Resume from the last checkpoint.
+      windows:
+        - Pause Windows updates while long runs train.
+
+  # ---------- Request checks ----------
+  - code: MRL-VAL-001
+    title: The app could not read this request.
+    why: The request is not in a format the app understands. It may be cut off or damaged.
+    what_to_do:
+      steps:
+        - Try the action again.
+        - If a script sent the request, check that it sends well-formed JSON.
+
+  - code: MRL-VAL-002
+    title: A required field is missing.
+    why: This request needs a value that was not sent. Details names the field.
+    what_to_do:
+      steps:
+        - Fill in the field named in Details, then try again.
+
+  - code: MRL-VAL-003
+    title: A field has a value that is not allowed.
+    why: The value is outside the allowed choices or range. Details lists what is allowed.
+    what_to_do:
+      steps:
+        - Change the field to one of the allowed values, then try again.
+
+  - code: MRL-IDEM-001
+    title: This request is already running.
+    why: A request with the same request key started earlier and has not finished.
+    what_to_do:
+      steps:
+        - Wait for the first request to finish.
+        - Check its status instead of sending it again.
+
+  - code: MRL-IDEM-002
+    title: This request key was already used for a different request.
+    why: Each request key must match one request. Reusing it with new content could run the wrong work.
+    what_to_do:
+      steps:
+        - Send this request with a new request key.
+
+  - code: MRL-DATA-001
+    title: Your dataset did not pass its checks.
+    why: Some rows are empty, miss fields or don't match the chosen format.
+    what_to_do:
+      steps:
+        - Open the dataset report to see the rows that need a fix.
+        - Fix those rows, or skip them, then try again.
+
+  - code: MRL-DATA-002
+    title: Your dataset is not ready yet.
+    why: The app is still checking or preparing it.
+    what_to_do:
+      steps:
+        - Wait until the dataset shows Ready, then try again.
+
+  - code: MRL-MODEL-001
+    title: The app did not load this model's files, to keep your computer safe.
+    why: The weights use the pickle format, which can run hidden code. Only safetensors files are allowed.
+    what_to_do:
+      steps:
+        - Pick a version of this model with safetensors files.
+        - Or convert the weights to safetensors on a machine you trust.
+
+  - code: MRL-MODEL-002
+    title: This model needs custom code that is not approved.
+    why: The model comes with its own code. Your workspace only runs approved code.
+    what_to_do:
+      steps:
+        - Ask a workspace admin to approve this model's code.
+        - Or pick a model that works without custom code.
+
+  - code: MRL-MODEL-003
+    title: This model's license has not been accepted yet.
+    why: The model's owner asks you to accept its license before you download it.
+    what_to_do:
+      steps:
+        - Open the model page and read the license.
+        - Accept the license, then try again.
+
+  # ---------- Capability checks ----------
+  - code: MRL-CAP-001
+    title: No engine here supports this method.
+    why: The training engines on this machine can't run the method you picked.
+    what_to_do:
+      steps:
+        - Pick another method.
+        - Or run the Environment Doctor to see which engines you can install.
+
+  - code: MRL-CAP-002
+    title: PPO is not available with the TRL engine.
+    why: The app does not offer PPO through TRL.
+    what_to_do:
+      steps:
+        - Switch the engine to verl to use PPO.
+        - Or keep TRL and pick GRPO or RLOO instead.
+
+  - code: MRL-CAP-003
+    title: DPO needs preference pairs, but this dataset has conversations.
+    why: DPO learns from a better and a worse answer for each prompt.
+    what_to_do:
+      steps:
+        - Pick a dataset with a chosen and a rejected answer per prompt.
+        - Or use SFT to teach by example with this dataset.
+
+  - code: MRL-CAP-004
+    title: GRPO needs a reward, and none is attached.
+    why: GRPO learns by scoring its own answers. Without a reward, it has nothing to learn from.
+    what_to_do:
+      steps:
+        - Attach a reward, like an answer checker or a reward model.
+
+  - code: MRL-CAP-005
+    title: KTO needs a batch size of at least 2.
+    why: KTO compares answers within each batch, so each device needs at least 2 samples.
+    what_to_do:
+      steps:
+        - Set the per-device batch size to 2 or more.
+        - If memory is tight, use QLoRA or a smaller model.
+
+  - code: MRL-CAP-006
+    title: DPO with LoRA can't also use reference syncing.
+    why: With LoRA, the reference model is the base model without the adapter. It can't change during training.
+    what_to_do:
+      steps:
+        - Turn off reference syncing.
+        - Or use full fine-tuning if you need reference syncing.
+
+  - code: MRL-CAP-007
+    title: The output head will be fully trained instead of using LoRA.
+    why: DPO, KTO and logit distillation can't use LoRA on the output head. The app trains the head fully instead.
+    what_to_do:
+      steps:
+        - You don't need to do anything. Training uses a bit more memory.
+        - If memory is tight, remove the output head from the LoRA targets.
+
+  - code: MRL-CAP-008
+    title: GRPO server mode needs a second GPU.
+    why: In server mode, one GPU writes answers and another GPU trains. This machine has one GPU.
+    what_to_do:
+      steps:
+        - Switch to colocated mode, which shares one GPU.
+        - Or add a machine with another GPU.
+
+  - code: MRL-CAP-009
+    title: The GRPO batch size must divide evenly by samples per prompt.
+    why: GRPO groups all answers for each prompt. Each batch must hold whole groups.
+    what_to_do:
+      steps:
+        - Set the batch size to a multiple of samples per prompt. For example, use 8 with 4 samples per prompt.
+
+  - code: MRL-CAP-010
+    title: This GRPO setup needs colocated mode.
+    why: In server mode, a top-p below 1 makes importance correction wrong.
+    what_to_do:
+      steps:
+        - Switch to colocated mode.
+        - Or set top-p to 1 to keep server mode.
+
+  - code: MRL-CAP-011
+    title: DAPO dynamic sampling is not available with TRL.
+    why: TRL does not offer dynamic sampling.
+    what_to_do:
+      steps:
+        - Switch the engine to verl to use dynamic sampling.
+        - Or turn off dynamic sampling to keep TRL.
+
+  - code: MRL-CAP-012
+    title: This field can't be changed right now.
+    why: A switch you turned on sets this field. The field stays read-only while that switch is on.
+    what_to_do:
+      steps:
+        - Turn off the switch named in Details to edit this field.
+
+  - code: MRL-CAP-013
+    title: Async mode works only with FSDP2 and text data.
+    why: Async mode can't run with DeepSpeed or with image data.
+    what_to_do:
+      steps:
+        - Switch the engine setup to FSDP2.
+        - Use a text-only dataset, or turn off async mode.
+
+  - code: MRL-CAP-014
+    title: This method can't train an encoder-only model.
+    why: This method teaches a model to write text. Encoder-only models read text but can't write it.
+    what_to_do:
+      steps:
+        - Pick a model that writes text, like a chat model.
+
+  - code: MRL-CAP-015
+    title: Your workspace rules block this model.
+    why: The model needs custom code or uses unsafe weight files. Your workspace allows neither.
+    what_to_do:
+      steps:
+        - Pick a model with safetensors files and no custom code.
+        - Or ask a workspace admin to change the rules.
+
+  - code: MRL-CAP-016
+    title: This model has no chat template for conversation data.
+    why: A chat template marks where each message starts and ends. Without one, conversations can't be formatted.
+    what_to_do:
+      steps:
+        - Pick the chat or instruct version of this model.
+        - Or turn the dataset into plain prompt and answer pairs.
+
+  - code: MRL-CAP-017
+    title: A streaming dataset needs a step limit.
+    why: The app can't know the size of a streaming dataset, so it can't tell when to stop.
+    what_to_do:
+      steps:
+        - Set the maximum number of training steps.
+
+  - code: MRL-CAP-018
+    title: No engine setup here matches this hardware.
+    why: None of the installed engine setups supports the hardware you selected.
+    what_to_do:
+      steps:
+        - Run the Environment Doctor to see what is missing.
+        - Or select different hardware for this run.
+
+  - code: MRL-CAP-019
+    title: This method runs on one machine only.
+    why: You selected several machines, but this method can't split its work across them.
+    what_to_do:
+      steps:
+        - Select one machine for this run.
+        - Or pick a method that runs on several machines.
+
+  - code: MRL-CAP-020
+    title: This checkpoint came from a different engine or format.
+    why: A run can resume only on the engine and format that made its checkpoint.
+    what_to_do:
+      steps:
+        - Resume with the engine that made this checkpoint.
+        - Or start a new run that loads the checkpoint's weights.
+
+  - code: MRL-CAP-021
+    title: This engine can't pause.
+    why: This engine can only stop. It saves progress at checkpoints instead.
+    what_to_do:
+      steps:
+        - Stop the run instead, and resume it later from the last checkpoint.
+        - You lose progress made since the last checkpoint.
+
+  - code: MRL-CAP-022
+    title: This method is experimental and turned off.
+    why: Experimental methods are off in this workspace.
+    what_to_do:
+      steps:
+        - Ask a workspace admin to turn on experimental methods.
+        - Or pick a method that is not experimental.
+
+  - code: MRL-CAP-023
+    title: This reward needs token log-probabilities, but the rollout engine doesn't return them.
+    why: The reward uses how likely the model thought each token was. This rollout engine doesn't report that.
+    what_to_do:
+      steps:
+        - Pick a rollout engine that returns log-probabilities, like vLLM.
+        - Or use a reward that only reads the answer text.
+
+  # ---------- Environment Doctor ----------
+  - code: MRL-ENV-001
+    title: This version of your operating system is not supported.
+    why: The training tools need a newer version of your OS.
+    what_to_do:
+      steps:
+        - Update your OS to the version shown in Details.
+      windows:
+        - Open Settings > Windows Update and install the updates.
+      macos:
+        - Open System Settings > General > Software Update.
+      linux:
+        - Use your distribution's update tool to upgrade to the version shown in Details.
+
+  - code: MRL-ENV-002
+    title: This computer's processor doesn't meet the app's needs.
+    why: The training tools need a 64-bit CPU with features this one lacks. Details lists them.
+    what_to_do:
+      steps:
+        - Use another machine for training.
+        - Or connect a machine that meets the needs and train there.
+
+  - code: MRL-ENV-003
+    title: This machine has too little free memory (RAM).
+    why: Training loads the model and data into memory. Too little free memory makes training crash.
+    what_to_do:
+      steps:
+        - Close apps you don't need.
+        - Pick a smaller model or a recipe that uses less memory.
+
+  - code: MRL-ENV-004
+    title: There is not enough free disk space.
+    why: Models, datasets and checkpoints need space. One run can need about 10–50 GB.
+    what_to_do:
+      steps:
+        - Free up the amount of space shown in Details.
+      windows:
+        - Open Settings > System > Storage to see what uses space.
+      macos:
+        - Open System Settings > General > Storage to see what uses space.
+      linux:
+        - Run `df -h` to see free space on each disk.
+
+  - code: MRL-ENV-005
+    title: No usable GPU was found, or its memory is too small.
+    why: Training is much faster on a GPU. The model must fit in the GPU's memory (VRAM).
+    what_to_do:
+      steps:
+        - Check that the GPU is connected and its driver is installed.
+        - Pick a recipe for your GPU size, or train tiny models on the CPU.
+
+  - code: MRL-ENV-006
+    title: The NVIDIA driver or CUDA version is too old.
+    why: The training engines need a recent driver to use the GPU.
+    what_to_do:
+      steps:
+        - Install the driver version shown in Details, then restart your computer.
+      windows:
+        - Install the driver in Windows, not inside WSL2. WSL2 uses the Windows driver.
+      linux:
+        - Run `nvidia-smi` to see your driver and CUDA versions.
+    docs_link: https://www.nvidia.com/en-us/drivers/
+
+  - code: MRL-ENV-007
+    title: WSL2 is missing or not set up.
+    why: On Windows, training runs inside WSL2, a Linux system inside Windows.
+    what_to_do:
+      steps:
+        - Install WSL2, then run the Environment Doctor again.
+      windows:
+        - Open PowerShell as an administrator and run `wsl --install`.
+        - Restart your computer when it asks.
+    docs_link: https://learn.microsoft.com/en-us/windows/wsl/install
+
+  - code: MRL-ENV-008
+    title: WSL2 mirrored networking is off.
+    why: Training across several machines needs WSL2 to share your computer's network address.
+    what_to_do:
+      steps:
+        - You need this only to train across several machines.
+      windows:
+        - Add `networkingMode=mirrored` under `[wsl2]` in the `.wslconfig` file in your user folder.
+        - Run `wsl --shutdown`, then open WSL2 again.
+    docs_link: https://learn.microsoft.com/en-us/windows/wsl/networking#mirrored-mode-networking
+
+  - code: MRL-ENV-009
+    title: This Mac's chip or memory is not enough for training.
+    why: Training on a Mac needs Apple Silicon (M1 or later) and at least 16 GB of memory.
+    what_to_do:
+      steps:
+        - Use tiny models to learn on this Mac.
+        - Or connect an NVIDIA machine to train bigger models.
+
+  - code: MRL-ENV-010
+    title: AMD GPU support is experimental.
+    why: Training on AMD GPUs uses ROCm, which the app has not fully tested. Runs may fail or be slow.
+    what_to_do:
+      steps:
+        - Use an NVIDIA GPU for full support.
+      linux:
+        - To try it anyway, install ROCm with AMD's guide.
+    docs_link: https://rocm.docs.amd.com/
+
+  - code: MRL-ENV-011
+    title: Python or uv is missing or too old.
+    why: The app uses uv to set up Python and the training tools.
+    what_to_do:
+      steps:
+        - Install uv, then run the Environment Doctor again.
+      windows:
+        - Run `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"` in PowerShell.
+      macos:
+        - Run `curl -LsSf https://astral.sh/uv/install.sh | sh` in Terminal.
+      linux:
+        - Run `curl -LsSf https://astral.sh/uv/install.sh | sh` in a terminal.
+    docs_link: https://docs.astral.sh/uv/getting-started/installation/
+
+  - code: MRL-ENV-012
+    title: Docker is not installed.
+    why: Docker is optional. The app uses it only for some sandboxes and engine setups, which stay off without it.
+    what_to_do:
+      steps:
+        - Install Docker if you want those features.
+    docs_link: https://docs.docker.com/get-started/get-docker/
+
+  # ---------- Link Doctor ----------
+  - code: MRL-LINK-001
+    title: These machines can't share one training job.
+    why: They use different kinds of chips, like a Mac and an NVIDIA computer. One job needs one kind.
+    what_to_do:
+      steps:
+        - Pick machines with the same kind of GPU for this job.
+        - You can still use the other machine for its own runs or the Playground.
+
+  - code: MRL-LINK-002
+    title: The machines run different driver, CUDA or engine versions.
+    why: Machines in one job must run matching versions to work together.
+    what_to_do:
+      steps:
+        - Update every machine to the versions shown in Details.
+        - Run the Environment Doctor on each machine.
+
+  - code: MRL-LINK-003
+    title: The connection between the machines is slow.
+    why: Training across machines sends a lot of data. Wi-Fi is often too slow or unsteady.
+    what_to_do:
+      steps:
+        - Connect the machines with network cables instead of Wi-Fi.
+        - Or train on one machine. Training across slow links can be slower than one machine.
+
+  - code: MRL-LINK-004
+    title: A firewall is blocking the machines from talking.
+    why: The machines need some network ports open to reach each other.
+    what_to_do:
+      steps:
+        - Allow the ports listed in Details on each machine.
+      windows:
+        - Open Windows Security > Firewall & network protection > Allow an app through firewall.
+      macos:
+        - Open System Settings > Network > Firewall > Options.
+      linux:
+        - If you use ufw, run `sudo ufw allow PORT/tcp` for each port in Details.
+
+  - code: MRL-LINK-005
+    title: The clocks on these machines don't match.
+    why: Machines in one job need clocks within a few seconds of each other. Otherwise logs and security checks fail.
+    what_to_do:
+      steps:
+        - Turn on automatic time on every machine.
+      windows:
+        - Open Settings > Time & language > Date & time, then select Sync now.
+      macos:
+        - Open System Settings > General > Date & Time and turn on automatic time.
+      linux:
+        - Run `sudo timedatectl set-ntp true`.
+
+  - code: MRL-LINK-006
+    title: A machine in this group is low on disk space.
+    why: Each machine stores model files and checkpoints for the job.
+    what_to_do:
+      steps:
+        - Free up space on the machine named in Details.
+        - Give each machine about as much free space as a single-machine run needs.

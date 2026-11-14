@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Error explanations",
+  "description": "Every error code: what happened (title), why, and what to do.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["errors"],
+  "properties": {
+    "errors": { "type": "array", "items": { "$ref": "#/$defs/entry" } },
+    "fallback": {
+      "description": "Shown for a code that has no entry yet. Base data only.",
+      "$ref": "#/$defs/body",
+      "unevaluatedProperties": false
+    }
+  },
+  "$defs": {
+    "text": { "type": "string", "minLength": 1 },
+    "steps": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/text" } },
+    "body": {
+      "type": "object",
+      "required": ["title", "why", "what_to_do"],
+      "properties": {
+        "title": { "$ref": "#/$defs/text", "description": "What happened." },
+        "why": { "$ref": "#/$defs/text" },
+        "what_to_do": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["steps"],
+          "properties": {
+            "steps": { "$ref": "#/$defs/steps", "description": "Steps for every system." },
+            "windows": { "$ref": "#/$defs/steps" },
+            "macos": { "$ref": "#/$defs/steps" },
+            "linux": { "$ref": "#/$defs/steps" }
+          }
+        },
+        "docs_link": { "type": "string", "pattern": "^https://" }
+      }
+    },
+    "entry": {
+      "type": "object",
+      "required": ["code"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^(?:[A-Z][A-Z_]*[A-Z](?:/[A-Z][A-Z_]*[A-Z])?|MRL-[A-Z]+-[0-9]{3})$"
+        }
+      },
+      "allOf": [{ "$ref": "#/$defs/body" }],
+      "unevaluatedProperties": false
+    }
+  }
+}

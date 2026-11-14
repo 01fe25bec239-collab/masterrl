@@ -1,0 +1,122 @@
+# Recipes with defaults per hardware profile.
+# Every number is an estimate (estimated: true) until measured on real machines.
+# model_params_b: model size in billions of parameters.
+# minutes_per_1k_samples: about 512 tokens per sample, smallest to largest model in the range.
+recipes:
+  - id: sft-lora
+    name: Teach by example with LoRA
+    method: sft
+    summary: The model learns from your examples by training a small adapter. This is the best place to start.
+    peft: lora
+    precision: bf16
+    defaults: { epochs: 3, learning_rate: 0.0002, gradient_accumulation_steps: 4, max_seq_length: 1024, lora_rank: 16, lora_alpha: 32 }
+    estimated: true
+    profiles:
+      - { profile: nvidia-4gb, model_params_b: { min: 0.1, max: 1 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 10, max: 40 } }
+      - { profile: nvidia-6gb, model_params_b: { min: 0.5, max: 1.5 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 8, max: 35 } }
+      - { profile: nvidia-8gb, model_params_b: { min: 0.5, max: 3 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 6, max: 40 } }
+      - { profile: nvidia-12gb, model_params_b: { min: 1, max: 4 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 5, max: 35 } }
+      - { profile: nvidia-16gb, model_params_b: { min: 1, max: 7 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 4, max: 45 } }
+      - { profile: nvidia-24gb, model_params_b: { min: 3, max: 8 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 3, max: 30 } }
+      - { profile: nvidia-32-80gb, model_params_b: { min: 7, max: 32 }, per_device_batch_size: 8, minutes_per_1k_samples: { min: 2, max: 40 } }
+      - { profile: apple-16gb, model_params_b: { min: 0.5, max: 3 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 10, max: 60 } }
+      - { profile: apple-24gb, model_params_b: { min: 1, max: 7 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 8, max: 60 } }
+      - { profile: apple-32gb, model_params_b: { min: 3, max: 8 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 8, max: 50 } }
+      - { profile: apple-64gb, model_params_b: { min: 7, max: 14 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 10, max: 60 } }
+      - { profile: apple-128gb, model_params_b: { min: 14, max: 32 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 15, max: 90 } }
+      - { profile: apple-192gb, model_params_b: { min: 14, max: 40 }, per_device_batch_size: 8, minutes_per_1k_samples: { min: 12, max: 90 } }
+      - { profile: cpu, model_params_b: { min: 0.05, max: 0.5 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 60, max: 600 }, precision: fp32 }
+
+  - id: sft-qlora
+    name: Teach by example with QLoRA
+    method: sft
+    summary: Like LoRA, but the model is stored in 4-bit form. You can train bigger models with less memory, a bit slower.
+    peft: qlora
+    precision: nf4-bf16
+    defaults: { epochs: 3, learning_rate: 0.0002, gradient_accumulation_steps: 4, max_seq_length: 1024, lora_rank: 16, lora_alpha: 32 }
+    estimated: true
+    profiles:
+      - { profile: nvidia-4gb, model_params_b: { min: 0.5, max: 3 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 15, max: 60 } }
+      - { profile: nvidia-6gb, model_params_b: { min: 1, max: 4 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 15, max: 70 } }
+      - { profile: nvidia-8gb, model_params_b: { min: 3, max: 8 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 20, max: 80 } }
+      - { profile: nvidia-12gb, model_params_b: { min: 3, max: 8 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 15, max: 60 } }
+      - { profile: nvidia-16gb, model_params_b: { min: 7, max: 14 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 20, max: 80 } }
+      - { profile: nvidia-24gb, model_params_b: { min: 7, max: 14 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 15, max: 60 } }
+      - { profile: nvidia-32-80gb, model_params_b: { min: 14, max: 70 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 15, max: 120 } }
+      - { profile: apple-16gb, model_params_b: { min: 1, max: 7 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 15, max: 80 } }
+      - { profile: apple-24gb, model_params_b: { min: 3, max: 8 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 15, max: 70 } }
+      - { profile: apple-32gb, model_params_b: { min: 7, max: 14 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 15, max: 80 } }
+      - { profile: apple-64gb, model_params_b: { min: 14, max: 32 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 20, max: 100 } }
+      - { profile: apple-128gb, model_params_b: { min: 32, max: 70 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 30, max: 150 } }
+      - { profile: apple-192gb, model_params_b: { min: 32, max: 70 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 25, max: 140 } }
+
+  - id: sft-full
+    name: Teach by example, training every weight
+    method: sft
+    summary: The model learns from your examples by changing all its weights. It needs much more memory than LoRA.
+    peft: none
+    precision: bf16
+    defaults: { epochs: 2, learning_rate: 0.00002, gradient_accumulation_steps: 8, max_seq_length: 1024 }
+    estimated: true
+    profiles:
+      - { profile: nvidia-4gb, model_params_b: { min: 0.1, max: 0.3 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 10, max: 30 } }
+      - { profile: nvidia-6gb, model_params_b: { min: 0.1, max: 0.3 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 8, max: 30 } }
+      - { profile: nvidia-8gb, model_params_b: { min: 0.1, max: 0.5 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 8, max: 35 } }
+      - { profile: nvidia-12gb, model_params_b: { min: 0.3, max: 1 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 8, max: 35 } }
+      - { profile: nvidia-16gb, model_params_b: { min: 0.5, max: 1 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 8, max: 30 } }
+      - { profile: nvidia-24gb, model_params_b: { min: 0.5, max: 1.5 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 6, max: 30 } }
+      - { profile: nvidia-32-80gb, model_params_b: { min: 1, max: 3 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 5, max: 40 } }
+      - { profile: apple-16gb, model_params_b: { min: 0.1, max: 0.5 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 15, max: 60 } }
+      - { profile: apple-24gb, model_params_b: { min: 0.3, max: 1 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 15, max: 60 } }
+      - { profile: apple-32gb, model_params_b: { min: 0.5, max: 1.5 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 15, max: 60 } }
+      - { profile: apple-64gb, model_params_b: { min: 1, max: 3 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 20, max: 80 } }
+      - { profile: apple-128gb, model_params_b: { min: 3, max: 7 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 30, max: 120 } }
+      - { profile: apple-192gb, model_params_b: { min: 3, max: 8 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 30, max: 120 } }
+      - { profile: cpu, model_params_b: { min: 0.05, max: 0.15 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 120, max: 900 }, precision: fp32 }
+
+  - id: dpo
+    name: Learn from preferred answers (DPO)
+    method: dpo
+    summary: The model sees a better and a worse answer for each prompt. It learns to give answers like the better one.
+    peft: lora
+    precision: bf16
+    defaults: { epochs: 1, learning_rate: 0.00005, gradient_accumulation_steps: 8, max_seq_length: 1024, beta: 0.1, lora_rank: 16, lora_alpha: 32 }
+    estimated: true
+    profiles:
+      - { profile: nvidia-4gb, model_params_b: { min: 0.1, max: 0.5 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 20, max: 60 } }
+      - { profile: nvidia-6gb, model_params_b: { min: 0.1, max: 1 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 15, max: 60 } }
+      - { profile: nvidia-8gb, model_params_b: { min: 0.5, max: 1.5 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 15, max: 70 } }
+      - { profile: nvidia-12gb, model_params_b: { min: 1, max: 3 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 15, max: 70 } }
+      - { profile: nvidia-16gb, model_params_b: { min: 1, max: 4 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 12, max: 70 } }
+      - { profile: nvidia-24gb, model_params_b: { min: 3, max: 8 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 10, max: 60 } }
+      - { profile: nvidia-32-80gb, model_params_b: { min: 7, max: 14 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 8, max: 80 } }
+
+  - id: grpo-verifiable
+    name: Practice with checkable answers (GRPO)
+    method: grpo
+    summary: The model writes several answers per problem. A checker scores them, and the model learns from the best ones.
+    peft: lora
+    precision: bf16
+    defaults: { epochs: 1, learning_rate: 0.00001, gradient_accumulation_steps: 4, samples_per_prompt: 4, max_completion_length: 512, lora_rank: 16, lora_alpha: 32 }
+    estimated: true
+    profiles:
+      - { profile: nvidia-8gb, model_params_b: { min: 0.5, max: 1 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 60, max: 240 } }
+      - { profile: nvidia-12gb, model_params_b: { min: 0.5, max: 1.5 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 50, max: 200 } }
+      - { profile: nvidia-16gb, model_params_b: { min: 1, max: 3 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 40, max: 240 } }
+      - { profile: nvidia-24gb, model_params_b: { min: 1.5, max: 7 }, per_device_batch_size: 8, minutes_per_1k_samples: { min: 30, max: 240 } }
+      - { profile: nvidia-32-80gb, model_params_b: { min: 3, max: 14 }, per_device_batch_size: 8, minutes_per_1k_samples: { min: 20, max: 300 } }
+
+  - id: distillation
+    name: Learn from a bigger model (distillation)
+    method: distillation
+    summary: A big teacher model answers your prompts. A small student model trains to match those answers.
+    peft: lora
+    precision: bf16
+    defaults: { epochs: 2, learning_rate: 0.0001, gradient_accumulation_steps: 4, max_seq_length: 1024, temperature: 2, lora_rank: 16, lora_alpha: 32 }
+    estimated: true
+    profiles:
+      - { profile: nvidia-8gb, model_params_b: { min: 0.1, max: 0.5 }, per_device_batch_size: 1, minutes_per_1k_samples: { min: 15, max: 60 } }
+      - { profile: nvidia-12gb, model_params_b: { min: 0.5, max: 1 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 15, max: 60 } }
+      - { profile: nvidia-16gb, model_params_b: { min: 0.5, max: 1.5 }, per_device_batch_size: 2, minutes_per_1k_samples: { min: 15, max: 70 } }
+      - { profile: nvidia-24gb, model_params_b: { min: 1, max: 3 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 10, max: 60 } }
+      - { profile: nvidia-32-80gb, model_params_b: { min: 1, max: 8 }, per_device_batch_size: 4, minutes_per_1k_samples: { min: 8, max: 80 } }

@@ -1,0 +1,53 @@
+# Goal cards for Guided mode. Recipes are listed best first.
+goals:
+  - id: answer-from-documents
+    title: Answer questions about my documents or data
+    summary: >-
+      The model learns to answer in the way your documents need.
+      Fine-tuning teaches style and format best, so keep facts that change often in your documents.
+    recipes: [sft-lora, sft-qlora]
+    dataset_schema: question-answer
+    reward_type: none
+
+  - id: follow-style
+    title: Follow my style or format
+    summary: The model learns to write like your examples.
+    recipes: [sft-lora, sft-qlora, sft-full]
+    dataset_schema: chat
+    reward_type: none
+
+  - id: checkable-answers
+    title: Get better at math or code with checkable answers
+    summary: >-
+      The model practices on problems with known answers.
+      It earns a reward each time its answer checks out.
+    recipes: [grpo-verifiable]
+    dataset_schema: prompt-with-answer
+    reward_type: verifiable
+
+  - id: team-preferences
+    title: Prefer the answers my team likes
+    summary: >-
+      You show pairs of answers and mark the better one.
+      The model learns to give answers like the ones your team picked.
+    recipes: [dpo]
+    dataset_schema: preference-pairs
+    reward_type: preference
+
+  - id: small-like-big
+    title: Make a small model behave like a bigger one
+    summary: >-
+      A big teacher model answers your prompts.
+      A small student model learns to copy those answers, so it runs faster and cheaper.
+    recipes: [distillation]
+    dataset_schema: prompts
+    reward_type: teacher
+
+  - id: learn-basics
+    title: Just learn how fine-tuning works
+    summary: >-
+      You train a tiny model on a sample dataset.
+      Then you compare its answers before and after training.
+    recipes: [sft-lora]
+    dataset_schema: chat
+    reward_type: none
