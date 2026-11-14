@@ -22,8 +22,8 @@ Adapters: `cd python/adapters/<name> && uv sync --locked && uv run lint-imports 
 
 ## Fixtures
 - `uv run python tools/fixtures/make_fixtures.py` builds `tests/fixtures/models/.cache/tiny-llama`
-  (1M-param random Llama, safetensors) and `tiny-llama-pickle` (same weights as `pytorch_model.bin` in torch.save zip+pickle layout,
-  for refusal tests), and rewrites the dataset files and `GOLDEN.json`. Never commit `.cache/`.
+  (1M-param random Llama, safetensors) and `tiny-llama-pickle` (same weights as a torch.save-format
+  `pytorch_model.bin`, for refusal tests), and rewrites the dataset files and `GOLDEN.json`. Never commit `.cache/`.
 - `--check` rebuilds in a temp dir and compares with `GOLDEN.json` and the committed datasets.
   Weight hashes are compared only on a platform listed in `GOLDEN.json`.
 - Each `<schema>-invalid.jsonl` line has one defect; `DEFECTS.json` lists them.
