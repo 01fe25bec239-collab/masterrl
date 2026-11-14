@@ -1921,7 +1921,7 @@ pub static CATALOG: Value = Value::Map(&[
             ("why", Value::Str("DPO, KTO and logit distillation can't use LoRA on the output head. Training needs extra memory for the output head.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
-                    Value::Str("You don't need to do anything."),
+                    Value::Str("Keep the run going."),
                     Value::Str("If memory is tight, remove the output head from the LoRA targets."),
                 ])),
             ])),
@@ -2496,7 +2496,7 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("code", Value::Str("OOM")),
-            ("title", Value::Str("The run stopped because memory ran out.")),
+            ("title", Value::Str("Training paused because memory ran out.")),
             ("why", Value::Str("This model with these settings needs more memory than this machine has free.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[

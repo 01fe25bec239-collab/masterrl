@@ -1862,7 +1862,7 @@
       "why": "DPO, KTO and logit distillation can't use LoRA on the output head. Training needs extra memory for the output head.",
       "what_to_do": {
         "steps": [
-          "You don't need to do anything.",
+          "Keep the run going.",
           "If memory is tight, remove the output head from the LoRA targets."
         ]
       }
@@ -2437,7 +2437,7 @@
     },
     {
       "code": "OOM",
-      "title": "The run stopped because memory ran out.",
+      "title": "Training paused because memory ran out.",
       "why": "This model with these settings needs more memory than this machine has free.",
       "what_to_do": {
         "steps": [
