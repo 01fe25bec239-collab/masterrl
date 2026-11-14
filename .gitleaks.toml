@@ -1,0 +1,8 @@
+# Secret scanning for CI (ci-security.yml) and local runs:
+#   gitleaks git --config .gitleaks.toml --redact .
+# Uses gitleaks' default rules. The dev-only passwords for the local stack
+# (deploy/local/) are low-entropy on purpose and do not need an allowlist.
+title = "MasterRL"
+
+[extend]
+useDefault = true

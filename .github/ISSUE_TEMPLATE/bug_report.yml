@@ -1,0 +1,45 @@
+name: Bug report
+description: Something does not work as expected.
+labels: [bug]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you do, and what went wrong?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Open ...
+        2. Click ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: MasterRL version or commit
+    validations:
+      required: true
+  - type: input
+    id: system
+    attributes:
+      label: Operating system and GPU
+      placeholder: macOS 26 on M4 Max / Ubuntu 24.04 with 2x RTX 4090
+  - type: textarea
+    id: crash-report
+    attributes:
+      label: Paste your redacted crash report
+      description: >-
+        If MasterRL showed a crash report, copy it here. It stays on your computer
+        until you paste it. Check that it contains no secrets or private data.
+      render: text

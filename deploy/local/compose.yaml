@@ -1,0 +1,61 @@
+# Local dev stack: `just dev` starts it, `just dev-down` stops it.
+# All ports bind to 127.0.0.1 only. Postgres uses host port 55432 so it does not
+# clash with a Postgres already on the machine. Data lives in named volumes;
+# wipe it with `docker compose -f deploy/local/compose.yaml down -v`.
+#
+# DEV-ONLY CREDENTIALS — never reuse them anywhere else:
+#   Postgres  user `mrl`, password `mrl-dev-only`, database `masterrl`
+#             DATABASE_URL=postgres://mrl:mrl-dev-only@127.0.0.1:55432/masterrl
+#   S3        endpoint http://127.0.0.1:8333, access key `mrl-dev`,
+#             secret key `mrl-dev-only` (see seaweedfs/s3.json)
+#   OTLP      gRPC 127.0.0.1:4317, HTTP 127.0.0.1:4318 (no auth)
+name: masterrl-dev
+
+services:
+  postgres:
+    image: postgres:16.16-alpine3.24
+    environment:
+      POSTGRES_USER: mrl
+      POSTGRES_PASSWORD: mrl-dev-only
+      POSTGRES_DB: masterrl
+    ports: ["127.0.0.1:55432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "mrl", "-d", "masterrl"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:4.52
+    command: ["server", "-dir=/data", "-ip.bind=0.0.0.0", "-s3", "-s3.config=/etc/seaweedfs/s3.json"]
+    ports: ["127.0.0.1:8333:8333"]
+    volumes:
+      - s3data:/data
+      - ./seaweedfs/s3.json:/etc/seaweedfs/s3.json:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8333/healthz"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+
+  otel-collector:
+    # The upstream image has no shell, so a static busybox is added for the healthcheck.
+    build:
+      dockerfile_inline: |
+        FROM busybox:1.37.0-musl AS busybox
+        FROM otel/opentelemetry-collector:0.164.0
+        COPY --from=busybox /bin/busybox /busybox
+    image: masterrl-dev/otel-collector:0.164.0
+    command: ["--config=/etc/otelcol/config.yaml"]
+    ports: ["127.0.0.1:4317:4317", "127.0.0.1:4318:4318"]
+    volumes: [./otel/config.yaml:/etc/otelcol/config.yaml:ro]
+    healthcheck:
+      test: ["CMD", "/busybox", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:13133/"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  pgdata:
+  s3data:

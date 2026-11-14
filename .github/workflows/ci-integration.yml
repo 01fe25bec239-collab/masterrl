@@ -1,0 +1,47 @@
+name: ci-integration
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  integration:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16.16-alpine3.24
+        env:
+          # Dev-only credentials, same as deploy/local/compose.yaml.
+          POSTGRES_USER: mrl
+          POSTGRES_PASSWORD: mrl-dev-only
+          POSTGRES_DB: masterrl
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U mrl -d masterrl"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+    env:
+      DATABASE_URL: postgres://mrl:mrl-dev-only@127.0.0.1:5432/masterrl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: extractions/setup-just@53165ef7e734c5c07cb06b3c8e7b647c5aa16db3 # v4
+        with:
+          just-version: 1.59.0
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: 0.11.28
+      - name: Set up Node
+        if: hashFiles('package.json') != ''
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 26.13.0
+      - name: Install JS dependencies
+        if: hashFiles('package.json') != ''
+        run: |
+          npm install --global pnpm@11.22.0
+          pnpm install --frozen-lockfile
+      - run: just test-integration
