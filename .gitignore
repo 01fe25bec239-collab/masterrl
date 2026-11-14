@@ -1,0 +1,44 @@
+# Rust
+target/
+# Node / pnpm / build output
+node_modules/
+dist/
+.vite/
+out/
+apps/desktop/release/
+apps/desktop/dist/
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+*.egg-info/
+.uv-cache/
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/*
+!.vscode/extensions.json
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+# Local data and ML artifacts
+/data/
+*.safetensors
+*.bin
+*.gguf
+*.pt
+checkpoints/
+wandb/
+mlruns/
+.cache/
+tests/fixtures/models/.cache/
+# Logs
+*.log
+logs/
