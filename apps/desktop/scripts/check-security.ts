@@ -57,7 +57,8 @@ if (DEV_CONTENT_SECURITY_POLICY !== REQUIRED_DEV_CSP) {
 
 const srcDir = new URL('../src/', import.meta.url);
 for (const name of readdirSync(srcDir, { recursive: true, encoding: 'utf8' })) {
-  if (!name.endsWith('.ts') || name.endsWith('.test.ts') || name.endsWith('security.ts')) continue;
+  const file = name.replaceAll('\\', '/');
+  if (!file.endsWith('.ts') || file.endsWith('.test.ts') || file === 'main/security.ts') continue;
   const text = readFileSync(new URL(name, srcDir), 'utf8');
   for (const [pattern, reason] of BANNED) {
     if (pattern.test(text)) failures.push(`src/${name}: ${reason}`);
