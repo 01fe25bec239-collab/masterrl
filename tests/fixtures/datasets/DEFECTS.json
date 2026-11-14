@@ -1,0 +1,276 @@
+{
+  "max_record_bytes": 4096,
+  "files": {
+    "pretrain.text.v1-invalid.jsonl": [
+      {
+        "line": 1,
+        "code": "empty_field",
+        "note": "text is empty"
+      },
+      {
+        "line": 2,
+        "code": "missing_field",
+        "note": "text is missing"
+      },
+      {
+        "line": 3,
+        "code": "wrong_type",
+        "note": "text is not a string"
+      },
+      {
+        "line": 4,
+        "code": "bad_utf8",
+        "note": "Latin-1 byte 0xE9, not UTF-8"
+      },
+      {
+        "line": 5,
+        "code": "oversized_record",
+        "note": "record is larger than 4096 bytes"
+      },
+      {
+        "line": 6,
+        "code": "invalid_json",
+        "note": "line is not valid JSON"
+      },
+      {
+        "line": 7,
+        "code": "not_object",
+        "note": "record is not a JSON object"
+      }
+    ],
+    "sft.messages.v1-invalid.jsonl": [
+      {
+        "line": 1,
+        "code": "role_order",
+        "note": "two user"
+      },
+      {
+        "line": 2,
+        "code": "role_order",
+        "note": "ends with user"
+      },
+      {
+        "line": 3,
+        "code": "role_order",
+        "note": "starts assistant"
+      },
+      {
+        "line": 4,
+        "code": "empty_field",
+        "note": "empty content"
+      },
+      {
+        "line": 5,
+        "code": "empty_field",
+        "note": "no messages"
+      },
+      {
+        "line": 6,
+        "code": "unknown_role",
+        "note": "role robot"
+      },
+      {
+        "line": 7,
+        "code": "missing_field",
+        "note": "messages is missing"
+      },
+      {
+        "line": 8,
+        "code": "bad_utf8",
+        "note": "byte 0xFF"
+      }
+    ],
+    "sft.prompt_completion.v1-invalid.jsonl": [
+      {
+        "line": 1,
+        "code": "empty_field",
+        "note": "prompt is empty"
+      },
+      {
+        "line": 2,
+        "code": "missing_field",
+        "note": "completion is missing"
+      },
+      {
+        "line": 3,
+        "code": "wrong_type",
+        "note": "completion is a number"
+      }
+    ],
+    "pref.pairwise.v1-invalid.jsonl": [
+      {
+        "line": 1,
+        "code": "chosen_equals_rejected",
+        "note": ""
+      },
+      {
+        "line": 2,
+        "code": "missing_field",
+        "note": "rejected is missing"
+      },
+      {
+        "line": 3,
+        "code": "empty_field",
+        "note": "prompt is empty"
+      },
+      {
+        "line": 4,
+        "code": "wrong_type",
+        "note": "margin is not a number"
+      }
+    ],
+    "pref.unpaired.v1-invalid.jsonl": [
+      {
+        "line": 1,
+        "code": "label_not_bool",
+        "note": "string"
+      },
+      {
+        "line": 2,
+        "code": "label_not_bool",
+        "note": "integer 1"
+      },
+      {
+        "line": 3,
+        "code": "missing_field",
+        "note": "label is missing"
+      }
+    ],
+    "rm.pairwise.v1-invalid.jsonl": [
+      {
+        "line": 1,
+        "code": "chosen_equals_rejected",
+        "note": ""
+      },
+      {
+        "line": 2,
+        "code": "missing_field",
+        "note": "chosen is missing"
+      }
+    ],
+    "rm.pointwise.v1-invalid.jsonl": [
+      {
+        "line": 1,
+        "code": "wrong_type",
+        "note": "string score"
+      },
+      {
+        "line": 2,
+        "code": "wrong_type",
+        "note": "bool score"
+      },
+      {
+        "line": 3,
+        "code": "missing_field",
+        "note": "score is missing"
+      }
+    ],
+    "rm.process.v1-invalid.jsonl": [
+      {
+        "line": 1,
+        "code": "length_mismatch",
+        "note": "2 steps, 1 label"
+      },
+      {
+        "line": 2,
+        "code": "empty_field",
+        "note": "no steps"
+      },
+      {
+        "line": 3,
+        "code": "wrong_type",
+        "note": "label is not a bool"
+      }
+    ],
+    "rl.prompt.v1-invalid.jsonl": [
+      {
+        "line": 1,
+        "code": "missing_field",
+        "note": "prompt is missing"
+      },
+      {
+        "line": 2,
+        "code": "empty_field",
+        "note": "prompt is empty"
+      },
+      {
+        "line": 3,
+        "code": "wrong_type",
+        "note": "meta is not an object"
+      }
+    ],
+    "agent.multiturn.v1-invalid.jsonl": [
+      {
+        "line": 1,
+        "code": "missing_field",
+        "note": "episode_id is missing"
+      },
+      {
+        "line": 2,
+        "code": "empty_field",
+        "note": "no turns"
+      },
+      {
+        "line": 3,
+        "code": "missing_field",
+        "note": "no env_spec_ref"
+      },
+      {
+        "line": 4,
+        "code": "unknown_role",
+        "note": "role robot"
+      }
+    ],
+    "distill.v1-invalid.jsonl": [
+      {
+        "line": 1,
+        "code": "missing_teacher",
+        "note": "no teacher_completion or teacher_logits_ref"
+      },
+      {
+        "line": 2,
+        "code": "missing_field",
+        "note": "prompt is missing"
+      },
+      {
+        "line": 3,
+        "code": "empty_field",
+        "note": "empty completion"
+      }
+    ],
+    "eval.v1-invalid.jsonl": [
+      {
+        "line": 1,
+        "code": "missing_field",
+        "note": "input is missing"
+      },
+      {
+        "line": 2,
+        "code": "empty_field",
+        "note": "input is empty"
+      },
+      {
+        "line": 3,
+        "code": "wrong_type",
+        "note": "reference is not a string"
+      }
+    ],
+    "mm.messages.v1-invalid.jsonl": [
+      {
+        "line": 1,
+        "code": "unknown_part_type",
+        "note": "audio part"
+      },
+      {
+        "line": 2,
+        "code": "empty_field",
+        "note": "empty image_ref"
+      },
+      {
+        "line": 3,
+        "code": "role_order",
+        "note": "starts with assistant, ends with user"
+      }
+    ]
+  }
+}

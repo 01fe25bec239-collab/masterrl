@@ -1,0 +1,22 @@
+{
+  "model": "tiny-llama",
+  "architecture": "LlamaForCausalLM",
+  "param_count": 1033344,
+  "dtype": "float32",
+  "context_length": 512,
+  "vocab_size": 384,
+  "seed": 1234,
+  "chat_template_sha256": "93f7917c316a23f5718c188562bdd83baba4b682bc06c9ebf2bc9d4ed38fcb12",
+  "files_sha256": {
+    "config.json": "206ecf46f75cf2c38b1bc67fb5a58f682dc85a04276f44ccdd7265984c86e4cb",
+    "generation_config.json": "f8d6d5d8d8521d521df1f07e83011e7788931f54f69f21673a118e3b94729e1e",
+    "tokenizer.json": "740f2cdff670325ad61758f8117aed40540527dfba1be91f838e2e17d5e22b5c",
+    "tokenizer_config.json": "178deb6384d2b394966ee0fcf465eabd6ce0439829780c69055acf8c68649d53"
+  },
+  "weights_sha256": {
+    "darwin-arm64": {
+      "model.safetensors": "1acb5b90d99c6bf5149c0c13a4a88d15a41858750a307890324634a848b6fbbe",
+      "pytorch_model.bin": "d5e10ec8c9b79956a3a532bb600d65ec1a4acf781cc951506b08268658cf4278"
+    }
+  }
+}

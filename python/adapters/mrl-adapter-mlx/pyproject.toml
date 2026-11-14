@@ -1,0 +1,39 @@
+# Separate uv project with its own lock (not a workspace member).
+# May depend on mrl-runtime only; never on another adapter.
+[project]
+name = "mrl-adapter-mlx"
+version = "0.1.0"
+description = "MasterRL adapter for MLX on Apple Silicon"
+license = "Apache-2.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "mrl-runtime",
+    "mlx==0.32.4; sys_platform == 'darwin'",
+    "mlx-lm==0.32.2; sys_platform == 'darwin'",
+]
+
+[dependency-groups]
+dev = ["pytest==9.2.0", "import-linter==2.15"]
+
+[build-system]
+requires = ["uv_build==0.11.28"]
+build-backend = "uv_build"
+
+[tool.uv]
+required-version = "==0.11.28"
+
+[tool.uv.sources]
+mrl-runtime = { path = "../../mrl-runtime", editable = true }
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
+
+[tool.importlinter]
+root_packages = ["mrl_adapter_mlx"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "mrl_adapter_mlx imports no other adapter and no MasterRL package but mrl_runtime"
+type = "forbidden"
+source_modules = ["mrl_adapter_mlx"]
+forbidden_modules = ["mrl_adapter_trl", "mrl_adapter_lmeval", "mrl_rewards", "mrl_sdk"]

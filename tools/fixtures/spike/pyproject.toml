@@ -1,0 +1,26 @@
+# DG-03 spike: TRL SFT on CPU with the tiny-llama fixture. Not a workspace member.
+[project]
+name = "mrl-spike-trl-sft-cpu"
+version = "0.0.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "trl==1.17.1",
+    "transformers==5.22.2",
+    "peft==0.21.2",
+    "accelerate==1.15.0",
+    "datasets==5.1.0",
+    "torch==2.14.1",
+]
+
+[tool.uv]
+package = false
+required-version = "==0.11.28"
+
+# CPU-only torch on Linux (macOS wheels from PyPI are CPU/MPS already).
+[tool.uv.sources]
+torch = { index = "pytorch-cpu", marker = "sys_platform == 'linux'" }
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true

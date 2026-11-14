@@ -1,0 +1,1 @@
+{"messages":[{"role":"user","content":[{"type":"image_ref","image_ref":"sha256:abababababababababababababababababababababababababababababababab"},{"type":"text","text":"What color is this?"}]},{"role":"assistant","content":[{"type":"text","text":"It is yellow."}]}]}

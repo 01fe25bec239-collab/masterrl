@@ -1,0 +1,40 @@
+# Separate uv project with its own lock (not a workspace member).
+# May depend on mrl-runtime only; never on another adapter.
+[project]
+name = "mrl-adapter-lmeval"
+version = "0.1.0"
+description = "MasterRL adapter for lm-evaluation-harness"
+license = "Apache-2.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "mrl-runtime",
+    "lm-eval[hf]==0.4.13",
+    "transformers==5.22.2",
+    "torch==2.14.1",
+]
+
+[dependency-groups]
+dev = ["pytest==9.2.0", "import-linter==2.15"]
+
+[build-system]
+requires = ["uv_build==0.11.28"]
+build-backend = "uv_build"
+
+[tool.uv]
+required-version = "==0.11.28"
+
+[tool.uv.sources]
+mrl-runtime = { path = "../../mrl-runtime", editable = true }
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
+
+[tool.importlinter]
+root_packages = ["mrl_adapter_lmeval"]
+include_external_packages = true
+
+[[tool.importlinter.contracts]]
+name = "mrl_adapter_lmeval imports no other adapter and no MasterRL package but mrl_runtime"
+type = "forbidden"
+source_modules = ["mrl_adapter_lmeval"]
+forbidden_modules = ["mrl_adapter_trl", "mrl_adapter_mlx", "mrl_rewards", "mrl_sdk"]
