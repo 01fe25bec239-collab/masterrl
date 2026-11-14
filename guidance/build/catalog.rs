@@ -317,7 +317,7 @@ pub static CATALOG: Value = Value::Map(&[
             ("id", Value::Str("sft-qlora")),
             ("name", Value::Str("Teach by example with QLoRA")),
             ("method", Value::Str("sft")),
-            ("summary", Value::Str("Like LoRA, but QLoRA stores the model in 4-bit form. You can train bigger models with less memory, but training is a bit slower.")),
+            ("summary", Value::Str("Like LoRA, but QLoRA stores the model in 4-bit form. You can train bigger models with less memory, but training takes about 1.5–2 times as long.")),
             ("peft", Value::Str("qlora")),
             ("precision", Value::Str("nf4-bf16")),
             ("defaults", Value::Map(&[
@@ -1552,7 +1552,7 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("term", Value::Str("Reference syncing")),
-            ("plain", Value::Str("Updating the reference model to the trained model now and then during training.")),
+            ("plain", Value::Str("Copying the trained model into the reference model at set intervals during training.")),
         ]),
         Value::Map(&[
             ("term", Value::Str("Request key")),
@@ -1918,7 +1918,7 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("MRL-CAP-007")),
             ("title", Value::Str("The app trains the output head fully instead of with LoRA.")),
-            ("why", Value::Str("DPO, KTO and logit distillation can't use LoRA on the output head. Training uses a bit more memory.")),
+            ("why", Value::Str("DPO, KTO and logit distillation can't use LoRA on the output head. Training needs extra memory for the output head.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("You don't need to do anything."),
@@ -2100,7 +2100,7 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("MRL-DATA-001")),
             ("title", Value::Str("Your dataset did not pass its checks.")),
-            ("why", Value::Str("Some rows are empty, miss fields or don't match the chosen format.")),
+            ("why", Value::Str("Some rows are empty, are missing fields, or don't match the chosen format.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Open the dataset report to see the rows that need a fix."),
@@ -2367,7 +2367,7 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("MRL-LINK-005")),
             ("title", Value::Str("The clocks on these machines don't match.")),
-            ("why", Value::Str("Machines in one job need clocks within a few seconds of each other. Otherwise logs and security checks fail.")),
+            ("why", Value::Str("Machines in one job need clocks that match within the limit shown in Details. Otherwise logs and security checks fail.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Turn on automatic time on every machine."),
@@ -2556,7 +2556,7 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("REWARD_INFRA")),
             ("title", Value::Str("The service that scores answers is not working.")),
-            ("why", Value::Str("The app could not reach the reward service, or it did not answer in time.")),
+            ("why", Value::Str("The app could not reach the reward service, or it did not answer within the time limit shown in Details.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Check that the reward service is running."),
@@ -2589,7 +2589,7 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("STALLED")),
             ("title", Value::Str("The run stopped making progress.")),
-            ("why", Value::Str("No training step finished for a long time.")),
+            ("why", Value::Str("No training step finished within the time limit shown in Details.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Check that the machine is awake and not overloaded."),

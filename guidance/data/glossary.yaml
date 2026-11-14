@@ -123,7 +123,7 @@ terms:
   - term: Reference model
     plain: A frozen copy of the starting model that keeps training from drifting too far.
   - term: Reference syncing
-    plain: Updating the reference model to the trained model now and then during training.
+    plain: Copying the trained model into the reference model at set intervals during training.
   - term: Policy
     plain: The model that reinforcement learning trains.
   - term: Rollout

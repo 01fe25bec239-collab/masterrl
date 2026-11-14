@@ -258,7 +258,7 @@
       "id": "sft-qlora",
       "name": "Teach by example with QLoRA",
       "method": "sft",
-      "summary": "Like LoRA, but QLoRA stores the model in 4-bit form. You can train bigger models with less memory, but training is a bit slower.",
+      "summary": "Like LoRA, but QLoRA stores the model in 4-bit form. You can train bigger models with less memory, but training takes about 1.5–2 times as long.",
       "peft": "qlora",
       "precision": "nf4-bf16",
       "defaults": {
@@ -1493,7 +1493,7 @@
     },
     {
       "term": "Reference syncing",
-      "plain": "Updating the reference model to the trained model now and then during training."
+      "plain": "Copying the trained model into the reference model at set intervals during training."
     },
     {
       "term": "Request key",
@@ -1859,7 +1859,7 @@
     {
       "code": "MRL-CAP-007",
       "title": "The app trains the output head fully instead of with LoRA.",
-      "why": "DPO, KTO and logit distillation can't use LoRA on the output head. Training uses a bit more memory.",
+      "why": "DPO, KTO and logit distillation can't use LoRA on the output head. Training needs extra memory for the output head.",
       "what_to_do": {
         "steps": [
           "You don't need to do anything.",
@@ -2041,7 +2041,7 @@
     {
       "code": "MRL-DATA-001",
       "title": "Your dataset did not pass its checks.",
-      "why": "Some rows are empty, miss fields or don't match the chosen format.",
+      "why": "Some rows are empty, are missing fields, or don't match the chosen format.",
       "what_to_do": {
         "steps": [
           "Open the dataset report to see the rows that need a fix.",
@@ -2308,7 +2308,7 @@
     {
       "code": "MRL-LINK-005",
       "title": "The clocks on these machines don't match.",
-      "why": "Machines in one job need clocks within a few seconds of each other. Otherwise logs and security checks fail.",
+      "why": "Machines in one job need clocks that match within the limit shown in Details. Otherwise logs and security checks fail.",
       "what_to_do": {
         "steps": [
           "Turn on automatic time on every machine."
@@ -2497,7 +2497,7 @@
     {
       "code": "REWARD_INFRA",
       "title": "The service that scores answers is not working.",
-      "why": "The app could not reach the reward service, or it did not answer in time.",
+      "why": "The app could not reach the reward service, or it did not answer within the time limit shown in Details.",
       "what_to_do": {
         "steps": [
           "Check that the reward service is running.",
@@ -2530,7 +2530,7 @@
     {
       "code": "STALLED",
       "title": "The run stopped making progress.",
-      "why": "No training step finished for a long time.",
+      "why": "No training step finished within the time limit shown in Details.",
       "what_to_do": {
         "steps": [
           "Check that the machine is awake and not overloaded.",
