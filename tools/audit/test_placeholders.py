@@ -28,15 +28,19 @@ class PlaceholdersTest(unittest.TestCase):
             self.assertEqual(placeholders.scan(root), [f"src/a.py:2: x = {pattern}"])
             self.assertEqual(placeholders.main([str(root)]), 1)
 
-    def test_skips_tests_testkit_and_docs(self):
+    def test_skips_root_tests_and_docs_and_any_testkit(self):
         root = repo({
             "tests/a.rs": TODO,
-            "crates/x/tests/b.rs": TODO,
+            "testkit/b.rs": TODO,
             "crates/x/testkit/c.rs": TODO,
             "crates/x/src/testkit/d.rs": TODO,
             "docs/e.md": TODO,
         })
         self.assertEqual(placeholders.scan(root), [])
+
+    def test_nested_tests_and_docs_are_scanned(self):
+        root = repo({"crates/x/tests/a.rs": TODO, "apps/web/docs/b.md": TODO})
+        self.assertEqual(len(placeholders.scan(root)), 2)
 
     def test_untracked_and_binary_files_are_ignored(self):
         root = repo({"bin.dat": "\0" + TODO})

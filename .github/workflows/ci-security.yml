@@ -26,7 +26,8 @@ jobs:
           curl -fsSLO "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${tarball}"
           echo "${GITLEAKS_SHA256}  ${tarball}" | sha256sum -c -
           tar -xzf "${tarball}" gitleaks
-          ./gitleaks git --config .gitleaks.toml --redact --verbose .
+          # Only the history of the commit under test, not other branches.
+          ./gitleaks git --config .gitleaks.toml --redact --verbose --log-opts=HEAD .
 
       - name: cargo-deny
         if: hashFiles('Cargo.toml') != ''

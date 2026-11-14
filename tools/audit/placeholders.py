@@ -5,7 +5,8 @@
 # ///
 """Fail when tracked files contain unfinished-work markers.
 
-Skips any tests/, testkit/ or docs/ folder. Prints file:line for each hit.
+Skips the root tests/ and docs/ folders and any testkit/ folder.
+Prints file:line for each hit.
 Usage: placeholders.py [REPO_ROOT]
 """
 
@@ -21,11 +22,11 @@ PATTERNS = (
     "TODO" + "(later)",
     "FIX" + "ME",
 )
-SKIP_DIRS = {"tests", "testkit", "docs"}
+ROOT_SKIP = ("tests/", "docs/")
 
 
 def is_skipped(rel: str) -> bool:
-    return any(part in SKIP_DIRS for part in rel.split("/")[:-1])
+    return rel.startswith(ROOT_SKIP) or "testkit" in rel.split("/")[:-1]
 
 
 def tracked_files(root: Path) -> list[str]:

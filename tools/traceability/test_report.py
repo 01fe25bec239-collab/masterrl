@@ -12,7 +12,8 @@ REGISTRY = """
 - {id: FR-RUN-2, text: Stop a run, release: R1}
 - {id: NFR-1, text: Correctness, release: null}
 """
-REQ = "req" + ":"  # split so this file is not tagged itself
+REQ = "req" + ":"  # split so this file does not tag itself
+MARK = "@pytest.mark." + "req"
 
 
 def repo(files: dict[str, str]) -> Path:
@@ -38,7 +39,7 @@ class ReportTest(unittest.TestCase):
 
     def test_collects_all_three_tag_styles(self):
         root = repo({
-            "tests/test_a.py": f"# {REQ} FR-RUN-1\n@pytest.mark.req(\"NFR-1\", \"FR-X-9\")\n",
+            "tests/test_a.py": f"# {REQ} FR-RUN-1\n{MARK}(\"NFR-1\", \"FR-X-9\")\n",
             "crates/x/src/lib.rs": f"fn a() {{}}\n// {REQ} FR-RUN-1, NFR-1\n",
         })
         self.assertEqual(report.collect_tags(root), {
@@ -60,6 +61,11 @@ class ReportTest(unittest.TestCase):
     def test_untagged_mentions_do_not_count(self):
         root = repo({"t.py": "FR-RUN-1 is mentioned in prose only\n"})
         self.assertEqual(report.collect_tags(root), {})
+
+    def test_tool_files_do_not_tag_themselves(self):
+        here = Path(__file__).parent
+        files = {f.name: f.read_text() for f in (here / "report.py", here / "test_report.py")}
+        self.assertEqual(report.collect_tags(repo(files)), {})
 
     def test_missing_registry_exits_2(self):
         self.registry.unlink()
