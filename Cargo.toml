@@ -1,0 +1,81 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mrl-domain",
+    "crates/mrl-proto",
+    "crates/mrl-server",
+    "crates/mrl-agent",
+    "crates/mrl-cli",
+    "crates/mrl-testkit",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.100"
+license = "Apache-2.0"
+publish = false
+
+# Shared version pins. Crates opt in with `name = { workspace = true }` and add features there.
+[workspace.dependencies]
+# async / web
+tokio = "1.54.1"
+axum = "0.8.9"
+tower = "0.5.3"
+tower-http = "0.7.1"
+hyper = "1.12.0"
+# RPC
+tonic = "0.14.9"
+prost = "0.14.6"
+# database
+sqlx = { version = "0.9.0", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "uuid", "time", "json", "migrate", "macros"] }
+# serialization and errors
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+anyhow = "1.0.104"
+# observability
+tracing = "0.1.44"
+tracing-subscriber = "0.3.23"
+opentelemetry = "0.33.1"
+opentelemetry-otlp = "0.33.1"
+# IDs and time
+uuid = { version = "1.29.2", features = ["v7"] }
+time = "0.3.55"
+# API / storage
+utoipa = "6.0.0"
+object_store = "0.14.2"
+# crypto / TLS
+sha2 = "0.11.1"
+blake3 = "1.8.7"
+rustls = "0.23.46"
+rcgen = "0.14.10"
+chacha20poly1305 = "0.11.0"
+argon2 = "0.6.0"
+# SSH and OS keychain
+russh = "0.65.1"
+keyring = "4.2.0"
+# system info
+sysinfo = "0.40.3"
+nvml-wrapper = "0.13.0"
+# testing
+proptest = "1.12.0"
+insta = "1.49.0"
+# build info (git SHA for `--version`)
+git-version = "0.3.9"
+
+[workspace.lints.rust]
+# ponytail: forbid everywhere; the mrl-agent `ffi` module switches its crate to `deny` + local allow once ADR-026 lands.
+unsafe_code = "forbid"
+missing_docs = "warn"
+
+[workspace.lints.cargo]
+# The pins above are shared versions for later parts; most are not used yet.
+unused_workspace_dependencies = "allow"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
