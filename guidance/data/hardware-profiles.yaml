@@ -1,0 +1,46 @@
+# Hardware profiles. None are measured on real machines yet, so all are verified: false.
+families:
+  - id: nvidia
+    name: NVIDIA GPU
+    headroom: { gpu_memory_free_pct: 10, system_ram_free_min_gb: 4, system_ram_free_pct: 15 }
+    rule: >-
+      Keep at least 10% of GPU memory free.
+      Keep 4 GB or 15% of system memory free, whichever is larger.
+  - id: apple-silicon
+    name: Apple Silicon Mac
+    headroom: { unified_memory_reserved_pct: 25 }
+    rule: Keep at least 25% of total memory free for macOS and the app.
+  - id: cpu
+    name: Computer without a supported GPU
+    headroom: { system_ram_free_min_gb: 4, system_ram_free_pct: 15 }
+    rule: Keep 4 GB or 15% of system memory free, whichever is larger.
+
+profiles:
+  - { id: nvidia-4gb, family: nvidia, name: NVIDIA GPU with 4 GB, memory_kind: gpu, memory_gb: { min: 4, max: 4 }, verified: false,
+      summary: "Fits small models of about 0.5–3 billion parameters with QLoRA." }
+  - { id: nvidia-6gb, family: nvidia, name: NVIDIA GPU with 6 GB, memory_kind: gpu, memory_gb: { min: 6, max: 6 }, verified: false,
+      summary: "Fits small models of about 1–4 billion parameters with QLoRA." }
+  - { id: nvidia-8gb, family: nvidia, name: NVIDIA GPU with 8 GB, memory_kind: gpu, memory_gb: { min: 8, max: 8 }, verified: false,
+      summary: "Fits models of about 3–8 billion parameters with QLoRA." }
+  - { id: nvidia-12gb, family: nvidia, name: NVIDIA GPU with 12 GB, memory_kind: gpu, memory_gb: { min: 12, max: 12 }, verified: false,
+      summary: "Fits models of about 3–8 billion parameters with QLoRA, and small reinforcement learning runs." }
+  - { id: nvidia-16gb, family: nvidia, name: NVIDIA GPU with 16 GB, memory_kind: gpu, memory_gb: { min: 16, max: 16 }, verified: false,
+      summary: "Fits models of about 7–14 billion parameters with QLoRA." }
+  - { id: nvidia-24gb, family: nvidia, name: NVIDIA GPU with 24 GB, memory_kind: gpu, memory_gb: { min: 24, max: 24 }, verified: false,
+      summary: "Fits models of about 7–14 billion parameters with QLoRA, or 3–8 billion with LoRA." }
+  - { id: nvidia-32-80gb, family: nvidia, name: NVIDIA GPU with 32–80 GB, memory_kind: gpu, memory_gb: { min: 32, max: 80 }, verified: false,
+      summary: "Fits models of about 14–70 billion parameters with QLoRA, or 7–32 billion with LoRA." }
+  - { id: apple-16gb, family: apple-silicon, name: Mac with 16 GB, memory_kind: unified, memory_gb: { min: 16, max: 16 }, verified: false,
+      summary: "Fits small models of about 1–7 billion parameters with 4-bit MLX." }
+  - { id: apple-24gb, family: apple-silicon, name: Mac with 24 GB, memory_kind: unified, memory_gb: { min: 24, max: 24 }, verified: false,
+      summary: "Fits models of about 3–8 billion parameters with 4-bit MLX." }
+  - { id: apple-32gb, family: apple-silicon, name: Mac with 32 GB, memory_kind: unified, memory_gb: { min: 32, max: 32 }, verified: false,
+      summary: "Fits models of about 7–14 billion parameters with 4-bit MLX." }
+  - { id: apple-64gb, family: apple-silicon, name: Mac with 64 GB, memory_kind: unified, memory_gb: { min: 64, max: 64 }, verified: false,
+      summary: "Fits models of about 14–32 billion parameters with 4-bit MLX." }
+  - { id: apple-128gb, family: apple-silicon, name: Mac with 128 GB, memory_kind: unified, memory_gb: { min: 128, max: 128 }, verified: false,
+      summary: "Fits large models of about 32–70 billion parameters with 4-bit MLX." }
+  - { id: apple-192gb, family: apple-silicon, name: Mac with 192 GB, memory_kind: unified, memory_gb: { min: 192, max: 192 }, verified: false,
+      summary: "Fits large models of about 32–70 billion parameters with 4-bit MLX, with room to spare." }
+  - { id: cpu, family: cpu, name: Computer without a supported GPU, memory_kind: system, memory_gb: { min: 8 }, verified: false,
+      summary: "Trains tiny models slowly, which is enough to learn how fine-tuning works." }

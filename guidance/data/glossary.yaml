@@ -1,0 +1,293 @@
+# Glossary: one plain sentence per term.
+# Every acronym used anywhere in the catalog must appear here as a term or alias.
+terms:
+  # Training basics
+  - term: Fine-tuning
+    plain: Training an existing model a little more so it gets better at your task.
+  - term: Model
+    plain: A program that learned patterns from data and uses them to write answers.
+  - term: Base model
+    plain: The model you start from, before your own training.
+  - term: Parameter
+    aliases: [parameters, weights, weight]
+    plain: One of the numbers inside a model that training changes, often counted in billions.
+  - term: Token
+    aliases: [tokens]
+    plain: A small piece of text, like a word or part of a word, that a model reads and writes.
+  - term: Tokenizer
+    plain: The tool that splits text into tokens and joins tokens back into text.
+  - term: Dataset
+    plain: The set of examples a model learns from.
+  - term: Sample
+    aliases: [samples, training sample]
+    plain: One example in a dataset, such as one question and its answer.
+  - term: Epoch
+    aliases: [epochs]
+    plain: One full pass of training over every sample in the dataset.
+  - term: Step
+    aliases: [training step]
+    plain: One update to the model's weights after it sees a batch of samples.
+  - term: Batch size
+    aliases: [per-device batch size]
+    plain: How many samples the model sees at once before one step.
+  - term: Gradient accumulation
+    plain: Adding up several small batches before one step, so you get a big batch with less memory.
+  - term: Learning rate
+    plain: How big each change to the weights is during one step.
+  - term: Loss
+    plain: A number that shows how far the model's answers are from the examples, where lower is better.
+  - term: Overfitting
+    plain: When a model memorizes its examples and gets worse at new questions.
+  - term: Checkpoint
+    aliases: [checkpoints]
+    plain: A saved copy of the model during training that you can resume from or use later.
+  - term: Prompt
+    plain: The text you give the model to start its answer.
+  - term: Completion
+    plain: The text the model writes after a prompt.
+  - term: Chat template
+    plain: The rules a model uses to mark where each message in a conversation starts and ends.
+  - term: Streaming dataset
+    plain: A dataset the app reads piece by piece while training, so it can't know the full size ahead.
+  - term: Recipe
+    plain: A ready set of training settings for one method that the app picks for your machine.
+
+  # Methods
+  - term: SFT
+    aliases: [supervised fine-tuning, teach by example]
+    plain: Teaching by example, where the model learns to copy the answers in your dataset.
+  - term: Full fine-tuning
+    plain: Training that changes every weight in the model, which needs a lot of memory.
+  - term: PEFT
+    aliases: [parameter-efficient fine-tuning]
+    plain: Training only a small add-on to the model, which saves memory and time.
+    learn_more: https://huggingface.co/docs/peft/index
+  - term: Adapter
+    aliases: [adapters]
+    plain: A small set of new weights trained on top of a frozen model.
+  - term: LoRA
+    aliases: [low-rank adaptation]
+    plain: A popular kind of adapter that trains two small tables of numbers per layer.
+    learn_more: https://arxiv.org/abs/2106.09685
+  - term: QLoRA
+    plain: LoRA on a model stored in 4-bit form, so bigger models fit in less memory.
+    learn_more: https://arxiv.org/abs/2305.14314
+  - term: RL
+    aliases: [reinforcement learning]
+    plain: Training where the model tries answers and learns from the scores they get.
+  - term: RLHF
+    aliases: [reinforcement learning from human feedback]
+    plain: Reinforcement learning where the scores come from what people prefer.
+    learn_more: https://arxiv.org/abs/2203.02155
+  - term: DPO
+    aliases: [direct preference optimization]
+    plain: A method that learns from pairs of a better and a worse answer, without a separate scorer.
+    learn_more: https://arxiv.org/abs/2305.18290
+  - term: KTO
+    plain: A method that learns from answers simply marked good or bad, instead of pairs.
+    learn_more: https://arxiv.org/abs/2402.01306
+  - term: PPO
+    aliases: [proximal policy optimization]
+    plain: A classic reinforcement learning method that uses a separate model to judge each step.
+    learn_more: https://arxiv.org/abs/1707.06347
+  - term: GRPO
+    aliases: [group relative policy optimization]
+    plain: A reinforcement learning method that compares several answers to the same prompt to learn which are better.
+    learn_more: https://arxiv.org/abs/2402.03300
+  - term: RLOO
+    plain: A reinforcement learning method like GRPO that scores each answer against the other answers for the same prompt.
+    learn_more: https://arxiv.org/abs/2402.14740
+  - term: DAPO
+    plain: A variant of GRPO that skips prompts where every answer scored the same.
+    learn_more: https://arxiv.org/abs/2503.14476
+  - term: Dynamic sampling
+    plain: Skipping prompts that teach nothing because all their answers scored the same.
+  - term: Distillation
+    aliases: [knowledge distillation, logit distillation]
+    plain: Training a small student model to copy the answers of a bigger teacher model.
+    learn_more: https://arxiv.org/abs/1503.02531
+  - term: Teacher model
+    plain: The bigger model whose answers a student model learns to copy.
+  - term: Student model
+    plain: The smaller model that learns from a teacher model.
+  - term: Reward
+    plain: A score that tells the model how good an answer was during reinforcement learning.
+  - term: Reward model
+    plain: A model trained to score answers the way people would.
+  - term: Verifiable reward
+    aliases: [answer checker]
+    plain: A score from a checker that can test an answer, like running code or checking a math result.
+  - term: Preference pair
+    aliases: [preference pairs]
+    plain: Two answers to one prompt, with one marked as better.
+  - term: Reference model
+    plain: A frozen copy of the starting model that keeps training from drifting too far.
+  - term: Reference syncing
+    plain: Copying the trained model into the reference model at set intervals during training.
+  - term: Policy
+    plain: The model that reinforcement learning trains.
+  - term: Rollout
+    aliases: [rollouts]
+    plain: Letting the model write answers during reinforcement learning so a reward can score them.
+  - term: Samples per prompt
+    plain: How many answers the model writes for each prompt during GRPO.
+  - term: Logits
+    aliases: [logit]
+    plain: The raw scores a model gives every possible next token before it picks one.
+  - term: Log-probability
+    aliases: [log-probabilities, token log-probabilities]
+    plain: A number for how likely the model thought a token was, stored in log form.
+  - term: Top-p
+    plain: A setting that limits the model to the most likely tokens when it writes.
+  - term: Importance correction
+    plain: A math fix that adjusts for answers written by a slightly different copy of the model.
+  - term: Colocated mode
+    plain: A GRPO setup where writing answers and training share the same GPU.
+  - term: Server mode
+    plain: A GRPO setup where one GPU writes answers and another GPU trains.
+  - term: Async mode
+    plain: A setup where writing answers and training run at the same time to save time.
+  - term: Output head
+    aliases: [language model head]
+    plain: The last layer of a model that turns its numbers into scores for the next token.
+  - term: Encoder-only model
+    plain: A model that reads text to understand or sort it, but can't write new text.
+  - term: Causal language model
+    plain: A model that writes text one token at a time, like most chat models.
+
+  # Number formats
+  - term: Precision
+    plain: How many bits each number in the model uses, which trades memory for accuracy.
+  - term: bf16
+    aliases: [bfloat16]
+    plain: A 16-bit number format that halves memory use and works well for training.
+  - term: fp16
+    plain: An older 16-bit number format that can overflow more easily than bf16.
+  - term: fp32
+    plain: A 32-bit number format that is more precise than bf16 but uses twice the memory.
+  - term: Quantization
+    aliases: [4-bit]
+    plain: Storing a model's numbers with fewer bits, such as 4 bits, to save memory.
+
+  # Hardware
+  - term: GPU
+    aliases: [graphics card]
+    plain: A chip built for doing many calculations at once, which makes training much faster.
+  - term: VRAM
+    aliases: [GPU memory]
+    plain: The memory on a GPU, which must hold the model while it trains.
+  - term: CPU
+    aliases: [processor]
+    plain: The main chip in a computer that runs all its programs.
+  - term: RAM
+    aliases: [system memory]
+    plain: The main memory of a computer, used by every running program.
+  - term: Unified memory
+    plain: Memory on Apple Silicon Macs that the CPU and GPU share.
+  - term: Shared memory
+    plain: A part of system memory that programs use to pass data to each other quickly.
+  - term: GB
+    aliases: [gigabyte, gigabytes]
+    plain: A gigabyte, a unit of memory or disk space equal to about one billion bytes.
+  - term: NVIDIA
+    plain: A company that makes the GPUs most training tools support.
+  - term: CUDA
+    plain: NVIDIA's software that lets programs run math on its GPUs.
+    learn_more: https://developer.nvidia.com/cuda-toolkit
+  - term: Driver
+    aliases: [GPU driver]
+    plain: Software that lets your operating system and programs talk to a piece of hardware.
+  - term: Apple Silicon
+    plain: Apple's own chips in newer Macs, such as M1 and later, with unified memory.
+  - term: AMD
+    plain: A company that makes CPUs and GPUs.
+  - term: ROCm
+    plain: AMD's software that lets programs run math on AMD GPUs.
+    learn_more: https://rocm.docs.amd.com/
+  - term: Out of memory
+    aliases: [OOM]
+    plain: When a program needs more memory than is free, so it has to stop.
+  - term: Headroom
+    plain: Memory the app keeps free on purpose so your computer stays stable.
+  - term: Hardware profile
+    plain: A class of machine, like a GPU with 8 GB, that the app uses to pick settings.
+
+  # Software and engines
+  - term: OS
+    aliases: [operating system]
+    plain: The main software that runs your computer, such as Windows, macOS or Linux.
+  - term: WSL2
+    aliases: [WSL, Windows Subsystem for Linux]
+    plain: A Linux system that runs inside Windows, where the app runs training on Windows.
+    learn_more: https://learn.microsoft.com/en-us/windows/wsl/about
+  - term: Mirrored networking
+    plain: A WSL2 setting that gives Linux the same network address as Windows.
+  - term: Python environment
+    aliases: [Python env]
+    plain: A private folder of Python and its libraries that the app uses for training tools.
+  - term: uv
+    plain: A fast tool that installs Python and its libraries.
+    learn_more: https://docs.astral.sh/uv/
+  - term: Docker
+    plain: A tool that runs software in sealed containers, so it doesn't change the rest of your computer.
+    learn_more: https://docs.docker.com/get-started/
+  - term: PyTorch
+    plain: The main open-source library used to train models.
+    learn_more: https://pytorch.org/
+  - term: TRL
+    plain: A training engine from Hugging Face for fine-tuning and preference methods.
+    learn_more: https://huggingface.co/docs/trl/index
+  - term: vLLM
+    plain: A fast engine that writes model answers, used for reinforcement learning and the Playground.
+    learn_more: https://docs.vllm.ai/
+  - term: verl
+    plain: A training engine built for large reinforcement learning runs.
+    learn_more: https://github.com/volcengine/verl
+  - term: MLX
+    plain: Apple's library for training and running models on Apple Silicon Macs.
+    learn_more: https://github.com/ml-explore/mlx
+  - term: DeepSpeed
+    plain: A library that splits big training jobs across GPUs to save memory.
+    learn_more: https://www.deepspeed.ai/
+  - term: FSDP2
+    aliases: [FSDP]
+    plain: A PyTorch feature that splits a model across GPUs so bigger models fit.
+  - term: Hugging Face
+    plain: A website that hosts models and datasets you can download.
+    learn_more: https://huggingface.co/
+  - term: Safetensors
+    plain: A safe file format for model weights that can't run hidden code.
+    learn_more: https://huggingface.co/docs/safetensors/index
+  - term: Pickle
+    plain: An older Python file format that can run hidden code when you open it.
+  - term: JSON
+    plain: A common text format for structured data, made of names and values.
+  - term: Engine
+    aliases: [training engine]
+    plain: The software that actually runs training, such as TRL, verl or MLX.
+
+  # App concepts
+  - term: Playground
+    plain: The place in the app where you chat with a model and compare answers before and after training.
+  - term: Environment Doctor
+    plain: A check that tells you what this machine can run and what to fix.
+  - term: Link Doctor
+    plain: A check that tells you whether several machines can train together.
+  - term: Sandbox
+    plain: A locked-down space where reward code runs so it can't harm your computer.
+  - term: Workspace
+    plain: Your shared space in the app, with its own models, data and rules.
+  - term: Request key
+    aliases: [idempotency key]
+    plain: A unique label on a request so the app never runs the same request twice.
+
+  # Networking
+  - term: Port
+    aliases: [ports]
+    plain: A numbered door a program uses to send and receive network traffic.
+  - term: Firewall
+    plain: Software that blocks network traffic your rules don't allow.
+  - term: Bandwidth
+    plain: How much data a connection can carry each second.
+  - term: Latency
+    plain: How long data takes to travel between two machines.

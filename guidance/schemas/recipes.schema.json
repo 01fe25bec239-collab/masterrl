@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Recipes",
+  "description": "Training recipes with defaults per hardware profile. All numbers are estimates.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["recipes"],
+  "properties": {
+    "recipes": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name", "method", "summary", "peft", "precision", "defaults", "profiles", "estimated"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+          "name": { "type": "string", "minLength": 1 },
+          "method": { "enum": ["sft", "dpo", "grpo", "distillation"] },
+          "summary": { "type": "string", "minLength": 1 },
+          "peft": { "enum": ["none", "lora", "qlora"] },
+          "precision": { "$ref": "#/$defs/precision" },
+          "defaults": {
+            "type": "object",
+            "description": "Batch and optimizer defaults shared by all profiles.",
+            "required": ["gradient_accumulation_steps", "learning_rate", "epochs"],
+            "additionalProperties": { "type": "number", "exclusiveMinimum": 0 }
+          },
+          "profiles": {
+            "type": "array",
+            "minItems": 1,
+            "description": "Profiles that can run this recipe. A missing profile means it can't.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["profile", "model_params_b", "per_device_batch_size", "minutes_per_1k_samples"],
+              "properties": {
+                "profile": { "type": "string" },
+                "model_params_b": { "$ref": "#/$defs/range", "description": "Model size in billions of parameters." },
+                "per_device_batch_size": { "type": "integer", "minimum": 1 },
+                "minutes_per_1k_samples": { "$ref": "#/$defs/range" },
+                "precision": { "$ref": "#/$defs/precision", "description": "Overrides the recipe precision." }
+              }
+            }
+          },
+          "estimated": { "const": true }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "precision": { "enum": ["bf16", "fp32", "nf4-bf16", "mlx-q4-bf16"] },
+    "range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["min", "max"],
+      "properties": {
+        "min": { "type": "number", "exclusiveMinimum": 0 },
+        "max": { "type": "number", "exclusiveMinimum": 0 }
+      }
+    }
+  }
+}

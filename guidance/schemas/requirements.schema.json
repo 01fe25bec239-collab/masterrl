@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Task requirements",
+  "description": "What each task needs per platform, with estimated download sizes.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["requirements"],
+  "properties": {
+    "components": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name", "summary", "download_gb", "estimated"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+          "name": { "type": "string", "minLength": 1 },
+          "summary": { "type": "string", "minLength": 1 },
+          "download_gb": {
+            "type": "object",
+            "description": "Platform id to size range. Only platforms that use it.",
+            "minProperties": 1,
+            "additionalProperties": { "$ref": "#/$defs/range" }
+          },
+          "estimated": { "const": true }
+        }
+      }
+    },
+    "platforms": {
+      "description": "Base data only.",
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name", "support", "summary"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+          "name": { "type": "string", "minLength": 1 },
+          "support": { "enum": ["full", "wsl2-only", "partial", "tiny-models"] },
+          "summary": { "type": "string", "minLength": 1 }
+        }
+      }
+    },
+    "requirements": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["task", "platform", "supported"],
+        "properties": {
+          "task": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+          "platform": { "type": "string" },
+          "supported": { "type": "boolean" },
+          "components": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+          "note": { "type": "string", "minLength": 1 }
+        },
+        "if": { "properties": { "supported": { "const": true } } },
+        "then": { "required": ["components"], "properties": { "components": { "minItems": 1 } } },
+        "else": { "required": ["note"], "not": { "required": ["components"] } }
+      }
+    }
+  },
+  "$defs": {
+    "range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["min", "max"],
+      "properties": {
+        "min": { "type": "number", "minimum": 0 },
+        "max": { "type": "number", "minimum": 0 }
+      }
+    }
+  }
+}

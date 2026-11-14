@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Hardware profiles",
+  "description": "Machine classes with memory headroom rules. Not yet measured on real machines.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["families", "profiles"],
+  "properties": {
+    "families": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name", "headroom", "rule"],
+        "properties": {
+          "id": { "enum": ["nvidia", "apple-silicon", "cpu"] },
+          "name": { "type": "string", "minLength": 1 },
+          "headroom": {
+            "type": "object",
+            "additionalProperties": false,
+            "minProperties": 1,
+            "properties": {
+              "gpu_memory_free_pct": { "type": "number", "minimum": 0, "maximum": 100 },
+              "system_ram_free_min_gb": { "type": "number", "minimum": 0 },
+              "system_ram_free_pct": { "type": "number", "minimum": 0, "maximum": 100 },
+              "unified_memory_reserved_pct": { "type": "number", "minimum": 0, "maximum": 100 }
+            }
+          },
+          "rule": { "type": "string", "minLength": 1, "description": "The headroom rule in plain words." }
+        }
+      }
+    },
+    "profiles": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "family", "name", "memory_kind", "memory_gb", "summary", "verified"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$" },
+          "family": { "type": "string" },
+          "name": { "type": "string", "minLength": 1 },
+          "memory_kind": { "enum": ["gpu", "unified", "system"] },
+          "memory_gb": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["min"],
+            "description": "No max means no upper limit.",
+            "properties": {
+              "min": { "type": "number", "exclusiveMinimum": 0 },
+              "max": { "type": "number", "exclusiveMinimum": 0 }
+            }
+          },
+          "summary": { "type": "string", "minLength": 1 },
+          "verified": { "const": false }
+        }
+      }
+    }
+  }
+}

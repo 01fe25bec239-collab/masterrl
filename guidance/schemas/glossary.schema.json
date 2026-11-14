@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Glossary",
+  "description": "Term to one plain sentence. Acronyms used anywhere in the catalog must be listed here.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["terms"],
+  "properties": {
+    "terms": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["term", "plain"],
+        "properties": {
+          "term": { "type": "string", "minLength": 1 },
+          "plain": { "type": "string", "minLength": 1, "description": "Exactly one sentence." },
+          "aliases": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+          "learn_more": { "type": "string", "pattern": "^https://" }
+        }
+      }
+    }
+  }
+}
