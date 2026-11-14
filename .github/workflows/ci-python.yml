@@ -1,0 +1,59 @@
+name: ci-python
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-python-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.11.28"
+  UV_PYTHON: "3.12"
+
+jobs:
+  checks:
+    name: lint, types, imports, fixtures, tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run --locked ruff check .
+      - run: uv run --locked ruff format --check .
+      - run: uv run --locked pyright
+      - run: uv run --locked lint-imports
+      - run: uv run --locked python tools/fixtures/make_fixtures.py --check
+      - run: uv run --locked pytest
+      - name: spike lock is current
+        run: uv lock --check --project tools/fixtures/spike
+
+  adapters:
+    name: adapter env ${{ matrix.adapter }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        adapter: [mrl-adapter-trl, mrl-adapter-lmeval, mrl-adapter-mlx]
+    defaults:
+      run:
+        working-directory: python/adapters/${{ matrix.adapter }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+      - run: uv sync --locked
+      - run: uv run --locked lint-imports
+      - run: uv run --locked pytest

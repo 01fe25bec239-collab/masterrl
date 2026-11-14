@@ -1,0 +1,17 @@
+[importlinter]
+root_packages =
+    mrl_runtime
+    mrl_rewards
+    mrl_sdk
+include_external_packages = True
+
+[importlinter:contract:runtime-no-ml-frameworks]
+name = mrl_runtime does not import ML frameworks (load them lazily in adapters)
+type = forbidden
+source_modules =
+    mrl_runtime
+forbidden_modules =
+    torch
+    transformers
+    trl
+    vllm

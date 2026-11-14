@@ -1,0 +1,3 @@
+{"messages":[{"role":"user","content":[{"type":"audio","audio_ref":"sha256:abababababababababababababababababababababababababababababababab"}]},{"role":"assistant","content":[{"type":"text","text":"Ok."}]}]}
+{"messages":[{"role":"user","content":[{"type":"image_ref","image_ref":""}]},{"role":"assistant","content":[{"type":"text","text":"Ok."}]}]}
+{"messages":[{"role":"assistant","content":[{"type":"text","text":"Ok."}]},{"role":"user","content":[{"type":"text","text":"Hi"}]}]}

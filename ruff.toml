@@ -1,0 +1,10 @@
+target-version = "py312"
+line-length = 100
+extend-exclude = ["tests/fixtures/models/.cache"]
+
+[lint]
+select = ["E", "W", "F", "I", "B", "UP", "N", "SIM", "PTH", "RUF", "PL", "C4", "PIE", "PT", "RET", "TID"]
+ignore = ["PLR2004"] # magic numbers are fine in tests and fixtures
+
+[lint.isort]
+known-first-party = ["mrl_runtime", "mrl_rewards", "mrl_sdk", "mrl_adapter_trl", "mrl_adapter_lmeval", "mrl_adapter_mlx"]

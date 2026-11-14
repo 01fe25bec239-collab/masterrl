@@ -1,0 +1,41 @@
+# Real models for GPU tests on the owner's 4–6 GB laptops (L0 is the CPU tiny-llama fixture).
+# Pinned by Hugging Face commit; every file is checked by sha256 after download.
+# Fetch: uv run python tools/fixtures/fetch_test_models.py
+# Licenses checked on the model card at the pinned commit. Only Apache-2.0 or MIT.
+# vram_gb is an estimate for bf16 LoRA training (seq 512, batch 4); GPU sessions measure it.
+models:
+  - level: L1
+    use: 4 GB GPU smoke tests
+    repo: HuggingFaceTB/SmolLM2-135M-Instruct
+    revision: 12fd25f77366fa6b3b4b768ec3050bf629380bac
+    license: apache-2.0
+    architecture: LlamaForCausalLM
+    params: 134515008
+    dtype: bfloat16
+    context_length: 8192
+    vram_gb: {min: 1.0, max: 3.5}
+    files:
+      config.json: 8eb740e8bbe4cff95ea7b4588d17a2432deb16e8075bc5828ff7ba9be94d982a
+      generation_config.json: 87b916edaaab66b3899b9d0dd0752727dff6666686da0504d89ae0a6e055a013
+      model.safetensors: 5af571cbf074e6d21a03528d2330792e532ca608f24ac70a143f6b369968ab8c
+      special_tokens_map.json: 2b7379f3ae813529281a5c602bc5a11c1d4e0a99107aaa597fe936c1e813ca52
+      tokenizer.json: 9ca9acddb6525a194ec8ac7a87f24fbba7232a9a15ffa1af0c1224fcd888e47c
+      tokenizer_config.json: 4ec77d44f62efeb38d7e044a1db318f6a939438425312dfa333b8382dbad98df
+
+  - level: L2
+    use: 6 GB GPU tests (LoRA; full fine-tune does not fit 6 GB)
+    repo: Qwen/Qwen2.5-0.5B-Instruct
+    revision: 7ae557604adf67be50417f59c2c2f167def9a775
+    license: apache-2.0
+    architecture: Qwen2ForCausalLM
+    params: 494032768
+    dtype: bfloat16
+    context_length: 32768
+    vram_gb: {min: 1.5, max: 5.5}
+    files:
+      LICENSE: 832dd9e00a68dd83b3c3fb9f5588dad7dcf337a0db50f7d9483f310cd292e92e
+      config.json: 18e18afcaccafade98daf13a54092927904649e1dd4eba8299ab717d5d94ff45
+      generation_config.json: e558847a8b4402616f1273797b015104dc266fe4b520056fca88823ba8f8ebe6
+      model.safetensors: fdf756fa7fcbe7404d5c60e26bff1a0c8b8aa1f72ced49e7dd0210fe288fb7fe
+      tokenizer.json: c0382117ea329cdf097041132f6d735924b697924d6f6fc3945713e96ce87539
+      tokenizer_config.json: 5b5d4f65d0acd3b2d56a35b56d374a36cbc1c8fa5cf3b3febbbfabf22f359583

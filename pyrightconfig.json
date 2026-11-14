@@ -1,0 +1,15 @@
+{
+  "include": ["python", "tests", "tools"],
+  "exclude": ["**/.venv", "**/__pycache__", "tests/fixtures/models/.cache", "tools/fixtures/spike"],
+  "extraPaths": [
+    "tools/fixtures",
+    "python/adapters/mrl-adapter-trl/src",
+    "python/adapters/mrl-adapter-lmeval/src",
+    "python/adapters/mrl-adapter-mlx/src"
+  ],
+  "pythonVersion": "3.12",
+  "typeCheckingMode": "standard",
+  "strict": ["python/mrl-runtime/src", "python/mrl-rewards/src"],
+  "venvPath": ".",
+  "venv": ".venv"
+}

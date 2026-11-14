@@ -1,0 +1,4 @@
+{"prompt":"Repeat: a","chosen":"a","rejected":"a"}
+{"prompt":"Repeat: a","chosen":"a"}
+{"prompt":"","chosen":"a","rejected":"b"}
+{"prompt":"Repeat: a","chosen":"a","rejected":"b","margin":"high"}

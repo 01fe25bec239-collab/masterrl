@@ -1,0 +1,8 @@
+{"messages":[{"role":"user","content":"Hi"},{"role":"user","content":"Hi again"},{"role":"assistant","content":"Hello"}]}
+{"messages":[{"role":"user","content":"Repeat: apple"}]}
+{"messages":[{"role":"assistant","content":"Hello"},{"role":"user","content":"Hi"},{"role":"assistant","content":"Hi"}]}
+{"messages":[{"role":"user","content":"Repeat: lamp"},{"role":"assistant","content":""}]}
+{"messages":[]}
+{"messages":[{"role":"user","content":"Hi"},{"role":"robot","content":"Hi"}]}
+{"text":"no messages"}
+{"messages":[{"role":"user","content":"ÿ"}]}

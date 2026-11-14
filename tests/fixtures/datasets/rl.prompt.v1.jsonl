@@ -1,0 +1,2 @@
+{"prompt":"Repeat: marble needle"}
+{"prompt":[{"role":"user","content":"Repeat: quartz rabbit"}],"reference":"quartz rabbit","verifier":"exact_match","meta":{"split":"train"}}

@@ -1,0 +1,1 @@
+{"episode_id":"ep-0001","env_spec_ref":"env/calculator@1","turns":[{"role":"user","content":"What is 6 times 7?"},{"role":"assistant","content":"","tool_calls":[{"name":"multiply","arguments":{"a":6,"b":7}}]},{"role":"tool","content":"","tool_results":[{"name":"multiply","output":42}]},{"role":"assistant","content":"6 times 7 is 42."}]}

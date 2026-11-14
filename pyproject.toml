@@ -1,0 +1,34 @@
+# Python workspace root (virtual: no package of its own).
+# Adapters under python/adapters/ are separate uv projects with their own locks.
+[tool.uv]
+required-version = "==0.11.28"
+
+[tool.uv.workspace]
+members = ["python/mrl-runtime", "python/mrl-rewards", "python/mrl-sdk"]
+
+[tool.uv.sources]
+mrl-runtime = { workspace = true }
+mrl-rewards = { workspace = true }
+mrl-sdk = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "mrl-runtime",
+    "mrl-rewards",
+    "mrl-sdk",
+    "ruff==0.17.4",
+    "pyright[nodejs]==1.1.414",
+    "import-linter==2.15",
+    "pytest==9.2.0",
+    # Fixture tools (tools/fixtures/): no torch needed.
+    "numpy==2.5.4",
+    "safetensors==0.8.0",
+    "tokenizers==0.23.3",
+    "huggingface-hub==2.4.0",
+    "pyyaml==6.0.3",
+]
+
+[tool.pytest.ini_options]
+addopts = "--import-mode=importlib"
+testpaths = ["python/mrl-runtime", "python/mrl-rewards", "python/mrl-sdk", "tests"]
+pythonpath = ["tools/fixtures"]

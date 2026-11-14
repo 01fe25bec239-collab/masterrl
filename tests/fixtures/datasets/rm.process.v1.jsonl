@@ -1,0 +1,2 @@
+{"prompt":"What is 2 + 3 * 4?","completions":["3 * 4 = 12","2 + 12 = 14","The answer is 14."],"labels":[true,true,true]}
+{"prompt":"What is 2 + 3 * 4?","completions":["2 + 3 = 5","5 * 4 = 20"],"labels":[false,false]}
