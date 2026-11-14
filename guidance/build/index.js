@@ -1674,7 +1674,7 @@ export const catalog = deepFreeze({
     {
       "code": "CANCELLED_BY_USER",
       "title": "You stopped this run.",
-      "why": "The app ended training because Stop was selected.",
+      "why": "The app ended training when you selected Stop.",
       "what_to_do": {
         "steps": [
           "Start the run again to continue from the last checkpoint.",

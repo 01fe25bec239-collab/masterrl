@@ -1722,7 +1722,7 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("CANCELLED_BY_USER")),
             ("title", Value::Str("You stopped this run.")),
-            ("why", Value::Str("The app ended training because Stop was selected.")),
+            ("why", Value::Str("The app ended training when you selected Stop.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Start the run again to continue from the last checkpoint."),
