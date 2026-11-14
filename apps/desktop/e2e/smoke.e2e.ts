@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { _electron as electron, expect, test } from '@playwright/test';
+import { CONTENT_SECURITY_POLICY } from '../src/main/security';
 
 const release = path.join(import.meta.dirname, '../release');
 const { version } = JSON.parse(
@@ -41,6 +42,13 @@ test('packaged app opens one secure window', async () => {
       return document.body.dataset.inline === 'ran';
     });
     expect(inlineRan).toBe(false);
+
+    // The packaged app serves its pages with the strict CSP.
+    const served = await app.evaluate(async ({ net }) => {
+      const response = await net.fetch('app://app/index.html');
+      return response.headers.get('content-security-policy');
+    });
+    expect(served).toBe(CONTENT_SECURITY_POLICY);
   } finally {
     await app.close();
   }

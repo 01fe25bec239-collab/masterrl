@@ -1,4 +1,5 @@
 import js from '@eslint/js';
+import { defineConfig } from 'eslint/config';
 import jsxA11y from 'eslint-plugin-jsx-a11y';
 import reactHooks from 'eslint-plugin-react-hooks';
 import globals from 'globals';
@@ -20,10 +21,10 @@ const noRawApiFetch = {
   ],
 };
 
-export default tseslint.config(
+export default defineConfig(
   { ignores: ['**/dist/**', '**/release/**', '**/test-results/**', '**/playwright-report/**'] },
   js.configs.recommended,
-  ...tseslint.configs.strictTypeChecked,
+  tseslint.configs.strictTypeChecked,
   {
     languageOptions: {
       parserOptions: { projectService: true, tsconfigRootDir: import.meta.dirname },

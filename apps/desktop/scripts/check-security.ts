@@ -42,6 +42,27 @@ const BANNED: [RegExp, string][] = [
   ],
   [/'unsafe-eval'/, "'unsafe-eval' is not allowed in any CSP"],
   [/\.loadFile\(|registerFileProtocol|file:\/\//, 'serve the renderer through app://, not file://'],
+  [/default-src|script-src/, 'CSP strings may only be defined in src/main/security.ts'],
+];
+
+// How src/main/index.ts must apply the CSP: strict on app://, the dev one only with a dev server.
+const REQUIRED_IN_INDEX: [RegExp, string][] = [
+  [
+    /const devServerUrl = app\.isPackaged \? undefined : process\.env\.MRL_DEV_SERVER_URL;/,
+    'the dev server URL must be ignored in packaged builds',
+  ],
+  [
+    /headers\.set\('Content-Security-Policy', CONTENT_SECURITY_POLICY\);/,
+    'app:// responses must send CONTENT_SECURITY_POLICY',
+  ],
+  [
+    /if \(devServerUrl\) \{\s*session\.defaultSession\.webRequest\.onHeadersReceived\(/,
+    'the dev CSP override must stay inside if (devServerUrl)',
+  ],
+  [
+    /'Content-Security-Policy': \[DEV_CONTENT_SECURITY_POLICY\]/,
+    'the dev server must get DEV_CONTENT_SECURITY_POLICY',
+  ],
 ];
 
 const failures: string[] = [];
@@ -63,6 +84,15 @@ for (const name of readdirSync(srcDir, { recursive: true, encoding: 'utf8' })) {
   for (const [pattern, reason] of BANNED) {
     if (pattern.test(text)) failures.push(`src/${name}: ${reason}`);
   }
+}
+
+const index = readFileSync(new URL('main/index.ts', srcDir), 'utf8');
+for (const [pattern, reason] of REQUIRED_IN_INDEX) {
+  if (!pattern.test(index)) failures.push(`src/main/index.ts: ${reason}`);
+}
+const count = (pattern: RegExp) => index.match(pattern)?.length ?? 0;
+if (count(/Content-Security-Policy/g) !== 2 || count(/onHeadersReceived/g) !== 1) {
+  failures.push('src/main/index.ts: set the CSP only in the two places checked above');
 }
 
 if (failures.length > 0) {
