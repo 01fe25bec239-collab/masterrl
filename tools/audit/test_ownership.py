@@ -31,6 +31,12 @@ WAVE = """# Wave 1
 """
 
 
+def temp_dir(case: unittest.TestCase) -> Path:
+    tmp = tempfile.TemporaryDirectory()
+    case.addCleanup(tmp.cleanup)
+    return Path(tmp.name)
+
+
 def git(root: Path, *args: str) -> None:
     subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
 
@@ -46,11 +52,11 @@ def commit(root: Path, files: list[str], message: str) -> None:
 
 class OwnershipTest(unittest.TestCase):
     def setUp(self):
-        self.root = Path(tempfile.mkdtemp())
+        self.root = temp_dir(self)
         git(self.root, "init", "-q")
         commit(self.root, ["README.md"], "base")
         git(self.root, "tag", "wave-00-done")
-        self.plan = Path(tempfile.mkdtemp())
+        self.plan = temp_dir(self)
         (self.plan / "README.md").write_text(README)
         (self.plan / "wave-01.md").write_text(WAVE)
         self.cwd = os.getcwd()
