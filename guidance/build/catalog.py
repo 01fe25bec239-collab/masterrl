@@ -122,8 +122,8 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              {'id': 'sft-qlora',
               'name': 'Teach by example with QLoRA',
               'method': 'sft',
-              'summary': 'Like LoRA, but the model is stored in 4-bit form. You can train bigger '
-                         'models with less memory, a bit slower.',
+              'summary': 'Like LoRA, but QLoRA stores the model in 4-bit form. You can train '
+                         'bigger models with less memory, but training is a bit slower.',
               'peft': 'qlora',
               'precision': 'nf4-bf16',
               'defaults': {'epochs': 3,

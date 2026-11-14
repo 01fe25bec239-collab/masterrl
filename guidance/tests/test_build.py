@@ -75,6 +75,15 @@ class BuildTest(unittest.TestCase):
         self.plant("errors", entry("MRL-TEST-001", "The XYZ service stopped."))
         self.assert_fails("acronym 'XYZ' is not in the glossary")
 
+    def test_component_text_is_checked(self):
+        bad = " ".join(["word"] * 25) + "."
+        self.plant("requirements", textwrap.dedent(f"""\
+            components:
+              - {{ id: extra, name: Extra tool, summary: "{bad}", download_gb: {{ cpu: {{ min: 0.1, max: 0.2 }} }}, estimated: true }}
+            requirements: []
+            """))
+        self.assert_fails("sentence has 25 words (max 20)")
+
     def test_missing_why_fails(self):
         self.plant("errors", "errors:\n  - code: MRL-TEST-001\n    title: Stopped.\n    what_to_do: {steps: [Retry.]}\n")
         self.assert_fails("'why' is a required property")

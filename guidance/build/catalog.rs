@@ -317,7 +317,7 @@ pub static CATALOG: Value = Value::Map(&[
             ("id", Value::Str("sft-qlora")),
             ("name", Value::Str("Teach by example with QLoRA")),
             ("method", Value::Str("sft")),
-            ("summary", Value::Str("Like LoRA, but the model is stored in 4-bit form. You can train bigger models with less memory, a bit slower.")),
+            ("summary", Value::Str("Like LoRA, but QLoRA stores the model in 4-bit form. You can train bigger models with less memory, but training is a bit slower.")),
             ("peft", Value::Str("qlora")),
             ("precision", Value::Str("nf4-bf16")),
             ("defaults", Value::Map(&[

@@ -35,7 +35,7 @@ SECTIONS = {
 }
 FRAGMENT_NAME = re.compile(r"^p\d{2}\.yaml$")
 
-# Keys whose values are ids, enums or links, not user-facing text.
+# Keys whose string (or list-of-string) values are ids, enums or links, not user-facing text.
 NON_TEXT_KEYS = {
     "id", "code", "aliases", "learn_more", "docs_link", "profile", "platform", "task", "family",
     "method", "peft", "precision", "dataset_schema", "reward_type", "recipes", "components",
@@ -78,7 +78,8 @@ def texts(node, path: str):
     """Yield (path, string) for every user-facing string."""
     if isinstance(node, dict):
         for key, value in node.items():
-            if key not in NON_TEXT_KEYS:
+            is_ids = isinstance(value, str) or (isinstance(value, list) and all(isinstance(v, str) for v in value))
+            if not (key in NON_TEXT_KEYS and is_ids):
                 yield from texts(value, f"{path}.{key}")
     elif isinstance(node, list):
         for i, value in enumerate(node):
