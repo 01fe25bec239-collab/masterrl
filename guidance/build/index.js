@@ -146,7 +146,7 @@ export const catalog = deepFreeze({
           "profile": "nvidia-16gb",
           "model_params_b": {
             "min": 1,
-            "max": 7
+            "max": 5
           },
           "per_device_batch_size": 4,
           "minutes_per_1k_samples": {
@@ -464,8 +464,8 @@ export const catalog = deepFreeze({
         {
           "profile": "nvidia-4gb",
           "model_params_b": {
-            "min": 0.1,
-            "max": 0.3
+            "min": 0.05,
+            "max": 0.2
           },
           "per_device_batch_size": 1,
           "minutes_per_1k_samples": {
@@ -489,7 +489,7 @@ export const catalog = deepFreeze({
           "profile": "nvidia-8gb",
           "model_params_b": {
             "min": 0.1,
-            "max": 0.5
+            "max": 0.4
           },
           "per_device_batch_size": 1,
           "minutes_per_1k_samples": {
@@ -501,7 +501,7 @@ export const catalog = deepFreeze({
           "profile": "nvidia-12gb",
           "model_params_b": {
             "min": 0.3,
-            "max": 1
+            "max": 0.6
           },
           "per_device_batch_size": 2,
           "minutes_per_1k_samples": {
@@ -513,7 +513,7 @@ export const catalog = deepFreeze({
           "profile": "nvidia-16gb",
           "model_params_b": {
             "min": 0.5,
-            "max": 1
+            "max": 0.8
           },
           "per_device_batch_size": 2,
           "minutes_per_1k_samples": {
@@ -525,7 +525,7 @@ export const catalog = deepFreeze({
           "profile": "nvidia-24gb",
           "model_params_b": {
             "min": 0.5,
-            "max": 1.5
+            "max": 1.2
           },
           "per_device_batch_size": 4,
           "minutes_per_1k_samples": {
@@ -537,7 +537,7 @@ export const catalog = deepFreeze({
           "profile": "nvidia-32-80gb",
           "model_params_b": {
             "min": 1,
-            "max": 3
+            "max": 4
           },
           "per_device_batch_size": 4,
           "minutes_per_1k_samples": {
@@ -549,7 +549,7 @@ export const catalog = deepFreeze({
           "profile": "apple-16gb",
           "model_params_b": {
             "min": 0.1,
-            "max": 0.5
+            "max": 0.6
           },
           "per_device_batch_size": 1,
           "minutes_per_1k_samples": {
@@ -573,7 +573,7 @@ export const catalog = deepFreeze({
           "profile": "apple-32gb",
           "model_params_b": {
             "min": 0.5,
-            "max": 1.5
+            "max": 1.4
           },
           "per_device_batch_size": 2,
           "minutes_per_1k_samples": {
@@ -585,7 +585,7 @@ export const catalog = deepFreeze({
           "profile": "apple-64gb",
           "model_params_b": {
             "min": 1,
-            "max": 3
+            "max": 2.8
           },
           "per_device_batch_size": 2,
           "minutes_per_1k_samples": {
@@ -597,7 +597,7 @@ export const catalog = deepFreeze({
           "profile": "apple-128gb",
           "model_params_b": {
             "min": 3,
-            "max": 7
+            "max": 5.5
           },
           "per_device_batch_size": 4,
           "minutes_per_1k_samples": {
@@ -782,7 +782,7 @@ export const catalog = deepFreeze({
           "profile": "nvidia-16gb",
           "model_params_b": {
             "min": 1,
-            "max": 3
+            "max": 2
           },
           "per_device_batch_size": 4,
           "minutes_per_1k_samples": {
@@ -794,7 +794,7 @@ export const catalog = deepFreeze({
           "profile": "nvidia-24gb",
           "model_params_b": {
             "min": 1.5,
-            "max": 7
+            "max": 4
           },
           "per_device_batch_size": 8,
           "minutes_per_1k_samples": {
@@ -1817,7 +1817,7 @@ export const catalog = deepFreeze({
     {
       "code": "MRL-CAP-002",
       "title": "PPO is not available with the TRL engine.",
-      "why": "The app does not offer PPO through TRL.",
+      "why": "PPO trains a second model that judges each step. The app runs that setup only on verl.",
       "what_to_do": {
         "steps": [
           "Switch the engine to verl to use PPO.",
@@ -1871,7 +1871,7 @@ export const catalog = deepFreeze({
     {
       "code": "MRL-CAP-007",
       "title": "The app trains the output head fully instead of with LoRA.",
-      "why": "DPO, KTO and logit distillation can't use LoRA on the output head. The app trains the head fully instead.",
+      "why": "DPO, KTO and logit distillation can't use LoRA on the output head.",
       "what_to_do": {
         "steps": [
           "You don't need to do anything. Training uses a bit more memory.",
@@ -1914,7 +1914,7 @@ export const catalog = deepFreeze({
     {
       "code": "MRL-CAP-011",
       "title": "DAPO dynamic sampling is not available with TRL.",
-      "why": "TRL does not offer dynamic sampling.",
+      "why": "Dynamic sampling skips prompts and refills each batch. In this app, only verl can do that.",
       "what_to_do": {
         "steps": [
           "Switch the engine to verl to use dynamic sampling.",

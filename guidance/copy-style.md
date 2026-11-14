@@ -14,7 +14,7 @@ The build (`guidance/tools/build.py`) checks the rules marked **checked**.
 | Explain every acronym. Each one must be in the glossary. **Checked.** | "GPU memory (VRAM)", with VRAM in the glossary | "Not enough VRAM", with no glossary entry |
 | Warnings say the consequence. | "You lose progress made since the last checkpoint." | "Warning: unsaved progress." |
 | Never blame the user. **Checked** for common phrases. | "This dataset has 3 rows without an answer." | "You forgot to add answers." |
-| Never say "invalid" alone. **Checked:** it needs "because" in the same sentence. | "A field has a value that is not allowed." | "Invalid input." |
+| Never say "invalid" alone. **Checked:** it needs "because" in the same sentence. | "This field has a value the app doesn't accept." | "Invalid input." |
 
 ## Errors
 

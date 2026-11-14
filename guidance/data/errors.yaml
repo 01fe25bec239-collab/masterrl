@@ -311,7 +311,7 @@ errors:
 
   - code: MRL-CAP-002
     title: PPO is not available with the TRL engine.
-    why: The app does not offer PPO through TRL.
+    why: PPO trains a second model that judges each step. The app runs that setup only on verl.
     what_to_do:
       steps:
         - Switch the engine to verl to use PPO.
@@ -350,7 +350,7 @@ errors:
 
   - code: MRL-CAP-007
     title: The app trains the output head fully instead of with LoRA.
-    why: DPO, KTO and logit distillation can't use LoRA on the output head. The app trains the head fully instead.
+    why: DPO, KTO and logit distillation can't use LoRA on the output head.
     what_to_do:
       steps:
         - You don't need to do anything. Training uses a bit more memory.
@@ -381,7 +381,7 @@ errors:
 
   - code: MRL-CAP-011
     title: DAPO dynamic sampling is not available with TRL.
-    why: TRL does not offer dynamic sampling.
+    why: Dynamic sampling skips prompts and refills each batch. In this app, only verl can do that.
     what_to_do:
       steps:
         - Switch the engine to verl to use dynamic sampling.

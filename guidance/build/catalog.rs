@@ -194,7 +194,7 @@ pub static CATALOG: Value = Value::Map(&[
                     ("profile", Value::Str("nvidia-16gb")),
                     ("model_params_b", Value::Map(&[
                         ("min", Value::Num(1.0)),
-                        ("max", Value::Num(7.0)),
+                        ("max", Value::Num(5.0)),
                     ])),
                     ("per_device_batch_size", Value::Num(4.0)),
                     ("minutes_per_1k_samples", Value::Map(&[
@@ -512,8 +512,8 @@ pub static CATALOG: Value = Value::Map(&[
                 Value::Map(&[
                     ("profile", Value::Str("nvidia-4gb")),
                     ("model_params_b", Value::Map(&[
-                        ("min", Value::Num(0.1)),
-                        ("max", Value::Num(0.3)),
+                        ("min", Value::Num(0.05)),
+                        ("max", Value::Num(0.2)),
                     ])),
                     ("per_device_batch_size", Value::Num(1.0)),
                     ("minutes_per_1k_samples", Value::Map(&[
@@ -537,7 +537,7 @@ pub static CATALOG: Value = Value::Map(&[
                     ("profile", Value::Str("nvidia-8gb")),
                     ("model_params_b", Value::Map(&[
                         ("min", Value::Num(0.1)),
-                        ("max", Value::Num(0.5)),
+                        ("max", Value::Num(0.4)),
                     ])),
                     ("per_device_batch_size", Value::Num(1.0)),
                     ("minutes_per_1k_samples", Value::Map(&[
@@ -549,7 +549,7 @@ pub static CATALOG: Value = Value::Map(&[
                     ("profile", Value::Str("nvidia-12gb")),
                     ("model_params_b", Value::Map(&[
                         ("min", Value::Num(0.3)),
-                        ("max", Value::Num(1.0)),
+                        ("max", Value::Num(0.6)),
                     ])),
                     ("per_device_batch_size", Value::Num(2.0)),
                     ("minutes_per_1k_samples", Value::Map(&[
@@ -561,7 +561,7 @@ pub static CATALOG: Value = Value::Map(&[
                     ("profile", Value::Str("nvidia-16gb")),
                     ("model_params_b", Value::Map(&[
                         ("min", Value::Num(0.5)),
-                        ("max", Value::Num(1.0)),
+                        ("max", Value::Num(0.8)),
                     ])),
                     ("per_device_batch_size", Value::Num(2.0)),
                     ("minutes_per_1k_samples", Value::Map(&[
@@ -573,7 +573,7 @@ pub static CATALOG: Value = Value::Map(&[
                     ("profile", Value::Str("nvidia-24gb")),
                     ("model_params_b", Value::Map(&[
                         ("min", Value::Num(0.5)),
-                        ("max", Value::Num(1.5)),
+                        ("max", Value::Num(1.2)),
                     ])),
                     ("per_device_batch_size", Value::Num(4.0)),
                     ("minutes_per_1k_samples", Value::Map(&[
@@ -585,7 +585,7 @@ pub static CATALOG: Value = Value::Map(&[
                     ("profile", Value::Str("nvidia-32-80gb")),
                     ("model_params_b", Value::Map(&[
                         ("min", Value::Num(1.0)),
-                        ("max", Value::Num(3.0)),
+                        ("max", Value::Num(4.0)),
                     ])),
                     ("per_device_batch_size", Value::Num(4.0)),
                     ("minutes_per_1k_samples", Value::Map(&[
@@ -597,7 +597,7 @@ pub static CATALOG: Value = Value::Map(&[
                     ("profile", Value::Str("apple-16gb")),
                     ("model_params_b", Value::Map(&[
                         ("min", Value::Num(0.1)),
-                        ("max", Value::Num(0.5)),
+                        ("max", Value::Num(0.6)),
                     ])),
                     ("per_device_batch_size", Value::Num(1.0)),
                     ("minutes_per_1k_samples", Value::Map(&[
@@ -621,7 +621,7 @@ pub static CATALOG: Value = Value::Map(&[
                     ("profile", Value::Str("apple-32gb")),
                     ("model_params_b", Value::Map(&[
                         ("min", Value::Num(0.5)),
-                        ("max", Value::Num(1.5)),
+                        ("max", Value::Num(1.4)),
                     ])),
                     ("per_device_batch_size", Value::Num(2.0)),
                     ("minutes_per_1k_samples", Value::Map(&[
@@ -633,7 +633,7 @@ pub static CATALOG: Value = Value::Map(&[
                     ("profile", Value::Str("apple-64gb")),
                     ("model_params_b", Value::Map(&[
                         ("min", Value::Num(1.0)),
-                        ("max", Value::Num(3.0)),
+                        ("max", Value::Num(2.8)),
                     ])),
                     ("per_device_batch_size", Value::Num(2.0)),
                     ("minutes_per_1k_samples", Value::Map(&[
@@ -645,7 +645,7 @@ pub static CATALOG: Value = Value::Map(&[
                     ("profile", Value::Str("apple-128gb")),
                     ("model_params_b", Value::Map(&[
                         ("min", Value::Num(3.0)),
-                        ("max", Value::Num(7.0)),
+                        ("max", Value::Num(5.5)),
                     ])),
                     ("per_device_batch_size", Value::Num(4.0)),
                     ("minutes_per_1k_samples", Value::Map(&[
@@ -830,7 +830,7 @@ pub static CATALOG: Value = Value::Map(&[
                     ("profile", Value::Str("nvidia-16gb")),
                     ("model_params_b", Value::Map(&[
                         ("min", Value::Num(1.0)),
-                        ("max", Value::Num(3.0)),
+                        ("max", Value::Num(2.0)),
                     ])),
                     ("per_device_batch_size", Value::Num(4.0)),
                     ("minutes_per_1k_samples", Value::Map(&[
@@ -842,7 +842,7 @@ pub static CATALOG: Value = Value::Map(&[
                     ("profile", Value::Str("nvidia-24gb")),
                     ("model_params_b", Value::Map(&[
                         ("min", Value::Num(1.5)),
-                        ("max", Value::Num(7.0)),
+                        ("max", Value::Num(4.0)),
                     ])),
                     ("per_device_batch_size", Value::Num(8.0)),
                     ("minutes_per_1k_samples", Value::Map(&[
@@ -1865,7 +1865,7 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("MRL-CAP-002")),
             ("title", Value::Str("PPO is not available with the TRL engine.")),
-            ("why", Value::Str("The app does not offer PPO through TRL.")),
+            ("why", Value::Str("PPO trains a second model that judges each step. The app runs that setup only on verl.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Switch the engine to verl to use PPO."),
@@ -1919,7 +1919,7 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("MRL-CAP-007")),
             ("title", Value::Str("The app trains the output head fully instead of with LoRA.")),
-            ("why", Value::Str("DPO, KTO and logit distillation can't use LoRA on the output head. The app trains the head fully instead.")),
+            ("why", Value::Str("DPO, KTO and logit distillation can't use LoRA on the output head.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("You don't need to do anything. Training uses a bit more memory."),
@@ -1962,7 +1962,7 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("MRL-CAP-011")),
             ("title", Value::Str("DAPO dynamic sampling is not available with TRL.")),
-            ("why", Value::Str("TRL does not offer dynamic sampling.")),
+            ("why", Value::Str("Dynamic sampling skips prompts and refills each batch. In this app, only verl can do that.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Switch the engine to verl to use dynamic sampling."),
