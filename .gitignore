@@ -42,3 +42,9 @@ tests/fixtures/models/.cache/
 # Logs
 *.log
 logs/
+
+# Internal planning and agent files (kept on this computer, not published)
+/docs/
+/AGENTS.md
+/CLAUDE.md
+/memory.md
