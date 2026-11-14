@@ -1251,9 +1251,10 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                                       'shared memory, like `--shm-size=8g`.']}},
             {'code': 'PREEMPTED',
              'title': 'The app paused the run to free this machine.',
-             'why': 'A job with higher priority needed the machine. The run resumes from its last '
-                    'checkpoint when the machine is free. You may lose progress made since then.',
-             'what_to_do': {'steps': ["You don't need to do anything."]}},
+             'why': 'A job with higher priority needed this machine. You lose progress made after '
+                    'the last checkpoint.',
+             'what_to_do': {'steps': ['Wait for the machine to be free. The run then resumes from '
+                                      'its last checkpoint.']}},
             {'code': 'REWARD_INFRA',
              'title': 'The service that scores answers is not working.',
              'why': 'The app could not reach the reward service, or it did not answer within the '

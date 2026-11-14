@@ -80,10 +80,10 @@ errors:
 
   - code: PREEMPTED
     title: The app paused the run to free this machine.
-    why: A job with higher priority needed the machine. The run resumes from its last checkpoint when the machine is free. You may lose progress made since then.
+    why: A job with higher priority needed this machine. You lose progress made after the last checkpoint.
     what_to_do:
       steps:
-        - You don't need to do anything.
+        - Wait for the machine to be free. The run then resumes from its last checkpoint.
 
   - code: CANCELLED_BY_USER
     title: You stopped this run.

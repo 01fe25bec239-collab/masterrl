@@ -84,6 +84,10 @@ class BuildTest(unittest.TestCase):
             """))
         self.assert_fails("sentence has 25 words (max 20)")
 
+    def test_long_why_fails(self):
+        self.plant("errors", entry("MRL-TEST-001", "Stopped.", "One reason. Two reasons. Three reasons."))
+        self.assert_fails("why must be one or two sentences")
+
     def test_missing_why_fails(self):
         self.plant("errors", "errors:\n  - code: MRL-TEST-001\n    title: Stopped.\n    what_to_do: {steps: [Retry.]}\n")
         self.assert_fails("'why' is a required property")

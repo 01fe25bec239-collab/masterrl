@@ -223,6 +223,12 @@ def build(root: Path) -> tuple[dict, list[str]]:
     for src, term in terms:
         if len(sentences(term["plain"])) != 1:
             problems.append(f"{src}: glossary {term['term']!r}: plain must be exactly one sentence")
+    fallback = base["errors"].get("fallback")
+    for src, error in errors + ([(docs["errors"][0][0], {"code": "fallback", **fallback})] if fallback else []):
+        if len(sentences(error["title"])) != 1:
+            problems.append(f"{src}: error {error['code']!r}: title must be one sentence")
+        if len(sentences(error["why"])) > 2:
+            problems.append(f"{src}: error {error['code']!r}: why must be one or two sentences")
 
     if problems:
         return {}, problems

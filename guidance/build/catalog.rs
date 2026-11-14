@@ -2546,10 +2546,10 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("PREEMPTED")),
             ("title", Value::Str("The app paused the run to free this machine.")),
-            ("why", Value::Str("A job with higher priority needed the machine. The run resumes from its last checkpoint when the machine is free. You may lose progress made since then.")),
+            ("why", Value::Str("A job with higher priority needed this machine. You lose progress made after the last checkpoint.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
-                    Value::Str("You don't need to do anything."),
+                    Value::Str("Wait for the machine to be free. The run then resumes from its last checkpoint."),
                 ])),
             ])),
         ]),

@@ -18,7 +18,7 @@ The build (`guidance/tools/build.py`) checks the rules marked **checked**.
 
 ## Errors
 
-Every error has three parts. **Checked:** all three are required.
+Every error has three parts. **Checked:** all three are required, the title is one sentence and why is one or two.
 
 - **Title:** what happened, in one short sentence.
 - **Why:** the cause, in one or two sentences.
