@@ -1249,7 +1249,7 @@ export const catalog = deepFreeze({
     },
     {
       "term": "Firewall",
-      "plain": "Software that blocks network traffic that is not allowed."
+      "plain": "Software that blocks network traffic your rules don't allow."
     },
     {
       "term": "fp16",
@@ -1257,7 +1257,7 @@ export const catalog = deepFreeze({
     },
     {
       "term": "fp32",
-      "plain": "A 32-bit number format that is exact but uses twice the memory of bf16."
+      "plain": "A 32-bit number format that is more precise than bf16 but uses twice the memory."
     },
     {
       "term": "FSDP2",
@@ -1431,7 +1431,7 @@ export const catalog = deepFreeze({
     },
     {
       "term": "Policy",
-      "plain": "The model being trained in reinforcement learning."
+      "plain": "The model that reinforcement learning trains."
     },
     {
       "term": "Port",
@@ -1551,7 +1551,7 @@ export const catalog = deepFreeze({
       "aliases": [
         "rollouts"
       ],
-      "plain": "Letting the model write answers during reinforcement learning so they can be scored."
+      "plain": "Letting the model write answers during reinforcement learning so a reward can score them."
     },
     {
       "term": "Safetensors",
@@ -1599,7 +1599,7 @@ export const catalog = deepFreeze({
     },
     {
       "term": "Streaming dataset",
-      "plain": "A dataset read piece by piece while training, so its full size is not known ahead."
+      "plain": "A dataset the app reads piece by piece while training, so it can't know the full size ahead."
     },
     {
       "term": "Student model",
@@ -1794,7 +1794,7 @@ export const catalog = deepFreeze({
     },
     {
       "code": "MODEL_INCOMPATIBLE",
-      "title": "This model can't be used with this method.",
+      "title": "You can't use this model with this method.",
       "why": "The model's type or files don't match what this method needs.",
       "what_to_do": {
         "steps": [
@@ -1838,7 +1838,7 @@ export const catalog = deepFreeze({
     },
     {
       "code": "MRL-CAP-004",
-      "title": "GRPO needs a reward, and none is attached.",
+      "title": "GRPO needs a reward, but this run has none.",
       "why": "GRPO learns by scoring its own answers. Without a reward, it has nothing to learn from.",
       "what_to_do": {
         "steps": [
@@ -1924,7 +1924,7 @@ export const catalog = deepFreeze({
     },
     {
       "code": "MRL-CAP-012",
-      "title": "This field can't be changed right now.",
+      "title": "You can't change this field right now.",
       "why": "A switch you turned on sets this field. The field stays read-only while that switch is on.",
       "what_to_do": {
         "steps": [
@@ -1967,7 +1967,7 @@ export const catalog = deepFreeze({
     {
       "code": "MRL-CAP-016",
       "title": "This model has no chat template for conversation data.",
-      "why": "A chat template marks where each message starts and ends. Without one, conversations can't be formatted.",
+      "why": "A chat template marks where each message starts and ends. Without one, the app can't format conversations.",
       "what_to_do": {
         "steps": [
           "Pick the chat or instruct version of this model.",
@@ -2097,8 +2097,7 @@ export const catalog = deepFreeze({
       "why": "The training tools need a 64-bit CPU with features this one lacks. Details lists them.",
       "what_to_do": {
         "steps": [
-          "Use another machine for training.",
-          "Or connect a machine that meets the needs and train there."
+          "Connect a machine that meets the needs and train on it from here."
         ]
       }
     },
@@ -2138,7 +2137,7 @@ export const catalog = deepFreeze({
       "why": "Training is much faster on a GPU. The model must fit in the GPU's memory (VRAM).",
       "what_to_do": {
         "steps": [
-          "Check that the GPU is connected and its driver is installed.",
+          "Check the GPU's connection and its driver.",
           "Pick a recipe for your GPU size, or train tiny models on the CPU."
         ]
       }
@@ -2237,7 +2236,7 @@ export const catalog = deepFreeze({
     },
     {
       "code": "MRL-ENV-012",
-      "title": "Docker is not installed.",
+      "title": "This computer doesn't have Docker.",
       "why": "Docker is optional. The app uses it only for some sandboxes and engine setups, which stay off without it.",
       "what_to_do": {
         "steps": [
@@ -2362,7 +2361,7 @@ export const catalog = deepFreeze({
     },
     {
       "code": "MRL-MODEL-002",
-      "title": "This model needs custom code that is not approved.",
+      "title": "This model needs custom code your workspace hasn't approved.",
       "why": "The model comes with its own code. Your workspace only runs approved code.",
       "what_to_do": {
         "steps": [
@@ -2385,7 +2384,7 @@ export const catalog = deepFreeze({
     {
       "code": "MRL-VAL-001",
       "title": "The app could not read this request.",
-      "why": "The request is not in a format the app understands. It may be cut off or damaged.",
+      "why": "The request is not in a format the app understands. Part of it may be missing.",
       "what_to_do": {
         "steps": [
           "Try the action again.",
@@ -2405,8 +2404,8 @@ export const catalog = deepFreeze({
     },
     {
       "code": "MRL-VAL-003",
-      "title": "A field has a value that is not allowed.",
-      "why": "The value is outside the allowed choices or range. Details lists what is allowed.",
+      "title": "A field has a value the app doesn't accept.",
+      "why": "The value is outside the allowed choices or range. Details lists the values the app accepts.",
       "what_to_do": {
         "steps": [
           "Change the field to one of the allowed values, then try again."

@@ -1297,7 +1297,7 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("term", Value::Str("Firewall")),
-            ("plain", Value::Str("Software that blocks network traffic that is not allowed.")),
+            ("plain", Value::Str("Software that blocks network traffic your rules don't allow.")),
         ]),
         Value::Map(&[
             ("term", Value::Str("fp16")),
@@ -1305,7 +1305,7 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("term", Value::Str("fp32")),
-            ("plain", Value::Str("A 32-bit number format that is exact but uses twice the memory of bf16.")),
+            ("plain", Value::Str("A 32-bit number format that is more precise than bf16 but uses twice the memory.")),
         ]),
         Value::Map(&[
             ("term", Value::Str("FSDP2")),
@@ -1479,7 +1479,7 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("term", Value::Str("Policy")),
-            ("plain", Value::Str("The model being trained in reinforcement learning.")),
+            ("plain", Value::Str("The model that reinforcement learning trains.")),
         ]),
         Value::Map(&[
             ("term", Value::Str("Port")),
@@ -1599,7 +1599,7 @@ pub static CATALOG: Value = Value::Map(&[
             ("aliases", Value::List(&[
                 Value::Str("rollouts"),
             ])),
-            ("plain", Value::Str("Letting the model write answers during reinforcement learning so they can be scored.")),
+            ("plain", Value::Str("Letting the model write answers during reinforcement learning so a reward can score them.")),
         ]),
         Value::Map(&[
             ("term", Value::Str("Safetensors")),
@@ -1647,7 +1647,7 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("term", Value::Str("Streaming dataset")),
-            ("plain", Value::Str("A dataset read piece by piece while training, so its full size is not known ahead.")),
+            ("plain", Value::Str("A dataset the app reads piece by piece while training, so it can't know the full size ahead.")),
         ]),
         Value::Map(&[
             ("term", Value::Str("Student model")),
@@ -1842,7 +1842,7 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("code", Value::Str("MODEL_INCOMPATIBLE")),
-            ("title", Value::Str("This model can't be used with this method.")),
+            ("title", Value::Str("You can't use this model with this method.")),
             ("why", Value::Str("The model's type or files don't match what this method needs.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
@@ -1886,7 +1886,7 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("code", Value::Str("MRL-CAP-004")),
-            ("title", Value::Str("GRPO needs a reward, and none is attached.")),
+            ("title", Value::Str("GRPO needs a reward, but this run has none.")),
             ("why", Value::Str("GRPO learns by scoring its own answers. Without a reward, it has nothing to learn from.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
@@ -1972,7 +1972,7 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("code", Value::Str("MRL-CAP-012")),
-            ("title", Value::Str("This field can't be changed right now.")),
+            ("title", Value::Str("You can't change this field right now.")),
             ("why", Value::Str("A switch you turned on sets this field. The field stays read-only while that switch is on.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
@@ -2015,7 +2015,7 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("MRL-CAP-016")),
             ("title", Value::Str("This model has no chat template for conversation data.")),
-            ("why", Value::Str("A chat template marks where each message starts and ends. Without one, conversations can't be formatted.")),
+            ("why", Value::Str("A chat template marks where each message starts and ends. Without one, the app can't format conversations.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Pick the chat or instruct version of this model."),
@@ -2145,8 +2145,7 @@ pub static CATALOG: Value = Value::Map(&[
             ("why", Value::Str("The training tools need a 64-bit CPU with features this one lacks. Details lists them.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
-                    Value::Str("Use another machine for training."),
-                    Value::Str("Or connect a machine that meets the needs and train there."),
+                    Value::Str("Connect a machine that meets the needs and train on it from here."),
                 ])),
             ])),
         ]),
@@ -2186,7 +2185,7 @@ pub static CATALOG: Value = Value::Map(&[
             ("why", Value::Str("Training is much faster on a GPU. The model must fit in the GPU's memory (VRAM).")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
-                    Value::Str("Check that the GPU is connected and its driver is installed."),
+                    Value::Str("Check the GPU's connection and its driver."),
                     Value::Str("Pick a recipe for your GPU size, or train tiny models on the CPU."),
                 ])),
             ])),
@@ -2285,7 +2284,7 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("code", Value::Str("MRL-ENV-012")),
-            ("title", Value::Str("Docker is not installed.")),
+            ("title", Value::Str("This computer doesn't have Docker.")),
             ("why", Value::Str("Docker is optional. The app uses it only for some sandboxes and engine setups, which stay off without it.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
@@ -2410,7 +2409,7 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("code", Value::Str("MRL-MODEL-002")),
-            ("title", Value::Str("This model needs custom code that is not approved.")),
+            ("title", Value::Str("This model needs custom code your workspace hasn't approved.")),
             ("why", Value::Str("The model comes with its own code. Your workspace only runs approved code.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
@@ -2433,7 +2432,7 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("MRL-VAL-001")),
             ("title", Value::Str("The app could not read this request.")),
-            ("why", Value::Str("The request is not in a format the app understands. It may be cut off or damaged.")),
+            ("why", Value::Str("The request is not in a format the app understands. Part of it may be missing.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Try the action again."),
@@ -2453,8 +2452,8 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("code", Value::Str("MRL-VAL-003")),
-            ("title", Value::Str("A field has a value that is not allowed.")),
-            ("why", Value::Str("The value is outside the allowed choices or range. Details lists what is allowed.")),
+            ("title", Value::Str("A field has a value the app doesn't accept.")),
+            ("why", Value::Str("The value is outside the allowed choices or range. Details lists the values the app accepts.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Change the field to one of the allowed values, then try again."),

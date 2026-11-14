@@ -48,7 +48,7 @@ terms:
   - term: Chat template
     plain: The rules a model uses to mark where each message in a conversation starts and ends.
   - term: Streaming dataset
-    plain: A dataset read piece by piece while training, so its full size is not known ahead.
+    plain: A dataset the app reads piece by piece while training, so it can't know the full size ahead.
   - term: Recipe
     plain: A ready set of training settings for one method that the app picks for your machine.
 
@@ -125,10 +125,10 @@ terms:
   - term: Reference syncing
     plain: Updating the reference model to the trained model now and then during training.
   - term: Policy
-    plain: The model being trained in reinforcement learning.
+    plain: The model that reinforcement learning trains.
   - term: Rollout
     aliases: [rollouts]
-    plain: Letting the model write answers during reinforcement learning so they can be scored.
+    plain: Letting the model write answers during reinforcement learning so a reward can score them.
   - term: Samples per prompt
     plain: How many answers the model writes for each prompt during GRPO.
   - term: Logits
@@ -164,7 +164,7 @@ terms:
   - term: fp16
     plain: An older 16-bit number format that can overflow more easily than bf16.
   - term: fp32
-    plain: A 32-bit number format that is exact but uses twice the memory of bf16.
+    plain: A 32-bit number format that is more precise than bf16 but uses twice the memory.
   - term: Quantization
     aliases: [4-bit]
     plain: Storing a model's numbers with fewer bits, such as 4 bits, to save memory.
@@ -286,7 +286,7 @@ terms:
     aliases: [ports]
     plain: A numbered door a program uses to send and receive network traffic.
   - term: Firewall
-    plain: Software that blocks network traffic that is not allowed.
+    plain: Software that blocks network traffic your rules don't allow.
   - term: Bandwidth
     plain: How much data a connection can carry each second.
   - term: Latency

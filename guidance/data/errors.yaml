@@ -119,7 +119,7 @@ errors:
         - Install or update the listed items, then start the run again.
 
   - code: MODEL_INCOMPATIBLE
-    title: This model can't be used with this method.
+    title: You can't use this model with this method.
     why: The model's type or files don't match what this method needs.
     what_to_do:
       steps:
@@ -226,7 +226,7 @@ errors:
   # ---------- Request checks ----------
   - code: MRL-VAL-001
     title: The app could not read this request.
-    why: The request is not in a format the app understands. It may be cut off or damaged.
+    why: The request is not in a format the app understands. Part of it may be missing.
     what_to_do:
       steps:
         - Try the action again.
@@ -240,8 +240,8 @@ errors:
         - Fill in the field named in Details, then try again.
 
   - code: MRL-VAL-003
-    title: A field has a value that is not allowed.
-    why: The value is outside the allowed choices or range. Details lists what is allowed.
+    title: A field has a value the app doesn't accept.
+    why: The value is outside the allowed choices or range. Details lists the values the app accepts.
     what_to_do:
       steps:
         - Change the field to one of the allowed values, then try again.
@@ -285,7 +285,7 @@ errors:
         - Or convert the weights to safetensors on a machine you trust.
 
   - code: MRL-MODEL-002
-    title: This model needs custom code that is not approved.
+    title: This model needs custom code your workspace hasn't approved.
     why: The model comes with its own code. Your workspace only runs approved code.
     what_to_do:
       steps:
@@ -326,7 +326,7 @@ errors:
         - Or use SFT to teach by example with this dataset.
 
   - code: MRL-CAP-004
-    title: GRPO needs a reward, and none is attached.
+    title: GRPO needs a reward, but this run has none.
     why: GRPO learns by scoring its own answers. Without a reward, it has nothing to learn from.
     what_to_do:
       steps:
@@ -388,7 +388,7 @@ errors:
         - Or turn off dynamic sampling to keep TRL.
 
   - code: MRL-CAP-012
-    title: This field can't be changed right now.
+    title: You can't change this field right now.
     why: A switch you turned on sets this field. The field stays read-only while that switch is on.
     what_to_do:
       steps:
@@ -419,7 +419,7 @@ errors:
 
   - code: MRL-CAP-016
     title: This model has no chat template for conversation data.
-    why: A chat template marks where each message starts and ends. Without one, conversations can't be formatted.
+    why: A chat template marks where each message starts and ends. Without one, the app can't format conversations.
     what_to_do:
       steps:
         - Pick the chat or instruct version of this model.
@@ -499,8 +499,7 @@ errors:
     why: The training tools need a 64-bit CPU with features this one lacks. Details lists them.
     what_to_do:
       steps:
-        - Use another machine for training.
-        - Or connect a machine that meets the needs and train there.
+        - Connect a machine that meets the needs and train on it from here.
 
   - code: MRL-ENV-003
     title: This machine has too little free memory (RAM).
@@ -528,7 +527,7 @@ errors:
     why: Training is much faster on a GPU. The model must fit in the GPU's memory (VRAM).
     what_to_do:
       steps:
-        - Check that the GPU is connected and its driver is installed.
+        - Check the GPU's connection and its driver.
         - Pick a recipe for your GPU size, or train tiny models on the CPU.
 
   - code: MRL-ENV-006
@@ -598,7 +597,7 @@ errors:
     docs_link: https://docs.astral.sh/uv/getting-started/installation/
 
   - code: MRL-ENV-012
-    title: Docker is not installed.
+    title: This computer doesn't have Docker.
     why: Docker is optional. The app uses it only for some sandboxes and engine setups, which stay off without it.
     what_to_do:
       steps:
