@@ -107,9 +107,9 @@ requirements:
   - { task: sft-full, platform: macos-apple-silicon, supported: true, components: [python-env, mlx], note: "Runs with MLX." }
   - { task: mlx-sft, platform: macos-apple-silicon, supported: true, components: [python-env, mlx] }
   - { task: playground, platform: macos-apple-silicon, supported: true, components: [python-env, mlx], note: "Runs with MLX." }
-  - { task: dpo, platform: macos-apple-silicon, supported: false, note: "DPO is not offered on a Mac. Run it on a connected NVIDIA machine." }
+  - { task: dpo, platform: macos-apple-silicon, supported: false, note: "The app doesn't offer DPO on a Mac. Run it on a connected NVIDIA machine." }
   - { task: grpo, platform: macos-apple-silicon, supported: false, note: "GRPO needs vLLM, which needs NVIDIA. Run it on a connected NVIDIA machine." }
-  - { task: distillation, platform: macos-apple-silicon, supported: false, note: "Distillation is not offered on a Mac. Run it on a connected NVIDIA machine." }
+  - { task: distillation, platform: macos-apple-silicon, supported: false, note: "The app doesn't offer distillation on a Mac. Run it on a connected NVIDIA machine." }
 
   # No supported GPU: tiny models only.
   - { task: sft-lora, platform: cpu, supported: true, components: [python-env, pytorch, trl], note: "Tiny models only. Training is slow." }

@@ -2134,7 +2134,7 @@ export const catalog = deepFreeze({
     },
     {
       "code": "MRL-ENV-005",
-      "title": "No usable GPU was found, or its memory is too small.",
+      "title": "The app found no usable GPU, or its memory is too small.",
       "why": "Training is much faster on a GPU. The model must fit in the GPU's memory (VRAM).",
       "what_to_do": {
         "steps": [
@@ -2259,7 +2259,7 @@ export const catalog = deepFreeze({
     },
     {
       "code": "MRL-IDEM-002",
-      "title": "This request key was already used for a different request.",
+      "title": "This request key already belongs to a different request.",
       "why": "Each request key must match one request. Reusing it with new content could run the wrong work.",
       "what_to_do": {
         "steps": [
@@ -2352,7 +2352,7 @@ export const catalog = deepFreeze({
     {
       "code": "MRL-MODEL-001",
       "title": "The app did not load this model's files, to keep your computer safe.",
-      "why": "The weights use the pickle format, which can run hidden code. Only safetensors files are allowed.",
+      "why": "The weights use the pickle format, which can run hidden code. The app allows only safetensors files.",
       "what_to_do": {
         "steps": [
           "Pick a version of this model with safetensors files.",
@@ -2396,7 +2396,7 @@ export const catalog = deepFreeze({
     {
       "code": "MRL-VAL-002",
       "title": "A required field is missing.",
-      "why": "This request needs a value that was not sent. Details names the field.",
+      "why": "This request is missing a value it needs. Details names the field.",
       "what_to_do": {
         "steps": [
           "Fill in the field named in Details, then try again."
@@ -2781,7 +2781,7 @@ export const catalog = deepFreeze({
         "task": "distillation",
         "platform": "macos-apple-silicon",
         "supported": false,
-        "note": "Distillation is not offered on a Mac. Run it on a connected NVIDIA machine."
+        "note": "The app doesn't offer distillation on a Mac. Run it on a connected NVIDIA machine."
       },
       {
         "task": "distillation",
@@ -2829,7 +2829,7 @@ export const catalog = deepFreeze({
         "task": "dpo",
         "platform": "macos-apple-silicon",
         "supported": false,
-        "note": "DPO is not offered on a Mac. Run it on a connected NVIDIA machine."
+        "note": "The app doesn't offer DPO on a Mac. Run it on a connected NVIDIA machine."
       },
       {
         "task": "dpo",

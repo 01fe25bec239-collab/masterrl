@@ -2182,7 +2182,7 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("code", Value::Str("MRL-ENV-005")),
-            ("title", Value::Str("No usable GPU was found, or its memory is too small.")),
+            ("title", Value::Str("The app found no usable GPU, or its memory is too small.")),
             ("why", Value::Str("Training is much faster on a GPU. The model must fit in the GPU's memory (VRAM).")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
@@ -2307,7 +2307,7 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("code", Value::Str("MRL-IDEM-002")),
-            ("title", Value::Str("This request key was already used for a different request.")),
+            ("title", Value::Str("This request key already belongs to a different request.")),
             ("why", Value::Str("Each request key must match one request. Reusing it with new content could run the wrong work.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
@@ -2400,7 +2400,7 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("MRL-MODEL-001")),
             ("title", Value::Str("The app did not load this model's files, to keep your computer safe.")),
-            ("why", Value::Str("The weights use the pickle format, which can run hidden code. Only safetensors files are allowed.")),
+            ("why", Value::Str("The weights use the pickle format, which can run hidden code. The app allows only safetensors files.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Pick a version of this model with safetensors files."),
@@ -2444,7 +2444,7 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("MRL-VAL-002")),
             ("title", Value::Str("A required field is missing.")),
-            ("why", Value::Str("This request needs a value that was not sent. Details names the field.")),
+            ("why", Value::Str("This request is missing a value it needs. Details names the field.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Fill in the field named in Details, then try again."),
@@ -2829,7 +2829,7 @@ pub static CATALOG: Value = Value::Map(&[
                 ("task", Value::Str("distillation")),
                 ("platform", Value::Str("macos-apple-silicon")),
                 ("supported", Value::Bool(false)),
-                ("note", Value::Str("Distillation is not offered on a Mac. Run it on a connected NVIDIA machine.")),
+                ("note", Value::Str("The app doesn't offer distillation on a Mac. Run it on a connected NVIDIA machine.")),
             ]),
             Value::Map(&[
                 ("task", Value::Str("distillation")),
@@ -2877,7 +2877,7 @@ pub static CATALOG: Value = Value::Map(&[
                 ("task", Value::Str("dpo")),
                 ("platform", Value::Str("macos-apple-silicon")),
                 ("supported", Value::Bool(false)),
-                ("note", Value::Str("DPO is not offered on a Mac. Run it on a connected NVIDIA machine.")),
+                ("note", Value::Str("The app doesn't offer DPO on a Mac. Run it on a connected NVIDIA machine.")),
             ]),
             Value::Map(&[
                 ("task", Value::Str("dpo")),
