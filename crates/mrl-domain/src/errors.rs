@@ -386,7 +386,25 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
     // <mrl:errors P11> rows for P11 go right below this line.
 
     // <mrl:errors P12> rows for P12 go right below this line.
-
+    (code(Val, 120), "The agent could not use its settings file."),
+    (
+        code(ErrorFamily::Node, 121),
+        "The agent could not save or read its local files.",
+    ),
+    (code(Env, 122), "The sandbox can't run on this computer."),
+    (
+        code(ErrorFamily::Node, 123),
+        "The agent could not start or stop the program.",
+    ),
+    (
+        code(ErrorFamily::Node, 124),
+        "The agent could not read this computer's hardware.",
+    ),
+    (
+        code(ErrorFamily::Node, 125),
+        "The agent could not set itself up to start with your computer.",
+    ),
+    (code(Val, 126), "The app doesn't know this name."),
     // <mrl:errors P13> rows for P13 go right below this line.
 
     // <mrl:errors P14> rows for P14 go right below this line.

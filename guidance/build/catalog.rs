@@ -2358,6 +2358,20 @@ pub static CATALOG: Value = Value::Map(&[
             ("docs_link", Value::Str("https://docs.docker.com/get-started/get-docker/")),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-ENV-122")),
+            ("title", Value::Str("The sandbox can't run on this computer.")),
+            ("why", Value::Str("The sandbox tool (bubblewrap) is missing, or this system blocks the isolation it needs.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Install bubblewrap, then try again."),
+                    Value::Str("If it is installed, ask your admin to allow unprivileged user namespaces."),
+                ])),
+                ("linux", Value::List(&[
+                    Value::Str("Run `sudo apt install bubblewrap` on Ubuntu or Debian."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-IDEM-001")),
             ("title", Value::Str("This request is already running.")),
             ("why", Value::Str("A request with the same request key started earlier and has not finished.")),
@@ -2608,6 +2622,55 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Open the model page and read the license."),
                     Value::Str("Accept the license, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-NODE-121")),
+            ("title", Value::Str("The agent could not save or read its local files.")),
+            ("why", Value::Str("The disk may be full, or the agent may not have permission to use its state folder.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Free up disk space on the drive named in Details."),
+                    Value::Str("Make sure your account owns the agent's state folder."),
+                    Value::Str("Start the agent again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-NODE-123")),
+            ("title", Value::Str("The agent could not start or stop the program.")),
+            ("why", Value::Str("The program may be missing, or this computer may be out of processes or memory.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check the program name and path in Details."),
+                    Value::Str("Close programs you don't need, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-NODE-124")),
+            ("title", Value::Str("The agent could not read this computer's hardware.")),
+            ("why", Value::Str("The GPU driver did not answer, or it stopped working while the agent read it.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Restart the computer, then check again."),
+                    Value::Str("If it keeps failing, update or reinstall the GPU driver."),
+                ])),
+                ("linux", Value::List(&[
+                    Value::Str("Run `nvidia-smi` to see whether the driver answers."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-NODE-125")),
+            ("title", Value::Str("The agent could not set itself up to start with your computer.")),
+            ("why", Value::Str("The system's service manager refused the change, or a path has characters it can't pass on.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Read the command and its message in Details."),
+                    Value::Str("Run `mrl-agent service install` again."),
+                    Value::Str("If it still fails, start the agent by hand with `mrl-agent run`."),
                 ])),
             ])),
         ]),
@@ -2970,6 +3033,29 @@ pub static CATALOG: Value = Value::Map(&[
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Check which methods the endpoint takes in the reference at `/api-docs/openapi.json`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-120")),
+            ("title", Value::Str("The agent could not use its settings file.")),
+            ("why", Value::Str("The file is missing, has a typing mistake, or has a value the agent can't use.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Read the setting and the problem named in Details."),
+                    Value::Str("Fix the settings file, or remove the setting to use the default."),
+                    Value::Str("Start the agent again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-126")),
+            ("title", Value::Str("The app doesn't know this name.")),
+            ("why", Value::Str("A profile, job name or other name doesn't match any the agent knows.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Pick one of the names listed in Details."),
+                    Value::Str("Check the spelling, then try again."),
                 ])),
             ])),
         ]),

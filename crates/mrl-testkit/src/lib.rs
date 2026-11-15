@@ -9,6 +9,7 @@ pub mod server;
 // <mrl:testkit P11> `pub mod pg;` goes right below this line.
 
 // <mrl:testkit P12> `pub mod agent;` goes right below this line.
+pub mod agent;
 
 /// The version of this crate, taken from its `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
