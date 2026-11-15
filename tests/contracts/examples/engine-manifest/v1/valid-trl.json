@@ -342,7 +342,7 @@
           }
         },
         "error": {
-          "code": "MRL-CFG-001",
+          "code": "MRL-CAP-016",
           "message": "This model has no chat template.",
           "hint": "Pick an instruct model, or add a chat template first."
         }

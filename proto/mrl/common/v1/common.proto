@@ -80,7 +80,7 @@ enum Severity {
 
 // One validation or doctor finding, in the same shape the UI shows.
 message Issue {
-  // Guidance error code, e.g. "MRL-CFG-004".
+  // Guidance error code, e.g. "MRL-VAL-011".
   string code = 1;
   Severity severity = 2;
   // JSON pointer to the offending config field, if any.
