@@ -7,6 +7,7 @@
 //!
 //! Without them the tests print SKIPPED and pass, unless `MRL_TEST_CGROUP_REQUIRED=1` or
 //! `MRL_TEST_SANDBOX_REQUIRED=1`, which make them fail instead.
+//! CI (`.github/workflows/ci-agent.yml`) sets up both and sets the REQUIRED flags.
 #![cfg(target_os = "linux")]
 
 use std::path::PathBuf;

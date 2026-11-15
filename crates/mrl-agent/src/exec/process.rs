@@ -10,6 +10,7 @@
 
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::task::JoinHandle;
@@ -126,6 +127,17 @@ impl Executor for ProcessExecutor {
             mkdir(d)?;
         }
         let support = self.limit_support();
+        // Logs are opened before anything starts, so a log failure never leaves a job running.
+        let open = |stream: &str| {
+            RotatingLog::open(
+                spec.log_dir.join(format!("{stream}.log")),
+                self.log_max_bytes,
+                self.log_keep,
+            )
+        };
+        let log_err = |e| AgentError::state(&spec.log_dir, e);
+        let out_log = open("stdout").await.map_err(log_err)?;
+        let err_log = open("stderr").await.map_err(log_err)?;
 
         #[cfg(target_os = "linux")]
         let cgroup = match &self.cgroups {
@@ -137,6 +149,10 @@ impl Executor for ProcessExecutor {
             })?),
             Err(_) => None,
         };
+        #[cfg(target_os = "linux")]
+        let has_cgroup = cgroup.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let has_cgroup = false;
 
         #[cfg(target_os = "linux")]
         let mut cmd = match &cgroup {
@@ -170,25 +186,31 @@ impl Executor for ProcessExecutor {
             }
             AgentError::exec(&spec.program, e)
         })?;
-
-        let open = |stream: &str| {
-            RotatingLog::open(
-                spec.log_dir.join(format!("{stream}.log")),
-                self.log_max_bytes,
-                self.log_keep,
-            )
-        };
+        // Nothing below can fail: the job is running and owned by the execution.
         let mut pumps = Vec::new();
-        let log_err = |e| AgentError::state(&spec.log_dir, e);
         if let Some(out) = child.stdout.take() {
-            let log = open("stdout").await.map_err(log_err)?;
-            pumps.push(tokio::spawn(log.pump(out)));
+            pumps.push(tokio::spawn(out_log.pump(out)));
         }
         if let Some(err) = child.stderr.take() {
-            let log = open("stderr").await.map_err(log_err)?;
-            pumps.push(tokio::spawn(log.pump(err)));
+            pumps.push(tokio::spawn(err_log.pump(err)));
         }
         let pid = child.id();
+        // Without a cgroup, descendants are found by parent links (see `tree`).
+        let tree = pid
+            .filter(|_| !has_cgroup)
+            .map(|p| Arc::new(super::tree::Tree::new(p)));
+        let tracker = tree.clone().map(|t| {
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(TREE_SCAN);
+                loop {
+                    tick.tick().await;
+                    let t = Arc::clone(&t);
+                    if tokio::task::spawn_blocking(move || t.scan()).await.is_err() {
+                        return;
+                    }
+                }
+            })
+        });
         Ok(Box::new(ProcessExecution {
             program: spec.program,
             child,
@@ -205,11 +227,16 @@ impl Executor for ProcessExecutor {
                 support
             },
             report: None,
+            tree,
+            tracker,
             #[cfg(target_os = "linux")]
             cgroup,
         }))
     }
 }
+
+/// How often the process tree is rescanned when there is no cgroup.
+const TREE_SCAN: Duration = Duration::from_millis(500);
 
 /// A running process tree.
 struct ProcessExecution {
@@ -220,6 +247,8 @@ struct ProcessExecution {
     started: Instant,
     limits: LimitSupport,
     report: Option<ExitReport>,
+    tree: Option<Arc<super::tree::Tree>>,
+    tracker: Option<JoinHandle<()>>,
     #[cfg(target_os = "linux")]
     cgroup: Option<super::cgroup::JobCgroup>,
 }
@@ -235,6 +264,10 @@ impl ProcessExecution {
                 cg.signal(nix::sys::signal::Signal::SIGTERM);
             }
             return;
+        }
+        // Descendants that left the process group (setsid) or lost their parent.
+        if let Some(tree) = &self.tree {
+            tree.signal(force);
         }
         #[cfg(unix)]
         if let Some(pid) = self.pid {
@@ -279,6 +312,9 @@ impl Execution for ProcessExecution {
         let oom_killed = false;
         // The main process is gone: end whatever it left running, so the logs reach EOF.
         self.signal_tree(true);
+        if let Some(t) = self.tracker.take() {
+            t.abort();
+        }
         #[cfg(target_os = "linux")]
         if let Some(cg) = self.cgroup.take() {
             tokio::task::spawn_blocking(move || cg.remove())
@@ -331,6 +367,9 @@ impl Execution for ProcessExecution {
 
 impl Drop for ProcessExecution {
     fn drop(&mut self) {
+        if let Some(t) = self.tracker.take() {
+            t.abort();
+        }
         if self.report.is_none() {
             self.signal_tree(true);
             #[cfg(target_os = "linux")]
@@ -420,6 +459,99 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(gone, "grandchild {child} survived");
+    }
+
+    /// Gone, or a zombie waiting for init to reap it.
+    #[cfg(unix)]
+    fn gone(pid: i32) -> bool {
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_err()
+            || std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .is_ok_and(|s| s.split_whitespace().nth(2) == Some("Z"))
+    }
+
+    #[cfg(unix)]
+    async fn wait_gone(pid: i32) -> bool {
+        for _ in 0..300 {
+            if gone(pid) {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    #[cfg(unix)]
+    async fn read_pid(file: &Path) -> i32 {
+        for _ in 0..300 {
+            if let Ok(s) = std::fs::read_to_string(file) {
+                if let Ok(p) = s.trim().parse() {
+                    return p;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{} was never written", file.display())
+    }
+
+    /// Starts `sleep 300` in a new session (out of the job's process group), like a worker
+    /// that daemonizes. perl is on macOS and on Linux CI images.
+    #[cfg(unix)]
+    fn setsid_child(pid_file: &Path) -> String {
+        format!(
+            "perl -e 'use POSIX; POSIX::setsid() or die; exec qw(sleep 300)' & echo $! > {}",
+            pid_file.display()
+        )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn children_that_leave_the_group_are_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let exec = executor();
+
+        // 1. stop() while the job runs.
+        let f1 = dir.path().join("a.pid");
+        let script = format!("{}; wait", setsid_child(&f1));
+        let mut run = exec
+            .spawn(shell(dir.path(), "setsid-stop", &script))
+            .await
+            .unwrap();
+        let child = read_pid(&f1).await;
+        tokio::time::sleep(TREE_SCAN * 2).await;
+        run.stop(Duration::from_secs(5)).await.unwrap();
+        assert!(wait_gone(child).await, "setsid child {child} survived stop");
+
+        // 2. The main process exits on its own and leaves the child behind.
+        let f2 = dir.path().join("b.pid");
+        let script = format!("{}; sleep 1.5", setsid_child(&f2));
+        let mut run = exec
+            .spawn(shell(dir.path(), "setsid-exit", &script))
+            .await
+            .unwrap();
+        let child = read_pid(&f2).await;
+        assert!(run.wait().await.unwrap().success());
+        assert!(
+            wait_gone(child).await,
+            "setsid child {child} outlived its job"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_log_failure_starts_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ran");
+        let spec = shell(
+            dir.path(),
+            "logfail",
+            &format!("touch {}", marker.display()),
+        );
+        // A folder where the log file must go.
+        std::fs::create_dir_all(spec.log_dir.join("stderr.log")).unwrap();
+        let e = executor().spawn(spec).await.err().unwrap();
+        assert_eq!(e.code(), "MRL-NODE-121");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!marker.exists(), "the job ran although spawn failed");
     }
 
     #[tokio::test]

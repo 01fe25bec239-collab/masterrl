@@ -10,6 +10,7 @@
 mod cgroup;
 pub mod logs;
 pub mod process;
+mod tree;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;

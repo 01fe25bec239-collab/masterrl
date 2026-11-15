@@ -198,15 +198,7 @@ async fn dispatch(config: Option<PathBuf>, command: Command) -> Result<ExitCode,
             let target = service::Target::current(&file, &state.logs_dir())?;
             match action {
                 ServiceAction::Install => {
-                    if !file.exists() {
-                        let text = "# MasterRL agent settings. Every field is optional.\n";
-                        mrl_agent::state::atomic_write(&file, text.as_bytes()).map_err(|e| {
-                            AgentError::State {
-                                path: file.clone(),
-                                source: e,
-                            }
-                        })?;
-                    }
+                    service::ensure_config_file(&file)?;
                     let plan = service::install_plan(manager, &target)?;
                     for w in service::apply(&plan)? {
                         eprintln!("{NAME}: note: {w}");

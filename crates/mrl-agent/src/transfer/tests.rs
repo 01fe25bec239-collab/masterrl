@@ -246,3 +246,44 @@ async fn bandwidth_limit_is_shared() {
         start.elapsed()
     );
 }
+
+#[tokio::test]
+async fn a_download_into_the_cache_resumes_after_a_restart() {
+    use crate::state::cache::{CacheBudget, NodeCache};
+    let (base, shared) = serve(Server {
+        data: data(),
+        ..Server::default()
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("cache");
+    let budget = CacheBudget {
+        max_bytes: 1 << 20,
+        min_free_bytes: 0,
+    };
+    let sha = mrl_storage::sha256_hex(&data());
+    // The agent stopped mid-download: a partial file sits in incoming/.
+    let cache = NodeCache::open(root.clone(), budget).unwrap();
+    let dest = cache.incoming_dir().join(&sha);
+    std::fs::write(
+        cache.incoming_dir().join(format!("{sha}.part")),
+        &data()[..5000],
+    )
+    .unwrap();
+    drop(cache);
+
+    // After the restart the partial is still there and the download resumes from it.
+    let cache = NodeCache::open(root, budget).unwrap();
+    let t = ticket(&format!("{base}/obj"), TicketMethod::Get, 1 << 20);
+    let r = client(0, None)
+        .download(&t, &dest, Some(&sha))
+        .await
+        .unwrap();
+    assert_eq!(r.resumed_from, 5000);
+    assert_eq!(
+        shared.lock().unwrap().ranges,
+        [Some("bytes=5000-".to_owned())]
+    );
+    let path = cache.insert_file(&dest, &sha).await.unwrap();
+    assert_eq!(std::fs::read(path).unwrap(), data());
+}

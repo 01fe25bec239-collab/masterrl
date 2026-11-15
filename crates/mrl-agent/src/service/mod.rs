@@ -363,6 +363,20 @@ pub fn uninstall_plan(manager: Manager, t: &Target) -> Plan {
     Plan { manager, actions }
 }
 
+/// Creates the settings file the service points at (with its folders) if it is missing, so
+/// the service's `--config` always names a file. Returns true when it was created.
+pub fn ensure_config_file(path: &Path) -> Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| AgentError::state(dir, e))?;
+    }
+    let text = "# MasterRL agent settings. Every field is optional.\n";
+    crate::state::atomic_write(path, text.as_bytes()).map_err(|e| AgentError::state(path, e))?;
+    Ok(true)
+}
+
 fn output(argv: &[&str]) -> Option<(bool, String)> {
     let (program, args) = argv.split_first()?;
     let out = std::process::Command::new(program)
@@ -559,6 +573,26 @@ mod tests {
         // Spaces can't be passed through the task's command line.
         let e = install_plan(Manager::WslTask, &target()).unwrap_err();
         assert_eq!(e.code(), "MRL-NODE-125");
+    }
+
+    #[test]
+    fn install_creates_the_settings_file_in_a_fresh_home() {
+        let home = tempfile::tempdir().unwrap();
+        // A brand-new account: not even ~/.config exists yet.
+        let file = home.path().join(".config/masterrl/agent.toml");
+        assert!(ensure_config_file(&file).unwrap());
+        let (cfg, used) = crate::config::AgentConfig::load(Some(&file)).unwrap();
+        assert_eq!(used, file);
+        assert_eq!(cfg.pool, crate::config::PoolHints::default());
+        std::fs::write(&file, "allowed_paths = []\n").unwrap();
+        assert!(
+            !ensure_config_file(&file).unwrap(),
+            "an existing file is kept"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "allowed_paths = []\n"
+        );
     }
 
     #[test]

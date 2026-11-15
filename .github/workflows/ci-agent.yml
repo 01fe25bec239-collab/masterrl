@@ -1,0 +1,81 @@
+name: ci-agent
+
+# mrl-agent isolation on real Linux: cgroup v2 limits, OOM detection, whole-tree kill, the
+# bubblewrap sandbox, and ticket transfers against SeaweedFS. Every test runs with its
+# *_REQUIRED flag, so a missing prerequisite fails the job instead of skipping.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-agent-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  isolation:
+    name: agent (linux isolation)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+
+      # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor; bubblewrap needs them.
+      - name: install bubblewrap and allow user namespaces
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      # A job `services:` entry cannot pass SeaweedFS its `-s3` flags, so start it from the dev compose file.
+      - name: start SeaweedFS
+        run: docker compose -f deploy/local/compose.yaml up -d --wait seaweedfs
+
+      - name: build the integration tests
+        id: build
+        run: |
+          set -euo pipefail
+          bin() {
+            cargo test -p mrl-agent --locked --test "$1" --no-run --message-format=json \
+              | jq -r --arg t "$1" 'select(.reason == "compiler-artifact" and .target.name == $t and .profile.test) | .executable'
+          }
+          echo "isolation=$(bin linux_isolation)" >> "$GITHUB_OUTPUT"
+          echo "transfer=$(bin transfer_s3)" >> "$GITHUB_OUTPUT"
+
+      # As the runner user, so the sandbox really uses unprivileged user namespaces.
+      - name: sandbox (bubblewrap, data_prep profile)
+        env:
+          MRL_TEST_SANDBOX_REQUIRED: "1"
+        run: ${{ steps.build.outputs.isolation }} --ignored --exact data_prep_blocks_network_and_writes_outside_staging
+
+      - name: transfer (SeaweedFS tickets)
+        env:
+          MRL_TEST_S3_ENDPOINT: http://127.0.0.1:8333
+          MRL_TEST_S3_REQUIRED: "1"
+        run: ${{ steps.build.outputs.transfer }} --ignored
+
+      # Moving a process into a cgroup needs write access at the common ancestor (the root),
+      # so these run as root on a fresh, empty cgroup with the controllers handed down.
+      - name: cgroup limits, OOM and tree kill
+        run: |
+          set -euo pipefail
+          echo "+cpu +memory +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
+          sudo mkdir -p /sys/fs/cgroup/mrl-test
+          sudo env MRL_TEST_CGROUP_ROOT=/sys/fs/cgroup/mrl-test MRL_TEST_CGROUP_REQUIRED=1 \
+            "${{ steps.build.outputs.isolation }}" --ignored --exact \
+            memory_limit_is_enforced_and_oom_is_detected kill_ends_the_whole_tree_even_after_setsid
+
+      - name: SeaweedFS logs
+        if: failure()
+        run: docker compose -f deploy/local/compose.yaml logs seaweedfs
