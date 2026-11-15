@@ -1,12 +1,18 @@
 //! The MasterRL core: API, scheduler, registries and events. Run by the desktop app.
 
 use clap::{Parser, Subcommand};
-use mrl_server::config::{Config, Mode, Overrides, Role};
+use mrl_server::config::{Config, DatabaseConfig, Mode, Overrides, Role};
+use mrl_server::db::{self, Db, DbError, PgIdempotencyStore};
 use mrl_server::error::{ErrorCode, ServerError};
+use mrl_server::pgbundle::{
+    self, BundleError, BundleOptions, FileSecretStore, PgBinaries, PgBundle,
+};
 use mrl_server::seams::{Seams, LAUNCH_SECRET_ENV};
 use mrl_server::{app, openapi, registry, telemetry, App};
+use sqlx::postgres::PgConnectOptions;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 const NAME: &str = env!("CARGO_BIN_NAME");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -43,7 +49,37 @@ struct Cli {
 enum Command {
     /// Print the OpenAPI document as YAML.
     Openapi,
+    /// Apply pending database migrations (backing up the bundled database first), then exit.
+    Migrate {
+        /// Only list the pending migrations.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
+
+/// Why the process stopped with an error.
+#[derive(Debug, thiserror::Error)]
+enum Failure {
+    #[error(transparent)]
+    Server(#[from] ServerError),
+    #[error(transparent)]
+    Db(#[from] DbError),
+    #[error(transparent)]
+    Bundle(#[from] BundleError),
+}
+
+impl Failure {
+    fn explain(&self) -> String {
+        match self {
+            Self::Server(e) => e.explain(),
+            Self::Db(e) => e.explain(),
+            Self::Bundle(e) => e.explain(),
+        }
+    }
+}
+
+/// The dev fallback when no PostgreSQL programs are found (the `deploy/local` stack).
+const DEV_DATABASE_URL_ENV: &str = "DATABASE_URL";
 
 fn version_line() -> String {
     format!("{NAME} {VERSION} ({GIT_SHA})")
@@ -74,9 +110,11 @@ fn main() -> ExitCode {
     }
 }
 
-async fn run(cli: Cli) -> Result<(), ServerError> {
+async fn run(cli: Cli) -> Result<(), Failure> {
     if let Some(Command::Openapi) = cli.command {
-        let yaml = openapi::document(&registry::modules())
+        // The document needs no database; this pool never connects.
+        let db = Db::connect_lazy(&DatabaseConfig::default(), PgConnectOptions::new());
+        let yaml = openapi::document(&registry::modules(&db))
             .to_yaml()
             .map_err(|e| ServerError::new(ErrorCode::Internal, format!("openapi document: {e}")))?;
         print!("{yaml}");
@@ -96,26 +134,125 @@ async fn run(cli: Cli) -> Result<(), ServerError> {
         return Err(ServerError::new(
             ErrorCode::ConfigValue,
             "--headless works only with --mode team; solo mode is started by the desktop app",
-        ));
+        )
+        .into());
     }
     let telemetry = telemetry::init(&config.telemetry)?;
-    let (secret, generated) = launch_secret(&env);
-    let seams = Seams::production(mode, &secret).build(mode)?;
-    let running = App::new(config, seams, registry::modules()).start().await?;
-    if !cli.headless {
+    let (db, bundle) = open_database(&config, &env).await?;
+    let result = match cli.command {
+        Some(Command::Migrate { dry_run }) => migrate(&db, dry_run).await,
+        _ => serve(config, &env, cli.headless, db, bundle.as_ref()).await,
+    };
+    let stopped = match bundle {
+        Some(b) => b.stop().await.map_err(Failure::from),
+        None => Ok(()),
+    };
+    telemetry.shutdown();
+    result.and(stopped)
+}
+
+async fn serve(
+    config: Config,
+    env: &[(String, String)],
+    headless: bool,
+    db: Db,
+    bundle: Option<&PgBundle>,
+) -> Result<(), Failure> {
+    let mode = config.server.mode;
+    let (secret, generated) = launch_secret(env);
+    let seams = Seams::production(mode, &secret)
+        .idempotency(PgIdempotencyStore::new(db.clone()))
+        .build(mode)?;
+    let running = App::new(config, seams, registry::modules(&db))
+        .start()
+        .await?;
+    if !headless {
         println!(
             "{}",
             listening_line(&running, generated.then_some(secret.as_str()))
         );
     }
     let token = running.shutdown_token();
+    let db_failed = bundle.map(PgBundle::failed).unwrap_or_default();
     tokio::select! {
         () = app::shutdown_signal() => token.cancel(),
         () = token.cancelled() => {},
+        () = db_failed.cancelled() => token.cancel(),
     }
-    let result = running.wait().await;
-    telemetry.shutdown();
-    result
+    running.wait().await?;
+    Ok(())
+}
+
+/// `migrate [--dry-run]`.
+async fn migrate(db: &Db, dry_run: bool) -> Result<(), Failure> {
+    let pending = db::migrate::pending(db, &db::migrator()).await?;
+    if pending.is_empty() {
+        println!("The database is up to date.");
+        return Ok(());
+    }
+    for m in &pending {
+        println!("{} {}", m.version, m.description);
+    }
+    if dry_run {
+        println!("{} database update(s) would be applied.", pending.len());
+        return Ok(());
+    }
+    let applied = db::migrate::apply(db).await?;
+    println!("Applied {} database update(s).", applied.len());
+    Ok(())
+}
+
+/// `database.url` if set (team mode needs it). In solo mode without it, the bundled
+/// PostgreSQL; when its programs are not found and `pgbundle.bin_dir` is unset, the
+/// `DATABASE_URL` of the dev stack (`just dev`).
+async fn open_database(
+    config: &Config,
+    env: &[(String, String)],
+) -> Result<(Db, Option<PgBundle>), Failure> {
+    let lazy = |url: &str| -> Result<Db, Failure> {
+        let options: PgConnectOptions = url.parse().map_err(|_| {
+            // Never echo the value: it may hold a password.
+            ServerError::new(
+                ErrorCode::ConfigValue,
+                "database.url: not a PostgreSQL address the server can read",
+            )
+        })?;
+        Ok(Db::connect_lazy(&config.database, options))
+    };
+    if let Some(url) = &config.database.url {
+        return Ok((lazy(url)?, None));
+    }
+    if config.server.mode == Mode::Team {
+        return Err(ServerError::new(
+            ErrorCode::ConfigValue,
+            "database.url: team mode needs the address of its PostgreSQL database",
+        )
+        .into());
+    }
+    let p = &config.pgbundle;
+    let binaries = match PgBinaries::locate(p.bin_dir.as_deref()).await {
+        Ok(b) => b,
+        Err(e) if p.bin_dir.is_none() => {
+            match env
+                .iter()
+                .find(|(k, v)| k == DEV_DATABASE_URL_ENV && !v.is_empty())
+            {
+                Some((_, url)) => {
+                    tracing::warn!("no PostgreSQL programs found; using DATABASE_URL (dev stack)");
+                    return Ok((lazy(url)?, None));
+                }
+                None => return Err(e.into()),
+            }
+        }
+        Err(e) => return Err(e.into()),
+    };
+    // ponytail: the password sits in the data folder until P16's keychain `SecretStore`.
+    let secrets = Arc::new(FileSecretStore::new(pgbundle::data_dir(p)?.join("secrets")));
+    let options = BundleOptions::from_config(p, binaries, secrets).await?;
+    let bundle = PgBundle::start(options).await?;
+    let db =
+        Db::connect_lazy(&config.database, bundle.connect_options()).with_backups(bundle.backups());
+    Ok((db, Some(bundle)))
 }
 
 /// The desktop app passes the secret in `MRL_LAUNCH_SECRET`. Started by hand (development),
@@ -191,6 +328,18 @@ mod tests {
                 .unwrap()
                 .command,
             Some(Command::Openapi)
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["mrl-server", "migrate", "--dry-run"])
+                .unwrap()
+                .command,
+            Some(Command::Migrate { dry_run: true })
+        ));
+        assert!(matches!(
+            Cli::try_parse_from(["mrl-server", "migrate"])
+                .unwrap()
+                .command,
+            Some(Command::Migrate { dry_run: false })
         ));
     }
 

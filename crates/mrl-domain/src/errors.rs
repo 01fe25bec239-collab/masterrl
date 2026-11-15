@@ -384,7 +384,40 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         "A file changed while the app was uploading it.",
     ),
     // <mrl:errors P11> rows for P11 go right below this line.
-
+    (
+        code(Internal, 110),
+        "The database needs an update before the server can start.",
+    ),
+    (code(Internal, 111), "The database update did not finish."),
+    (
+        code(Internal, 112),
+        "The app's database stopped and could not start again.",
+    ),
+    (
+        code(Internal, 113),
+        "The app could not back up its database.",
+    ),
+    (
+        code(Internal, 114),
+        "The app could not move its database to the new version.",
+    ),
+    (
+        code(Internal, 115),
+        "The server set an event aside after it failed many times.",
+    ),
+    (code(Env, 110), "The app's database programs are missing."),
+    (
+        code(Env, 111),
+        "Another copy of the app is already using this data folder.",
+    ),
+    (
+        code(Env, 112),
+        "This data folder was made by a newer version of the app.",
+    ),
+    (
+        code(Conflict, 110),
+        "Too many changes happened at the same time.",
+    ),
     // <mrl:errors P12> rows for P12 go right below this line.
 
     // <mrl:errors P13> rows for P13 go right below this line.
