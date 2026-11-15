@@ -43,6 +43,9 @@ export interface JsonSchema {
   minItems?: number;
   maxItems?: number;
   uniqueItems?: boolean;
+  contains?: JsonSchema;
+  minContains?: number;
+  maxContains?: number;
   minProperties?: number;
   maxProperties?: number;
   'x-mrl-level'?: Level;
