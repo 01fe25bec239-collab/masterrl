@@ -16,7 +16,7 @@ type TaskFn = Box<
 
 /// A long-running task (background job or event consumer) owned by the server.
 ///
-/// It must return soon after `cancel` fires. `Err` shuts the server down (MRL-SRV-007).
+/// It must return soon after `cancel` fires. `Err` shuts the server down (MRL-INTERNAL-009).
 pub struct Task {
     /// Name for logs and errors.
     pub name: String,

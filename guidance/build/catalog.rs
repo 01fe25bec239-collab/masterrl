@@ -1840,6 +1840,19 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("INFRA_TRANSIENT/SHM_EXHAUSTED")),
+            ("title", Value::Str("Training paused: shared memory ran out.")),
+            ("why", Value::Str("Data loading workers pass data through shared memory, and it filled up.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Lower the number of data loading workers to 0 or 1, then resume."),
+                ])),
+                ("linux", Value::List(&[
+                    Value::Str("If training runs in Docker, start the container with more shared memory, like `--shm-size=8g`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MODEL_INCOMPATIBLE")),
             ("title", Value::Str("You can't use this model with this method.")),
             ("why", Value::Str("The model's type or files don't match what this method needs.")),
@@ -1852,12 +1865,33 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("code", Value::Str("MRL-AUTH-001")),
-            ("title", Value::Str("The request was not signed in.")),
-            ("why", Value::Str("It had no sign-in details, or the details did not match.")),
+            ("title", Value::Str("You need to sign in.")),
+            ("why", Value::Str("The app found no sign-in for this request, or your sign-in has ended.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Sign in again, then repeat the action."),
-                    Value::Str("If you use the desktop app, restart it."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-AUTH-002")),
+            ("title", Value::Str("The app could not sign you in with these details.")),
+            ("why", Value::Str("The user name and password don't match an account here.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check the user name and password, then try again."),
+                    Value::Str("Ask your org owner to reset your password if it still doesn't work."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-AUTH-003")),
+            ("title", Value::Str("This access token no longer works.")),
+            ("why", Value::Str("Someone revoked the token, or it reached its end date.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Create a new token in Settings."),
+                    Value::Str("Update the tool that uses the old token."),
                 ])),
             ])),
         ]),
@@ -2105,63 +2139,6 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Pick a rollout engine that returns log-probabilities, like vLLM."),
                     Value::Str("Or use a reward that only reads the answer text."),
-                ])),
-            ])),
-        ]),
-        Value::Map(&[
-            ("code", Value::Str("MRL-CFG-001")),
-            ("title", Value::Str("The server could not open its settings file.")),
-            ("why", Value::Str("The file is missing, or the server is not allowed to read it.")),
-            ("what_to_do", Value::Map(&[
-                ("steps", Value::List(&[
-                    Value::Str("Check the path you passed with `--config`."),
-                    Value::Str("Make sure the file exists and your account can read it."),
-                ])),
-            ])),
-        ]),
-        Value::Map(&[
-            ("code", Value::Str("MRL-CFG-002")),
-            ("title", Value::Str("The server could not understand its settings file.")),
-            ("why", Value::Str("The file has a typing mistake or a setting name the server does not know.")),
-            ("what_to_do", Value::Map(&[
-                ("steps", Value::List(&[
-                    Value::Str("Look at the line and setting named in Details."),
-                    Value::Str("Fix the spelling, or remove the setting, then start the server again."),
-                ])),
-            ])),
-        ]),
-        Value::Map(&[
-            ("code", Value::Str("MRL-CFG-003")),
-            ("title", Value::Str("A server setting has a value it cannot use.")),
-            ("why", Value::Str("The value is outside the allowed range or does not fit with another setting.")),
-            ("what_to_do", Value::Map(&[
-                ("steps", Value::List(&[
-                    Value::Str("Read the setting name and allowed values in Details."),
-                    Value::Str("Change the value in the settings file, then start the server again."),
-                ])),
-            ])),
-        ]),
-        Value::Map(&[
-            ("code", Value::Str("MRL-CFG-004")),
-            ("title", Value::Str("A server setting from the environment could not be used.")),
-            ("why", Value::Str("A variable that starts with `MRL_` names a setting the server does not know.")),
-            ("what_to_do", Value::Map(&[
-                ("steps", Value::List(&[
-                    Value::Str("Check the variable name in Details."),
-                    Value::Str("Use the form `MRL_SECTION__KEY`, with two underscores between parts."),
-                    Value::Str("Remove the variable if you did not mean to set it."),
-                ])),
-            ])),
-        ]),
-        Value::Map(&[
-            ("code", Value::Str("MRL-CFG-005")),
-            ("title", Value::Str("The server could not use its certificate or key file.")),
-            ("why", Value::Str("The file is not in the expected format, or the key does not match the certificate.")),
-            ("what_to_do", Value::Map(&[
-                ("steps", Value::List(&[
-                    Value::Str("Check `server.tls.cert_path` and `server.tls.key_path` in the settings file."),
-                    Value::Str("Use text files that start with `-----BEGIN`, with the certificate chain first."),
-                    Value::Str("Remove the `[server.tls]` section to run without a secure connection."),
                 ])),
             ])),
         ]),
@@ -2434,6 +2411,92 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-INTERNAL-003")),
+            ("title", Value::Str("The server could not start because a required part is missing.")),
+            ("why", Value::Str("This mode needs a part, such as sign-in, that this build does not include.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Read which part is missing in Details."),
+                    Value::Str("Start the server in `solo` mode, or install the version that includes that part."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-INTERNAL-004")),
+            ("title", Value::Str("Team mode could not start because no sign-in provider is set up.")),
+            ("why", Value::Str("In team mode, people sign in through a provider. This build has no provider yet.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Start the server with `--mode solo` to use it on this computer only."),
+                    Value::Str("Use a version with team sign-in when you need team mode."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-INTERNAL-005")),
+            ("title", Value::Str("The server could not open a network port.")),
+            ("why", Value::Str("Another program may use the port already, or the address is not on this computer.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Read the address in Details."),
+                    Value::Str("Close the other program, or pick a free port in the settings file."),
+                ])),
+                ("linux", Value::List(&[
+                    Value::Str("Run `ss -ltnp` to see which program uses the port."),
+                ])),
+                ("macos", Value::List(&[
+                    Value::Str("Run `lsof -nP -iTCP -sTCP:LISTEN` to see which program uses the port."),
+                ])),
+                ("windows", Value::List(&[
+                    Value::Str("Run `netstat -ano` to see which program uses the port."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-INTERNAL-006")),
+            ("title", Value::Str("The server stopped during startup.")),
+            ("why", Value::Str("One of its startup steps, like preparing the database, did not finish.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Read which step stopped in Details."),
+                    Value::Str("Fix the cause shown there, then start the server again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-INTERNAL-007")),
+            ("title", Value::Str("The server could not set up trace export.")),
+            ("why", Value::Str("The trace collector address in the settings file is not one the server can use.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check `telemetry.otlp_endpoint` in the settings file."),
+                    Value::Str("Remove that setting to run without trace export."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-INTERNAL-008")),
+            ("title", Value::Str("The server took too long to stop.")),
+            ("why", Value::Str("Some work was still running when the shutdown time ran out.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Start the server again. Unfinished work resumes where the app supports it."),
+                    Value::Str("If this keeps happening, raise `server.shutdown_grace_seconds`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-INTERNAL-009")),
+            ("title", Value::Str("A background job in the server stopped, so the server shut down.")),
+            ("why", Value::Str("The job hit a problem it could not recover from.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Read which job stopped in Details."),
+                    Value::Str("Start the server again. If it happens again, report it with the diagnostics."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-LINK-001")),
             ("title", Value::Str("These machines can't share one training job.")),
             ("why", Value::Str("They use different kinds of chips, like a Mac and an NVIDIA computer. One job needs one kind.")),
@@ -2550,21 +2613,54 @@ pub static CATALOG: Value = Value::Map(&[
         ]),
         Value::Map(&[
             ("code", Value::Str("MRL-PERM-001")),
-            ("title", Value::Str("Your account cannot do this.")),
-            ("why", Value::Str("Your role in this project does not include this action.")),
+            ("title", Value::Str("Your role doesn't allow this action.")),
+            ("why", Value::Str("Each project role can do a set list of things. This action needs a different role.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
-                    Value::Str("Ask a project owner to give your account a role with this action."),
+                    Value::Str("Ask a project owner or maintainer to give you the role you need."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-PERM-002")),
+            ("title", Value::Str("This feedback task isn't assigned to you.")),
+            ("why", Value::Str("Annotators can open only the tasks assigned to them.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Pick a task from your own list."),
+                    Value::Str("Ask a maintainer to assign this task to you."),
                 ])),
             ])),
         ]),
         Value::Map(&[
             ("code", Value::Str("MRL-QUOTA-001")),
-            ("title", Value::Str("Too many requests came in at once.")),
-            ("why", Value::Str("The server limits how fast each account and team can send requests.")),
+            ("title", Value::Str("Your team reached its limit on jobs or GPUs.")),
+            ("why", Value::Str("Your org limits how many jobs and GPUs a project can use at once.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
-                    Value::Str("Wait the number of seconds in the `Retry-After` header, then try again."),
+                    Value::Str("Wait for a running job to finish, then submit again."),
+                    Value::Str("Ask your org owner to raise the limit."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-QUOTA-002")),
+            ("title", Value::Str("The compute budget for this period is used up.")),
+            ("why", Value::Str("Your org set a budget for this period, and this job would go over it.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Wait for the next budget period to start."),
+                    Value::Str("Ask your org owner to raise the budget."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-QUOTA-003")),
+            ("title", Value::Str("The app got too many requests from you in a short time.")),
+            ("why", Value::Str("The app limits how fast one account can send requests, so it stays fast for everyone.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Wait about 1 minute, then try again."),
                 ])),
             ])),
         ]),
@@ -2579,108 +2675,12 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
-            ("code", Value::Str("MRL-ROUTE-001")),
+            ("code", Value::Str("MRL-RES-002")),
             ("title", Value::Str("There is nothing at this address.")),
             ("why", Value::Str("The server has no endpoint at this path.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Check the path against the reference at `/api-docs/openapi.json`."),
-                ])),
-            ])),
-        ]),
-        Value::Map(&[
-            ("code", Value::Str("MRL-ROUTE-002")),
-            ("title", Value::Str("This address does not support that action.")),
-            ("why", Value::Str("The endpoint exists, but not for this request method.")),
-            ("what_to_do", Value::Map(&[
-                ("steps", Value::List(&[
-                    Value::Str("Check which methods the endpoint takes in the reference at `/api-docs/openapi.json`."),
-                ])),
-            ])),
-        ]),
-        Value::Map(&[
-            ("code", Value::Str("MRL-SRV-001")),
-            ("title", Value::Str("The server could not start because a required part is missing.")),
-            ("why", Value::Str("This mode needs a part, such as sign-in, that this build does not include.")),
-            ("what_to_do", Value::Map(&[
-                ("steps", Value::List(&[
-                    Value::Str("Read which part is missing in Details."),
-                    Value::Str("Start the server in `solo` mode, or install the version that includes that part."),
-                ])),
-            ])),
-        ]),
-        Value::Map(&[
-            ("code", Value::Str("MRL-SRV-002")),
-            ("title", Value::Str("Team mode could not start because no sign-in provider is set up.")),
-            ("why", Value::Str("In team mode, people sign in through a provider. This build has no provider yet.")),
-            ("what_to_do", Value::Map(&[
-                ("steps", Value::List(&[
-                    Value::Str("Start the server with `--mode solo` to use it on this computer only."),
-                    Value::Str("Use a version with team sign-in when you need team mode."),
-                ])),
-            ])),
-        ]),
-        Value::Map(&[
-            ("code", Value::Str("MRL-SRV-003")),
-            ("title", Value::Str("The server could not open a network port.")),
-            ("why", Value::Str("Another program may use the port already, or the address is not on this computer.")),
-            ("what_to_do", Value::Map(&[
-                ("steps", Value::List(&[
-                    Value::Str("Read the address in Details."),
-                    Value::Str("Close the other program, or pick a free port in the settings file."),
-                ])),
-                ("linux", Value::List(&[
-                    Value::Str("Run `ss -ltnp` to see which program uses the port."),
-                ])),
-                ("macos", Value::List(&[
-                    Value::Str("Run `lsof -nP -iTCP -sTCP:LISTEN` to see which program uses the port."),
-                ])),
-                ("windows", Value::List(&[
-                    Value::Str("Run `netstat -ano` to see which program uses the port."),
-                ])),
-            ])),
-        ]),
-        Value::Map(&[
-            ("code", Value::Str("MRL-SRV-004")),
-            ("title", Value::Str("The server stopped during startup.")),
-            ("why", Value::Str("One of its startup steps, like preparing the database, did not finish.")),
-            ("what_to_do", Value::Map(&[
-                ("steps", Value::List(&[
-                    Value::Str("Read which step stopped in Details."),
-                    Value::Str("Fix the cause shown there, then start the server again."),
-                ])),
-            ])),
-        ]),
-        Value::Map(&[
-            ("code", Value::Str("MRL-SRV-005")),
-            ("title", Value::Str("The server could not set up trace export.")),
-            ("why", Value::Str("The trace collector address in the settings file is not one the server can use.")),
-            ("what_to_do", Value::Map(&[
-                ("steps", Value::List(&[
-                    Value::Str("Check `telemetry.otlp_endpoint` in the settings file."),
-                    Value::Str("Remove that setting to run without trace export."),
-                ])),
-            ])),
-        ]),
-        Value::Map(&[
-            ("code", Value::Str("MRL-SRV-006")),
-            ("title", Value::Str("The server took too long to stop.")),
-            ("why", Value::Str("Some work was still running when the shutdown time ran out.")),
-            ("what_to_do", Value::Map(&[
-                ("steps", Value::List(&[
-                    Value::Str("Start the server again. Unfinished work resumes where the app supports it."),
-                    Value::Str("If this keeps happening, raise `server.shutdown_grace_seconds`."),
-                ])),
-            ])),
-        ]),
-        Value::Map(&[
-            ("code", Value::Str("MRL-SRV-007")),
-            ("title", Value::Str("A background job in the server stopped, so the server shut down.")),
-            ("why", Value::Str("The job hit a problem it could not recover from.")),
-            ("what_to_do", Value::Map(&[
-                ("steps", Value::List(&[
-                    Value::Str("Read which job stopped in Details."),
-                    Value::Str("Start the server again. If it happens again, report it with the diagnostics."),
                 ])),
             ])),
         ]),
@@ -2755,6 +2755,73 @@ pub static CATALOG: Value = Value::Map(&[
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Send large files through an upload instead."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-008")),
+            ("title", Value::Str("The server could not open its settings file.")),
+            ("why", Value::Str("The file is missing, or the server is not allowed to read it.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check the path you passed with `--config`."),
+                    Value::Str("Make sure the file exists and your account can read it."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-009")),
+            ("title", Value::Str("The server could not understand its settings file.")),
+            ("why", Value::Str("The file has a typing mistake or a setting name the server does not know.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Look at the line and setting named in Details."),
+                    Value::Str("Fix the spelling, or remove the setting, then start the server again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-010")),
+            ("title", Value::Str("A server setting has a value it cannot use.")),
+            ("why", Value::Str("The value is outside the allowed range or does not fit with another setting.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Read the setting name and allowed values in Details."),
+                    Value::Str("Change the value in the settings file, then start the server again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-011")),
+            ("title", Value::Str("A server setting from the environment could not be used.")),
+            ("why", Value::Str("A variable that starts with `MRL_` names a setting the server does not know.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check the variable name in Details."),
+                    Value::Str("Use the form `MRL_SECTION__KEY`, with two underscores between parts."),
+                    Value::Str("Remove the variable if you did not mean to set it."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-012")),
+            ("title", Value::Str("The server could not use its certificate or key file.")),
+            ("why", Value::Str("The file is not in the expected format, or the key does not match the certificate.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check `server.tls.cert_path` and `server.tls.key_path` in the settings file."),
+                    Value::Str("Use text files that start with `-----BEGIN`, with the certificate chain first."),
+                    Value::Str("Remove the `[server.tls]` section to run without a secure connection."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-013")),
+            ("title", Value::Str("This address does not support that action.")),
+            ("why", Value::Str("The endpoint exists, but not for this request method.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check which methods the endpoint takes in the reference at `/api-docs/openapi.json`."),
                 ])),
             ])),
         ]),

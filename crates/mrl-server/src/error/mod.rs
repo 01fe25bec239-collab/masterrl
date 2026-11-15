@@ -44,29 +44,29 @@ macro_rules! codes {
 
 codes! {
     /// Settings file could not be read.
-    ConfigUnreadable = "MRL-CFG-001", INTERNAL_SERVER_ERROR;
+    ConfigUnreadable = "MRL-VAL-008", INTERNAL_SERVER_ERROR;
     /// Settings file could not be parsed, or has an unknown key.
-    ConfigParse = "MRL-CFG-002", INTERNAL_SERVER_ERROR;
+    ConfigParse = "MRL-VAL-009", INTERNAL_SERVER_ERROR;
     /// A setting has a value the server cannot use.
-    ConfigValue = "MRL-CFG-003", INTERNAL_SERVER_ERROR;
+    ConfigValue = "MRL-VAL-010", INTERNAL_SERVER_ERROR;
     /// An `MRL_*` environment override could not be used.
-    ConfigEnv = "MRL-CFG-004", INTERNAL_SERVER_ERROR;
+    ConfigEnv = "MRL-VAL-011", INTERNAL_SERVER_ERROR;
     /// The TLS certificate or key file could not be used.
-    TlsFiles = "MRL-CFG-005", INTERNAL_SERVER_ERROR;
+    TlsFiles = "MRL-VAL-012", INTERNAL_SERVER_ERROR;
     /// A seam this mode needs has no implementation.
-    SeamMissing = "MRL-SRV-001", INTERNAL_SERVER_ERROR;
+    SeamMissing = "MRL-INTERNAL-003", INTERNAL_SERVER_ERROR;
     /// Team mode has no `IdentityProvider`.
-    IdentityProviderMissing = "MRL-SRV-002", INTERNAL_SERVER_ERROR;
+    IdentityProviderMissing = "MRL-INTERNAL-004", INTERNAL_SERVER_ERROR;
     /// A listener could not bind its address.
-    Bind = "MRL-SRV-003", INTERNAL_SERVER_ERROR;
+    Bind = "MRL-INTERNAL-005", INTERNAL_SERVER_ERROR;
     /// A `StartupStep` failed.
-    StartupStep = "MRL-SRV-004", INTERNAL_SERVER_ERROR;
+    StartupStep = "MRL-INTERNAL-006", INTERNAL_SERVER_ERROR;
     /// Telemetry (OTLP export) could not be set up.
-    Telemetry = "MRL-SRV-005", INTERNAL_SERVER_ERROR;
+    Telemetry = "MRL-INTERNAL-007", INTERNAL_SERVER_ERROR;
     /// Shutdown did not finish within the grace period.
-    DrainTimeout = "MRL-SRV-006", INTERNAL_SERVER_ERROR;
+    DrainTimeout = "MRL-INTERNAL-008", INTERNAL_SERVER_ERROR;
     /// A background task or event consumer failed.
-    TaskFailed = "MRL-SRV-007", INTERNAL_SERVER_ERROR;
+    TaskFailed = "MRL-INTERNAL-009", INTERNAL_SERVER_ERROR;
     /// The request is not authenticated.
     Unauthenticated = "MRL-AUTH-001", UNAUTHORIZED;
     /// The principal may not do this.
@@ -98,11 +98,11 @@ codes! {
     /// The idempotency key is empty, too long or not visible ASCII.
     IdempotencyKey = "MRL-IDEM-003", BAD_REQUEST;
     /// Rate limit hit.
-    RateLimited = "MRL-QUOTA-001", TOO_MANY_REQUESTS;
+    RateLimited = "MRL-QUOTA-003", TOO_MANY_REQUESTS;
     /// No route at this path.
-    RouteNotFound = "MRL-ROUTE-001", NOT_FOUND;
+    RouteNotFound = "MRL-RES-002", NOT_FOUND;
     /// The route exists but not for this method.
-    MethodNotAllowed = "MRL-ROUTE-002", METHOD_NOT_ALLOWED;
+    MethodNotAllowed = "MRL-VAL-013", METHOD_NOT_ALLOWED;
     /// Unexpected server error.
     Internal = "MRL-INTERNAL-001", INTERNAL_SERVER_ERROR;
     /// A backing service (a seam) failed.
@@ -408,7 +408,7 @@ mod tests {
     #[test]
     fn explain_includes_title_and_steps() {
         let text = ServerError::new(ErrorCode::IdentityProviderMissing, "team mode").explain();
-        assert!(text.starts_with("MRL-SRV-002 — "));
+        assert!(text.starts_with("MRL-INTERNAL-004 — "));
         assert!(text.contains("--mode solo"));
     }
 }

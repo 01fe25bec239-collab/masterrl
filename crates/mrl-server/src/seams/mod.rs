@@ -291,7 +291,7 @@ pub trait ReadinessCheck: Send + Sync {
 pub trait StartupStep: Send + Sync {
     /// Short name for logs and errors, like `migrations`.
     fn name(&self) -> &str;
-    /// Runs the step. An error stops startup (MRL-SRV-004).
+    /// Runs the step. An error stops startup (MRL-INTERNAL-006).
     async fn run(&self) -> Result<(), SeamError>;
 }
 
@@ -375,7 +375,7 @@ impl Seams {
     }
 
     /// The seams production uses for `mode`. Team mode has no identity provider yet (P16),
-    /// so `build(Mode::Team)` on this fails with MRL-SRV-002.
+    /// so `build(Mode::Team)` on this fails with MRL-INTERNAL-004.
     pub fn production(mode: Mode, launch_secret: &str) -> SeamsBuilder {
         let ids: Arc<dyn IdGenerator> = Arc::new(UuidV7Ids);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);

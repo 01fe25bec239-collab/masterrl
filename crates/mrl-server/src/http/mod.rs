@@ -391,7 +391,7 @@ pub(crate) mod tests {
         let (status, headers, json, _) = send(&app, r).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(headers[header::CONTENT_TYPE], PROBLEM_JSON);
-        assert_eq!(json["code"], "MRL-ROUTE-001");
+        assert_eq!(json["code"], "MRL-RES-002");
         assert_eq!(json["instance"], "/nope");
         assert_eq!(json["trace_id"].as_str().unwrap().len(), 32);
         assert!(headers.contains_key(&REQUEST_ID));
@@ -405,7 +405,7 @@ pub(crate) mod tests {
             .unwrap();
         let (status, _, json, _) = send(&app, r).await;
         assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(json["code"], "MRL-ROUTE-002");
+        assert_eq!(json["code"], "MRL-VAL-013");
     }
 
     #[tokio::test]

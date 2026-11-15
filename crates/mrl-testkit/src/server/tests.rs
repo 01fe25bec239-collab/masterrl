@@ -336,7 +336,7 @@ async fn rate_limit_returns_429_with_retry_after() {
     let limited = srv.get_authed("/api/v1/ping").await;
     assert_eq!(limited.status, 429);
     assert_eq!(limited.headers["retry-after"], "1");
-    assert_eq!(limited.json()["code"], "MRL-QUOTA-001");
+    assert_eq!(limited.json()["code"], "MRL-QUOTA-003");
     assert_eq!(
         srv.get_authed("/healthz").await.status,
         200,

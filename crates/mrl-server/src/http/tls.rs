@@ -21,7 +21,7 @@ use tokio_util::task::TaskTracker;
 /// Longest a client may take to finish the TLS handshake.
 pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Loads the certificate chain and key into an acceptor (MRL-CFG-005 on failure).
+/// Loads the certificate chain and key into an acceptor (MRL-VAL-012 on failure).
 pub fn acceptor(cfg: &TlsConfig) -> Result<TlsAcceptor, ServerError> {
     let fail = |what: &str, e: &dyn std::fmt::Display| {
         // `e` describes the file problem; it never contains key material.

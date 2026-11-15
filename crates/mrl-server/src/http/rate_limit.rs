@@ -1,5 +1,5 @@
 //! In-memory token buckets per principal and per org (per replica). Over the limit → 429
-//! MRL-QUOTA-001 with `Retry-After`.
+//! MRL-QUOTA-003 with `Retry-After`.
 
 use crate::app::AppState;
 use crate::config::{BucketConfig, RateLimitConfig};
