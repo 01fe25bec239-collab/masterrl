@@ -1,0 +1,3 @@
+/* App stylesheet: the P02 base plus the UI kit's sources, so Tailwind sees classes used in packages/ui. */
+@import '../index.css';
+@source '../../../../packages/ui/src';

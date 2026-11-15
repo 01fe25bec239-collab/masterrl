@@ -1,8 +1,21 @@
-export function App() {
+import { QueryClientProvider, type QueryClient } from '@tanstack/react-query';
+import { RouterProvider } from '@tanstack/react-router';
+import { EventStreamProvider } from '@mrl/ui';
+import { streamHub } from './lib/api';
+import type { AppRouter } from './app/router';
+
+export interface AppProps {
+  router: AppRouter;
+  queryClient: QueryClient;
+}
+
+/** Server state through TanStack Query, live data through one shared SSE hub, pages through the router. */
+export function App({ router, queryClient }: AppProps) {
   return (
-    <main className="min-h-screen bg-bg p-8 text-fg">
-      <h1 className="text-2xl font-semibold">MasterRL</h1>
-      <p className="mt-2 text-fg-muted">Train and test language models on your own computer.</p>
-    </main>
+    <QueryClientProvider client={queryClient}>
+      <EventStreamProvider value={streamHub}>
+        <RouterProvider router={router} />
+      </EventStreamProvider>
+    </QueryClientProvider>
   );
 }

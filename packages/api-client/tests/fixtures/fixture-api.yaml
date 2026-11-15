@@ -1,0 +1,98 @@
+# Small stand-in for openapi/mrl-api-v1.yaml, shaped like Doc 09 §6 (cursor pages, :actions, problems).
+openapi: 3.1.0
+info: { title: MasterRL fixture API, version: 1.0.0 }
+paths:
+  /api/v1/projects:
+    get:
+      operationId: listProjects
+      parameters:
+        - { name: limit, in: query, schema: { type: integer, maximum: 200 } }
+        - { name: cursor, in: query, schema: { type: string } }
+      responses:
+        '200':
+          description: One page of projects.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items, next_cursor]
+                properties:
+                  items: { type: array, items: { $ref: '#/components/schemas/Project' } }
+                  next_cursor: { type: [string, 'null'] }
+        default: { $ref: '#/components/responses/Problem' }
+    post:
+      operationId: createProject
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ProjectCreate' }
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/v1/projects/{prj}:
+    parameters:
+      - { name: prj, in: path, required: true, schema: { type: string, pattern: '^prj_' } }
+    get:
+      operationId: getProject
+      responses:
+        '200':
+          description: The project.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Project' }
+        default: { $ref: '#/components/responses/Problem' }
+    delete:
+      operationId: deleteProject
+      responses:
+        '204': { description: Deleted. }
+        default: { $ref: '#/components/responses/Problem' }
+  /api/v1/runs/{run}:cancel:
+    post:
+      operationId: cancelRun
+      parameters:
+        - { name: run, in: path, required: true, schema: { type: string } }
+      responses:
+        '202':
+          description: Cancelling.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [state]
+                properties:
+                  state: { type: string, enum: [CANCELLING] }
+        default: { $ref: '#/components/responses/Problem' }
+components:
+  responses:
+    Problem:
+      description: Something went wrong.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+  schemas:
+    Project:
+      type: object
+      required: [id, name]
+      properties:
+        id: { type: string }
+        name: { type: string }
+    ProjectCreate:
+      type: object
+      required: [name]
+      properties:
+        name: { type: string, maxLength: 200 }
+    Problem:
+      type: object
+      required: [type, title, status, code]
+      properties:
+        type: { type: string, format: uri }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        code: { type: string }
+        trace_id: { type: string }
