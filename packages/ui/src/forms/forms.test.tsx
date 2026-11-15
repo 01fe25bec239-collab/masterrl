@@ -324,6 +324,27 @@ describe('every validator failure is reported', () => {
     });
   });
 
+  it('keeps a failed contains rule, which reports nothing more specific', () => {
+    const lists: JsonSchema = {
+      type: 'object',
+      properties: { xs: { type: 'array', contains: { type: 'number' } } },
+    };
+    expect(Object.fromEntries(validateValue(lists, { xs: ['x'] }))).toEqual({
+      '/xs': 'Add at least one item of the kind this list needs.',
+    });
+    expect(validateValue(lists, { xs: ['x', 1] }).size).toBe(0);
+  });
+
+  it('hides a summary only when its specific error is kept', () => {
+    const lists: JsonSchema = {
+      type: 'object',
+      properties: { xs: { type: 'array', items: { type: 'number' } } },
+    };
+    expect(Object.fromEntries(validateValue(lists, { xs: ['x'] }))).toEqual({
+      '/xs/0': 'Enter a number.',
+    });
+  });
+
   it('SchemaForm lists problems no field can show and blocks submit', async () => {
     const user = userEvent.setup();
     const onSubmit = vi.fn();

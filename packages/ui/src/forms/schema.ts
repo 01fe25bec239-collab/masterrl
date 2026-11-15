@@ -142,7 +142,11 @@ export function isPathActive(root: JsonSchema, value: JsonValue, path: readonly 
 
 const unitSuffix = (s: JsonSchema) => (s['x-mrl-unit'] ? ` ${s['x-mrl-unit']}` : '');
 
-/** Keywords that only summarize failures already reported on a child location. */
+/**
+ * Keywords that usually summarize failures reported at or below their location
+ * (`contains` often reports nothing below it). They are shown only when nothing more
+ * specific is.
+ */
 const SUMMARY_KEYWORDS = new Set([
   'properties',
   'patternProperties',
@@ -202,6 +206,11 @@ function plainMessage(keyword: string, s: JsonSchema, key: string | undefined): 
       return `Add at least ${s.minItems ?? ''} items.`;
     case 'maxItems':
       return `Use at most ${s.maxItems ?? ''} items.`;
+    case 'contains':
+      return 'Add at least one item of the kind this list needs.';
+    case 'minContains':
+    case 'maxContains':
+      return 'This list has the wrong number of items of the needed kind.';
     case 'uniqueItems':
       return 'Remove the repeated items.';
     case 'oneOf':
@@ -249,6 +258,7 @@ export function validateValue(schema: JsonSchema, value: JsonValue): FieldErrors
   const validator = new Validator(schema, '2020-12', false);
   const result = validator.validate(value);
   const errors: FieldErrors = new Map();
+  const summaries: { pointer: string; message: string }[] = [];
   for (const unit of result.errors) {
     const path = unit.instanceLocation.replace(/^#/, '').split('/').slice(1).map(decode);
     if (unit.keyword === 'required') {
@@ -258,10 +268,19 @@ export function validateValue(schema: JsonSchema, value: JsonValue): FieldErrors
       if (!errors.has(pointer)) errors.set(pointer, 'This is required.');
       continue;
     }
-    if (SUMMARY_KEYWORDS.has(unit.keyword)) continue;
     const message = plainMessage(unit.keyword, schemaAt(schema, path) ?? {}, path.at(-1));
     const pointer = pointerOf(path);
-    if (!errors.has(pointer)) errors.set(pointer, message);
+    if (SUMMARY_KEYWORDS.has(unit.keyword)) summaries.push({ pointer, message });
+    else if (!errors.has(pointer)) errors.set(pointer, message);
+  }
+  // A summary stays hidden only when a more specific error at or below it is kept.
+  // Deepest first, so a kept inner summary also explains the outer ones.
+  const depth = (p: string) => p.split('/').length;
+  for (const { pointer, message } of summaries.sort(
+    (a, b) => depth(b.pointer) - depth(a.pointer),
+  )) {
+    const explained = [...errors.keys()].some((k) => k === pointer || k.startsWith(`${pointer}/`));
+    if (!explained) errors.set(pointer, message);
   }
   for (const pointer of [...errors.keys()]) {
     if (!isPathActive(schema, value, pointer.split('/').slice(1).map(decode)))
