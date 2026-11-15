@@ -1,0 +1,12 @@
+component: builtin/math.numeric_close@1
+params: {}
+cases:
+  - {name: last_number, completion: "so the total is 42.", reference: "42", expect: {value: 1.0}}
+  - {name: off, completion: "so the total is 41", reference: "42", expect: {value: 0.0}}
+  - {name: rel_tolerance, params: {rel_tolerance: 0.01}, completion: "1005", reference: "1000", expect: {value: 1.0}}
+  - {name: abs_default_tight, completion: "1005", reference: "1000", expect: {value: 0.0}}
+  - {name: no_number, completion: "no idea", reference: "1", expect: {value: 0.0, flags: [no_answer]}}
+  - {name: reference_not_number, completion: "1", reference: "one", expect: {status: INVALID_INPUT}}
+  - {name: tag_with_text, params: {answer_extractor: "tag:answer"}, completion: "<answer>about 3</answer>", reference: "3", expect: {value: 0.0, flags: [parse_failed]}}
+  - {name: overflow_is_zero, completion: "1e999", reference: "1", expect: {value: 0.0}}
+  - {name: negative, completion: "it is -2.5", reference: -2.5, expect: {value: 1.0}}

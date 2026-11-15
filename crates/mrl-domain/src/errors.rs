@@ -390,7 +390,46 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
     // <mrl:errors P13> rows for P13 go right below this line.
 
     // <mrl:errors P14> rows for P14 go right below this line.
-
+    (
+        code(ErrorFamily::Rwd, 140),
+        "The reward policy has a problem.",
+    ),
+    (
+        code(ErrorFamily::Rwd, 141),
+        "A condition in the reward policy could not be read.",
+    ),
+    (
+        code(ErrorFamily::Rwd, 142),
+        "The reward policy uses a component that isn't installed.",
+    ),
+    (
+        code(ErrorFamily::Rwd, 143),
+        "A reward component's settings need a change.",
+    ),
+    (
+        code(ErrorFamily::Rwd, 144),
+        "Too many samples in a batch failed to get a reward.",
+    ),
+    (
+        code(ErrorFamily::Rwd, 145),
+        "The reward service got a request for a different run or reward version.",
+    ),
+    (
+        code(ErrorFamily::Rwd, 146),
+        "This reward's custom code can't run here yet.",
+    ),
+    (
+        code(ErrorFamily::Rwd, 147),
+        "The app could not load the reward files.",
+    ),
+    (
+        code(ErrorFamily::Rwd, 148),
+        "Step-by-step rewards aren't available yet.",
+    ),
+    (
+        code(ErrorFamily::Rwd, 149),
+        "The reward service could not start.",
+    ),
     // <mrl:errors P15> rows for P15 go right below this line.
 ];
 

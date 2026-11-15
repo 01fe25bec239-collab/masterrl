@@ -1,0 +1,10 @@
+component: builtin/length.penalty_linear@1
+params: {max_tokens: 100}
+cases:
+  - {name: zero, tokens: 0, expect: {value: 0.0}}
+  - {name: half, tokens: 50, expect: {value: -0.5}}
+  - {name: at_max, tokens: 100, expect: {value: -1.0}}
+  - {name: beyond, tokens: 5000, expect: {value: -1.0}}
+  - {name: free_budget, params: {max_tokens: 100, free_tokens: 50}, tokens: 75, expect: {value: -0.5}}
+  - {name: inside_free, params: {max_tokens: 100, free_tokens: 50}, tokens: 10, expect: {value: 0.0}}
+  - {name: bad_params, params: {max_tokens: 10, free_tokens: 10}, tokens: 1, expect: {setup_error: MRL-RWD-143}}
