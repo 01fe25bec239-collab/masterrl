@@ -101,6 +101,7 @@ impl Cgroups {
             memory: on("memory"),
             pids: on("pids"),
             oom_detection: on("memory"),
+            contained: true,
             note: (!missing.is_empty())
                 .then(|| format!("these cgroup controllers are off: {}", missing.join(", "))),
         };

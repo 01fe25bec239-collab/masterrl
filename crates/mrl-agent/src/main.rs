@@ -289,7 +289,7 @@ async fn run_local(
             " (no isolation)"
         }
     );
-    if !limits.is_empty() {
+    if !limits.is_empty() || !support.contained {
         if let Some(note) = &support.note {
             eprintln!("{NAME}: note: {note}");
         }

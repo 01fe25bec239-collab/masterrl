@@ -5,6 +5,8 @@
 //! - Linux: the job starts as `sh -c 'echo $$ > <cgroup>/cgroup.procs && exec "$@"'`, so it is
 //!   inside its cgroup before the real program runs (no window to fork outside it).
 //! - Unix: each job leads its own process group, so the tree can be signalled without cgroups.
+//!   Every job also carries a unique `MRL_JOB_TOKEN`; without a cgroup, processes that left
+//!   the group or lost their parent are found by it (see `tree`).
 //!   Windows: the tree is ended with `taskkill /T`.
 //! - stdout and stderr go to rotating files in the spec's `log_dir`.
 
@@ -63,6 +65,16 @@ impl ProcessExecutor {
     }
 }
 
+/// A token no other job on this computer has: job name, agent pid, time and a counter.
+fn job_token(name: &str) -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos());
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{name}.{}.{nanos}.{n}", std::process::id())
+}
+
 fn check_name(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 128
@@ -92,7 +104,9 @@ impl Executor for ProcessExecutor {
         {
             match &self.cgroups {
                 Ok(c) => c.support().clone(),
+                // Without a cgroup the job token (readable in /proc) still finds every process.
                 Err(reason) => LimitSupport {
+                    contained: true,
                     note: Some(reason.clone()),
                     ..LimitSupport::default()
                 },
@@ -101,7 +115,8 @@ impl Executor for ProcessExecutor {
         #[cfg(not(target_os = "linux"))]
         LimitSupport {
             note: Some(
-                "this OS has no cgroups, so CPU, memory and process limits are not enforced".into(),
+                "this OS has no cgroups, so CPU, memory and process limits are not enforced, and a process that detaches from its job and loses its parent within 0.5 s can outlive the job"
+                    .into(),
             ),
             ..LimitSupport::default()
         }
@@ -169,9 +184,11 @@ impl Executor for ProcessExecutor {
         #[cfg(not(target_os = "linux"))]
         let mut cmd = tokio::process::Command::new(&spec.program);
 
+        let token = job_token(&spec.name);
         cmd.args(&spec.args)
             .env_clear()
             .envs(self.env_for(&spec))
+            .env(super::TOKEN_ENV, &token)
             .current_dir(&spec.work_dir)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
@@ -198,14 +215,17 @@ impl Executor for ProcessExecutor {
         // Without a cgroup, descendants are found by parent links (see `tree`).
         let tree = pid
             .filter(|_| !has_cgroup)
-            .map(|p| Arc::new(super::tree::Tree::new(p)));
+            .map(|p| Arc::new(super::tree::Tree::new(p, &token)));
         let tracker = tree.clone().map(|t| {
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(TREE_SCAN);
                 loop {
                     tick.tick().await;
                     let t = Arc::clone(&t);
-                    if tokio::task::spawn_blocking(move || t.scan()).await.is_err() {
+                    if tokio::task::spawn_blocking(move || t.scan(false))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -221,6 +241,7 @@ impl Executor for ProcessExecutor {
                 LimitSupport {
                     note: support.note.clone(),
                     oom_detection: support.oom_detection,
+                    contained: support.contained,
                     ..LimitSupport::default()
                 }
             } else {
@@ -536,6 +557,27 @@ mod tests {
         );
     }
 
+    /// The case polling can't catch: after 200 ms the job forks a child that calls setsid,
+    /// and its parent and the job's main process exit at once. Linux only: macOS hides other
+    /// processes' environments, so there `limit_support().contained` is false (tested below).
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn a_child_orphaned_right_before_exit_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("orphan.pid");
+        let script = format!("( sleep 0.2; {} ); exit 0", setsid_child(&f));
+        let mut run = executor()
+            .spawn(shell(dir.path(), "orphan", &script))
+            .await
+            .unwrap();
+        assert!(run.wait().await.unwrap().success());
+        let child = read_pid(&f).await;
+        assert!(
+            wait_gone(child).await,
+            "orphaned setsid child {child} survived"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn a_log_failure_starts_nothing() {
@@ -576,6 +618,11 @@ mod tests {
     fn limits_are_reported_as_unsupported_without_cgroups() {
         let s = executor().limit_support();
         assert!(!s.cpu && !s.memory && !s.pids && !s.oom_detection);
-        assert!(s.note.unwrap().contains("not enforced"));
+        assert!(!s.contained, "macOS can't contain detached orphans; say so");
+        let note = s.note.unwrap();
+        assert!(
+            note.contains("not enforced") && note.contains("outlive"),
+            "{note}"
+        );
     }
 }

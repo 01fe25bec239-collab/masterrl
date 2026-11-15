@@ -12,6 +12,8 @@ pub mod logs;
 pub mod process;
 mod tree;
 
+pub use tree::TOKEN_ENV;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -91,6 +93,10 @@ pub struct LimitSupport {
     pub pids: bool,
     /// Out-of-memory kills are detected.
     pub oom_detection: bool,
+    /// Stopping a job reaches every process it started, even ones that detached (`setsid`)
+    /// and lost their parent. True on Linux (cgroup, or the job token in `/proc`); false on
+    /// macOS, which offers no unprivileged way to find such a process.
+    pub contained: bool,
     /// Why some are missing, in plain words.
     pub note: Option<String>,
 }
