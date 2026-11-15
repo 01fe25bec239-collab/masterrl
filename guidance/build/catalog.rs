@@ -1840,6 +1840,19 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("INFRA_TRANSIENT/SHM_EXHAUSTED")),
+            ("title", Value::Str("Training paused: shared memory ran out.")),
+            ("why", Value::Str("Data loading workers pass data through shared memory, and it filled up.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Lower the number of data loading workers to 0 or 1, then resume."),
+                ])),
+                ("linux", Value::List(&[
+                    Value::Str("If training runs in Docker, start the container with more shared memory, like `--shm-size=8g`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MODEL_INCOMPATIBLE")),
             ("title", Value::Str("You can't use this model with this method.")),
             ("why", Value::Str("The model's type or files don't match what this method needs.")),

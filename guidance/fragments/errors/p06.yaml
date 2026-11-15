@@ -60,3 +60,14 @@ errors:
     what_to_do:
       steps:
         - Wait about 1 minute, then try again.
+
+  # Shared memory filling up is a machine-side problem, so it retries like other short system problems.
+  # guidance/data/errors.yaml still lists OOM/SHM_EXHAUSTED; P05 (base data) should drop that entry.
+  - code: INFRA_TRANSIENT/SHM_EXHAUSTED
+    title: "Training paused: shared memory ran out."
+    why: Data loading workers pass data through shared memory, and it filled up.
+    what_to_do:
+      steps:
+        - Lower the number of data loading workers to 0 or 1, then resume.
+      linux:
+        - If training runs in Docker, start the container with more shared memory, like `--shm-size=8g`.

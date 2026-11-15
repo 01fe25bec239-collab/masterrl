@@ -56,6 +56,18 @@ pub enum CapabilityRejection {
     RewardNeedsLogprobs = 23,
 }
 
+/// `MRL-CAP-NNN` for each rejection, in `ALL` order. Built at compile time, so a bad
+/// number stops the build.
+const CODES: [ErrorCode; 23] = {
+    let mut codes = [ErrorCode::known(ErrorFamily::Cap, 1); 23];
+    let mut i = 0;
+    while i < codes.len() {
+        codes[i] = ErrorCode::known(ErrorFamily::Cap, CapabilityRejection::ALL[i] as u16);
+        i += 1;
+    }
+    codes
+};
+
 impl CapabilityRejection {
     /// Every rejection, in code order.
     pub const ALL: [Self; 23] = [
@@ -86,7 +98,8 @@ impl CapabilityRejection {
 
     /// The error code, like `MRL-CAP-004`.
     pub const fn code(self) -> ErrorCode {
-        ErrorCode::new(ErrorFamily::Cap, self as u16)
+        // ponytail: discriminants run 1..=23 in `ALL` order, so the index is always in range.
+        CODES[self as usize - 1]
     }
 
     /// The rejection for a code, if it is an `MRL-CAP` code.
@@ -137,11 +150,11 @@ mod tests {
             assert_eq!(CapabilityRejection::from_code(r.code()), Some(*r));
         }
         assert_eq!(
-            CapabilityRejection::from_code(ErrorCode::new(ErrorFamily::Cap, 24)),
+            ErrorCode::new(ErrorFamily::Cap, 24).and_then(CapabilityRejection::from_code),
             None
         );
         assert_eq!(
-            CapabilityRejection::from_code(ErrorCode::new(ErrorFamily::Val, 1)),
+            ErrorCode::new(ErrorFamily::Val, 1).and_then(CapabilityRejection::from_code),
             None
         );
     }

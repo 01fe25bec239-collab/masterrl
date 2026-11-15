@@ -128,7 +128,15 @@ pub enum ResourceRequestError {
     /// A role appears twice.
     #[error("the `{0}` role appears more than once")]
     DuplicateRole(WorkloadRole),
-    /// A role pins fewer nodes than it needs.
+    /// A role lists the same node twice.
+    #[error("the `{role}` role lists node `{node}` more than once")]
+    DuplicateNode {
+        /// The role.
+        role: WorkloadRole,
+        /// The repeated node.
+        node: NodeId,
+    },
+    /// A role pins fewer distinct nodes than it needs.
     #[error("the `{role}` role needs {replicas} nodes but allows only {pinned}")]
     TooFewNodes {
         /// The role.
@@ -153,6 +161,15 @@ impl ResourceRequest {
             if self.roles[..i].iter().any(|o| o.role == r.role) {
                 return Err(ResourceRequestError::DuplicateRole(r.role));
             }
+            for (j, node) in r.node_ids.iter().enumerate() {
+                if r.node_ids[..j].contains(node) {
+                    return Err(ResourceRequestError::DuplicateNode {
+                        role: r.role,
+                        node: *node,
+                    });
+                }
+            }
+            // ponytail: O(n²) duplicate scan; pinned lists are a handful of nodes.
             let pinned = r.node_ids.len();
             if pinned > 0 && pinned < r.replicas as usize {
                 return Err(ResourceRequestError::TooFewNodes {
@@ -324,6 +341,23 @@ mod tests {
         assert_eq!(
             err,
             Err("the `trainer` role needs 2 nodes but allows only 1".into())
+        );
+        let node_a = NodeId::from_uuid(Uuid::from_u128(1));
+        let mut twice = pinned.clone();
+        twice.node_ids.push(node_a);
+        let err = ResourceRequest { roles: vec![twice] }.validate();
+        assert_eq!(
+            err,
+            Err(ResourceRequestError::DuplicateNode {
+                role: WorkloadRole::Trainer,
+                node: node_a
+            })
+        );
+        assert_eq!(
+            err.map_err(|e| e.to_string()),
+            Err(format!(
+                "the `trainer` role lists node `{node_a}` more than once"
+            ))
         );
         pinned.node_ids.push(NodeId::from_uuid(Uuid::from_u128(2)));
         assert_eq!(

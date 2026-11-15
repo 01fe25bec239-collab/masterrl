@@ -78,9 +78,27 @@ pub struct ErrorCode {
 pub struct ErrorCodeParseError(pub String);
 
 impl ErrorCode {
-    /// A code from its family and number (1 to 999).
-    pub const fn new(family: ErrorFamily, number: u16) -> Self {
-        Self { family, number }
+    /// The lowest code number.
+    pub const MIN_NUMBER: u16 = 1;
+    /// The highest code number (codes have three digits).
+    pub const MAX_NUMBER: u16 = 999;
+
+    /// A code from its family and number, or `None` if the number is not 1 to 999.
+    pub const fn new(family: ErrorFamily, number: u16) -> Option<Self> {
+        if number >= Self::MIN_NUMBER && number <= Self::MAX_NUMBER {
+            Some(Self { family, number })
+        } else {
+            None
+        }
+    }
+
+    /// A code for the built-in tables. Use it only in `const` items, so a number outside
+    /// 1 to 999 stops the build instead of reaching runtime.
+    pub(crate) const fn known(family: ErrorFamily, number: u16) -> Self {
+        match Self::new(family, number) {
+            Some(code) => code,
+            None => panic!("error code numbers must be 1 to 999"),
+        }
     }
 
     /// The family.
@@ -121,10 +139,7 @@ impl FromStr for ErrorCode {
             return Err(bad());
         }
         let number: u16 = number.parse().map_err(|_| bad())?;
-        if number == 0 {
-            return Err(bad());
-        }
-        Ok(Self::new(family, number))
+        Self::new(family, number).ok_or_else(bad)
     }
 }
 
@@ -142,7 +157,7 @@ impl<'de> serde::Deserialize<'de> for ErrorCode {
 }
 
 const fn code(family: ErrorFamily, number: u16) -> ErrorCode {
-    ErrorCode::new(family, number)
+    ErrorCode::known(family, number)
 }
 
 use ErrorFamily::{Auth, Data, Env, Idem, Link, Model, Perm, Quota, Val};
@@ -297,6 +312,26 @@ mod tests {
     }
 
     #[test]
+    fn numbers_must_be_one_to_999() {
+        assert_eq!(ErrorCode::new(Val, 0), None);
+        assert_eq!(
+            ErrorCode::new(Val, 1).map(|c| c.to_string()),
+            Some("MRL-VAL-001".into())
+        );
+        assert_eq!(
+            ErrorCode::new(Val, 999).map(|c| c.to_string()),
+            Some("MRL-VAL-999".into())
+        );
+        assert_eq!(ErrorCode::new(Val, 1000), None);
+        assert_eq!(ErrorCode::new(Val, u16::MAX), None);
+        for n in [1, 999] {
+            let c = ErrorCode::new(Link, n);
+            let back = c.map(|c| c.to_string().parse::<ErrorCode>());
+            assert_eq!(back, c.map(Ok), "{n}");
+        }
+    }
+
+    #[test]
     fn every_code_is_unique_and_round_trips() {
         let mut seen = BTreeSet::new();
         for (c, title) in all() {
@@ -351,6 +386,10 @@ mod tests {
         }
     }
 
+    /// Catalog failure codes the domain no longer uses. They live in P05's base data
+    /// (`guidance/data/errors.yaml`), which P06 must not edit; the replacement is in `p06.yaml`.
+    const RETIRED_IN_CATALOG: &[&str] = &["OOM/SHM_EXHAUSTED"];
+
     #[test]
     fn failure_codes_match_guidance_catalog() {
         let catalog = catalog();
@@ -365,12 +404,18 @@ mod tests {
             .collect();
         let listed: BTreeSet<String> = catalog
             .keys()
-            .filter(|c| !c.starts_with("MRL-"))
+            .filter(|c| !c.starts_with("MRL-") && !RETIRED_IN_CATALOG.contains(&c.as_str()))
             .cloned()
             .collect();
         assert_eq!(
             domain, listed,
             "failure classes and sub-codes differ from the catalog"
         );
+        for c in RETIRED_IN_CATALOG {
+            assert!(
+                c.parse::<FailureCode>().is_err(),
+                "{c} is retired but still parses"
+            );
+        }
     }
 }

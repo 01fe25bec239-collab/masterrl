@@ -881,6 +881,13 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                             'macos': ['Open System Settings > General > Storage to see what uses '
                                       'space.'],
                             'linux': ['Run `df -h` to see free space on each disk.']}},
+            {'code': 'INFRA_TRANSIENT/SHM_EXHAUSTED',
+             'title': 'Training paused: shared memory ran out.',
+             'why': 'Data loading workers pass data through shared memory, and it filled up.',
+             'what_to_do': {'steps': ['Lower the number of data loading workers to 0 or 1, then '
+                                      'resume.'],
+                            'linux': ['If training runs in Docker, start the container with more '
+                                      'shared memory, like `--shm-size=8g`.']}},
             {'code': 'MODEL_INCOMPATIBLE',
              'title': "You can't use this model with this method.",
              'why': "The model's type or files don't match what this method needs.",

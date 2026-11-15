@@ -284,7 +284,7 @@ pub enum SubCode {
     OomGpu,
     /// `OOM/OOM_HOST`: the computer ran out of memory.
     OomHost,
-    /// `OOM/SHM_EXHAUSTED`: shared memory (`/dev/shm`) ran out.
+    /// `INFRA_TRANSIENT/SHM_EXHAUSTED`: shared memory (`/dev/shm`) ran out.
     ShmExhausted,
     /// `INFRA_TRANSIENT/DISK_FULL`: the scratch disk is full.
     DiskFull,
@@ -308,8 +308,8 @@ impl SubCode {
     /// The class this sub-code belongs to.
     pub const fn class(self) -> FailureClass {
         match self {
-            Self::OomGpu | Self::OomHost | Self::ShmExhausted => FailureClass::Oom,
-            Self::DiskFull => FailureClass::InfraTransient,
+            Self::OomGpu | Self::OomHost => FailureClass::Oom,
+            Self::ShmExhausted | Self::DiskFull => FailureClass::InfraTransient,
             Self::GpuContended => FailureClass::Hardware,
             Self::NodeRebooted => FailureClass::NodeLost,
         }
@@ -621,6 +621,27 @@ mod tests {
             wrong,
             Err("the sub-code `OOM_GPU` belongs to `OOM`, not `HARDWARE`".into())
         );
+    }
+
+    #[test]
+    fn shm_exhausted_is_infra_transient() {
+        let shm = FailureCode::from(SubCode::ShmExhausted);
+        assert_eq!(shm.to_string(), "INFRA_TRANSIENT/SHM_EXHAUSTED");
+        assert_eq!("INFRA_TRANSIENT/SHM_EXHAUSTED".parse(), Ok(shm));
+        let old = "OOM/SHM_EXHAUSTED".parse::<FailureCode>();
+        assert_eq!(
+            old,
+            Err(FailureCodeError::WrongClass {
+                sub: "SHM_EXHAUSTED",
+                expected: FailureClass::InfraTransient,
+                found: FailureClass::Oom
+            })
+        );
+        // Retries like other short system problems: no auto_tune needed, 5 tries, backoff from 10 s.
+        let policy = shm.class().retry_policy_default();
+        assert!(shm.class().is_retryable(false));
+        assert_eq!(policy.next_delay(0, false), Some(Duration::from_secs(10)));
+        assert_eq!(policy.next_delay(5, false), None);
     }
 
     #[test]
