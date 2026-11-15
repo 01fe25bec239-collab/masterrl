@@ -222,6 +222,8 @@ message PolicyVersionEvent {
   double probe_delta = 10;
   string abort_reason = 11;
   google.protobuf.Timestamp time = 12;
+  // Optimizer updates the trainer had applied when the version was allocated.
+  uint64 optimizer_updates = 13;
 }
 
 enum PolicyVersionState {

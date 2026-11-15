@@ -93,7 +93,6 @@ class AttemptRef(_message.Message):
 
 class Failure(_message.Message):
     __slots__ = (
-        "failure_class",
         "sub_code",
         "message",
         "detail_ref",
@@ -101,14 +100,13 @@ class Failure(_message.Message):
         "suggested_mutations",
         "classified_by",
     )
-    FAILURE_CLASS_FIELD_NUMBER: _ClassVar[int]
+    CLASS_FIELD_NUMBER: _ClassVar[int]
     SUB_CODE_FIELD_NUMBER: _ClassVar[int]
     MESSAGE_FIELD_NUMBER: _ClassVar[int]
     DETAIL_REF_FIELD_NUMBER: _ClassVar[int]
     RETRYABLE_HINT_FIELD_NUMBER: _ClassVar[int]
     SUGGESTED_MUTATIONS_FIELD_NUMBER: _ClassVar[int]
     CLASSIFIED_BY_FIELD_NUMBER: _ClassVar[int]
-    failure_class: FailureClass
     sub_code: str
     message: str
     detail_ref: str
@@ -117,13 +115,13 @@ class Failure(_message.Message):
     classified_by: ClassifiedBy
     def __init__(
         self,
-        failure_class: _Optional[_Union[FailureClass, str]] = ...,
         sub_code: _Optional[str] = ...,
         message: _Optional[str] = ...,
         detail_ref: _Optional[str] = ...,
         retryable_hint: _Optional[bool] = ...,
         suggested_mutations: _Optional[_Iterable[_Union[ConfigMutation, _Mapping]]] = ...,
         classified_by: _Optional[_Union[ClassifiedBy, str]] = ...,
+        **kwargs,
     ) -> None: ...
 
 class ConfigMutation(_message.Message):

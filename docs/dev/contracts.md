@@ -28,6 +28,8 @@ base commit, and fails if `just gen` changes any file.
 - Python: `from mrl_runtime._generated.mrl.worker.v1 import worker_control_pb2, worker_control_pb2_grpc`.
   `mrl_runtime` holds common, worker, reward and env; `mrl_rewards` holds common, reward and env.
   The agent gateway is Rust only.
+- `Failure.class` is a Python keyword: read it with `getattr(failure, "class")`, build with
+  `Failure(**{"class": ...})`. The `.pyi` stub leaves that one field out.
 
 ## Rules for changing a proto
 

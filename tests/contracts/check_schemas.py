@@ -11,11 +11,12 @@ Checks, for each schema:
   carries "x-mrl-open": "<why>";
 - its valid examples pass and its invalid examples fail.
 
-Dataset schemas use JSONL: tests/fixtures/datasets/<id>.jsonl and <id>-invalid.jsonl (or the
-same names under tests/contracts/examples/datasets/), with DEFECTS.json naming each invalid
-line's defect. A defect must be caught by the right layer: the JSONL reader (bad_utf8,
-invalid_json, oversized_record), a record rule the schema lists in "x-mrl-rules", or the
-schema itself. Other schemas use tests/contracts/examples/<path>/: valid-*.json documents, and
+Dataset schemas use JSONL: tests/fixtures/datasets/<id>.jsonl and <id>-invalid.jsonl and/or the
+same names under tests/contracts/examples/datasets/ (both are checked), with DEFECTS.json
+naming each invalid line's defect. A defect must be caught by the right layer: the JSONL reader
+(bad_utf8, invalid_json, oversized_record), a record rule the schema lists in "x-mrl-rules", or
+the schema itself. Other schemas use tests/contracts/examples/<path>/: valid-*.json documents,
+and
 invalid-*.json patches of one valid document, each naming where it must fail:
     {"base": "valid-x.json", "set": {"/json/pointer": value}, "remove": ["/json/pointer"],
      "fails_at": "/json/pointer" or "rule:<code>"}
@@ -121,29 +122,42 @@ def read_line(line: bytes) -> tuple[Any, str | None]:
         return None, "invalid_json"
 
 
-def dataset_cases(name: str) -> tuple[Path, Path, list[dict[str, Any]]] | None:
+def dataset_cases(name: str) -> list[tuple[Path, Path, list[dict[str, Any]]]]:
+    """(valid file, invalid file, defects) from every folder that has both files."""
+    cases = []
     for folder in (FIXTURES, EXAMPLES / "datasets"):
         valid, invalid = folder / f"{name}.jsonl", folder / f"{name}-invalid.jsonl"
         if valid.exists() and invalid.exists():
             defects = json.loads((folder / "DEFECTS.json").read_text())["files"][invalid.name]
-            return valid, invalid, defects
-    return None
+            cases.append((valid, invalid, defects))
+    return cases
 
 
 def check_dataset(name: str, validator: Any, schema: dict[str, Any]) -> list[str]:
     cases = dataset_cases(name)
-    if cases is None:
+    if not cases:
         return [f"{name}: no valid + invalid JSONL examples"]
-    valid, invalid, defects = cases
+    return [f for case in cases for f in check_case(*case, validator, schema)]
+
+
+def check_case(
+    valid: Path,
+    invalid: Path,
+    defects: list[dict[str, Any]],
+    validator: Any,
+    schema: dict[str, Any],
+) -> list[str]:
     fails = []
     for n, line in enumerate(valid.read_bytes().splitlines(), 1):
         rec, reader = read_line(line)
         found = [reader] if reader else problems(validator, schema, rec)
         if found:
-            fails.append(f"{valid.name}:{n}: valid line rejected: {found}")
+            fails.append(f"{valid.relative_to(ROOT)}:{n}: valid line rejected: {found}")
     lines = invalid.read_bytes().splitlines()
     if [d["line"] for d in defects] != list(range(1, len(lines) + 1)):
-        fails.append(f"{invalid.name}: DEFECTS.json must list every line once, in order")
+        fails.append(
+            f"{invalid.relative_to(ROOT)}: DEFECTS.json must list every line once, in order"
+        )
     for defect in defects:
         n, code = defect["line"], defect["code"]
         rec, reader = read_line(lines[n - 1])
@@ -158,7 +172,7 @@ def check_dataset(name: str, validator: Any, schema: dict[str, Any]) -> list[str
             found = [] if reader else problems(validator, schema, rec)
             ok, layer = bool(found) and not found[0].startswith("rule:"), "the schema"
         if not ok:
-            fails.append(f"{invalid.name}:{n}: defect {code} not caught by {layer}")
+            fails.append(f"{invalid.relative_to(ROOT)}:{n}: defect {code} not caught by {layer}")
     return fails
 
 

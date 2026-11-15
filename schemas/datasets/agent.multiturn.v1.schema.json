@@ -4,13 +4,16 @@
   "title": "agent.multiturn.v1",
   "description": "Multi-turn agent episodes with tool calls. Only tokens sampled by the policy count toward the loss.",
   "type": "object",
-  "required": ["episode_id", "env_spec_ref", "turns"],
+  "required": ["episode_id", "turns"],
+  "anyOf": [{ "required": ["env_spec_ref"] }, { "required": ["env_id", "env_version"] }],
   "properties": {
     "episode_id": { "$ref": "common.v1.schema.json#/$defs/text" },
     "env_spec_ref": {
-      "description": "Environment and version, e.g. env/calculator@1.",
+      "description": "Environment and version in one reference, e.g. env/calculator@1. Alternative to env_id + env_version.",
       "$ref": "common.v1.schema.json#/$defs/text"
     },
+    "env_id": { "description": "Environment id, e.g. env/calculator.", "$ref": "common.v1.schema.json#/$defs/text" },
+    "env_version": { "description": "Environment version, e.g. 1.", "$ref": "common.v1.schema.json#/$defs/text" },
     "task": {
       "description": "Prompt plus reference/verifier metadata for the episode.",
       "type": "object",

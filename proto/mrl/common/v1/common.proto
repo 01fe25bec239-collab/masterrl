@@ -46,9 +46,10 @@ enum ClassifiedBy {
   CLASSIFIED_BY_SERVER = 4;
 }
 
-// A classified failure.
+// A classified failure. Python: `class` is a keyword, so use getattr(failure, "class")
+// and Failure(**{"class": ...}).
 message Failure {
-  FailureClass failure_class = 1;
+  FailureClass class = 1;
   // Stable sub-code inside the class, e.g. "OOM_GPU", "DATA_TOKENIZATION".
   string sub_code = 2;
   // One line, safe to show to the user.

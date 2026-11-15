@@ -606,6 +606,7 @@ class PolicyVersionEvent(_message.Message):
         "probe_delta",
         "abort_reason",
         "time",
+        "optimizer_updates",
     )
     POLICY_VERSION_FIELD_NUMBER: _ClassVar[int]
     PARENT_POLICY_VERSION_FIELD_NUMBER: _ClassVar[int]
@@ -619,6 +620,7 @@ class PolicyVersionEvent(_message.Message):
     PROBE_DELTA_FIELD_NUMBER: _ClassVar[int]
     ABORT_REASON_FIELD_NUMBER: _ClassVar[int]
     TIME_FIELD_NUMBER: _ClassVar[int]
+    OPTIMIZER_UPDATES_FIELD_NUMBER: _ClassVar[int]
     policy_version: int
     parent_policy_version: int
     state: PolicyVersionState
@@ -631,6 +633,7 @@ class PolicyVersionEvent(_message.Message):
     probe_delta: float
     abort_reason: str
     time: _timestamp_pb2.Timestamp
+    optimizer_updates: int
     def __init__(
         self,
         policy_version: _Optional[int] = ...,
@@ -645,6 +648,7 @@ class PolicyVersionEvent(_message.Message):
         probe_delta: _Optional[float] = ...,
         abort_reason: _Optional[str] = ...,
         time: _Optional[_Union[datetime.datetime, _timestamp_pb2.Timestamp, _Mapping]] = ...,
+        optimizer_updates: _Optional[int] = ...,
     ) -> None: ...
 
 class RolloutBatchSummary(_message.Message):

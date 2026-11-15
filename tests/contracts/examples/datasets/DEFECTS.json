@@ -1,10 +1,43 @@
 {
   "files": {
     "rl.rollout.v1-invalid.jsonl": [
-      { "line": 1, "code": "missing_field", "note": "status is missing" },
-      { "line": 2, "code": "missing_field", "note": "neither policy_version nor version_spans" },
-      { "line": 3, "code": "wrong_type", "note": "reward_total is a string" },
-      { "line": 4, "code": "unknown_value", "note": "status failed" }
+      {
+        "line": 1,
+        "code": "missing_field",
+        "note": "status is missing"
+      },
+      {
+        "line": 2,
+        "code": "missing_field",
+        "note": "neither policy_version nor version_spans"
+      },
+      {
+        "line": 3,
+        "code": "wrong_type",
+        "note": "reward_total is a string"
+      },
+      {
+        "line": 4,
+        "code": "unknown_value",
+        "note": "status failed"
+      }
+    ],
+    "agent.multiturn.v1-invalid.jsonl": [
+      {
+        "line": 1,
+        "code": "missing_field",
+        "note": "env_id without env_version"
+      },
+      {
+        "line": 2,
+        "code": "empty_field",
+        "note": "env_version is empty"
+      },
+      {
+        "line": 3,
+        "code": "empty_field",
+        "note": "assistant turn with no content and no tool calls"
+      }
     ]
   }
 }
