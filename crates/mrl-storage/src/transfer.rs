@@ -555,7 +555,8 @@ pub struct Download {
 
 impl Store {
     /// Downloads `key` to a local file in parallel ranged parts, resumable after a crash.
-    /// With `expected_sha256`, a mismatching file is deleted and an error returned.
+    /// With `expected_sha256`, content that does not match is discarded and any existing file at
+    /// `local` is left untouched.
     pub async fn download_file(
         &self,
         key: &str,
@@ -696,21 +697,21 @@ impl Download {
             .buffer_unordered(self.opts.concurrency)
             .try_collect::<Vec<()>>()
             .await?;
-        let (tmp, local) = (self.tmp.clone(), self.local.clone());
+        let tmp = self.tmp.clone();
         blocking(move || {
             std::fs::OpenOptions::new()
                 .write(true)
                 .open(&tmp)
                 .and_then(|f| f.sync_all())
-                .map_err(|e| StorageError::io(&tmp, e))?;
-            std::fs::rename(&tmp, &local).map_err(|e| StorageError::io(&local, e))
+                .map_err(|e| StorageError::io(&tmp, e))
         })
         .await?;
-        remove_file(&self.ledger_path).await?;
-        let (size, sha256) = sha256_file(&self.local).await?;
+        // Check the content before it replaces anything already at the destination.
+        let (size, sha256) = sha256_file(&self.tmp).await?;
         if let Some(expected) = expected_sha256 {
             if expected != sha256 {
-                remove_file(&self.local).await?;
+                remove_file(&self.tmp).await?;
+                remove_file(&self.ledger_path).await?;
                 return Err(StorageError::ChecksumMismatch {
                     key: self.key,
                     expected: expected.to_owned(),
@@ -718,6 +719,10 @@ impl Download {
                 });
             }
         }
+        let (tmp, local) = (self.tmp.clone(), self.local.clone());
+        blocking(move || std::fs::rename(&tmp, &local).map_err(|e| StorageError::io(&local, e)))
+            .await?;
+        remove_file(&self.ledger_path).await?;
         Ok(TransferOutcome {
             size,
             sha256,

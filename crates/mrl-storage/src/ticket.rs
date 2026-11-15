@@ -107,8 +107,9 @@ pub struct TransferTicket {
     pub method: TicketMethod,
     /// Full object key.
     pub key: String,
-    /// Size limit in bytes. Presigned PUT URLs cannot enforce it; the server checks the
-    /// object size before it accepts the upload.
+    /// Size limit in bytes, always enforced: a presigned GET is checked when issued and
+    /// pinned to that version by `if-match`; a proxied ticket is checked by the endpoint
+    /// with [`TicketClaims::check_size`].
     pub max_size: u64,
     /// When the ticket stops working.
     #[serde(with = "time::serde::rfc3339")]
@@ -117,6 +118,8 @@ pub struct TransferTicket {
     pub url: String,
     /// True when `url` is a presigned object store URL.
     pub presigned: bool,
+    /// Headers the client must send exactly as given (they are part of the signature).
+    pub headers: std::collections::BTreeMap<String, String>,
 }
 
 /// Checks a requested lifetime and returns the expiry.

@@ -103,6 +103,20 @@ mod harness {
 
 /// Minimal HTTP/1.1 client for presigned URLs (keeps test deps small).
 async fn http(method: &str, url: &str, body: &[u8]) -> (u16, Vec<u8>) {
+    http_with(method, url, &[], body).await
+}
+
+/// Like [`http`], plus extra request headers.
+async fn http_with(
+    method: &str,
+    url: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> (u16, Vec<u8>) {
+    let extra: String = headers
+        .iter()
+        .map(|(k, v)| format!("{k}: {v}\r\n"))
+        .collect();
     let u = Url::parse(url).unwrap();
     let host = u.host_str().unwrap().to_owned();
     let port = u.port_or_known_default().unwrap();
@@ -111,7 +125,7 @@ async fn http(method: &str, url: &str, body: &[u8]) -> (u16, Vec<u8>) {
         .await
         .unwrap();
     let head = format!(
-        "{method} {target} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {target} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Length: {}\r\n{extra}Connection: close\r\n\r\n",
         body.len()
     );
     s.write_all(head.as_bytes()).await.unwrap();
@@ -180,33 +194,26 @@ mod cases {
     pub async fn capabilities_are_honest(h: &Harness) {
         let c = h.backend.capabilities();
         let s = h.backend.org(&org()).unwrap();
-        // presign <=> tickets are presigned URLs.
+        // presign <=> GET tickets are presigned URLs; PUT tickets always use the proxy.
         let key = s.keys().run_config("r").unwrap();
-        let backend = if c.presign {
-            h.backend.clone()
-        } else {
-            h.backend
-                .clone()
-                .with_ticket_key(TicketKey::new([3u8; 32]).unwrap())
-        };
-        let t = backend
+        s.put(&key, Bytes::from_static(b"x")).await.unwrap();
+        let s = h
+            .backend
+            .clone()
+            .with_ticket_key(TicketKey::new([3u8; 32]).unwrap())
             .org(s.keys().org_id())
-            .unwrap()
-            .transfer_ticket(&key, TicketMethod::Get, 1, Duration::from_secs(5))
+            .unwrap();
+        let ttl = Duration::from_secs(5);
+        let get = s
+            .transfer_ticket(&key, TicketMethod::Get, 1, ttl)
             .await
             .unwrap();
-        assert_eq!(t.presigned, c.presign);
-        if !c.presign {
-            assert_eq!(
-                c,
-                Capabilities {
-                    presign: false,
-                    multipart: false,
-                    object_lock: false,
-                    checksum: false
-                }
-            );
-        }
+        assert_eq!(get.presigned, c.presign);
+        let put = s
+            .transfer_ticket(&key, TicketMethod::Put, 1, ttl)
+            .await
+            .unwrap();
+        assert!(!put.presigned);
     }
 
     pub async fn put_get_list_delete(h: &Harness) {
@@ -466,79 +473,97 @@ mod cases {
             .await;
         assert_eq!(too_long.unwrap_err().code(), "MRL-STORE-009");
 
+        // PUT: always the validating proxy, on every backend.
         let put = s
             .transfer_ticket(&key, TicketMethod::Put, 5, ttl)
-            .await
-            .unwrap();
-        let get = s
-            .transfer_ticket(&key, TicketMethod::Get, 5, ttl)
             .await
             .unwrap();
         assert_eq!(
             (put.key.as_str(), put.method, put.max_size),
             (key.as_str(), TicketMethod::Put, 5)
         );
+        assert!(!put.presigned && put.headers.is_empty());
         let left = put.expires_at - OffsetDateTime::now_utc();
         assert!(left <= ttl && left > ttl - Duration::from_secs(30));
+        let token = put.url.strip_prefix(PROXY_PATH).unwrap();
+        let now = OffsetDateTime::now_utc();
+        let claims = verify_ticket(&tk, token, TicketMethod::Put, now).unwrap();
+        assert_eq!(
+            (claims.key.as_str(), claims.org_id()),
+            (key.as_str(), s.keys().org_id())
+        );
+        assert!(claims.check_size(5).is_ok());
+        assert_eq!(claims.check_size(6).unwrap_err().code(), "MRL-STORE-009");
+        let wrong_method = verify_ticket(&tk, token, TicketMethod::Get, now);
+        assert_eq!(wrong_method.unwrap_err().code(), "MRL-STORE-009");
+        assert!(matches!(
+            verify_ticket(&tk, token, TicketMethod::Put, now + ttl),
+            Err(StorageError::TicketExpired)
+        ));
+        let mut forged = token.to_owned();
+        forged.insert(5, 'x');
+        let forged = verify_ticket(&tk, &forged, TicketMethod::Put, now);
+        assert_eq!(forged.unwrap_err().code(), "MRL-STORE-007");
+        let other = TicketKey::new([9u8; 32]).unwrap();
+        let other = verify_ticket(&other, token, TicketMethod::Put, now);
+        assert_eq!(other.unwrap_err().code(), "MRL-STORE-007");
+        // Without a ticket key, no PUT ticket can be issued.
+        let plain = h.backend.org(s.keys().org_id()).unwrap();
+        let err = plain
+            .transfer_ticket(&key, TicketMethod::Put, 5, ttl)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "MRL-STORE-006");
 
-        if s.capabilities().presign {
-            // Presigned: the URL itself carries the scope and expiry; use it for real.
-            let url = Url::parse(&put.url).unwrap();
+        // GET: the size is checked when the ticket is issued.
+        s.put(&key, Bytes::from_static(b"hello")).await.unwrap();
+        let small = s.transfer_ticket(&key, TicketMethod::Get, 4, ttl).await;
+        assert_eq!(small.unwrap_err().code(), "MRL-STORE-009");
+        let get = s
+            .transfer_ticket(&key, TicketMethod::Get, 5, ttl)
+            .await
+            .unwrap();
+        assert_eq!(get.presigned, s.capabilities().presign);
+
+        if get.presigned {
+            // Presigned: the URL carries scope and expiry, and if-match pins this version.
+            let url = Url::parse(&get.url).unwrap();
             assert!(url.path().ends_with(&key), "{url}");
             let q: Vec<(String, String)> = url.query_pairs().into_owned().collect();
             assert!(q.contains(&("X-Amz-Expires".into(), "300".into())), "{q:?}");
-            assert_eq!(http("PUT", &put.url, b"hello").await.0, 200);
-            assert_eq!(s.get(&key).await.unwrap(), Bytes::from_static(b"hello"));
-            let (status, body) = http("GET", &get.url, b"").await;
+            let etag = get
+                .headers
+                .get("if-match")
+                .expect("GET tickets pin the version");
+            let (status, body) = http_with("GET", &get.url, &[("If-Match", etag)], b"").await;
             assert_eq!((status, body.as_slice()), (200, b"hello".as_slice()));
+            assert_eq!(
+                http("GET", &get.url, b"").await.0,
+                403,
+                "if-match is required"
+            );
             // The GET URL does not allow a PUT, and a tampered signature fails.
-            assert_eq!(http("PUT", &get.url, b"evil").await.0, 403);
-            let forged = put.url.replace("X-Amz-Expires=300", "X-Amz-Expires=900");
-            assert_eq!(http("PUT", &forged, b"evil").await.0, 403);
-            assert_eq!(s.get(&key).await.unwrap(), Bytes::from_static(b"hello"));
+            let put_try = http_with("PUT", &get.url, &[("If-Match", etag)], b"evil").await;
+            assert_eq!(put_try.0, 403);
+            let forged = get.url.replace("X-Amz-Expires=300", "X-Amz-Expires=900");
+            assert_eq!(
+                http_with("GET", &forged, &[("If-Match", etag)], b"")
+                    .await
+                    .0,
+                403
+            );
+            // A bigger object written later cannot be read with the old ticket.
+            s.put(&key, Bytes::from(vec![b'x'; 1000])).await.unwrap();
+            let (status, _) = http_with("GET", &get.url, &[("If-Match", etag)], b"").await;
+            assert_eq!(status, 412);
         } else {
-            // Proxied: the token is checked by verify_ticket.
-            let token = put.url.strip_prefix(PROXY_PATH).unwrap();
-            let now = OffsetDateTime::now_utc();
-            let claims = verify_ticket(&tk, token, TicketMethod::Put, now).unwrap();
-            assert_eq!(
-                (claims.key.as_str(), claims.org_id()),
-                (key.as_str(), s.keys().org_id())
-            );
-            assert!(claims.check_size(5).is_ok());
-            assert_eq!(claims.check_size(6).unwrap_err().code(), "MRL-STORE-009");
-            assert_eq!(
-                verify_ticket(&tk, token, TicketMethod::Get, now)
-                    .unwrap_err()
-                    .code(),
-                "MRL-STORE-009"
-            );
-            assert!(matches!(
-                verify_ticket(&tk, token, TicketMethod::Put, now + ttl),
-                Err(StorageError::TicketExpired)
-            ));
-            let mut forged = token.to_owned();
-            forged.insert(5, 'x');
-            assert_eq!(
-                verify_ticket(&tk, &forged, TicketMethod::Put, now)
-                    .unwrap_err()
-                    .code(),
-                "MRL-STORE-007"
-            );
-            let other = TicketKey::new([9u8; 32]).unwrap();
-            assert_eq!(
-                verify_ticket(&other, token, TicketMethod::Put, now)
-                    .unwrap_err()
-                    .code(),
-                "MRL-STORE-007"
-            );
-            // Without a ticket key, a non-presign backend refuses to issue tickets.
-            let plain = h.backend.org(s.keys().org_id()).unwrap();
-            let err = plain
-                .transfer_ticket(&key, TicketMethod::Put, 5, ttl)
-                .await
-                .unwrap_err();
-            assert_eq!(err.code(), "MRL-STORE-006");
+            let token = get.url.strip_prefix(PROXY_PATH).unwrap();
+            let claims = verify_ticket(&tk, token, TicketMethod::Get, now).unwrap();
+            assert_eq!(claims.max_size, 5);
+            // The proxy checks the object size it is about to send.
+            s.put(&key, Bytes::from(vec![b'x'; 1000])).await.unwrap();
+            let size = s.head(&key).await.unwrap().size;
+            assert_eq!(claims.check_size(size).unwrap_err().code(), "MRL-STORE-009");
         }
     }
 
@@ -629,6 +654,17 @@ mod cases {
             .unwrap_err();
         assert_eq!(err.code(), "MRL-STORE-010");
         assert!(!dst.exists());
+        assert!(!dir.path().join("cfg.json.mrl-part").exists());
+        assert!(!dir.path().join("cfg.json.mrl-download.json").exists());
+
+        // A failed download never replaces or deletes a file already at the destination.
+        std::fs::write(&dst, b"keep me").unwrap();
+        let err = s
+            .download_file(&cfg, &dst, Some(&m.files[1].sha256), opts())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "MRL-STORE-010");
+        assert_eq!(std::fs::read(&dst).unwrap(), b"keep me");
 
         // A manifest that is not artifact-manifest/v1 is refused on read.
         s.put(

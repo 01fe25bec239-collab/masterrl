@@ -1,5 +1,6 @@
 //! Backends and the org-scoped [`Store`] handle.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::ops::Range;
 use std::path::PathBuf;
@@ -10,7 +11,7 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 use object_store::multipart::MultipartStore;
 use object_store::path::Path;
-use object_store::signer::{Method, Signer};
+use object_store::signer::{HeaderName, HeaderValue, Method, SignedUrlOptions, Signer};
 use object_store::{ObjectStore, ObjectStoreExt, PutPayload};
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
@@ -110,7 +111,8 @@ impl fmt::Debug for S3Config {
 /// What a backend really supports. Nothing here is emulated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct Capabilities {
-    /// Can hand out presigned URLs. Without it, tickets go through the server proxy.
+    /// Hands out presigned GET URLs (size checked, version pinned). PUT tickets, and GET
+    /// tickets without it, go through the server proxy.
     pub presign: bool,
     /// Has native multipart uploads. Without it, parts are staged as objects under
     /// `uploads/{id}/parts/` and joined on completion.
@@ -211,13 +213,15 @@ impl Backend {
                     .build()
                     .map_err(StorageError::Backend)?;
                 let az = Arc::new(az);
+                // Azure SAS URLs cannot sign headers, so a size limit cannot be bound into
+                // them: tickets go through the proxy and presign is reported as missing.
                 let caps = Capabilities {
-                    presign: true,
+                    presign: false,
                     multipart: true,
                     object_lock: false,
                     checksum: false,
                 };
-                Ok(Self::assemble(az.clone(), Some(az.clone()), Some(az), caps))
+                Ok(Self::assemble(az.clone(), Some(az), None, caps))
             }
         }
     }
@@ -398,10 +402,15 @@ impl Store {
         ArtifactManifest::from_json(&self.get(key).await?)
     }
 
-    /// A ticket for one `method` on one `key`, valid for `ttl` (at most 15 minutes).
+    /// A ticket for one `method` on one `key`, up to `max_size` bytes, valid for `ttl`
+    /// (at most 15 minutes). The size limit is always enforced:
     ///
-    /// Presign-capable backends return a presigned URL. Others return a signed token for the
-    /// server-proxied endpoint, which checks it with [`crate::verify_ticket`].
+    /// - GET: the object size is checked now. On a presign backend the result is a presigned
+    ///   URL whose signed `if-match` header pins this version, so a bigger object written later
+    ///   cannot be read with it.
+    /// - PUT, and GET elsewhere: a token for the server-proxied endpoint, which checks it with
+    ///   [`crate::verify_ticket`] and [`TicketClaims::check_size`]. Needs
+    ///   [`Backend::with_ticket_key`].
     pub async fn transfer_ticket(
         &self,
         key: &str,
@@ -412,30 +421,45 @@ impl Store {
         let path = self.path(key)?;
         let now = OffsetDateTime::now_utc();
         let expires_at = expiry(now, ttl)?;
-        let (url, presigned) = if let Some(signer) = &self.backend.signer {
-            let m = match method {
-                TicketMethod::Get => Method::GET,
-                TicketMethod::Put => Method::PUT,
-            };
-            let url = signer
-                .signed_url(m, &path, ttl)
-                .await
-                .map_err(|e| StorageError::backend(key, e))?;
-            (url.to_string(), true)
-        } else {
-            let tk = self.backend.ticket_key.as_ref().ok_or_else(|| {
-                StorageError::Config(
-                    "this backend needs a ticket key to issue transfer tickets".into(),
-                )
-            })?;
-            let claims = TicketClaims {
-                key: key.to_owned(),
-                method,
-                max_size,
-                issued_at: now.unix_timestamp(),
-                expires_at: expires_at.unix_timestamp(),
-            };
-            (format!("{PROXY_PATH}{}", sign_ticket(tk, &claims)?), false)
+        let presigned = match method {
+            TicketMethod::Get => {
+                let info = self.head(key).await?;
+                if info.size > max_size {
+                    return Err(StorageError::TicketScope(format!(
+                        "the object is {} bytes, more than the {max_size} bytes allowed",
+                        info.size
+                    )));
+                }
+                match (&self.backend.signer, info.etag) {
+                    (Some(signer), Some(etag)) => {
+                        self.presign_get(signer.as_ref(), key, &path, etag, ttl)
+                            .await?
+                    }
+                    _ => None,
+                }
+            }
+            // ponytail: object_store cannot sign content-length, so a presigned PUT cannot cap
+            // the size; PUTs go through the proxy. Upgrade: S3 POST policy with content-length-range.
+            TicketMethod::Put => None,
+        };
+        let (url, headers, presigned) = match presigned {
+            Some((url, headers)) => (url, headers, true),
+            None => {
+                let tk = self.backend.ticket_key.as_ref().ok_or_else(|| {
+                    StorageError::Config(
+                        "this backend needs a ticket key to issue transfer tickets".into(),
+                    )
+                })?;
+                let claims = TicketClaims {
+                    key: key.to_owned(),
+                    method,
+                    max_size,
+                    issued_at: now.unix_timestamp(),
+                    expires_at: expires_at.unix_timestamp(),
+                };
+                let url = format!("{PROXY_PATH}{}", sign_ticket(tk, &claims)?);
+                (url, BTreeMap::new(), false)
+            }
         };
         Ok(TransferTicket {
             method,
@@ -444,7 +468,32 @@ impl Store {
             expires_at,
             url,
             presigned,
+            headers,
         })
+    }
+
+    /// A presigned GET pinned to version `etag`, or `None` if the signer cannot sign headers.
+    async fn presign_get(
+        &self,
+        signer: &dyn Signer,
+        key: &str,
+        path: &Path,
+        etag: String,
+        ttl: Duration,
+    ) -> Result<Option<(String, BTreeMap<String, String>)>> {
+        let Ok(value) = HeaderValue::from_str(&etag) else {
+            return Ok(None);
+        };
+        let opts =
+            SignedUrlOptions::new().with_signed_header(HeaderName::from_static("if-match"), value);
+        match signer.signed_url_opts(Method::GET, path, ttl, &opts).await {
+            Ok(url) => Ok(Some((
+                url.to_string(),
+                BTreeMap::from([("if-match".to_owned(), etag)]),
+            ))),
+            Err(object_store::Error::NotSupported { .. }) => Ok(None),
+            Err(e) => Err(StorageError::backend(key, e)),
+        }
     }
 }
 
