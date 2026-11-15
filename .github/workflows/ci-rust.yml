@@ -77,10 +77,17 @@ jobs:
       - name: release build
         run: cargo build --workspace --release --locked
 
-      # Type-checks the targets this runner does not build itself (the desktop app ships all of them).
-      - name: cross-target check
+      # Type-checks the targets the native runners do not build (the desktop app ships all of them).
+      # `ring` (rustls crypto) compiles C in its build script, so each target needs its C cross-compiler.
+      # windows-msvc and aarch64-darwin are built natively by the Windows/macOS jobs.
+      - name: cross-target check (aarch64 Linux)
         if: runner.os == 'Linux'
         run: |
-          targets="aarch64-unknown-linux-gnu x86_64-apple-darwin aarch64-apple-darwin x86_64-pc-windows-msvc"
-          rustup target add $targets
-          cargo check --workspace --all-targets --locked $(printf -- '--target %s ' $targets)
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+          rustup target add aarch64-unknown-linux-gnu
+          CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc cargo check --workspace --all-targets --locked --target aarch64-unknown-linux-gnu
+      - name: cross-target check (x86_64 macOS)
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add x86_64-apple-darwin
+          cargo check --workspace --all-targets --locked --target x86_64-apple-darwin
