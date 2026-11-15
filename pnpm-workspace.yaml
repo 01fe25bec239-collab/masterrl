@@ -10,3 +10,7 @@ allowBuilds:
 
 saveExact: true
 engineStrict: true
+
+# monaco-editor 0.57.0 pins dompurify 3.4.15 (GHSA-cg2g-xh64-v4q7, GHSA-mrv2-3pqr-j5jr); 3.4.17 fixes both.
+overrides:
+  dompurify: 3.4.17
