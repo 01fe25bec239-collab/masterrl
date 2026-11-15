@@ -11,6 +11,8 @@ export default defineConfig({
   test: {
     environment: 'jsdom',
     globals: true,
+    // lint-rules.test.ts starts typed ESLint on the whole app; its first call can pass 5 s on CI.
+    testTimeout: 30_000,
     setupFiles: ['../../packages/ui/src/lib/test-env.ts', './src/mocks/test-setup.ts'],
   },
 });
