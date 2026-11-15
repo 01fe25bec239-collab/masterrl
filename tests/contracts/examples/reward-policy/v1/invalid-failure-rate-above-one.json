@@ -1,0 +1,7 @@
+{
+  "base": "valid-math.json",
+  "set": {
+    "/spec/failure/max_failure_rate": 2
+  },
+  "fails_at": "/spec/failure/max_failure_rate"
+}

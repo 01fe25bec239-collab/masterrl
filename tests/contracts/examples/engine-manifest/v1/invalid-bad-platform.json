@@ -1,0 +1,7 @@
+{
+  "base": "valid-mlx.json",
+  "set": {
+    "/spec/runtime/environments/0/platform": "macos"
+  },
+  "fails_at": "/spec/runtime/environments/0/platform"
+}

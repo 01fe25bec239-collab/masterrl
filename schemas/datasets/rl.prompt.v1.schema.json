@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.masterrl.dev/datasets/rl.prompt.v1.schema.json",
+  "title": "rl.prompt.v1",
+  "description": "Prompts for online RL. The model generates; rewards score the result, optionally against reference.",
+  "type": "object",
+  "required": ["prompt"],
+  "properties": {
+    "prompt": { "$ref": "common.v1.schema.json#/$defs/textOrMessages" },
+    "reference": { "description": "Expected answer for verifiers.", "type": "string" },
+    "verifier": {
+      "description": "Verifier name, or a verifier config object.",
+      "anyOf": [
+        { "$ref": "common.v1.schema.json#/$defs/text" },
+        { "type": "object", "x-mrl-open": "verifier config is defined by the verifier component" }
+      ]
+    },
+    "meta": { "$ref": "common.v1.schema.json#/$defs/meta" }
+  },
+  "additionalProperties": false
+}

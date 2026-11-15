@@ -1,0 +1,7 @@
+{
+  "base": "valid-huggingface.json",
+  "set": {
+    "/scoring/0/metric": "accuracy"
+  },
+  "fails_at": "/scoring/0"
+}

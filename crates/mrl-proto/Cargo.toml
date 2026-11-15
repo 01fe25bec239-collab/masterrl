@@ -8,3 +8,14 @@ publish.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+prost = { workspace = true }
+prost-types = "=0.14.6"
+tonic = { workspace = true }
+tonic-prost = "=0.14.9"
+
+[build-dependencies]
+# protox compiles .proto files in Rust, so no system protoc is needed.
+protox = "=0.10.0"
+tonic-prost-build = "=0.14.9"

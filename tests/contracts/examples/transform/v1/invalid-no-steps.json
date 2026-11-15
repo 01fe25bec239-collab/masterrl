@@ -1,0 +1,7 @@
+{
+  "base": "valid-csv-to-sft.json",
+  "set": {
+    "/steps": []
+  },
+  "fails_at": "/steps"
+}

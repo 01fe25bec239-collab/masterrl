@@ -1,0 +1,7 @@
+{
+  "base": "valid-csv-to-sft.json",
+  "set": {
+    "/to": "sft.chat.v1"
+  },
+  "fails_at": "/to"
+}

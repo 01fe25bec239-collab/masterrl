@@ -1,0 +1,24 @@
+{
+  "schema_version": "artifact-manifest/v1",
+  "kind": "model",
+  "created_at": "2026-11-15T10:20:30Z",
+  "files": [
+    {
+      "path": "model.safetensors",
+      "size": 1048576,
+      "sha256": "abababababababababababababababababababababababababababababababab",
+      "role": "weights",
+      "format": "safetensors"
+    },
+    {
+      "path": "tokenizer/tokenizer.json",
+      "size": 0,
+      "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "role": "tokenizer"
+    }
+  ],
+  "source": {
+    "run_id": "run_0001",
+    "checkpoint_id": "ckpt_0001"
+  }
+}

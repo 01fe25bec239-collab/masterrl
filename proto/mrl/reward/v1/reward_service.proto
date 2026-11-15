@@ -1,0 +1,142 @@
+// RewardService: served by mrl-reward-exec (the reward sandbox), called by the harness over
+// a Unix domain socket. Every call carries the per-attempt nonce. The harness treats every
+// response as untrusted: same length and order, finite values, size caps.
+//
+// A failed sample is never a bare 0.0: status and resolution always say what happened.
+syntax = "proto3";
+
+package mrl.reward.v1;
+
+service RewardService {
+  // The loaded reward version, its content hash, components and batch limit.
+  rpc Describe(DescribeRequest) returns (DescribeResponse);
+  // Scores one generation batch. Same request_id returns the cached response.
+  rpc Score(ScoreRequest) returns (ScoreResponse);
+  rpc Health(HealthRequest) returns (HealthResponse);
+}
+
+message DescribeRequest {
+  string attempt_nonce = 1;
+}
+
+message DescribeResponse {
+  string reward_version_id = 1;
+  string content_sha256 = 2;
+  // "scalar.sequence" or "scalar.step".
+  string signal = 3;
+  repeated ComponentInfo components = 4;
+  // Largest number of samples one ScoreRequest may carry.
+  uint32 max_batch = 5;
+  // Highest sandbox tier any component needs (1 or 2).
+  uint32 max_tier = 6;
+}
+
+message ComponentInfo {
+  string component_id = 1;
+  // Registry reference, e.g. "builtin/math.verify@1".
+  string component_ref = 2;
+  double weight = 3;
+  double value_min = 4;
+  double value_max = 5;
+  uint32 tier = 6;
+  bool deterministic = 7;
+}
+
+message ScoreRequest {
+  string attempt_nonce = 1;
+  // Idempotency key: the same id returns the same response for the attempt.
+  string request_id = 2;
+  // Must equal the loaded version, else FAILED_PRECONDITION.
+  string reward_version_id = 3;
+  // At most max_batch; the harness splits larger batches.
+  repeated Sample samples = 4;
+  // Whole-request deadline.
+  uint32 deadline_ms = 5;
+  // Used only by declared shaping schedules.
+  uint64 trainer_step = 6;
+}
+
+message Sample {
+  // Stable id assigned by the harness.
+  string sample_id = 1;
+  // Prompt group (GRPO/RLOO): the same for all samples of one prompt.
+  string group_id = 2;
+  // Prompt as rendered for the policy.
+  string prompt = 3;
+  string completion = 4;
+  uint32 completion_token_count = 5;
+  // "stop", "length", "tool_calls" or "abort".
+  string finish_reason = 6;
+  // rl.prompt.v1 reference and verifier metadata, JSON.
+  string reference_json = 7;
+  // agent.multiturn.v1 episode for multi-turn samples, JSON; empty otherwise.
+  string episode_json = 8;
+  // Informational; components must not branch on it.
+  uint64 policy_version = 9;
+}
+
+message ScoreResponse {
+  // Same length and order as ScoreRequest.samples.
+  repeated SampleScore scores = 1;
+  BatchStats stats = 2;
+}
+
+message SampleScore {
+  string sample_id = 1;
+  // Absent when the sample is masked.
+  optional double total = 2;
+  // Per-step totals for scalar.step policies.
+  repeated double step_totals = 3;
+  repeated ComponentScore components = 4;
+  ScoreStatus status = 5;
+  Resolution resolution = 6;
+  // e.g. "gated", "clipped", "fallback", "timeout:<component>".
+  repeated string flags = 7;
+}
+
+message ComponentScore {
+  string component_id = 1;
+  // Absent when the component does not apply to this sample.
+  optional double value = 2;
+  repeated double steps = 3;
+  ScoreStatus status = 4;
+  // Bounded (4 KiB per sample); values are JSON-encoded scalars or strings.
+  map<string, string> diagnostics = 5;
+  repeated string flags = 6;
+}
+
+enum ScoreStatus {
+  SCORE_STATUS_UNSPECIFIED = 0;
+  SCORE_STATUS_OK = 1;
+  SCORE_STATUS_TIMEOUT = 2;
+  SCORE_STATUS_ERROR = 3;
+  SCORE_STATUS_INVALID_OUTPUT = 4;
+  SCORE_STATUS_NOT_APPLICABLE = 5;
+  SCORE_STATUS_INVALID_INPUT = 6;
+}
+
+enum Resolution {
+  RESOLUTION_UNSPECIFIED = 0;
+  RESOLUTION_SCORED = 1;
+  RESOLUTION_MASKED = 2;
+  RESOLUTION_FALLBACK_APPLIED = 3;
+}
+
+message BatchStats {
+  uint32 latency_ms = 1;
+  // Score status name -> count.
+  map<string, uint32> failures_by_status = 2;
+  uint32 cache_hits = 3;
+  uint32 sample_count = 4;
+}
+
+message HealthRequest {
+  string attempt_nonce = 1;
+}
+
+message HealthResponse {
+  bool serving = 1;
+  // Sandbox restarts in this attempt (the agent allows at most 3).
+  uint32 sandbox_restarts = 2;
+  string detail = 3;
+}

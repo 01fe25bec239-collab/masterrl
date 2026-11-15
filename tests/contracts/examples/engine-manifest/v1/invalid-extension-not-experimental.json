@@ -1,0 +1,8 @@
+{
+  "base": "valid-trl.json",
+  "set": {
+    "/spec/algorithms/2/maturity": "beta",
+    "/spec/algorithms/2/upstreamStatus": "stable"
+  },
+  "fails_at": "/spec/algorithms/2/maturity"
+}

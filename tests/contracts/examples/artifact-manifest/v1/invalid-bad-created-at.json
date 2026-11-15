@@ -1,0 +1,7 @@
+{
+  "base": "valid-model.json",
+  "set": {
+    "/created_at": "15 Nov 2026"
+  },
+  "fails_at": "/created_at"
+}

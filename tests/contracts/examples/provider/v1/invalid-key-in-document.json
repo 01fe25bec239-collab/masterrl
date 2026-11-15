@@ -1,0 +1,7 @@
+{
+  "base": "valid-openai-compatible.json",
+  "set": {
+    "/api_key": "sk-test"
+  },
+  "fails_at": "/"
+}

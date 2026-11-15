@@ -1,0 +1,73 @@
+# P06 (mrl-domain): sign-in, permission and quota errors.
+errors:
+  - code: MRL-AUTH-001
+    title: You need to sign in.
+    why: The app found no sign-in for this request, or your sign-in has ended.
+    what_to_do:
+      steps:
+        - Sign in again, then repeat the action.
+
+  - code: MRL-AUTH-002
+    title: The app could not sign you in with these details.
+    why: The user name and password don't match an account here.
+    what_to_do:
+      steps:
+        - Check the user name and password, then try again.
+        - Ask your org owner to reset your password if it still doesn't work.
+
+  - code: MRL-AUTH-003
+    title: This access token no longer works.
+    why: Someone revoked the token, or it reached its end date.
+    what_to_do:
+      steps:
+        - Create a new token in Settings.
+        - Update the tool that uses the old token.
+
+  - code: MRL-PERM-001
+    title: Your role doesn't allow this action.
+    why: Each project role can do a set list of things. This action needs a different role.
+    what_to_do:
+      steps:
+        - Ask a project owner or maintainer to give you the role you need.
+
+  - code: MRL-PERM-002
+    title: This feedback task isn't assigned to you.
+    why: Annotators can open only the tasks assigned to them.
+    what_to_do:
+      steps:
+        - Pick a task from your own list.
+        - Ask a maintainer to assign this task to you.
+
+  - code: MRL-QUOTA-001
+    title: Your team reached its limit on jobs or GPUs.
+    why: Your org limits how many jobs and GPUs a project can use at once.
+    what_to_do:
+      steps:
+        - Wait for a running job to finish, then submit again.
+        - Ask your org owner to raise the limit.
+
+  - code: MRL-QUOTA-002
+    title: The compute budget for this period is used up.
+    why: Your org set a budget for this period, and this job would go over it.
+    what_to_do:
+      steps:
+        - Wait for the next budget period to start.
+        - Ask your org owner to raise the budget.
+
+  - code: MRL-QUOTA-003
+    title: The app got too many requests from you in a short time.
+    why: The app limits how fast one account can send requests, so it stays fast for everyone.
+    what_to_do:
+      steps:
+        - Wait about 1 minute, then try again.
+
+  # Shared memory filling up is a machine-side problem, so it retries like other short system problems.
+  # guidance/data/errors.yaml still lists OOM/SHM_EXHAUSTED; P05 (base data) should drop that entry.
+  - code: INFRA_TRANSIENT/SHM_EXHAUSTED
+    title: "Training paused: shared memory ran out."
+    why: Data loading workers pass data through shared memory, and it filled up.
+    what_to_do:
+      steps:
+        - Lower the number of data loading workers to 0 or 1, then resume.
+      linux:
+        - If training runs in Docker, start the container with more shared memory, like `--shm-size=8g`.

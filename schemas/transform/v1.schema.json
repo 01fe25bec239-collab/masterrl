@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.masterrl.dev/transform/v1.schema.json",
+  "title": "Transform v1",
+  "description": "A recorded, repeatable mapping from a source table (file or hub dataset) to a canonical dataset schema. Steps run in order; the output must validate against `to`.",
+  "type": "object",
+  "required": ["schema_version", "name", "from", "to", "steps"],
+  "properties": {
+    "schema_version": { "const": "transform/v1" },
+    "name": { "type": "string", "minLength": 1 },
+    "description": { "type": "string" },
+    "from": {
+      "type": "object",
+      "required": ["format"],
+      "properties": {
+        "format": { "enum": ["jsonl", "json", "csv", "parquet", "hf"] },
+        "columns": { "description": "Expected source columns.", "type": "array", "items": { "type": "string", "minLength": 1 } }
+      },
+      "additionalProperties": false
+    },
+    "to": { "$ref": "../engine-manifest/v1.schema.json#/$defs/datasetSchema" },
+    "steps": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/step" } }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "field": { "description": "Column name; dots address nested fields.", "type": "string", "minLength": 1 },
+    "step": {
+      "oneOf": [
+        {
+          "description": "Rename a column.",
+          "type": "object",
+          "required": ["op", "from", "to"],
+          "properties": { "op": { "const": "rename" }, "from": { "$ref": "#/$defs/field" }, "to": { "$ref": "#/$defs/field" } },
+          "additionalProperties": false
+        },
+        {
+          "description": "Build a text field from a template with {column} placeholders.",
+          "type": "object",
+          "required": ["op", "to", "template"],
+          "properties": { "op": { "const": "template" }, "to": { "$ref": "#/$defs/field" }, "template": { "type": "string", "minLength": 1 } },
+          "additionalProperties": false
+        },
+        {
+          "description": "Turn columns into a chat messages list.",
+          "type": "object",
+          "required": ["op", "to", "messages"],
+          "properties": {
+            "op": { "const": "to_messages" },
+            "to": { "$ref": "#/$defs/field" },
+            "messages": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": ["role", "from"],
+                "properties": { "role": { "enum": ["system", "user", "assistant"] }, "from": { "$ref": "#/$defs/field" } },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Convert a column's values.",
+          "type": "object",
+          "required": ["op", "field", "type"],
+          "properties": {
+            "op": { "const": "cast" },
+            "field": { "$ref": "#/$defs/field" },
+            "type": { "enum": ["string", "number", "integer", "boolean"] },
+            "true_values": { "description": "For boolean: source values that mean true.", "type": "array", "items": { "type": "string" } }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Keep only the listed columns.",
+          "type": "object",
+          "required": ["op", "fields"],
+          "properties": { "op": { "const": "select" }, "fields": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/field" } } },
+          "additionalProperties": false
+        },
+        {
+          "description": "Drop rows where a field is missing or empty.",
+          "type": "object",
+          "required": ["op", "field"],
+          "properties": { "op": { "const": "drop_empty" }, "field": { "$ref": "#/$defs/field" } },
+          "additionalProperties": false
+        },
+        {
+          "description": "Drop exact duplicate rows over the given fields.",
+          "type": "object",
+          "required": ["op", "fields"],
+          "properties": { "op": { "const": "dedupe" }, "fields": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/field" } } },
+          "additionalProperties": false
+        },
+        {
+          "description": "Drop rows whose text field has more characters than max_chars.",
+          "type": "object",
+          "required": ["op", "field", "max_chars"],
+          "properties": {
+            "op": { "const": "max_length" },
+            "field": { "$ref": "#/$defs/field" },
+            "max_chars": { "type": "integer", "minimum": 1 }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

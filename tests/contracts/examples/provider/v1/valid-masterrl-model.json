@@ -1,0 +1,8 @@
+{
+  "schema_version": "provider/v1",
+  "id": "my-judge",
+  "display_name": "My trained judge",
+  "type": "masterrl_model",
+  "model_version_id": "mv_01jcz8",
+  "open_weight": true
+}

@@ -1,0 +1,7 @@
+{
+  "base": "valid-helpfulness.json",
+  "set": {
+    "/output/format": "xml"
+  },
+  "fails_at": "/output/format"
+}

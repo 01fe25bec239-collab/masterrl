@@ -1,0 +1,7 @@
+{
+  "base": "valid-trl.json",
+  "remove": [
+    "/spec/validate"
+  ],
+  "fails_at": "/spec"
+}

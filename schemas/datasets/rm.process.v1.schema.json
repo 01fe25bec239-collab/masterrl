@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.masterrl.dev/datasets/rm.process.v1.schema.json",
+  "title": "rm.process.v1",
+  "description": "Step-labelled solutions for process reward models: one label per step.",
+  "x-mrl-rules": {
+    "length_mismatch": "labels has exactly one entry per item in completions."
+  },
+  "type": "object",
+  "required": ["prompt", "completions", "labels"],
+  "properties": {
+    "prompt": { "$ref": "common.v1.schema.json#/$defs/text" },
+    "completions": {
+      "description": "Solution steps, in order.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "common.v1.schema.json#/$defs/text" }
+    },
+    "labels": {
+      "description": "true if the step is correct.",
+      "type": "array",
+      "items": { "type": "boolean" }
+    },
+    "meta": { "$ref": "common.v1.schema.json#/$defs/meta" }
+  },
+  "additionalProperties": false
+}

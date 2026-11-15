@@ -35,6 +35,11 @@ allow = [
     "MPL-2.0",
 ]
 
+# Mozilla's root certificate data (via object_store -> reqwest -> rustls-platform-verifier, wasm32 only).
+[[licenses.exceptions]]
+crate = "webpki-root-certs"
+allow = ["CDLA-Permissive-2.0"]
+
 [licenses.private]
 ignore = true
 

@@ -1,0 +1,7 @@
+{
+  "base": "valid-math.json",
+  "set": {
+    "/spec/failure/on_error/fallback_value": null
+  },
+  "fails_at": "/spec/failure/on_error/fallback_value"
+}

@@ -1,0 +1,7 @@
+{
+  "base": "valid-full-resume.json",
+  "set": {
+    "/checkpoint_id": "01jcz8"
+  },
+  "fails_at": "/checkpoint_id"
+}

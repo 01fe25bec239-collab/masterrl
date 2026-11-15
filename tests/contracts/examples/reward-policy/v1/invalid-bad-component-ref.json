@@ -1,0 +1,7 @@
+{
+  "base": "valid-math.json",
+  "set": {
+    "/spec/components/0/use": "math.verify"
+  },
+  "fails_at": "/spec/components/0/use"
+}

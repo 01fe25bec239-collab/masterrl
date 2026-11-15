@@ -1,0 +1,19 @@
+# buf config for MasterRL's internal RPC protos. Rules: docs/dev/contracts.md.
+version: v2
+lint:
+  use:
+    - STANDARD
+  ignore_only:
+    # The two session streams use named envelopes (WorkerMessage/AgentMessage, CoreMessage)
+    # instead of <Rpc>Request/<Rpc>Response; the agent envelopes serve both dial directions.
+    RPC_REQUEST_STANDARD_NAME:
+      - mrl/agent/v1/agent_gateway.proto
+      - mrl/worker/v1/worker_control.proto
+    RPC_RESPONSE_STANDARD_NAME:
+      - mrl/agent/v1/agent_gateway.proto
+      - mrl/worker/v1/worker_control.proto
+    RPC_REQUEST_RESPONSE_UNIQUE:
+      - mrl/agent/v1/agent_gateway.proto
+breaking:
+  use:
+    - FILE

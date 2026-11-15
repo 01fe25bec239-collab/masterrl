@@ -1,0 +1,592 @@
+// AgentGateway: the channel between the MasterRL core (mrl-server or the desktop app) and
+// mrl-agent on each machine. gRPC with mutual TLS.
+//
+// Transport-agnostic: either side may dial (local network, SSH forward, Tailscale,
+// Cloudflare Tunnel). The same two envelopes flow in both cases; only the gRPC service
+// differs. Identity is the node certificate, never the transport: AgentHello.node_id must
+// equal the node id in the client certificate SAN, else the session is closed.
+//
+// Lanes: a node opens one Session per lane so bulk telemetry never delays commands.
+// Each lane has its own seq/ack counters. Delivery is at-least-once; dedupe on
+// (node_id, lane, seq).
+//
+// The command set is closed and typed. There is no shell or exec command.
+syntax = "proto3";
+
+package mrl.agent.v1;
+
+import "google/protobuf/timestamp.proto";
+import "mrl/common/v1/common.proto";
+import "mrl/worker/v1/worker_control.proto";
+
+// Hosted by the core; the agent dials out (default, works behind NAT and from WSL2).
+service AgentGatewayService {
+  rpc Session(stream AgentMessage) returns (stream CoreMessage);
+}
+
+// Hosted by the agent; the core dials in (local network, SSH forward, tunnel).
+service AgentEndpointService {
+  rpc Session(stream CoreMessage) returns (stream AgentMessage);
+}
+
+enum Lane {
+  LANE_UNSPECIFIED = 0;
+  // Hello, commands, leases, reconciliation, command results, attempt status.
+  LANE_CONTROL = 1;
+  // Node telemetry, guard events, relayed worker messages.
+  LANE_TELEMETRY = 2;
+  // Logs and sample batches.
+  LANE_BULK = 3;
+}
+
+// Agent -> core.
+message AgentMessage {
+  uint64 seq = 1;
+  // Highest contiguous CoreMessage.seq the agent has durably accepted on this lane.
+  uint64 ack_seq = 2;
+  google.protobuf.Timestamp sent_at = 3;
+  oneof body {
+    AgentHello hello = 10;
+    Heartbeat heartbeat = 11;
+    ReconcileReport reconcile = 12;
+    CommandResult command_result = 13;
+    AttemptStatus attempt_status = 14;
+    WorkerRelay worker = 15;
+    Inventory inventory = 16;
+    NodeTelemetry telemetry = 17;
+    GuardEvent guard = 18;
+    ProbeResult probe_result = 19;
+    DeploymentStatus deployment_status = 20;
+    EnrollRequest enroll = 21;
+    RenewCertificateRequest renew_certificate = 22;
+  }
+}
+
+// Core -> agent.
+message CoreMessage {
+  uint64 seq = 1;
+  // Highest contiguous AgentMessage.seq the core has durably accepted on this lane.
+  uint64 ack_seq = 2;
+  google.protobuf.Timestamp sent_at = 3;
+  oneof body {
+    CoreHello hello = 10;
+    Command command = 11;
+    LeaseGrant lease = 12;
+    ReconcileResult reconcile_result = 13;
+    EnrollResult enroll_result = 14;
+    RenewCertificateResult renew_certificate_result = 15;
+  }
+}
+
+// ---- session handshake ----
+
+// First AgentMessage on every lane.
+message AgentHello {
+  string node_id = 1;
+  // sha256 of the DER client certificate presented on this connection.
+  string certificate_sha256 = 2;
+  string installation_id = 3;
+  string agent_version = 4;
+  repeated string protocol_versions = 5;
+  Lane lane = 6;
+  // Replay core messages from this seq (after a reconnect).
+  uint64 resume_from_seq = 7;
+  Transport transport = 8;
+}
+
+// First CoreMessage on every lane.
+message CoreHello {
+  string core_id = 1;
+  string protocol_version = 2;
+  uint32 heartbeat_interval_s = 3;
+  uint32 max_message_bytes = 4;
+  uint64 resume_from_seq = 5;
+  Lane lane = 6;
+}
+
+enum Transport {
+  TRANSPORT_UNSPECIFIED = 0;
+  TRANSPORT_DIRECT = 1;
+  TRANSPORT_SSH = 2;
+  TRANSPORT_TAILSCALE = 3;
+  TRANSPORT_CLOUDFLARE_TUNNEL = 4;
+}
+
+// ---- enrollment ----
+// Sent on a session whose TLS has a pinned server certificate but no client certificate yet.
+// Such a session may carry only EnrollRequest / EnrollResult.
+
+message EnrollRequest {
+  // Single-use "mrlj_" token, sent only after the server certificate matches the pin.
+  string join_token = 1;
+  // PKCS#10 CSR for a key generated on the node (ECDSA P-256), DER.
+  bytes csr_der = 2;
+  string hardware_fingerprint = 3;
+  string agent_version = 4;
+  string hostname = 5;
+}
+
+message EnrollResult {
+  bool ok = 1;
+  string node_id = 2;
+  // Client certificate chain, DER, leaf first.
+  repeated bytes certificate_chain_der = 3;
+  bytes ca_bundle_der = 4;
+  // Key that signs agent updates.
+  bytes update_signing_public_key = 5;
+  google.protobuf.Timestamp not_after = 6;
+  mrl.common.v1.Failure failure = 7;
+}
+
+// At 2/3 of the certificate lifetime, with a fresh keypair.
+message RenewCertificateRequest {
+  bytes csr_der = 1;
+}
+
+message RenewCertificateResult {
+  bool ok = 1;
+  repeated bytes certificate_chain_der = 2;
+  google.protobuf.Timestamp not_after = 3;
+  mrl.common.v1.Failure failure = 4;
+}
+
+// ---- liveness, leases, reconciliation (stream messages, not commands) ----
+
+message Heartbeat {
+  google.protobuf.Timestamp time = 1;
+  // Attempts running on this node; their leases are renewed by the matching LeaseGrant.
+  repeated mrl.common.v1.AttemptRef running = 2;
+}
+
+// Reply to a Heartbeat. The agent computes each deadline from the send time of the
+// acknowledged heartbeat (deadline = heartbeat sent_at + duration), on a monotonic clock.
+message LeaseGrant {
+  // seq of the AgentMessage carrying the Heartbeat being acknowledged.
+  uint64 heartbeat_seq = 1;
+  repeated AttemptLease leases = 2;
+}
+
+message AttemptLease {
+  mrl.common.v1.AttemptRef attempt = 1;
+  uint32 duration_s = 2;
+  // Without renewal the agent stops the attempt this many seconds before the deadline.
+  uint32 kill_budget_s = 3;
+}
+
+// Sent after (re)connecting: what the node is running and what finished while offline.
+message ReconcileReport {
+  repeated AttemptStatus attempts = 1;
+  repeated DeploymentStatus deployments = 2;
+}
+
+message ReconcileResult {
+  repeated AttemptDirective attempts = 1;
+}
+
+message AttemptDirective {
+  mrl.common.v1.AttemptRef attempt = 1;
+  ReconcileAction action = 2;
+}
+
+enum ReconcileAction {
+  RECONCILE_ACTION_UNSPECIFIED = 0;
+  // The attempt is still current: keep running.
+  RECONCILE_ACTION_KEEP = 1;
+  // The attempt was declared lost: stop it now.
+  RECONCILE_ACTION_STOP = 2;
+  // The attempt is over: delete its scratch and staging.
+  RECONCILE_ACTION_PURGE = 3;
+}
+
+// ---- commands (core -> agent) ----
+
+message Command {
+  // Idempotency key; CommandResult echoes it.
+  string command_id = 1;
+  oneof kind {
+    LaunchAttempt launch_attempt = 10;
+    StartAttempt start_attempt = 11;
+    CancelAttempt cancel_attempt = 12;
+    PauseAttempt pause_attempt = 13;
+    StageArtifacts stage_artifacts = 14;
+    UploadArtifacts upload_artifacts = 15;
+    Cleanup cleanup = 16;
+    Drain drain = 17;
+    UpdateCredentials update_credentials = 18;
+    LaunchDeployment launch_deployment = 19;
+    StopDeployment stop_deployment = 20;
+    Probe probe = 21;
+    CheckpointAttempt checkpoint_attempt = 22;
+  }
+}
+
+message CommandResult {
+  string command_id = 1;
+  bool accepted = 2;
+  // Set when accepted is false.
+  mrl.common.v1.Failure failure = 3;
+}
+
+// Materialise the environment and launch the worker processes up to Prepared.
+message LaunchAttempt {
+  mrl.common.v1.AttemptRef attempt = 1;
+  string engine_name = 2;
+  string engine_version = 3;
+  // A registered environment: image digest or lock hash. Never a command line.
+  string environment_id = 4;
+  string environment_digest = 5;
+  // Resolved job config, JSON.
+  string job_spec_json = 6;
+  repeated RoleLaunch roles = 7;
+  mrl.worker.v1.Allocation allocation = 8;
+  // true: stop at Prepared and wait for StartAttempt (multi-node jobs start together).
+  bool barrier = 9;
+  bool dry_run = 10;
+  uint32 smoke_steps = 11;
+  uint32 lease_duration_s = 12;
+  GuardSettings guard = 13;
+}
+
+message RoleLaunch {
+  string role_id = 1;
+  // trainer, rollout_server, ray_head, ray_worker, reward_exec, scorer, ...
+  string kind = 2;
+  bool primary = 3;
+  uint32 count = 4;
+  repeated uint32 gpu_indices = 5;
+  // Runtime from the manifest's runtimes[] for this role.
+  string runtime_ref = 6;
+}
+
+// Releases the barrier: the prepared workers start training.
+message StartAttempt {
+  mrl.common.v1.AttemptRef attempt = 1;
+}
+
+message CancelAttempt {
+  mrl.common.v1.AttemptRef attempt = 1;
+  string request_id = 2;
+  uint32 grace_s = 3;
+  string reason = 4;
+}
+
+message PauseAttempt {
+  mrl.common.v1.AttemptRef attempt = 1;
+  string request_id = 2;
+  uint32 deadline_s = 3;
+  mrl.worker.v1.PauseReason reason = 4;
+}
+
+// Emergency checkpoint: save now and keep running.
+message CheckpointAttempt {
+  mrl.common.v1.AttemptRef attempt = 1;
+  string request_id = 2;
+  uint32 deadline_s = 3;
+  string reason = 4;
+}
+
+// Download inputs (model, datasets, resume checkpoint) into the attempt staging directory.
+message StageArtifacts {
+  mrl.common.v1.AttemptRef attempt = 1;
+  repeated StageItem items = 2;
+}
+
+message StageItem {
+  // Role name the worker sees, e.g. "model", "dataset.train", "resume_from".
+  string name = 1;
+  // Presigned URL or transfer ticket URL.
+  string url = 2;
+  string sha256 = 3;
+  uint64 size = 4;
+  // Path relative to the staging directory.
+  string local_path = 5;
+  google.protobuf.Timestamp expires_at = 6;
+}
+
+// Upload staged outputs (checkpoint files) with short-lived, attempt-scoped URLs.
+message UploadArtifacts {
+  mrl.common.v1.AttemptRef attempt = 1;
+  string checkpoint_id = 2;
+  repeated UploadItem items = 3;
+}
+
+message UploadItem {
+  // Path relative to the staging directory.
+  string local_path = 1;
+  string url = 2;
+  string sha256 = 3;
+  uint64 size = 4;
+  google.protobuf.Timestamp expires_at = 5;
+}
+
+// Remove processes, GPU memory, scratch and containers; optionally prune caches.
+message Cleanup {
+  // Empty attempt id: node-wide cleanup.
+  mrl.common.v1.AttemptRef attempt = 1;
+  bool purge_scratch = 2;
+  // Prune environment and model caches down to this size (0 = leave caches).
+  uint64 cache_limit_bytes = 3;
+}
+
+// Accept no new attempts; running attempts continue unless cancel_running is set.
+message Drain {
+  bool cancel_running = 1;
+  string reason = 2;
+}
+
+// Short-lived, attempt-scoped tokens (storage, hub). Never long-lived secrets.
+message UpdateCredentials {
+  mrl.common.v1.AttemptRef attempt = 1;
+  repeated Credential credentials = 2;
+}
+
+message Credential {
+  // e.g. "storage", "hf_hub".
+  string name = 1;
+  bytes value = 2;
+  google.protobuf.Timestamp expires_at = 3;
+}
+
+message LaunchDeployment {
+  string deployment_id = 1;
+  string model_version_id = 2;
+  string environment_digest = 3;
+  // Serving config, JSON.
+  string config_json = 4;
+  repeated uint32 gpu_indices = 5;
+  uint32 port = 6;
+}
+
+message StopDeployment {
+  string deployment_id = 1;
+  uint32 grace_s = 2;
+}
+
+// Environment Doctor / Link Doctor probe.
+message Probe {
+  string request_id = 1;
+  repeated ProbeCheck checks = 2;
+  // For LINK checks: the peer node to measure against.
+  string peer_node_id = 3;
+}
+
+enum ProbeCheck {
+  PROBE_CHECK_UNSPECIFIED = 0;
+  PROBE_CHECK_OS = 1;
+  PROBE_CHECK_CPU_RAM_DISK = 2;
+  PROBE_CHECK_GPU = 3;
+  PROBE_CHECK_NVIDIA_DRIVER = 4;
+  PROBE_CHECK_WSL2 = 5;
+  PROBE_CHECK_APPLE_SILICON = 6;
+  PROBE_CHECK_ROCM = 7;
+  PROBE_CHECK_PYTHON_UV = 8;
+  PROBE_CHECK_DOCKER = 9;
+  PROBE_CHECK_LINK = 10;
+  PROBE_CHECK_ENVIRONMENT = 11;
+}
+
+// ---- attempt and deployment status (agent -> core) ----
+
+message AttemptStatus {
+  mrl.common.v1.AttemptRef attempt = 1;
+  AttemptPhase phase = 2;
+  uint64 last_step = 3;
+  // Set when the worker sent its ExitReport.
+  mrl.worker.v1.ExitKind exit_kind = 4;
+  int32 exit_code = 5;
+  // The agent's classification, combining the ExitReport with out-of-band evidence.
+  mrl.common.v1.Failure failure = 6;
+  google.protobuf.Timestamp time = 7;
+}
+
+enum AttemptPhase {
+  ATTEMPT_PHASE_UNSPECIFIED = 0;
+  ATTEMPT_PHASE_STAGING = 1;
+  ATTEMPT_PHASE_PREPARING = 2;
+  // Prepared and waiting at the barrier.
+  ATTEMPT_PHASE_PREPARED = 3;
+  ATTEMPT_PHASE_RUNNING = 4;
+  ATTEMPT_PHASE_STOPPING = 5;
+  ATTEMPT_PHASE_EXITED = 6;
+  // Stopped by the agent because the lease ran out.
+  ATTEMPT_PHASE_SELF_FENCED = 7;
+}
+
+// One Worker Protocol message, relayed unchanged.
+message WorkerRelay {
+  mrl.common.v1.AttemptRef attempt = 1;
+  string role_id = 2;
+  mrl.worker.v1.WorkerMessage message = 3;
+}
+
+message DeploymentStatus {
+  string deployment_id = 1;
+  DeploymentPhase phase = 2;
+  string endpoint = 3;
+  mrl.common.v1.Failure failure = 4;
+}
+
+enum DeploymentPhase {
+  DEPLOYMENT_PHASE_UNSPECIFIED = 0;
+  DEPLOYMENT_PHASE_STARTING = 1;
+  DEPLOYMENT_PHASE_SERVING = 2;
+  DEPLOYMENT_PHASE_STOPPED = 3;
+  DEPLOYMENT_PHASE_FAILED = 4;
+}
+
+// ---- hardware ----
+
+message Inventory {
+  string hostname = 1;
+  Platform platform = 2;
+  string os_version = 3;
+  // "x86_64" or "aarch64".
+  string arch = 4;
+  string cpu_model = 5;
+  uint32 cpu_cores = 6;
+  uint64 ram_bytes = 7;
+  uint64 disk_free_bytes = 8;
+  repeated Gpu gpus = 9;
+  bool apple_silicon = 10;
+  uint64 unified_memory_bytes = 11;
+  string cuda_runtime = 12;
+  // WSL2 networkingMode=mirrored (needed for multi-machine jobs from Windows).
+  bool wsl2_mirrored_networking = 13;
+}
+
+enum Platform {
+  PLATFORM_UNSPECIFIED = 0;
+  PLATFORM_LINUX = 1;
+  PLATFORM_MACOS = 2;
+  PLATFORM_WINDOWS = 3;
+  PLATFORM_WSL2 = 4;
+}
+
+message Gpu {
+  uint32 index = 1;
+  string uuid = 2;
+  // "nvidia", "amd" or "apple".
+  string vendor = 3;
+  string model = 4;
+  uint64 memory_bytes = 5;
+  string compute_capability = 6;
+  string driver_version = 7;
+}
+
+message NodeTelemetry {
+  google.protobuf.Timestamp time = 1;
+  repeated GpuSample gpus = 2;
+  uint64 ram_used_bytes = 3;
+  uint64 swap_used_bytes = 4;
+  uint64 disk_free_bytes = 5;
+  // Apple unified-memory pressure, 0..1.
+  double memory_pressure = 6;
+  bool on_battery = 7;
+  uint32 battery_percent = 8;
+}
+
+message GpuSample {
+  uint32 index = 1;
+  uint64 memory_used_bytes = 2;
+  uint32 utilization_percent = 3;
+  uint32 temperature_c = 4;
+  bool thermal_throttling = 5;
+}
+
+// ---- live guard (Doc 24 layer 3) ----
+
+message GuardSettings {
+  // Sampling period; 0 = agent default (1-2 s).
+  uint32 sample_interval_ms = 1;
+  // Fraction of GPU memory that triggers an emergency checkpoint.
+  double gpu_memory_soft = 2;
+  // Fraction of GPU memory that triggers a pause.
+  double gpu_memory_hard = 3;
+  double host_memory_soft = 4;
+  double host_memory_hard = 5;
+  // Pause on battery at or below this percentage.
+  uint32 battery_pause_percent = 6;
+  // Minutes above the vendor temperature limit before a pause.
+  uint32 thermal_pause_minutes = 7;
+}
+
+// A guard action taken by the agent; shown in the run timeline.
+message GuardEvent {
+  mrl.common.v1.AttemptRef attempt = 1;
+  GuardSignal signal = 2;
+  GuardLevel level = 3;
+  GuardAction action = 4;
+  double value = 5;
+  double threshold = 6;
+  string message = 7;
+  google.protobuf.Timestamp time = 8;
+}
+
+enum GuardSignal {
+  GUARD_SIGNAL_UNSPECIFIED = 0;
+  GUARD_SIGNAL_GPU_MEMORY = 1;
+  GUARD_SIGNAL_HOST_MEMORY = 2;
+  GUARD_SIGNAL_DISK_FREE = 3;
+  GUARD_SIGNAL_GPU_TEMPERATURE = 4;
+  GUARD_SIGNAL_BATTERY = 5;
+  GUARD_SIGNAL_SYSTEM_SLEEP = 6;
+  GUARD_SIGNAL_WORKER_UNRESPONSIVE = 7;
+}
+
+enum GuardLevel {
+  GUARD_LEVEL_UNSPECIFIED = 0;
+  GUARD_LEVEL_SOFT = 1;
+  GUARD_LEVEL_HARD = 2;
+}
+
+enum GuardAction {
+  GUARD_ACTION_UNSPECIFIED = 0;
+  GUARD_ACTION_WARN = 1;
+  GUARD_ACTION_EMERGENCY_CHECKPOINT = 2;
+  GUARD_ACTION_PAUSE = 3;
+  GUARD_ACTION_KILL = 4;
+  GUARD_ACTION_PRUNE_LOCAL_CHECKPOINTS = 5;
+  GUARD_ACTION_THROTTLE_DATALOADER = 6;
+  GUARD_ACTION_BLOCK_SLEEP = 7;
+}
+
+// ---- doctor ----
+
+message ProbeResult {
+  string request_id = 1;
+  repeated ProbeCheckResult checks = 2;
+  Inventory inventory = 3;
+}
+
+message ProbeCheckResult {
+  ProbeCheck check = 1;
+  ProbeOutcome outcome = 2;
+  // One plain line, e.g. "NVIDIA driver 580.65 with CUDA 12.9".
+  string summary = 3;
+  repeated mrl.common.v1.Issue issues = 4;
+  // LINK checks only.
+  LinkQuality link = 5;
+}
+
+enum ProbeOutcome {
+  PROBE_OUTCOME_UNSPECIFIED = 0;
+  PROBE_OUTCOME_OK = 1;
+  PROBE_OUTCOME_WARNING = 2;
+  PROBE_OUTCOME_FAILED = 3;
+  PROBE_OUTCOME_NOT_APPLICABLE = 4;
+}
+
+message LinkQuality {
+  double latency_ms = 1;
+  double bandwidth_mbps = 2;
+  double loss_percent = 3;
+  LinkRating rating = 4;
+  bool wifi = 5;
+}
+
+enum LinkRating {
+  LINK_RATING_UNSPECIFIED = 0;
+  LINK_RATING_GOOD = 1;
+  LINK_RATING_USABLE = 2;
+  LINK_RATING_POOR = 3;
+}

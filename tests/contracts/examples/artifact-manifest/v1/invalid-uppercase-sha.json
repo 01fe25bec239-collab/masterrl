@@ -1,0 +1,7 @@
+{
+  "base": "valid-model.json",
+  "set": {
+    "/files/0/sha256": "ABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABABAB"
+  },
+  "fails_at": "/files/0/sha256"
+}

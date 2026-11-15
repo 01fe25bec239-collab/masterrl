@@ -1,0 +1,7 @@
+{
+  "base": "valid-masterrl-model.json",
+  "set": {
+    "/open_weight": false
+  },
+  "fails_at": "/open_weight"
+}

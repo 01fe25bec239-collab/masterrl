@@ -1,0 +1,7 @@
+{
+  "base": "valid-model.json",
+  "set": {
+    "/files/0/mtime": 1
+  },
+  "fails_at": "/files/0"
+}

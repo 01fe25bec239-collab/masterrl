@@ -1,0 +1,50 @@
+name: ci-storage
+
+# mrl-storage conformance against a real S3-compatible service (SeaweedFS, same setup as `just dev`).
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-storage-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  storage:
+    name: storage (s3 conformance)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      MRL_TEST_S3_ENDPOINT: http://127.0.0.1:8333
+      # Fail instead of skipping when SeaweedFS is not reachable.
+      MRL_TEST_S3_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-nextest@0.9.152
+
+      # A job `services:` entry cannot pass SeaweedFS its `-s3` flags, so start it from the dev compose file.
+      - name: start SeaweedFS
+        run: docker compose -f deploy/local/compose.yaml up -d --wait seaweedfs
+
+      - name: conformance (local folder + S3)
+        run: cargo nextest run -p mrl-storage --locked --run-ignored all
+
+      - name: clippy with GCS and Azure backends
+        run: cargo clippy -p mrl-storage --all-targets --all-features --locked -- -D warnings
+
+      - name: SeaweedFS logs
+        if: failure()
+        run: docker compose -f deploy/local/compose.yaml logs seaweedfs

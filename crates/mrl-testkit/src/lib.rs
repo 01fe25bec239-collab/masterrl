@@ -1,4 +1,10 @@
 //! Shared test helpers for MasterRL's Rust crates. Used only from tests.
+//!
+//! - [`seams`]: in-memory and deterministic seam implementations.
+//! - [`server`]: start a real `mrl-server` on loopback and talk HTTP to it.
+
+pub mod seams;
+pub mod server;
 
 /// The version of this crate, taken from its `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

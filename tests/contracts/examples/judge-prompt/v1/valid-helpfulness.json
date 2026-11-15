@@ -1,0 +1,32 @@
+{
+  "schema_version": "judge-prompt/v1",
+  "name": "helpfulness-v2",
+  "description": "Rates support answers.",
+  "provider": "local-ollama",
+  "model": "qwen3:8b",
+  "system_prompt": "You are a strict grader.",
+  "prompt_template": "Question:\n{prompt}\n\nAnswer:\n{completion}\n\nReference:\n{reference}\n\nRate each criterion:\n{criteria}",
+  "criteria": [
+    {
+      "id": "correct",
+      "description": "The answer is factually right.",
+      "weight": 2
+    },
+    {
+      "id": "clear",
+      "description": "Easy to follow.",
+      "weight": 1
+    }
+  ],
+  "output": {
+    "format": "json",
+    "min": 0,
+    "max": 10
+  },
+  "sampling": {
+    "temperature": 0,
+    "max_tokens": 256,
+    "seed": 7
+  },
+  "cache": true
+}

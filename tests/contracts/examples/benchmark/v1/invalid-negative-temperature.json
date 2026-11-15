@@ -1,0 +1,7 @@
+{
+  "base": "valid-huggingface.json",
+  "set": {
+    "/generation/temperature": -0.1
+  },
+  "fails_at": "/generation/temperature"
+}

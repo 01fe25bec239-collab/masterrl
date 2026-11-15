@@ -1,0 +1,7 @@
+{
+  "base": "valid-math.json",
+  "remove": [
+    "/spec/failure/on_error/fallback_value"
+  ],
+  "fails_at": "/spec/failure/on_error"
+}

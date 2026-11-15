@@ -1,0 +1,7 @@
+{
+  "base": "valid-profile.json",
+  "set": {
+    "/updated_at": "yesterday"
+  },
+  "fails_at": "/updated_at"
+}
