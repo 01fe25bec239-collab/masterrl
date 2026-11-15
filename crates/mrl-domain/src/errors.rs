@@ -39,11 +39,17 @@ pub enum ErrorFamily {
     Res,
     /// `STORE`: object storage, file lists and transfer links.
     Store,
+    /// `STATE`: the action isn't allowed in the item's current state.
+    State,
+    /// `RWD`: reward policies and reward services.
+    Rwd,
+    /// `NODE`: machines and their agents.
+    Node,
 }
 
 impl ErrorFamily {
     /// Every family.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 17] = [
         Self::Auth,
         Self::Perm,
         Self::Val,
@@ -58,6 +64,9 @@ impl ErrorFamily {
         Self::Internal,
         Self::Res,
         Self::Store,
+        Self::State,
+        Self::Rwd,
+        Self::Node,
     ];
 
     /// The family name, like `CAP`.
@@ -77,6 +86,9 @@ impl ErrorFamily {
             Self::Internal => "INTERNAL",
             Self::Res => "RES",
             Self::Store => "STORE",
+            Self::State => "STATE",
+            Self::Rwd => "RWD",
+            Self::Node => "NODE",
         }
     }
 }
@@ -371,6 +383,15 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         code(Store, 13),
         "A file changed while the app was uploading it.",
     ),
+    // <mrl:errors P11> rows for P11 go right below this line.
+
+    // <mrl:errors P12> rows for P12 go right below this line.
+
+    // <mrl:errors P13> rows for P13 go right below this line.
+
+    // <mrl:errors P14> rows for P14 go right below this line.
+
+    // <mrl:errors P15> rows for P15 go right below this line.
 ];
 
 /// Every code with its title: the registry plus every capability rejection.
@@ -456,12 +477,14 @@ mod tests {
             assert_eq!(c.to_string().parse(), Ok(c));
             assert!(title.ends_with('.') && !title.is_empty(), "{c}");
         }
+        // Families reserved by names-frozen-v1 may stay empty until a part adds codes.
+        let reserved = [ErrorFamily::State, ErrorFamily::Rwd, ErrorFamily::Node];
         let families: BTreeSet<_> = seen.iter().map(ErrorCode::family).collect();
-        assert_eq!(
-            families,
-            ErrorFamily::ALL.into_iter().collect(),
-            "every family has a code"
-        );
+        let expected: BTreeSet<_> = ErrorFamily::ALL
+            .into_iter()
+            .filter(|f| !reserved.contains(f) || families.contains(f))
+            .collect();
+        assert_eq!(families, expected, "every family has a code");
     }
 
     /// `(code, title)` for every entry of the built guidance catalog.
