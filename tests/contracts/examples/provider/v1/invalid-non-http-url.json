@@ -1,0 +1,7 @@
+{
+  "base": "valid-local-server.json",
+  "set": {
+    "/base_url": "file:///tmp/x"
+  },
+  "fails_at": "/base_url"
+}

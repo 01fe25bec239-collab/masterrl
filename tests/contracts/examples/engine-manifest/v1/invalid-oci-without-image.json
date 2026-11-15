@@ -1,0 +1,7 @@
+{
+  "base": "valid-trl.json",
+  "remove": [
+    "/spec/runtime/environments/0/image"
+  ],
+  "fails_at": "/spec/runtime/environments/0"
+}

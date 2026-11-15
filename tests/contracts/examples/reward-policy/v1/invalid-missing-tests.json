@@ -1,0 +1,7 @@
+{
+  "base": "valid-math.json",
+  "remove": [
+    "/spec/tests"
+  ],
+  "fails_at": "/spec"
+}

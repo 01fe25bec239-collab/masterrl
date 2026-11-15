@@ -1,0 +1,7 @@
+{
+  "base": "valid-huggingface.json",
+  "set": {
+    "/source/revision": "main"
+  },
+  "fails_at": "/source"
+}

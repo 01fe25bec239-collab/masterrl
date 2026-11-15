@@ -1,0 +1,7 @@
+{
+  "base": "valid-full-resume.json",
+  "set": {
+    "/kind": "full_state"
+  },
+  "fails_at": "/kind"
+}

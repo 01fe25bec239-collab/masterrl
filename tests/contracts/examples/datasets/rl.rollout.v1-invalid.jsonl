@@ -1,0 +1,4 @@
+{"sample_id":"s-1","group_id":"g-1","batch_no":0,"prompt":"Repeat: a","completion":"a","policy_version":0,"reward_total":1.0,"resolution":"scored"}
+{"sample_id":"s-1","group_id":"g-1","batch_no":0,"prompt":"Repeat: a","completion":"a","reward_total":1.0,"status":"ok","resolution":"scored"}
+{"sample_id":"s-1","group_id":"g-1","batch_no":0,"prompt":"Repeat: a","completion":"a","policy_version":0,"reward_total":"0","status":"ok","resolution":"scored"}
+{"sample_id":"s-1","group_id":"g-1","batch_no":0,"prompt":"Repeat: a","completion":"a","policy_version":0,"reward_total":1.0,"status":"failed","resolution":"scored"}

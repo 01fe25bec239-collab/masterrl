@@ -1,0 +1,9 @@
+{
+  "base": "valid-trl.json",
+  "set": {
+    "/spec/algorithms/0/requires/datasetSchemas/train": [
+      "sft.chat.v9"
+    ]
+  },
+  "fails_at": "/spec/algorithms/0/requires/datasetSchemas/train/0"
+}

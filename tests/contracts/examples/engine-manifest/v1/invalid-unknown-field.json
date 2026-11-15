@@ -1,0 +1,7 @@
+{
+  "base": "valid-mlx.json",
+  "set": {
+    "/spec/gpuCount": 1
+  },
+  "fails_at": "/spec"
+}

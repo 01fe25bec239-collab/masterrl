@@ -1,0 +1,7 @@
+{
+  "base": "valid-custom-command.json",
+  "remove": [
+    "/command"
+  ],
+  "fails_at": "/"
+}

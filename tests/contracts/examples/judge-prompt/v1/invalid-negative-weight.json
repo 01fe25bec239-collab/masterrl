@@ -1,0 +1,7 @@
+{
+  "base": "valid-helpfulness.json",
+  "set": {
+    "/criteria/0/weight": -1
+  },
+  "fails_at": "/criteria/0/weight"
+}

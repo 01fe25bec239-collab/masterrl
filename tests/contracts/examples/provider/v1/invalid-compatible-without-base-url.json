@@ -1,0 +1,7 @@
+{
+  "base": "valid-openai-compatible.json",
+  "remove": [
+    "/base_url"
+  ],
+  "fails_at": "/"
+}

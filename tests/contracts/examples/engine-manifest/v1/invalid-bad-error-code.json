@@ -1,0 +1,7 @@
+{
+  "base": "valid-trl.json",
+  "set": {
+    "/spec/constraints/0/error/code": "no-chat-template"
+  },
+  "fails_at": "/spec/constraints/0/error/code"
+}

@@ -1,0 +1,7 @@
+{
+  "base": "valid-model.json",
+  "set": {
+    "/schema_version": "artifact-manifest/v2"
+  },
+  "fails_at": "/schema_version"
+}

@@ -1,0 +1,7 @@
+{
+  "base": "valid-model.json",
+  "set": {
+    "/kind": "Model"
+  },
+  "fails_at": "/kind"
+}

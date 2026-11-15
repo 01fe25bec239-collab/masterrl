@@ -1,0 +1,7 @@
+{
+  "base": "valid-mlx.json",
+  "set": {
+    "/spec/adapter/entrypoint": "mrl_adapter_mlx.engine.MlxEngine"
+  },
+  "fails_at": "/spec/adapter/entrypoint"
+}

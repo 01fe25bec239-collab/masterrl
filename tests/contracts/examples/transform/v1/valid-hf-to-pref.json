@@ -1,0 +1,30 @@
+{
+  "schema_version": "transform/v1",
+  "name": "hh to pairwise",
+  "from": {
+    "format": "hf"
+  },
+  "to": "pref.pairwise.v1",
+  "steps": [
+    {
+      "op": "rename",
+      "from": "good",
+      "to": "chosen"
+    },
+    {
+      "op": "rename",
+      "from": "bad",
+      "to": "rejected"
+    },
+    {
+      "op": "template",
+      "to": "prompt",
+      "template": "Question: {question}"
+    },
+    {
+      "op": "cast",
+      "field": "margin",
+      "type": "number"
+    }
+  ]
+}

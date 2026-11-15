@@ -1,0 +1,7 @@
+{
+  "base": "valid-trl.json",
+  "set": {
+    "/spec/runtime/environments/0/image": "ghcr.io/masterrl/engine-trl:latest"
+  },
+  "fails_at": "/spec/runtime/environments/0/image"
+}

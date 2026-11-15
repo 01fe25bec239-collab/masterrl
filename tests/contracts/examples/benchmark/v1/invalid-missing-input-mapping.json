@@ -1,0 +1,7 @@
+{
+  "base": "valid-huggingface.json",
+  "remove": [
+    "/mapping/input"
+  ],
+  "fails_at": "/mapping"
+}

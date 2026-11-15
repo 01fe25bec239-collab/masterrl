@@ -1,0 +1,14 @@
+{
+  "schema_version": "provider/v1",
+  "id": "my-cli",
+  "display_name": "My CLI",
+  "type": "custom_command",
+  "command": {
+    "argv": [
+      "my-llm",
+      "--quiet"
+    ],
+    "timeout_s": 120
+  },
+  "open_weight": false
+}

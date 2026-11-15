@@ -1,0 +1,7 @@
+{
+  "base": "valid-model.json",
+  "remove": [
+    "/files"
+  ],
+  "fails_at": "/"
+}

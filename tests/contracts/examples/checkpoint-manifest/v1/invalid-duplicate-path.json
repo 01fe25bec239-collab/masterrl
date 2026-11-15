@@ -1,0 +1,7 @@
+{
+  "base": "valid-full-resume.json",
+  "set": {
+    "/files/1/path": "model.safetensors"
+  },
+  "fails_at": "rule:duplicate_path"
+}

@@ -1,0 +1,7 @@
+{
+  "base": "valid-helpfulness.json",
+  "set": {
+    "/prompt_template": "Rate {prompt}"
+  },
+  "fails_at": "/prompt_template"
+}

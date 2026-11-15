@@ -1,0 +1,53 @@
+{
+  "schema_version": "setup-profile/v1",
+  "updated_at": "2026-11-15T10:20:30Z",
+  "machines": [
+    {
+      "id": "m1",
+      "name": "Desk PC",
+      "node_id": "node_01jcz8",
+      "transport": "direct",
+      "address": "192.168.1.20:7443",
+      "wsl2": true
+    },
+    {
+      "id": "m2",
+      "name": "Lab server",
+      "transport": "ssh",
+      "ssh": {
+        "host": "lab",
+        "port": 22,
+        "user": "me"
+      }
+    },
+    {
+      "id": "m3",
+      "name": "Cloud box",
+      "transport": "cloudflare_tunnel",
+      "tunnel_hostname": "agent.example.org"
+    },
+    {
+      "id": "m4",
+      "name": "Laptop",
+      "transport": "tailscale",
+      "address": "laptop.tail1234.ts.net"
+    }
+  ],
+  "preferences": {
+    "theme": "system",
+    "language": "en-GB",
+    "experience": "beginner",
+    "default_machine": "m1",
+    "notifications": true
+  },
+  "teams": [
+    {
+      "team_id": "team_1",
+      "name": "Lab",
+      "role": "member"
+    }
+  ],
+  "ui": {
+    "sidebar": "collapsed"
+  }
+}

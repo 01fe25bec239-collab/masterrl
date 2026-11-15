@@ -1,0 +1,10 @@
+{
+  "base": "valid-csv-to-sft.json",
+  "set": {
+    "/steps/0": {
+      "op": "shell",
+      "command": "rm -rf /"
+    }
+  },
+  "fails_at": "/steps/0"
+}

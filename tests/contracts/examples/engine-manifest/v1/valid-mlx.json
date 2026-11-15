@@ -1,0 +1,138 @@
+{
+  "apiVersion": "mrl.dev/engine/v1",
+  "kind": "EngineManifest",
+  "metadata": {
+    "name": "mlx",
+    "version": "0.1.0",
+    "displayName": "MLX (Apple Silicon)",
+    "license": "Apache-2.0"
+  },
+  "spec": {
+    "adapter": {
+      "entrypoint": "mrl_adapter_mlx.engine:MlxEngine",
+      "adapterApi": ">=1.0,<2",
+      "workerProtocol": ">=1.0,<2"
+    },
+    "upstream": [
+      {
+        "name": "mlx-lm",
+        "version": "0.29.0",
+        "license": "MIT",
+        "source": "https://pypi.org/project/mlx-lm/"
+      }
+    ],
+    "runtime": {
+      "environments": [
+        {
+          "id": "metal-uv",
+          "kind": "uv",
+          "lockfile": "uv.lock",
+          "lockSha256": "abababababababababababababababababababababababababababababababab",
+          "python": "3.12",
+          "platform": "darwin/arm64",
+          "accelerator": {
+            "vendor": "apple",
+            "runtime": "mlx"
+          },
+          "mrlRuntime": "0.1.0"
+        }
+      ]
+    },
+    "runtimes": [
+      {
+        "role": "trainer",
+        "runtime_ref": "metal-uv"
+      }
+    ],
+    "capabilities": {
+      "updateStrategies": [
+        "lora"
+      ],
+      "precision": [
+        "bf16",
+        "fp32"
+      ],
+      "parallelism": [
+        "single"
+      ],
+      "multiNode": false,
+      "execution": {
+        "modes": [
+          "offline"
+        ]
+      },
+      "resume": true,
+      "pause": true,
+      "onDemandCheckpoint": true,
+      "trustRemoteCode": "never"
+    },
+    "topology": {
+      "roles": [
+        {
+          "id": "trainer",
+          "kind": "trainer",
+          "environment": "metal-uv",
+          "count": 1,
+          "reportsVia": "worker_protocol"
+        }
+      ],
+      "primary": "trainer",
+      "network": "none",
+      "launcher": "inprocess"
+    },
+    "algorithms": [
+      {
+        "id": "sft",
+        "displayName": "Supervised fine-tuning",
+        "summary": "LoRA fine-tuning on Apple Silicon.",
+        "parent": "mlx_lm.lora",
+        "upstreamStatus": "stable",
+        "maturity": "beta",
+        "fidelity": "full",
+        "requires": {
+          "datasetSchemas": {
+            "train": [
+              "sft.messages.v1"
+            ]
+          },
+          "signals": {
+            "reward": "none",
+            "reference": "none",
+            "referenceModel": "none",
+            "critic": "none",
+            "rolloutEngine": "none",
+            "teacher": "none"
+          }
+        },
+        "metrics": [
+          {
+            "name": "train/loss",
+            "kind": "live",
+            "required": true
+          }
+        ],
+        "resume": true,
+        "pause": true
+      }
+    ],
+    "checkpoint": {
+      "format": "mlx-adapter-v1",
+      "resumable": true,
+      "portableWeights": false
+    },
+    "validate": {
+      "l1": false
+    },
+    "hardware": {
+      "os": [
+        "macos"
+      ],
+      "accelerators": [
+        "apple"
+      ],
+      "apple_silicon": true,
+      "wsl2": false,
+      "minHostMemoryGib": 16
+    }
+  }
+}

@@ -1,0 +1,10 @@
+{
+  "base": "valid-openai-compatible.json",
+  "set": {
+    "/type": "anthropic"
+  },
+  "remove": [
+    "/api_key_ref"
+  ],
+  "fails_at": "/"
+}

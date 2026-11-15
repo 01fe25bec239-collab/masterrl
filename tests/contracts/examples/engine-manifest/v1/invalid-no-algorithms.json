@@ -1,0 +1,7 @@
+{
+  "base": "valid-trl.json",
+  "set": {
+    "/spec/algorithms": []
+  },
+  "fails_at": "/spec/algorithms"
+}

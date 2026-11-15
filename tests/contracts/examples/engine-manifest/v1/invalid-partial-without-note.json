@@ -1,0 +1,7 @@
+{
+  "base": "valid-trl.json",
+  "remove": [
+    "/spec/algorithms/2/fidelityNote"
+  ],
+  "fails_at": "/spec/algorithms/2"
+}

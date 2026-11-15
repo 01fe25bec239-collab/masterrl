@@ -1,0 +1,7 @@
+{
+  "base": "valid-model.json",
+  "set": {
+    "/files/0/role": ""
+  },
+  "fails_at": "/files/0/role"
+}
