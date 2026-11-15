@@ -2626,6 +2626,154 @@
       }
     },
     {
+      "code": "MRL-STORE-001",
+      "title": "The app refused a storage path.",
+      "why": "The path points outside your workspace's storage area, or it has a part the app doesn't allow, like `..`.",
+      "what_to_do": {
+        "steps": [
+          "Try the action again from the app.",
+          "If a script sent the request, use the paths the app gives you."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STORE-002",
+      "title": "A name used for storage has characters the app doesn't allow.",
+      "why": "Names in storage paths can use only letters, digits and the marks . _ - = + @ and commas.",
+      "what_to_do": {
+        "steps": [
+          "Rename the item with only allowed characters, then try again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STORE-003",
+      "title": "The app could not find this file in storage.",
+      "why": "The file was deleted, or it was never fully saved.",
+      "what_to_do": {
+        "steps": [
+          "Check that the item still exists in the app.",
+          "If you were uploading it, upload it again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STORE-004",
+      "title": "The storage service did not respond as expected.",
+      "why": "The app tried several times, but the storage service kept failing. It may be down or out of reach.",
+      "what_to_do": {
+        "steps": [
+          "Check your network connection.",
+          "Wait about 1–2 minutes, then try again.",
+          "If it keeps failing, ask your admin to check the storage service."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STORE-005",
+      "title": "The app could not read or write a file on this computer.",
+      "why": "The disk may be full, or the app may not have permission to use that folder.",
+      "what_to_do": {
+        "steps": [
+          "Free up disk space, then try again.",
+          "Check that the app can write to the folder named in Details."
+        ],
+        "windows": [
+          "Right-click the folder, open Properties, then check the Security tab."
+        ],
+        "macos": [
+          "Open System Settings, then Privacy & Security, then Files and Folders."
+        ],
+        "linux": [
+          "Run `ls -ld` on the folder to see who can write to it."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STORE-006",
+      "title": "The storage settings need a change.",
+      "why": "A storage setting is missing or has a value the app doesn't accept. Details names the setting.",
+      "what_to_do": {
+        "steps": [
+          "Open the storage settings and fix the setting named in Details.",
+          "Restart the app, then try again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STORE-007",
+      "title": "The app refused this transfer link.",
+      "why": "The link was changed, cut short or made by a different server. The app could not confirm it is real.",
+      "what_to_do": {
+        "steps": [
+          "Ask the app for a new transfer link, then try again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STORE-008",
+      "title": "This transfer link has expired.",
+      "why": "Transfer links work for 15 minutes at most, to keep your files safe.",
+      "what_to_do": {
+        "steps": [
+          "Ask the app for a new transfer link, then try again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STORE-009",
+      "title": "This transfer link doesn't allow that.",
+      "why": "Each link allows one action on one file, up to a set size. This request asked for more.",
+      "what_to_do": {
+        "steps": [
+          "Ask the app for a new link for this exact action and file."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STORE-010",
+      "title": "A file changed on its way through storage.",
+      "why": "The content the app received doesn't match the content that was saved. The app deleted the damaged copy.",
+      "what_to_do": {
+        "steps": [
+          "Try the download again.",
+          "If it fails again, upload the file again from the original."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STORE-011",
+      "title": "Some files in storage don't match their file list.",
+      "why": "Files are missing, have the wrong size or have different content. Details lists each file.",
+      "what_to_do": {
+        "steps": [
+          "Open Details to see which files need attention.",
+          "Upload those files again, or save the item again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STORE-012",
+      "title": "The app could not read this file list.",
+      "why": "The file list is not in the format the app expects. Details names the field that needs a fix.",
+      "what_to_do": {
+        "steps": [
+          "Save the item again so the app writes a new file list."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STORE-013",
+      "title": "A file changed while the app was uploading it.",
+      "why": "Something wrote to the file during the upload, so the copy in storage would not match.",
+      "what_to_do": {
+        "steps": [
+          "Wait until nothing else is writing to the file.",
+          "Start the upload again."
+        ]
+      }
+    },
+    {
       "code": "MRL-VAL-001",
       "title": "The app could not read this request.",
       "why": "The request is not in a format the app understands. Part of it may be missing.",

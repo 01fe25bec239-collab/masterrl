@@ -37,11 +37,13 @@ pub enum ErrorFamily {
     Internal,
     /// `RES`: the item or address does not exist, or is hidden from you.
     Res,
+    /// `STORE`: object storage, file lists and transfer links.
+    Store,
 }
 
 impl ErrorFamily {
     /// Every family.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::Auth,
         Self::Perm,
         Self::Val,
@@ -55,6 +57,7 @@ impl ErrorFamily {
         Self::Conflict,
         Self::Internal,
         Self::Res,
+        Self::Store,
     ];
 
     /// The family name, like `CAP`.
@@ -73,6 +76,7 @@ impl ErrorFamily {
             Self::Conflict => "CONFLICT",
             Self::Internal => "INTERNAL",
             Self::Res => "RES",
+            Self::Store => "STORE",
         }
     }
 }
@@ -172,7 +176,9 @@ const fn code(family: ErrorFamily, number: u16) -> ErrorCode {
     ErrorCode::known(family, number)
 }
 
-use ErrorFamily::{Auth, Conflict, Data, Env, Idem, Internal, Link, Model, Perm, Quota, Res, Val};
+use ErrorFamily::{
+    Auth, Conflict, Data, Env, Idem, Internal, Link, Model, Perm, Quota, Res, Store, Val,
+};
 
 /// Every non-capability code with its title. `MRL-CAP` codes live in [`CapabilityRejection`].
 pub const REGISTRY: &[(ErrorCode, &str)] = &[
@@ -329,6 +335,41 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
     (
         code(Internal, 2),
         "A service the server needs is not answering.",
+    ),
+    // Storage errors (P08).
+    (code(Store, 1), "The app refused a storage path."),
+    (
+        code(Store, 2),
+        "A name used for storage has characters the app doesn't allow.",
+    ),
+    (
+        code(Store, 3),
+        "The app could not find this file in storage.",
+    ),
+    (
+        code(Store, 4),
+        "The storage service did not respond as expected.",
+    ),
+    (
+        code(Store, 5),
+        "The app could not read or write a file on this computer.",
+    ),
+    (code(Store, 6), "The storage settings need a change."),
+    (code(Store, 7), "The app refused this transfer link."),
+    (code(Store, 8), "This transfer link has expired."),
+    (code(Store, 9), "This transfer link doesn't allow that."),
+    (
+        code(Store, 10),
+        "A file changed on its way through storage.",
+    ),
+    (
+        code(Store, 11),
+        "Some files in storage don't match their file list.",
+    ),
+    (code(Store, 12), "The app could not read this file list."),
+    (
+        code(Store, 13),
+        "A file changed while the app was uploading it.",
     ),
 ];
 
