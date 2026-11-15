@@ -416,22 +416,58 @@ async fn authorize_maps_decisions_to_errors() {
 
 #[tokio::test]
 async fn oversized_body_over_the_wire_is_problem_413() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     let srv = TestServer::solo(module(TestModule::default())).await;
-    let big = "x".repeat(mrl_server::http::BODY_LIMIT + 1);
-    let len = big.len().to_string();
-    let headers = [
-        (LAUNCH_SECRET_HEADER, TEST_SECRET),
-        ("content-type", "application/json"),
-        ("content-length", len.as_str()),
-    ];
-    let r = srv
-        .request(Method::POST, "/api/v1/items", &headers, big)
-        .await;
-    assert_eq!(r.status, 413);
-    assert_eq!(r.headers["content-type"], "application/problem+json");
-    assert_eq!(r.json()["code"], "MRL-VAL-007");
-    assert_eq!(r.json()["trace_id"].as_str().unwrap().len(), 32);
+    // Send only the head, declaring a body over 2 MiB, and read the answer before sending
+    // any body byte. The server must refuse from Content-Length alone. With no unread data
+    // on its socket, its close is a clean FIN on every OS (Windows resets on unread data).
+    let head = format!(
+        "POST /api/v1/items HTTP/1.1\r\nhost: test\r\n{LAUNCH_SECRET_HEADER}: {TEST_SECRET}\r\n\
+         content-type: application/json\r\ncontent-length: {}\r\n\r\n",
+        mrl_server::http::BODY_LIMIT + 1
+    );
+    let mut tcp = tokio::net::TcpStream::connect(srv.api()).await.unwrap();
+    tcp.write_all(head.as_bytes()).await.unwrap();
+    let mut raw = Vec::new();
+    let read = async {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = tcp.read(&mut buf).await.unwrap();
+            raw.extend_from_slice(&buf[..n]);
+            if n == 0 || response_complete(&raw) {
+                break;
+            }
+        }
+    };
+    tokio::time::timeout(Duration::from_secs(5), read)
+        .await
+        .unwrap();
+    let text = String::from_utf8(raw).unwrap();
+    let (head, body) = text.split_once("\r\n\r\n").unwrap();
+    let head = head.to_ascii_lowercase();
+    assert!(head.starts_with("http/1.1 413"), "{head}");
+    assert!(
+        head.contains("content-type: application/problem+json"),
+        "{head}"
+    );
+    let json: serde_json::Value = serde_json::from_str(body).unwrap();
+    assert_eq!(json["code"], "MRL-VAL-007");
+    assert_eq!(json["status"], 413);
+    assert_eq!(json["trace_id"].as_str().unwrap().len(), 32);
     srv.shutdown().await.unwrap();
+}
+
+/// True once `raw` holds a full response head and `content-length` body bytes.
+fn response_complete(raw: &[u8]) -> bool {
+    let Some(end) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&raw[..end]).to_ascii_lowercase();
+    let len = head
+        .lines()
+        .find_map(|l| l.strip_prefix("content-length:"))
+        .and_then(|v| v.trim().parse::<usize>().ok());
+    len.is_some_and(|len| raw.len() >= end + 4 + len)
 }
 
 /// Writes a throwaway self-signed `localhost` cert and key; returns (dir, cert DER).
