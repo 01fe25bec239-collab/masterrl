@@ -1,0 +1,149 @@
+openapi: 3.1.0
+info:
+  title: MasterRL API
+  description: The MasterRL server API. Errors use RFC 9457 problem documents.
+  license:
+    name: Apache-2.0
+    identifier: Apache-2.0
+  version: 0.1.0
+paths:
+  /healthz:
+    get:
+      tags:
+      - health
+      summary: 'Liveness: the process is up.'
+      operationId: healthz
+      responses:
+        '200':
+          description: The process is up.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Health'
+  /readyz:
+    get:
+      tags:
+      - health
+      summary: 'Readiness: every module check passes and the server is not shutting down.'
+      operationId: readyz
+      responses:
+        '200':
+          description: Ready for traffic.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+        '503':
+          description: Not ready, or shutting down.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Readiness'
+components:
+  schemas:
+    CheckResult:
+      type: object
+      description: One readiness check result.
+      required:
+      - name
+      - status
+      properties:
+        detail:
+          type:
+          - string
+          - 'null'
+          description: Why it is not ready.
+        name:
+          type: string
+          description: Check name.
+        status:
+          type: string
+          description: '`ready` or `not_ready`.'
+    FieldError:
+      type: object
+      description: One field problem inside a 422 response.
+      required:
+      - path
+      - code
+      - message
+      - hint
+      properties:
+        code:
+          type: string
+          description: Field-level code, like `MRL-VAL-003`.
+        hint:
+          type: string
+          description: How to fix it.
+        message:
+          type: string
+          description: What is wrong with the field.
+        path:
+          type: string
+          description: JSON Pointer to the field, like `/config/peft/r`.
+    Health:
+      type: object
+      description: '`/healthz` body.'
+      required:
+      - status
+      properties:
+        status:
+          type: string
+          description: '`ok`.'
+    Problem:
+      type: object
+      description: RFC 9457 problem document.
+      required:
+      - type
+      - title
+      - status
+      - detail
+      - instance
+      - code
+      - trace_id
+      properties:
+        code:
+          type: string
+          description: The error code, like `MRL-AUTH-001`.
+        detail:
+          type: string
+          description: What happened in this case.
+        errors:
+          type: array
+          items:
+            $ref: '#/components/schemas/FieldError'
+          description: Field problems, present on 422.
+        instance:
+          type: string
+          description: The request path.
+        status:
+          type: integer
+          format: int32
+          description: HTTP status.
+          minimum: 0
+        title:
+          type: string
+          description: Plain-language title from the guidance catalog.
+        trace_id:
+          type: string
+          description: Trace id to quote in reports.
+        type:
+          type: string
+          description: '`https://docs.masterrl.dev/errors/<code>`.'
+    Readiness:
+      type: object
+      description: '`/readyz` body.'
+      required:
+      - status
+      - checks
+      properties:
+        checks:
+          type: array
+          items:
+            $ref: '#/components/schemas/CheckResult'
+          description: Module checks.
+        status:
+          type: string
+          description: '`ready`, `not_ready` or `draining`.'
+tags:
+- name: health
+  description: Liveness and readiness.

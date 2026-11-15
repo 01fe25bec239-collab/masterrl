@@ -1,0 +1,34 @@
+# Sample settings for local development: `cargo run -p mrl-server -- --config crates/mrl-server/config/server.dev.toml`
+# Any key can be overridden with MRL_<SECTION>__<KEY>, like MRL_SERVER__MODE=team.
+
+[server]
+# solo: this computer only, 127.0.0.1 on a random port. team: the listeners below.
+mode = "solo"
+roles = ["api", "gateway", "scheduler", "background"]
+shutdown_grace_seconds = 30
+
+[server.listeners]
+api = "0.0.0.0:8443"
+grpc = "0.0.0.0:9443"
+internal = "127.0.0.1:9090"
+
+[server.rate_limit.principal]
+per_second = 20
+burst = 40
+
+[server.rate_limit.org]
+per_second = 100
+burst = 200
+
+[database]
+# The dev stack from `just dev`. Dev-only password.
+url = "postgres://mrl:mrl-dev-only@127.0.0.1:55432/masterrl"
+
+[object_store]
+url = "s3://masterrl-dev/artifacts"
+endpoint = "http://127.0.0.1:8333"
+
+[telemetry]
+log_level = "info"
+# Uncomment to send traces to the dev collector from `just dev`.
+# otlp_endpoint = "http://127.0.0.1:4317"
