@@ -188,23 +188,96 @@ async fn idempotency_keys_replay_refuse_and_expire() {
         "released keys start over"
     );
 
-    // A key a crashed server left running is taken over after 10 minutes.
-    t.seed("UPDATE idempotency_keys SET created_at = now() - interval '11 minutes' WHERE scope = 'usr_2'").await;
-    assert_eq!(
-        store.begin("usr_2", "k", b).await.unwrap(),
-        IdempotencyBegin::Started
-    );
-
-    // Expired keys are free again and swept.
-    t.seed("UPDATE idempotency_keys SET expires_at = now() - interval '1 second' WHERE scope = 'usr_1'").await;
+    // Expired finished keys are free again.
+    t.seed("UPDATE idempotency_keys SET expires_at = now() - interval '1 second' WHERE scope = 'usr_1'")
+        .await;
     assert_eq!(
         store.begin("usr_1", "k", b).await.unwrap(),
         IdempotencyBegin::Started
     );
-    t.seed("UPDATE idempotency_keys SET expires_at = now() - interval '1 second'")
-        .await;
-    assert_eq!(db::sweep_idempotency_keys(t.db()).await.unwrap(), 2);
-    assert_eq!(t.count("idempotency_keys").await, 0);
+    // Keys of running requests are never swept, however old.
+    t.seed(
+        "UPDATE idempotency_keys
+         SET created_at = now() - interval '2 days', expires_at = now() - interval '1 day'",
+    )
+    .await;
+    assert_eq!(db::sweep_idempotency_keys(t.db()).await.unwrap(), 0);
+    assert_eq!(t.count("idempotency_keys").await, 2);
+}
+
+/// Ends the database sessions holding the owner locks of `scope`'s keys.
+async fn cut_owner(t: &TestDb, scope: &str) {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT count(pg_terminate_backend(l.pid)) FROM pg_locks l
+         JOIN idempotency_keys k ON l.objid = k.owner::oid
+         WHERE k.scope = $1 AND l.locktype = 'advisory' AND l.classid = 70110::oid
+           AND l.objsubid = 2
+           AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+    )
+    .bind(scope)
+    .fetch_one(t.pool())
+    .await
+    .unwrap();
+    assert_eq!(n, 1, "one owner session");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_running_key_moves_only_when_its_server_is_gone() {
+    let t = TestDb::new().await;
+    let first = PgIdempotencyStore::new(t.replica());
+    let second = PgIdempotencyStore::new(t.replica());
+    let fp = [7u8; 32];
+    let response = |body: &str| StoredResponse {
+        status: 201,
+        headers: Vec::new(),
+        body: body.as_bytes().to_vec(),
+    };
+    assert_eq!(
+        first.begin("usr_1", "k", fp).await.unwrap(),
+        IdempotencyBegin::Started
+    );
+    assert_eq!(
+        second.begin("usr_1", "k", fp).await.unwrap(),
+        IdempotencyBegin::InProgress
+    );
+    // A slow request is still running: age alone never hands its key to another request.
+    t.seed(
+        "UPDATE idempotency_keys
+         SET created_at = now() - interval '2 days', expires_at = now() - interval '1 day'",
+    )
+    .await;
+    assert_eq!(
+        second.begin("usr_1", "k", fp).await.unwrap(),
+        IdempotencyBegin::InProgress
+    );
+
+    // The first server's session ends (crash, network cut): the key can be claimed.
+    cut_owner(&t, "usr_1").await;
+    assert_eq!(
+        second.begin("usr_1", "k", fp).await.unwrap(),
+        IdempotencyBegin::Started
+    );
+
+    // The first request finishing late must not touch the new claim.
+    first
+        .complete("usr_1", "k", response("late"))
+        .await
+        .unwrap();
+    first.release("usr_1", "k").await.unwrap();
+    assert_eq!(
+        first.begin("usr_1", "k", fp).await.unwrap(),
+        IdempotencyBegin::InProgress
+    );
+
+    second
+        .complete("usr_1", "k", response("second"))
+        .await
+        .unwrap();
+    assert_eq!(
+        first.begin("usr_1", "k", fp).await.unwrap(),
+        IdempotencyBegin::Replay(response("second"))
+    );
 }
 
 #[tokio::test]
@@ -392,4 +465,22 @@ async fn retention_waits_for_every_consumer() {
     .await;
     assert_eq!(sweep(t.db(), &["a"]).await.unwrap().processed, 1);
     assert_eq!(t.count("processed_events").await, 1);
+
+    // An old dedup row of an event the consumer's cursor has not passed stays.
+    let ahead = t.write_events(&[event("job", agg, 4)]).await[0];
+    sqlx::query(
+        "INSERT INTO processed_events (consumer, event_id, processed_at)
+         VALUES ('a', $1, now() - interval '15 days')",
+    )
+    .bind(ahead)
+    .execute(t.pool())
+    .await
+    .unwrap();
+    assert_eq!(sweep(t.db(), &["a"]).await.unwrap().processed, 0);
+    t.seed(
+        "UPDATE consumer_cursors SET last_id = o.id, last_xid = (o.xid::text)::bigint
+         FROM outbox_events o WHERE consumer = 'a' AND o.aggregate_seq = 4",
+    )
+    .await;
+    assert_eq!(sweep(t.db(), &["a"]).await.unwrap().processed, 1);
 }

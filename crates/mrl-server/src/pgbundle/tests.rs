@@ -2,7 +2,8 @@
 //!
 //! Programs come from `MRL_TEST_PG_BIN`, else [`PgBinaries::locate`]. Outside CI the tests
 //! skip with a message when none are found; in CI (`CI` set) they fail instead.
-//! The upgrade test needs `MRL_TEST_PG_OLD_BIN` and `MRL_TEST_PG_NEW_BIN` (two majors).
+//! The upgrade test needs `MRL_TEST_PG_OLD_BIN` and `MRL_TEST_PG_NEW_BIN` (two majors);
+//! in CI it fails without them.
 
 use super::*;
 use crate::config::DatabaseConfig;
@@ -238,7 +239,9 @@ async fn pg_upgrade_moves_the_data_to_the_new_major() {
         std::env::var_os("MRL_TEST_PG_OLD_BIN"),
         std::env::var_os("MRL_TEST_PG_NEW_BIN"),
     ) else {
-        eprintln!("skipped: set MRL_TEST_PG_OLD_BIN and MRL_TEST_PG_NEW_BIN to two PostgreSQL bin folders");
+        let why = "set MRL_TEST_PG_OLD_BIN and MRL_TEST_PG_NEW_BIN to two PostgreSQL bin folders";
+        assert!(std::env::var_os("CI").is_none(), "CI must run the upgrade test: {why}");
+        eprintln!("skipped: {why}");
         return;
     };
     let old = PgBinaries::in_dir(Path::new(&old)).await.unwrap();

@@ -1,5 +1,7 @@
 //! Retention: outbox rows older than 7 days once every consumer is past them;
-//! `processed_events` and recovered failure rows older than 14 days; expired idempotency keys.
+//! `processed_events` older than 14 days once their consumer's cursor is past the event
+//! (an event delivered early for aggregate order keeps its dedup row until then); recovered
+//! failure rows older than 14 days; expired idempotency keys.
 
 use crate::db::{sweep_idempotency_keys, Db, DbError};
 
@@ -35,11 +37,20 @@ pub async fn sweep(db: &Db, consumers: &[&str]) -> Result<Swept, DbError> {
     .execute(db.pool())
     .await?
     .rows_affected();
-    let processed =
-        sqlx::query("DELETE FROM processed_events WHERE processed_at < now() - interval '14 days'")
-            .execute(db.pool())
-            .await?
-            .rows_affected();
+    // Once the cursor is past an event (or the event is gone), the dispatcher never reads
+    // it again, so its dedup row is no longer needed.
+    let processed = sqlx::query(
+        "DELETE FROM processed_events p
+         WHERE p.processed_at < now() - interval '14 days'
+           AND NOT EXISTS (
+             SELECT 1 FROM outbox_events o
+             LEFT JOIN consumer_cursors c ON c.consumer = p.consumer
+             WHERE o.event_id = p.event_id
+               AND (o.xid, o.id) > ((COALESCE(c.last_xid, 0))::text::xid8, COALESCE(c.last_id, 0)))",
+    )
+    .execute(db.pool())
+    .await?
+    .rows_affected();
     let failures = sqlx::query(
         "DELETE FROM outbox_failures
          WHERE quarantined_at IS NULL AND updated_at < now() - interval '14 days'",

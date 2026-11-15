@@ -4,7 +4,7 @@ use super::*;
 use async_trait::async_trait;
 use mrl_server::db::Tx;
 use mrl_server::modules::events::{
-    ConsumerError, Dispatcher, DispatcherOptions, Event, EventConsumer, Quarantined,
+    sweep, ConsumerError, Dispatcher, DispatcherOptions, Event, EventConsumer, Quarantined,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -271,11 +271,32 @@ async fn aggregate_order_holds_when_transaction_ids_run_backwards() {
     )
     .await;
     assert_eq!(effects(&t, "ordered").await, vec![(agg, 1), (agg, 2)]);
-    hold.commit().await.unwrap();
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(effects(&t, "ordered").await.len(), 2, "no second delivery");
     cancel.cancel();
     task.await.unwrap();
+
+    // Two weeks pass with the cursor still before seq 1 (it waits on `hold`). Retention may
+    // drop seq 2's dedup row (the cursor passed it) but must keep seq 1's.
+    t.seed("UPDATE processed_events SET processed_at = now() - interval '15 days'")
+        .await;
+    assert_eq!(sweep(t.db(), &["ordered"]).await.unwrap().processed, 1);
+    assert_eq!(t.count("processed_events").await, 1);
+
+    hold.commit().await.unwrap();
+    let rec = Arc::new(Recorder::new("ordered"));
+    let (d, cancel, task) =
+        start(Dispatcher::new(t.replica(), vec![rec.clone()]).with_options(fast()));
+    let caught_up = Instant::now();
+    while d.lag().await.unwrap() > 0.0 {
+        assert!(
+            caught_up.elapsed() < Duration::from_secs(10),
+            "did not catch up"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    cancel.cancel();
+    task.await.unwrap();
+    assert_eq!(rec.calls.load(Ordering::SeqCst), 0, "seq 1 ran again");
+    assert_eq!(effects(&t, "ordered").await.len(), 2, "no second delivery");
 }
 
 #[tokio::test]
