@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.masterrl.dev/benchmark/v1.schema.json",
+  "title": "Benchmark v1 (benchmark.yaml)",
+  "description": "A user benchmark: where the items come from, how columns map to eval.v1, and how answers are scored. Benchmark versions are immutable.",
+  "type": "object",
+  "required": ["schema_version", "name", "source", "mapping", "scoring"],
+  "properties": {
+    "schema_version": { "const": "benchmark/v1" },
+    "name": { "type": "string", "pattern": "^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$" },
+    "description": { "type": "string" },
+    "source": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "path", "format"],
+          "properties": {
+            "kind": { "const": "file" },
+            "path": { "type": "string", "minLength": 1 },
+            "format": { "enum": ["jsonl", "csv", "parquet"] }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "repo", "revision", "split"],
+          "properties": {
+            "kind": { "const": "huggingface" },
+            "repo": { "type": "string", "pattern": "^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$" },
+            "revision": { "description": "Pinned commit sha.", "type": "string", "pattern": "^[0-9a-f]{40}$" },
+            "config": { "type": "string" },
+            "split": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "path"],
+          "properties": {
+            "kind": { "const": "lm_eval_task" },
+            "path": { "description": "lm-evaluation-harness task YAML.", "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "mapping": {
+      "description": "Source column -> eval.v1 field.",
+      "type": "object",
+      "required": ["input"],
+      "properties": {
+        "input": { "type": "string", "minLength": 1 },
+        "reference": { "type": "string", "minLength": 1 },
+        "meta": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+      },
+      "additionalProperties": false
+    },
+    "scoring": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/scorer" } },
+    "generation": {
+      "description": "Deterministic by default.",
+      "type": "object",
+      "properties": {
+        "temperature": { "type": "number", "minimum": 0, "default": 0 },
+        "max_tokens": { "type": "integer", "minimum": 1 },
+        "seed": { "type": "integer", "default": 0 },
+        "prompt_template": { "type": "string" },
+        "samples_per_item": { "description": "For pass@k.", "type": "integer", "minimum": 1, "default": 1 }
+      },
+      "additionalProperties": false
+    },
+    "validation": {
+      "type": "object",
+      "properties": {
+        "dry_run_samples": { "type": "integer", "minimum": 0, "default": 5 },
+        "contamination_check": { "type": "boolean", "default": true }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "scorer": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["kind", "metric"],
+          "properties": {
+            "kind": { "const": "builtin" },
+            "metric": { "enum": ["exact_match", "normalized_match", "numeric_tolerance", "regex", "bleu", "rouge", "pass_at_k"] },
+            "params": { "type": "object", "x-mrl-open": "params depend on the metric" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "reward_version_id"],
+          "properties": {
+            "kind": { "const": "reward_version" },
+            "reward_version_id": { "type": "string", "pattern": "^rwdv_[0-9A-Za-z-]+$" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["kind", "judge"],
+          "properties": {
+            "kind": { "const": "judge" },
+            "judge": { "description": "Path or name of a judge-prompt/v1 document.", "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Custom Python scoring, run in the reward sandbox.",
+          "type": "object",
+          "required": ["kind", "path", "function"],
+          "properties": {
+            "kind": { "const": "script" },
+            "path": { "type": "string", "minLength": 1 },
+            "function": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

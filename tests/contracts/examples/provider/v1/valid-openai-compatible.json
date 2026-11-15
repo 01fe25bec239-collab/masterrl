@@ -1,0 +1,16 @@
+{
+  "schema_version": "provider/v1",
+  "id": "openrouter",
+  "display_name": "OpenRouter",
+  "type": "openai_compatible",
+  "base_url": "https://openrouter.ai/api/v1",
+  "api_key_ref": "masterrl/provider/openrouter",
+  "models": [
+    "meta-llama/llama-3.1-8b-instruct"
+  ],
+  "open_weight": false,
+  "limits": {
+    "max_requests_per_minute": 60,
+    "max_spend_per_run_usd": 5
+  }
+}

@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.masterrl.dev/judge-prompt/v1.schema.json",
+  "title": "JudgePrompt v1",
+  "description": "An AI-judge prompt and rubric, used by judge reward components, AI labelling and evaluation. Versioned with the reward version.",
+  "type": "object",
+  "required": ["schema_version", "name", "provider", "model", "prompt_template", "criteria", "output"],
+  "properties": {
+    "schema_version": { "const": "judge-prompt/v1" },
+    "name": { "type": "string", "pattern": "^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$" },
+    "description": { "type": "string" },
+    "provider": { "description": "A provider id (provider/v1).", "type": "string", "minLength": 1 },
+    "model": { "type": "string", "minLength": 1 },
+    "system_prompt": { "type": "string" },
+    "prompt_template": {
+      "description": "Text with {prompt}, {completion}, {reference} and {criteria} placeholders.",
+      "type": "string",
+      "pattern": "\\{completion\\}"
+    },
+    "criteria": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "description", "weight"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[a-z0-9_]+$" },
+          "description": { "type": "string", "minLength": 1 },
+          "weight": { "type": "number", "minimum": 0 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "output": {
+      "type": "object",
+      "required": ["format", "min", "max"],
+      "properties": {
+        "format": { "description": "json: {\"scores\": {criterion: value}}; tag: <score>value</score> per criterion.", "enum": ["json", "tag"] },
+        "min": { "type": "number" },
+        "max": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "sampling": {
+      "type": "object",
+      "properties": {
+        "temperature": { "type": "number", "minimum": 0 },
+        "max_tokens": { "type": "integer", "minimum": 1 },
+        "seed": { "type": "integer" }
+      },
+      "additionalProperties": false
+    },
+    "cache": { "description": "Reuse answers for identical judge calls.", "type": "boolean" }
+  },
+  "additionalProperties": false
+}

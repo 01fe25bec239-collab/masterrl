@@ -1,0 +1,135 @@
+// EnvService: multi-turn environments and tools for agentic RL. Hosted by mrl-reward-exec
+// next to RewardService on the same Unix domain socket; every episode's tool calls run in
+// a Tier-2 sandbox. One sandbox per episode; its state is destroyed at CloseEpisode.
+//
+// Tools are denied by default: an environment declares them and the job config grants them.
+syntax = "proto3";
+
+package mrl.env.v1;
+
+import "mrl/reward/v1/reward_service.proto";
+
+service EnvService {
+  // reset(): starts an episode and returns the first observation and the granted tools.
+  rpc OpenEpisode(OpenEpisodeRequest) returns (OpenEpisodeResponse);
+  // call(): runs one tool, time- and size-bounded.
+  rpc CallTool(CallToolRequest) returns (CallToolResponse);
+  // step_reward(): optional per-turn reward.
+  rpc StepReward(StepRewardRequest) returns (StepRewardResponse);
+  // final_reward(): outcome reward with diagnostics.
+  rpc FinalReward(FinalRewardRequest) returns (FinalRewardResponse);
+  // close(): destroys the episode sandbox.
+  rpc CloseEpisode(CloseEpisodeRequest) returns (CloseEpisodeResponse);
+}
+
+message OpenEpisodeRequest {
+  string attempt_nonce = 1;
+  string episode_id = 2;
+  string env_id = 3;
+  string env_version = 4;
+  // Task: prompt plus reference/verifier metadata, JSON.
+  string task_json = 5;
+  uint64 seed = 6;
+  // Tools the job config grants; others are refused.
+  repeated string granted_tools = 7;
+}
+
+message OpenEpisodeResponse {
+  // Opaque handle for the following calls.
+  string episode_handle = 1;
+  repeated ChatMessage observation = 2;
+  repeated ToolSpec tools = 3;
+  EnvLimits limits = 4;
+}
+
+message ChatMessage {
+  // "system", "user", "assistant" or "tool".
+  string role = 1;
+  string content = 2;
+}
+
+message ToolSpec {
+  string name = 1;
+  string description = 2;
+  // JSON Schema of the arguments.
+  string arguments_schema_json = 3;
+  ToolCategory category = 4;
+}
+
+enum ToolCategory {
+  TOOL_CATEGORY_UNSPECIFIED = 0;
+  // No side effects.
+  TOOL_CATEGORY_PURE = 1;
+  // Episode-private scratch filesystem.
+  TOOL_CATEGORY_FS_SCRATCH = 2;
+  // Runs code (Tier 2).
+  TOOL_CATEGORY_EXEC = 3;
+  // Network through a logged, allow-listed egress broker (not available before R5).
+  TOOL_CATEGORY_NET = 4;
+}
+
+message EnvLimits {
+  uint32 max_turns = 1;
+  uint32 call_timeout_ms = 2;
+  uint32 episode_wall_ms = 3;
+  // Larger tool output is truncated with a visible marker.
+  uint32 tool_output_max_bytes = 4;
+}
+
+message CallToolRequest {
+  string attempt_nonce = 1;
+  string episode_handle = 2;
+  // The tool_call id from the assistant turn.
+  string call_id = 3;
+  string tool_name = 4;
+  string arguments_json = 5;
+}
+
+message CallToolResponse {
+  string call_id = 1;
+  string output = 2;
+  bool truncated = 3;
+  bool is_error = 4;
+  uint32 duration_ms = 5;
+  ToolOutcome outcome = 6;
+}
+
+enum ToolOutcome {
+  TOOL_OUTCOME_UNSPECIFIED = 0;
+  TOOL_OUTCOME_OK = 1;
+  TOOL_OUTCOME_TIMEOUT = 2;
+  TOOL_OUTCOME_ERROR = 3;
+  // Tool not granted, or the episode is over its turn limit.
+  TOOL_OUTCOME_REFUSED = 4;
+}
+
+message StepRewardRequest {
+  string attempt_nonce = 1;
+  string episode_handle = 2;
+}
+
+message StepRewardResponse {
+  // Absent when the environment has no step reward.
+  optional double value = 1;
+}
+
+message FinalRewardRequest {
+  string attempt_nonce = 1;
+  string episode_handle = 2;
+}
+
+message FinalRewardResponse {
+  mrl.reward.v1.ComponentScore score = 1;
+  // "stop", "max_turns", "timeout" or "error".
+  string finish_reason = 2;
+}
+
+message CloseEpisodeRequest {
+  string attempt_nonce = 1;
+  string episode_handle = 2;
+}
+
+message CloseEpisodeResponse {
+  uint32 turns = 1;
+  uint32 tool_calls = 2;
+}

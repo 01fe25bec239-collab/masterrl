@@ -1,0 +1,7 @@
+{
+  "base": "valid-experimenter-tools.json",
+  "remove": [
+    "/tools/0/input_schema"
+  ],
+  "fails_at": "/tools/0"
+}

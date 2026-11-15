@@ -1,0 +1,7 @@
+{
+  "base": "valid-profile.json",
+  "remove": [
+    "/machines/1/ssh"
+  ],
+  "fails_at": "/machines/1"
+}

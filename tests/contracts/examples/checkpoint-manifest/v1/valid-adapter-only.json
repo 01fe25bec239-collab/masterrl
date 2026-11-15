@@ -1,0 +1,39 @@
+{
+  "schema_version": "checkpoint-manifest/v1",
+  "checkpoint_id": "ckpt_01jcz9",
+  "run_id": "run_01jcz7",
+  "attempt_id": "att_1",
+  "step": 500,
+  "kind": "adapter_only",
+  "format": "hf-trainer-v1",
+  "engine": {
+    "name": "trl",
+    "adapter_version": "1.0.0"
+  },
+  "base_model_sha256": "abababababababababababababababababababababababababababababababab",
+  "created_at": "2026-11-15T10:20:30Z",
+  "is_final": true,
+  "policy_version": 12,
+  "metrics": {
+    "train/loss": 0.42
+  },
+  "files": [
+    {
+      "path": "adapter_model.safetensors",
+      "size": 10,
+      "sha256": "abababababababababababababababababababababababababababababababab",
+      "role": "adapter",
+      "format": "safetensors"
+    }
+  ],
+  "parent_checkpoint_id": "ckpt_01jcz8",
+  "adapter": {
+    "method": "lora",
+    "rank": 16,
+    "alpha": 32,
+    "target_modules": [
+      "q_proj",
+      "v_proj"
+    ]
+  }
+}

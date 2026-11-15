@@ -1,0 +1,90 @@
+// Shared types for every MasterRL internal protocol.
+//
+// IDs are prefixed UUIDv7 strings (job_…, run_…, node_…, ckpt_…). Times are
+// google.protobuf.Timestamp. Changes are additive only: see docs/dev/contracts.md.
+syntax = "proto3";
+
+package mrl.common.v1;
+
+// The attempt a message is about. A stale fencing epoch makes the message harmless:
+// the server rejects commits and uploads from an attempt that is no longer current.
+message AttemptRef {
+  string job_id = 1;
+  string attempt_id = 2;
+  uint64 fencing_epoch = 3;
+}
+
+// Why something failed. Numbers are fixed forever; mrl-domain mirrors them.
+enum FailureClass {
+  FAILURE_CLASS_UNSPECIFIED = 0;
+  FAILURE_CLASS_USER_CONFIG = 1;
+  FAILURE_CLASS_DATA = 2;
+  FAILURE_CLASS_OOM = 3;
+  FAILURE_CLASS_NODE_LOST = 4;
+  FAILURE_CLASS_HARDWARE = 5;
+  FAILURE_CLASS_INFRA_TRANSIENT = 6;
+  FAILURE_CLASS_ENGINE_ERROR = 7;
+  FAILURE_CLASS_SANDBOX_VIOLATION = 8;
+  FAILURE_CLASS_PREEMPTED = 9;
+  FAILURE_CLASS_CANCELLED_BY_USER = 10;
+  FAILURE_CLASS_VERIFICATION_FAILED = 11;
+  FAILURE_CLASS_REWARD_INFRA = 12;
+  FAILURE_CLASS_DEPENDENCY_ENV = 13;
+  FAILURE_CLASS_MODEL_INCOMPATIBLE = 14;
+  FAILURE_CLASS_NUMERIC_DIVERGENCE = 15;
+  FAILURE_CLASS_STALLED = 16;
+  FAILURE_CLASS_HARNESS_ERROR = 17;
+  FAILURE_CLASS_SAFETY_HALT = 18;
+}
+
+// Who assigned the failure class (higher layers win, see Doc 05 §14).
+enum ClassifiedBy {
+  CLASSIFIED_BY_UNSPECIFIED = 0;
+  CLASSIFIED_BY_ADAPTER = 1;
+  CLASSIFIED_BY_HARNESS = 2;
+  CLASSIFIED_BY_AGENT = 3;
+  CLASSIFIED_BY_SERVER = 4;
+}
+
+// A classified failure.
+message Failure {
+  FailureClass failure_class = 1;
+  // Stable sub-code inside the class, e.g. "OOM_GPU", "DATA_TOKENIZATION".
+  string sub_code = 2;
+  // One line, safe to show to the user.
+  string message = 3;
+  // Object-store reference to the traceback and log tail.
+  string detail_ref = 4;
+  // Advisory only; the server's retry policy decides.
+  bool retryable_hint = 5;
+  repeated ConfigMutation suggested_mutations = 6;
+  ClassifiedBy classified_by = 7;
+}
+
+// A suggested config change, e.g. halve the batch size after an OOM.
+message ConfigMutation {
+  // JSON pointer into the job config.
+  string path = 1;
+  // New value, JSON-encoded.
+  string value_json = 2;
+  string reason = 3;
+}
+
+enum Severity {
+  SEVERITY_UNSPECIFIED = 0;
+  SEVERITY_INFO = 1;
+  SEVERITY_WARNING = 2;
+  SEVERITY_ERROR = 3;
+}
+
+// One validation or doctor finding, in the same shape the UI shows.
+message Issue {
+  // Guidance error code, e.g. "MRL-CFG-004".
+  string code = 1;
+  Severity severity = 2;
+  // JSON pointer to the offending config field, if any.
+  string path = 3;
+  string message = 4;
+  // A concrete next action.
+  string hint = 5;
+}

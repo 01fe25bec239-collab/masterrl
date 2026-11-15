@@ -1,0 +1,7 @@
+{
+  "base": "valid-math.json",
+  "set": {
+    "/spec/aggregation/method": "mean"
+  },
+  "fails_at": "/spec/aggregation/method"
+}

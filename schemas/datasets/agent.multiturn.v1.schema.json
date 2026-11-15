@@ -1,0 +1,75 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.masterrl.dev/datasets/agent.multiturn.v1.schema.json",
+  "title": "agent.multiturn.v1",
+  "description": "Multi-turn agent episodes with tool calls. Only tokens sampled by the policy count toward the loss.",
+  "type": "object",
+  "required": ["episode_id", "env_spec_ref", "turns"],
+  "properties": {
+    "episode_id": { "$ref": "common.v1.schema.json#/$defs/text" },
+    "env_spec_ref": {
+      "description": "Environment and version, e.g. env/calculator@1.",
+      "$ref": "common.v1.schema.json#/$defs/text"
+    },
+    "task": {
+      "description": "Prompt plus reference/verifier metadata for the episode.",
+      "type": "object",
+      "x-mrl-open": "task fields are defined by the environment"
+    },
+    "turns": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/turn" } },
+    "reward": { "type": "number" },
+    "step_rewards": { "type": "array", "items": { "type": "number" } },
+    "finish_reason": { "enum": ["stop", "max_turns", "timeout", "error"] },
+    "meta": { "$ref": "common.v1.schema.json#/$defs/meta" }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "turn": {
+      "type": "object",
+      "required": ["role", "content"],
+      "properties": {
+        "role": { "enum": ["system", "user", "assistant", "tool"] },
+        "content": { "type": "string" },
+        "tool_calls": { "type": "array", "items": { "$ref": "#/$defs/toolCall" } },
+        "tool_results": { "type": "array", "items": { "$ref": "#/$defs/toolResult" } },
+        "tool_call_id": { "description": "On tool turns: the call this answers.", "type": "string" },
+        "token_span": {
+          "description": "[start, end) of this turn in the flattened token sequence.",
+          "type": "array",
+          "prefixItems": [{ "type": "integer", "minimum": 0 }, { "type": "integer", "minimum": 0 }],
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "policy_version": { "description": "Assistant turns: the policy that sampled it.", "type": "integer", "minimum": 0 },
+        "trainable": { "type": "boolean" }
+      },
+      "additionalProperties": false,
+      "anyOf": [
+        { "properties": { "content": { "minLength": 1 } } },
+        { "required": ["tool_calls"], "properties": { "tool_calls": { "minItems": 1 } } },
+        { "required": ["tool_results"], "properties": { "tool_results": { "minItems": 1 } } }
+      ]
+    },
+    "toolCall": {
+      "type": "object",
+      "required": ["name", "arguments"],
+      "properties": {
+        "id": { "type": "string" },
+        "name": { "$ref": "common.v1.schema.json#/$defs/text" },
+        "arguments": { "type": "object", "x-mrl-open": "arguments follow the tool's own schema" }
+      },
+      "additionalProperties": false
+    },
+    "toolResult": {
+      "type": "object",
+      "required": ["name", "output"],
+      "properties": {
+        "tool_call_id": { "type": "string" },
+        "name": { "$ref": "common.v1.schema.json#/$defs/text" },
+        "output": { "description": "Any JSON value the tool returned." },
+        "truncated": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  }
+}

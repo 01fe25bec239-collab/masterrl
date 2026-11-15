@@ -1,0 +1,7 @@
+{
+  "base": "valid-profile.json",
+  "set": {
+    "/preferences/hf_token": "hf_test"
+  },
+  "fails_at": "/preferences"
+}

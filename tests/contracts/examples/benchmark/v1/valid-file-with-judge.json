@@ -1,0 +1,30 @@
+{
+  "schema_version": "benchmark/v1",
+  "name": "support-winrate",
+  "source": {
+    "kind": "file",
+    "path": "data/support.jsonl",
+    "format": "jsonl"
+  },
+  "mapping": {
+    "input": "ticket",
+    "meta": [
+      "product"
+    ]
+  },
+  "scoring": [
+    {
+      "kind": "judge",
+      "judge": "judges/helpfulness-v2.json"
+    },
+    {
+      "kind": "reward_version",
+      "reward_version_id": "rwdv_01jcz8"
+    },
+    {
+      "kind": "script",
+      "path": "score.py",
+      "function": "score"
+    }
+  ]
+}

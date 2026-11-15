@@ -1,0 +1,391 @@
+// Worker Protocol v1: the harness (mrl-worker, inside the training process) talks to
+// mrl-agent over a Unix domain socket. The harness is the gRPC client; the agent listens.
+// Auth: socket permissions plus the per-attempt nonce in Hello.
+//
+// Delivery is at-least-once. Receivers dedupe on (attempt_id, role_id, seq).
+// Workers never hold storage credentials: they stage files locally and the agent uploads.
+syntax = "proto3";
+
+package mrl.worker.v1;
+
+import "google/protobuf/timestamp.proto";
+import "mrl/common/v1/common.proto";
+
+service WorkerControlService {
+  // One long-lived stream per worker process. The first WorkerMessage must be Hello.
+  rpc Session(stream WorkerMessage) returns (stream AgentMessage);
+}
+
+// Worker -> agent.
+message WorkerMessage {
+  // Per attempt and role, strictly increasing.
+  uint64 seq = 1;
+  google.protobuf.Timestamp sent_at = 2;
+  oneof body {
+    Hello hello = 10;
+    Prepared prepared = 11;
+    Progress progress = 12;
+    MetricsBatch metrics = 13;
+    LogChunk log = 14;
+    SampleBatch samples = 15;
+    CheckpointStaged checkpoint_staged = 16;
+    CheckpointCommitRequest checkpoint_commit = 17;
+    Heartbeat heartbeat = 18;
+    ExitReport exit = 19;
+    PolicyVersionEvent policy_version = 20;
+    RolloutBatchSummary rollout_batch = 21;
+    RewardBatchStats reward_batch_stats = 22;
+  }
+}
+
+// Agent -> worker.
+message AgentMessage {
+  // Highest contiguous WorkerMessage.seq the agent has durably accepted.
+  uint64 ack_seq = 1;
+  oneof body {
+    HelloAck hello_ack = 10;
+    Prepare prepare = 11;
+    Start start = 12;
+    UploadGrant upload_grant = 13;
+    CheckpointCommitAck checkpoint_commit_ack = 14;
+    PauseRequest pause = 15;
+    CancelRequest cancel = 16;
+    Heartbeat heartbeat = 17;
+    CheckpointRequest checkpoint_request = 18;
+    LeaseDeadline lease_deadline = 19;
+  }
+}
+
+// ---- handshake ----
+
+message Hello {
+  string attempt_id = 1;
+  string nonce = 2;
+  string role_id = 3;
+  // Only the primary role sends metrics, samples, checkpoints and the authoritative ExitReport.
+  bool primary = 4;
+  // Supported versions, e.g. ["1.0", "1.1"]; the agent picks the highest common one.
+  repeated string protocol_versions = 5;
+  string mrl_runtime_version = 6;
+  string adapter_name = 7;
+  string adapter_version = 8;
+  string adapter_api = 9;
+  // Upstream package versions as imported, e.g. {"trl": "1.17.1"}.
+  map<string, string> upstream_versions = 10;
+  // Image digest or lock hash as seen from inside the environment.
+  string environment_digest = 11;
+  Capabilities capabilities = 12;
+}
+
+message Capabilities {
+  bool pause = 1;
+  bool on_demand_checkpoint = 2;
+  bool samples = 3;
+  repeated string algorithms = 4;
+}
+
+message HelloAck {
+  string protocol_version = 1;
+  uint32 heartbeat_interval_s = 2;
+  uint32 max_message_bytes = 3;
+  // Replay the spool from this seq after an agent restart.
+  uint64 resume_from_seq = 4;
+}
+
+// ---- prepare / start ----
+
+message Prepare {
+  // Resolved config as JSON: algorithm, common block, engine block, pinned switch.
+  string job_spec_json = 1;
+  // Role -> local path, e.g. "model", "dataset.train", "dataset.eval", "resume_from".
+  map<string, string> staged_paths = 2;
+  Allocation allocation = 3;
+  // L2 check: stop after prepare.
+  bool dry_run = 4;
+  // L3 check: run this many steps and commit nothing (0 = normal run).
+  uint32 smoke_steps = 5;
+  // RewardService/EnvService socket path; empty if the job has no rewards.
+  string reward_socket = 6;
+  // Local directory where the worker stages checkpoints and other outputs.
+  string staging_dir = 7;
+}
+
+message Allocation {
+  repeated uint32 gpu_indices = 1;
+  uint32 world_size = 2;
+  uint32 node_rank = 3;
+  // Role id -> host:port on the job network.
+  map<string, string> role_endpoints = 4;
+}
+
+message Prepared {
+  bool ok = 1;
+  repeated mrl.common.v1.Issue issues = 2;
+  ResourceEstimate estimate = 3;
+  string effective_config_sha256 = 4;
+}
+
+message ResourceEstimate {
+  double gpu_mem_gib_lo = 1;
+  double gpu_mem_gib_hi = 2;
+  uint64 total_steps = 3;
+  double wall_seconds_lo = 4;
+  double wall_seconds_hi = 5;
+  repeated string assumptions = 6;
+}
+
+message Start {}
+
+// ---- telemetry ----
+
+message Progress {
+  uint64 step = 1;
+  uint64 total_steps = 2;
+  double epoch = 3;
+  string phase = 4;
+  uint64 tokens_seen = 5;
+  double eta_seconds = 6;
+}
+
+message MetricsBatch {
+  repeated MetricPoint points = 1;
+}
+
+message MetricPoint {
+  string name = 1;
+  uint64 step = 2;
+  double value = 3;
+  google.protobuf.Timestamp time = 4;
+  string split = 5;
+  MetricKind kind = 6;
+  // True when the metric is not declared in the engine manifest.
+  bool undeclared = 7;
+}
+
+enum MetricKind {
+  METRIC_KIND_UNSPECIFIED = 0;
+  METRIC_KIND_LIVE = 1;
+  METRIC_KIND_SAMPLED = 2;
+  METRIC_KIND_DELAYED = 3;
+}
+
+message LogChunk {
+  LogStream stream = 1;
+  bytes data = 2;
+  uint32 rank = 3;
+  // Byte offset in the stream; makes replays idempotent.
+  uint64 offset = 4;
+}
+
+enum LogStream {
+  LOG_STREAM_UNSPECIFIED = 0;
+  LOG_STREAM_STDOUT = 1;
+  LOG_STREAM_STDERR = 2;
+  LOG_STREAM_HARNESS = 3;
+}
+
+message SampleBatch {
+  uint64 step = 1;
+  repeated Sample samples = 2;
+  // Object-store reference for samples above max_message_bytes.
+  string overflow_ref = 3;
+}
+
+message Sample {
+  string sample_id = 1;
+  string group_id = 2;
+  string prompt = 3;
+  string completion = 4;
+  double reward_total = 5;
+  map<string, double> reward_components = 6;
+  bool truncated = 7;
+  uint32 completion_tokens = 8;
+  uint64 policy_version = 9;
+}
+
+// ---- online RL ----
+
+// One PolicyVersion state change (Doc 06 §3.2).
+message PolicyVersionEvent {
+  uint64 policy_version = 1;
+  uint64 parent_policy_version = 2;
+  PolicyVersionState state = 3;
+  uint64 trainer_step = 4;
+  // "fp1:" + xxh3-128 over the trainable tensors.
+  string fingerprint = 5;
+  // sha256 of the checkpoint manifest, only when the version coincides with a checkpoint.
+  string full_hash = 6;
+  string checkpoint_id = 7;
+  uint32 acked_workers = 8;
+  uint64 transfer_ms = 9;
+  // Max absolute logprob difference from the probe, in nats.
+  double probe_delta = 10;
+  string abort_reason = 11;
+  google.protobuf.Timestamp time = 12;
+}
+
+enum PolicyVersionState {
+  POLICY_VERSION_STATE_UNSPECIFIED = 0;
+  POLICY_VERSION_STATE_PROPOSED = 1;
+  POLICY_VERSION_STATE_TRANSFERRING = 2;
+  POLICY_VERSION_STATE_ACKED = 3;
+  POLICY_VERSION_STATE_ACTIVE = 4;
+  POLICY_VERSION_STATE_SUPERSEDED = 5;
+  POLICY_VERSION_STATE_ABORTED = 6;
+  POLICY_VERSION_STATE_ORPHANED = 7;
+}
+
+// One generation batch (a RolloutBatch row).
+message RolloutBatchSummary {
+  uint64 batch_no = 1;
+  uint64 trainer_step = 2;
+  uint64 policy_version_min = 3;
+  uint64 policy_version_max = 4;
+  // Policy lag -> number of samples.
+  map<uint32, uint64> lag_histogram = 5;
+  uint32 n_prompts = 6;
+  uint32 n_samples = 7;
+  uint64 tokens_generated = 8;
+  double truncated_frac = 9;
+  string archive_ref = 10;
+  string reward_version_id = 11;
+}
+
+// Reward statistics for one generation batch.
+message RewardBatchStats {
+  uint64 batch_no = 1;
+  string reward_version_id = 2;
+  double mean = 3;
+  double std = 4;
+  double min = 5;
+  double max = 6;
+  map<string, double> component_means = 7;
+  // Fraction of prompt groups whose rewards all equal each other.
+  double zero_variance_frac = 8;
+  // Score status name -> count, e.g. {"TIMEOUT": 3}.
+  map<string, uint32> failures_by_status = 9;
+  uint32 groups_dropped = 10;
+}
+
+// ---- checkpoints ----
+
+message CheckpointStaged {
+  string checkpoint_id = 1;
+  uint64 step = 2;
+  // Format tag, e.g. "hf-trainer-v1".
+  string format = 3;
+  CheckpointKind kind = 4;
+  bool is_final = 5;
+  repeated FileEntry files = 6;
+  string manifest_sha256 = 7;
+  map<string, double> metrics_at_step = 8;
+  uint64 policy_version = 9;
+}
+
+enum CheckpointKind {
+  CHECKPOINT_KIND_UNSPECIFIED = 0;
+  CHECKPOINT_KIND_FULL_RESUME = 1;
+  CHECKPOINT_KIND_WEIGHTS_ONLY = 2;
+  CHECKPOINT_KIND_ADAPTER_ONLY = 3;
+}
+
+message FileEntry {
+  // Relative to the staging directory.
+  string path = 1;
+  uint64 size = 2;
+  string sha256 = 3;
+  string role = 4;
+}
+
+// Tells the worker where each staged file must be placed for the agent to upload it.
+message UploadGrant {
+  string checkpoint_id = 1;
+  // File path -> local staging path. The agent moves the bytes, never the worker.
+  map<string, string> targets = 2;
+  google.protobuf.Timestamp expires_at = 3;
+}
+
+message CheckpointCommitRequest {
+  string checkpoint_id = 1;
+  string manifest_sha256 = 2;
+}
+
+message CheckpointCommitAck {
+  string checkpoint_id = 1;
+  CommitState state = 2;
+  string reason = 3;
+}
+
+enum CommitState {
+  COMMIT_STATE_UNSPECIFIED = 0;
+  COMMIT_STATE_COMMITTED = 1;
+  COMMIT_STATE_CORRUPT = 2;
+  COMMIT_STATE_REJECTED = 3;
+}
+
+// ---- control ----
+
+// Checkpoint, then exit with PAUSED.
+message PauseRequest {
+  string request_id = 1;
+  uint32 deadline_s = 2;
+  PauseReason reason = 3;
+}
+
+enum PauseReason {
+  PAUSE_REASON_UNSPECIFIED = 0;
+  PAUSE_REASON_USER = 1;
+  // The live guard hit a hard threshold (Doc 24 layer 3).
+  PAUSE_REASON_GUARD = 2;
+  PAUSE_REASON_PREEMPTION = 3;
+  // A safety detector chose auto_pause.
+  PAUSE_REASON_SAFETY = 4;
+  PAUSE_REASON_APP_UPDATE = 5;
+  PAUSE_REASON_SYSTEM_SLEEP = 6;
+}
+
+message CancelRequest {
+  string request_id = 1;
+  uint32 grace_s = 2;
+  string reason = 3;
+}
+
+// Emergency checkpoint: save now and keep training (guard soft threshold, preemption notice).
+message CheckpointRequest {
+  string request_id = 1;
+  uint32 deadline_s = 2;
+  string reason = 3;
+}
+
+// The attempt lease deadline. The harness exits on its own once it passes (fencing layer F2).
+message LeaseDeadline {
+  google.protobuf.Timestamp deadline = 1;
+  uint64 fencing_epoch = 2;
+}
+
+message Heartbeat {
+  google.protobuf.Timestamp time = 1;
+  uint64 last_step = 2;
+}
+
+// ---- exit ----
+
+message ExitReport {
+  ExitKind kind = 1;
+  // Set if and only if kind is FAILED.
+  mrl.common.v1.Failure failure = 2;
+  uint64 final_step = 3;
+  string last_committed_checkpoint_id = 4;
+  map<string, double> final_metrics = 5;
+  // Pause, cancel and checkpoint request_ids that were honoured.
+  repeated string acknowledged_requests = 6;
+}
+
+enum ExitKind {
+  EXIT_KIND_UNSPECIFIED = 0;
+  EXIT_KIND_COMPLETED = 1;
+  EXIT_KIND_PAUSED = 2;
+  EXIT_KIND_CANCELLED = 3;
+  EXIT_KIND_FAILED = 4;
+  EXIT_KIND_DRY_RUN_OK = 5;
+}

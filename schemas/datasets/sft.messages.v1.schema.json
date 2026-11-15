@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.masterrl.dev/datasets/sft.messages.v1.schema.json",
+  "title": "sft.messages.v1",
+  "description": "Supervised fine-tuning on chat conversations.",
+  "x-mrl-rules": {
+    "role_order": "An optional first system message, then user and assistant alternating, starting with user and ending with assistant."
+  },
+  "type": "object",
+  "required": ["messages"],
+  "properties": {
+    "messages": { "$ref": "common.v1.schema.json#/$defs/messages" },
+    "tools": {
+      "description": "Tool definitions shown to the model (JSON Schema function specs).",
+      "type": "array",
+      "items": { "type": "object", "x-mrl-open": "tool definitions follow the model's chat template" }
+    },
+    "images": {
+      "description": "Image references for vision models.",
+      "type": "array",
+      "items": { "$ref": "common.v1.schema.json#/$defs/text" }
+    },
+    "meta": { "$ref": "common.v1.schema.json#/$defs/meta" }
+  },
+  "additionalProperties": false
+}

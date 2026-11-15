@@ -1,0 +1,7 @@
+{
+  "base": "valid-huggingface.json",
+  "set": {
+    "/scoring": []
+  },
+  "fails_at": "/scoring"
+}

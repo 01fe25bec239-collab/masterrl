@@ -1,0 +1,7 @@
+{
+  "base": "valid-profile.json",
+  "remove": [
+    "/machines/0/address"
+  ],
+  "fails_at": "/machines/0"
+}

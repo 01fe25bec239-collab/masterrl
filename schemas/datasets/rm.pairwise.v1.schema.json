@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.masterrl.dev/datasets/rm.pairwise.v1.schema.json",
+  "title": "rm.pairwise.v1",
+  "description": "Preference pairs for training a reward model.",
+  "x-mrl-rules": {
+    "chosen_equals_rejected": "chosen and rejected must differ."
+  },
+  "type": "object",
+  "required": ["prompt", "chosen", "rejected"],
+  "properties": {
+    "prompt": { "$ref": "common.v1.schema.json#/$defs/textOrMessages" },
+    "chosen": { "$ref": "common.v1.schema.json#/$defs/textOrMessages" },
+    "rejected": { "$ref": "common.v1.schema.json#/$defs/textOrMessages" },
+    "margin": { "description": "How strongly chosen is preferred.", "type": "number" },
+    "annotator_ids": { "type": "array", "items": { "$ref": "common.v1.schema.json#/$defs/text" } },
+    "meta": { "$ref": "common.v1.schema.json#/$defs/meta" }
+  },
+  "additionalProperties": false
+}

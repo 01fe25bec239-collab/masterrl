@@ -1,0 +1,11 @@
+{
+  "schema_version": "provider/v1",
+  "id": "local-ollama",
+  "display_name": "Ollama on this computer",
+  "type": "local_server",
+  "base_url": "http://127.0.0.1:11434/v1",
+  "models": [
+    "qwen3:8b"
+  ],
+  "open_weight": true
+}

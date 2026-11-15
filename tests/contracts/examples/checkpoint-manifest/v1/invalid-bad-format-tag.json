@@ -1,0 +1,7 @@
+{
+  "base": "valid-full-resume.json",
+  "set": {
+    "/format": "hf trainer"
+  },
+  "fails_at": "/format"
+}

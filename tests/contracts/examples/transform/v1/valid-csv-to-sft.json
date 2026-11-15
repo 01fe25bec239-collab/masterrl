@@ -1,0 +1,51 @@
+{
+  "schema_version": "transform/v1",
+  "name": "support tickets to chat",
+  "description": "question/answer CSV to sft.messages.v1",
+  "from": {
+    "format": "csv",
+    "columns": [
+      "question",
+      "answer",
+      "lang"
+    ]
+  },
+  "to": "sft.messages.v1",
+  "steps": [
+    {
+      "op": "drop_empty",
+      "field": "answer"
+    },
+    {
+      "op": "dedupe",
+      "fields": [
+        "question"
+      ]
+    },
+    {
+      "op": "max_length",
+      "field": "answer",
+      "max_chars": 8000
+    },
+    {
+      "op": "to_messages",
+      "to": "messages",
+      "messages": [
+        {
+          "role": "user",
+          "from": "question"
+        },
+        {
+          "role": "assistant",
+          "from": "answer"
+        }
+      ]
+    },
+    {
+      "op": "select",
+      "fields": [
+        "messages"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,7 @@
+{
+  "base": "valid-local-server.json",
+  "set": {
+    "/type": "openai"
+  },
+  "fails_at": "/type"
+}

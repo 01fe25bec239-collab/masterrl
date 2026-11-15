@@ -1,0 +1,7 @@
+{
+  "base": "valid-full-resume.json",
+  "set": {
+    "/files": []
+  },
+  "fails_at": "/files"
+}

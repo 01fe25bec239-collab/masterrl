@@ -1,0 +1,7 @@
+{
+  "base": "valid-experimenter-tools.json",
+  "set": {
+    "/tools/0/name": "List Runs"
+  },
+  "fails_at": "/tools/0/name"
+}

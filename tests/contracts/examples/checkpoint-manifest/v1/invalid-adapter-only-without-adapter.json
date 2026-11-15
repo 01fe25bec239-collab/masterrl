@@ -1,0 +1,7 @@
+{
+  "base": "valid-adapter-only.json",
+  "remove": [
+    "/adapter"
+  ],
+  "fails_at": "/"
+}

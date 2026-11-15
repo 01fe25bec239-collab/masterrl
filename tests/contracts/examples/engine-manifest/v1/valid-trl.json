@@ -1,0 +1,385 @@
+{
+  "apiVersion": "mrl.dev/engine/v1",
+  "kind": "EngineManifest",
+  "metadata": {
+    "name": "trl",
+    "version": "1.0.0",
+    "displayName": "Hugging Face TRL",
+    "description": "SFT, preference and online RL trainers from TRL.",
+    "license": "Apache-2.0",
+    "homepage": "https://github.com/huggingface/trl",
+    "maintainers": [
+      "MasterRL"
+    ]
+  },
+  "spec": {
+    "adapter": {
+      "entrypoint": "mrl_adapter_trl.engine:TrlEngine",
+      "adapterApi": ">=1.0,<2",
+      "workerProtocol": ">=1.0,<2"
+    },
+    "upstream": [
+      {
+        "name": "trl",
+        "version": "1.17.1",
+        "license": "Apache-2.0",
+        "source": "https://pypi.org/project/trl/"
+      }
+    ],
+    "runtime": {
+      "environments": [
+        {
+          "id": "cuda12-oci",
+          "kind": "oci",
+          "image": "ghcr.io/masterrl/engine-trl@sha256:abababababababababababababababababababababababababababababababab",
+          "lockfile": "uv.lock",
+          "lockSha256": "abababababababababababababababababababababababababababababababab",
+          "python": "3.12",
+          "platform": "linux/amd64",
+          "accelerator": {
+            "vendor": "nvidia",
+            "runtime": "cuda12",
+            "minDriver": "550",
+            "minComputeCapability": "8.0"
+          },
+          "mrlRuntime": "0.1.0",
+          "sbom": "sbom/engine-trl.spdx.json"
+        },
+        {
+          "id": "cuda12-uv",
+          "kind": "uv",
+          "lockfile": "uv.lock",
+          "lockSha256": "abababababababababababababababababababababababababababababababab",
+          "python": "3.12",
+          "platform": "linux/amd64",
+          "accelerator": {
+            "vendor": "nvidia",
+            "runtime": "cuda12"
+          },
+          "mrlRuntime": "0.1.0"
+        }
+      ]
+    },
+    "runtimes": [
+      {
+        "role": "trainer",
+        "runtime_ref": "cuda12-oci"
+      },
+      {
+        "role": "rollout",
+        "runtime_ref": "cuda12-oci"
+      },
+      {
+        "role": "reward_exec",
+        "runtime_ref": "cuda12-oci"
+      }
+    ],
+    "capabilities": {
+      "updateStrategies": [
+        "full",
+        "lora",
+        "qlora"
+      ],
+      "precision": [
+        "bf16",
+        "fp16",
+        "fp32"
+      ],
+      "quantizedTraining": [
+        "bnb-4bit"
+      ],
+      "parallelism": [
+        "single",
+        "ddp",
+        "deepspeed-zero2",
+        "fsdp2"
+      ],
+      "multiNode": true,
+      "multimodal": [
+        "image"
+      ],
+      "execution": {
+        "modes": [
+          "offline",
+          "on_policy_sync"
+        ]
+      },
+      "rollout": {
+        "providers": [
+          "hf-generate",
+          "vllm-colocate",
+          "vllm-server"
+        ]
+      },
+      "liveWeightSync": [
+        "shared",
+        "nccl"
+      ],
+      "resume": true,
+      "pause": true,
+      "onDemandCheckpoint": true,
+      "gradientCheckpointing": true,
+      "streamingDatasets": false,
+      "trustRemoteCode": "never",
+      "rl": {
+        "version_label": "adapter",
+        "tool_output_masking": false,
+        "max_policy_lag_supported": 0,
+        "in_flight_modes": [
+          "finish"
+        ],
+        "on_stale_modes": [
+          "drop"
+        ]
+      },
+      "reward": {
+        "multi_component": true,
+        "per_sample_mask": true
+      }
+    },
+    "topology": {
+      "roles": [
+        {
+          "id": "trainer",
+          "kind": "trainer",
+          "environment": "cuda12-oci",
+          "count": 1,
+          "gpus": 1,
+          "reportsVia": "worker_protocol"
+        },
+        {
+          "id": "rewards",
+          "kind": "reward_exec",
+          "environment": "cuda12-oci",
+          "count": 1,
+          "gpus": 0,
+          "reportsVia": "logs_only"
+        }
+      ],
+      "primary": "trainer",
+      "network": "job-internal",
+      "launcher": "accelerate"
+    },
+    "algorithms": [
+      {
+        "id": "sft",
+        "displayName": "Supervised fine-tuning",
+        "summary": "Teach the model to imitate example answers.",
+        "objective": "supervised",
+        "parent": "trl.SFTTrainer",
+        "switch": {},
+        "defaults": {
+          "learning_rate": 2e-05
+        },
+        "upstreamStatus": "stable",
+        "maturity": "stable",
+        "fidelity": "full",
+        "requires": {
+          "datasetSchemas": {
+            "train": [
+              "sft.messages.v1",
+              "sft.prompt_completion.v1"
+            ],
+            "eval": [
+              "sft.messages.v1",
+              "eval.v1"
+            ]
+          },
+          "signals": {
+            "reward": "none",
+            "reference": "none",
+            "referenceModel": "none",
+            "critic": "none",
+            "rolloutEngine": "none",
+            "teacher": "none"
+          },
+          "modelFamilies": [
+            "decoder",
+            "decoder-moe"
+          ]
+        },
+        "config": {
+          "schema": "schemas/sft.config.schema.json",
+          "presets": [
+            {
+              "id": "lora-beginner",
+              "title": "LoRA, safe defaults",
+              "tier": "beginner",
+              "patch": {
+                "peft": {
+                  "r": 16
+                }
+              }
+            }
+          ]
+        },
+        "metrics": [
+          {
+            "name": "train/loss",
+            "source": "loss",
+            "kind": "live",
+            "required": true
+          },
+          {
+            "name": "train/learning_rate",
+            "source": "learning_rate",
+            "kind": "live",
+            "required": false
+          }
+        ],
+        "samples": {
+          "emitted": false
+        },
+        "resume": true,
+        "pause": true,
+        "estimator": "trl-sft-v1"
+      },
+      {
+        "id": "grpo",
+        "displayName": "GRPO",
+        "summary": "Online RL from rewards, comparing answers within a group.",
+        "paper": "arXiv:2402.03300",
+        "objective": "online_rl",
+        "parent": "trl.GRPOTrainer",
+        "switch": {
+          "loss_type": "grpo"
+        },
+        "upstreamStatus": "stable",
+        "maturity": "beta",
+        "fidelity": "full",
+        "requires": {
+          "datasetSchemas": {
+            "train": [
+              "rl.prompt.v1"
+            ]
+          },
+          "signals": {
+            "reward": "required",
+            "rewardGranularity": "sequence",
+            "reference": "optional",
+            "referenceModel": "explicit",
+            "critic": "none",
+            "rolloutEngine": "required",
+            "teacher": "none"
+          }
+        },
+        "supports": {
+          "execution": {
+            "modes": [
+              "on_policy_sync"
+            ]
+          },
+          "rollout": {
+            "providers": [
+              "vllm-colocate",
+              "vllm-server"
+            ]
+          }
+        },
+        "metrics": [
+          {
+            "name": "rl/reward/mean",
+            "source": "reward",
+            "kind": "live",
+            "required": true
+          }
+        ],
+        "samples": {
+          "emitted": true,
+          "fields": [
+            "prompt",
+            "completion",
+            "reward_total"
+          ]
+        },
+        "resume": true,
+        "pause": true
+      },
+      {
+        "id": "x-trl.async_grpo",
+        "displayName": "Async GRPO",
+        "summary": "GRPO with a separate rollout worker; upstream marks it experimental.",
+        "parent": "trl.experimental.AsyncGRPOTrainer",
+        "upstreamStatus": "experimental",
+        "maturity": "experimental",
+        "fidelity": "partial",
+        "fidelityNote": "FSDP2 only; staleness handling is upstream's.",
+        "requires": {
+          "datasetSchemas": {
+            "train": [
+              "rl.prompt.v1"
+            ]
+          },
+          "signals": {
+            "reward": "required",
+            "reference": "none",
+            "referenceModel": "none",
+            "critic": "none",
+            "rolloutEngine": "required",
+            "teacher": "none"
+          }
+        },
+        "metrics": [],
+        "resume": false,
+        "pause": false
+      }
+    ],
+    "constraints": [
+      {
+        "id": "grpo-needs-chat-template",
+        "appliesTo": [
+          "grpo"
+        ],
+        "schema": {
+          "properties": {
+            "model": {
+              "properties": {
+                "has_chat_template": {
+                  "const": true
+                }
+              }
+            }
+          }
+        },
+        "error": {
+          "code": "MRL-CFG-001",
+          "message": "This model has no chat template.",
+          "hint": "Pick an instruct model, or add a chat template first."
+        }
+      }
+    ],
+    "checkpoint": {
+      "format": "hf-trainer-v1",
+      "resumable": true,
+      "portableWeights": true,
+      "stateFiles": "strip_after_completion"
+    },
+    "metrics": {
+      "namespaces": {
+        "loss": "train/loss",
+        "learning_rate": "train/learning_rate"
+      }
+    },
+    "exports": [
+      "hf-safetensors",
+      "hf-peft-adapter",
+      "merged-safetensors"
+    ],
+    "validate": {
+      "l1": true
+    },
+    "hardware": {
+      "os": [
+        "linux",
+        "windows"
+      ],
+      "accelerators": [
+        "nvidia"
+      ],
+      "apple_silicon": false,
+      "wsl2": true,
+      "minGpus": 1,
+      "minGpuMemoryGib": 8
+    }
+  }
+}

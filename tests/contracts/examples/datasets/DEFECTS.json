@@ -1,0 +1,10 @@
+{
+  "files": {
+    "rl.rollout.v1-invalid.jsonl": [
+      { "line": 1, "code": "missing_field", "note": "status is missing" },
+      { "line": 2, "code": "missing_field", "note": "neither policy_version nor version_spans" },
+      { "line": 3, "code": "wrong_type", "note": "reward_total is a string" },
+      { "line": 4, "code": "unknown_value", "note": "status failed" }
+    ]
+  }
+}

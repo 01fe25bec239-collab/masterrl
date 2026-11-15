@@ -1,0 +1,7 @@
+{
+  "base": "valid-trl.json",
+  "set": {
+    "/spec/runtimes/0/role": "planner"
+  },
+  "fails_at": "/spec/runtimes/0/role"
+}

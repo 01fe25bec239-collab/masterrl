@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.masterrl.dev/artifact-manifest/v1.schema.json",
+  "title": "ArtifactManifest v1",
+  "description": "The file list of a stored artifact, with sizes and hashes. Matches mrl-storage's ArtifactManifest field for field.",
+  "x-mrl-rules": {
+    "duplicate_path": "Each path appears once in files."
+  },
+  "type": "object",
+  "required": ["schema_version", "kind", "created_at", "files"],
+  "properties": {
+    "schema_version": { "const": "artifact-manifest/v1" },
+    "kind": { "enum": ["model", "dataset", "checkpoint", "eval", "export", "other"] },
+    "created_at": { "type": "string", "format": "date-time" },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["path", "size", "sha256", "role"],
+        "properties": {
+          "path": { "$ref": "#/$defs/relativePath" },
+          "size": { "type": "integer", "minimum": 0 },
+          "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "role": { "description": "e.g. weights, config, tokenizer, data.", "type": "string", "minLength": 1 },
+          "format": { "description": "e.g. safetensors, json, parquet.", "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    },
+    "source": {
+      "description": "Where the artifact came from (run, import URL, parent ids).",
+      "type": "object",
+      "x-mrl-open": "provenance fields differ per artifact kind"
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "relativePath": {
+      "description": "Relative path with / separators: no leading /, no backslash, no empty, . or .. parts.",
+      "type": "string",
+      "pattern": "^(?!/)(?!.*//)(?!(?:.*/)?\\.\\.?(?:/|$))[^\\\\\\u0000]+(?<!/)$"
+    }
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "base": "valid-trl.json",
+  "set": {
+    "/spec/algorithms/0/id": "my_sft"
+  },
+  "fails_at": "/spec/algorithms/0/id"
+}

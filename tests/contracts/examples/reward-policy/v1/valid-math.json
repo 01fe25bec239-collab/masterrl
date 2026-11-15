@@ -1,0 +1,112 @@
+{
+  "apiVersion": "mrl.dev/reward/v1",
+  "kind": "RewardPolicy",
+  "metadata": {
+    "name": "gsm-style-math-v3",
+    "description": "Correct final answer dominates; small format bonus; soft penalty near the token limit.",
+    "signal": "scalar.sequence",
+    "intended_algorithms": [
+      "grpo",
+      "dr_grpo",
+      "dapo",
+      "gspo",
+      "rloo"
+    ],
+    "intended_schemas": [
+      "rl.prompt.v1"
+    ]
+  },
+  "spec": {
+    "components": [
+      {
+        "id": "correct",
+        "use": "builtin/math.verify@1",
+        "params": {
+          "answer_extractor": "tag:answer",
+          "numeric_tolerance": 1e-06,
+          "per_sample_timeout_ms": 2000
+        },
+        "weight": 1.0,
+        "range": [
+          0,
+          1
+        ]
+      },
+      {
+        "id": "format",
+        "use": "builtin/format.think_answer_tags@1",
+        "weight": 0.1,
+        "range": [
+          0,
+          1
+        ]
+      },
+      {
+        "id": "overlong",
+        "use": "builtin/length.soft_overlong@1",
+        "params": {
+          "max_tokens": 2048,
+          "cache_tokens": 256
+        },
+        "weight": 1.0,
+        "range": [
+          -1,
+          0
+        ]
+      },
+      {
+        "id": "lang",
+        "use": "builtin/lang.match@1",
+        "when": "sample.reference.lang != null",
+        "weight": 0.05
+      }
+    ],
+    "gates": [
+      {
+        "id": "parseable",
+        "require": "components.format.diagnostics.answer_tag_found == true",
+        "else_value": -0.5
+      }
+    ],
+    "aggregation": {
+      "method": "weighted_sum",
+      "where": "platform"
+    },
+    "normalization": {
+      "per_component": "none",
+      "final": "none"
+    },
+    "clipping": {
+      "min": -1.0,
+      "max": 1.2
+    },
+    "shaping": [
+      {
+        "id": "format-warmup",
+        "component": "format",
+        "schedule": [
+          {
+            "from_step": 0,
+            "weight": 0.3
+          },
+          {
+            "from_step": 200,
+            "weight": 0.1
+          }
+        ]
+      }
+    ],
+    "failure": {
+      "on_timeout": {
+        "action": "mask",
+        "fallback_value": null
+      },
+      "on_error": {
+        "action": "fallback",
+        "fallback_value": -1.0
+      },
+      "max_failure_rate": 0.05
+    },
+    "tests": "./tests/cases.yaml"
+  }
+}
