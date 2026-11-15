@@ -31,11 +31,17 @@ pub enum ErrorFamily {
     Env,
     /// `LINK`: machines that must work together.
     Link,
+    /// `CONFLICT`: the item changed since it was read (ETag / version checks).
+    Conflict,
+    /// `INTERNAL`: the server failed or a service behind it is down.
+    Internal,
+    /// `RES`: the item or address does not exist, or is hidden from you.
+    Res,
 }
 
 impl ErrorFamily {
     /// Every family.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 13] = [
         Self::Auth,
         Self::Perm,
         Self::Val,
@@ -46,6 +52,9 @@ impl ErrorFamily {
         Self::Model,
         Self::Env,
         Self::Link,
+        Self::Conflict,
+        Self::Internal,
+        Self::Res,
     ];
 
     /// The family name, like `CAP`.
@@ -61,6 +70,9 @@ impl ErrorFamily {
             Self::Model => "MODEL",
             Self::Env => "ENV",
             Self::Link => "LINK",
+            Self::Conflict => "CONFLICT",
+            Self::Internal => "INTERNAL",
+            Self::Res => "RES",
         }
     }
 }
@@ -160,7 +172,7 @@ const fn code(family: ErrorFamily, number: u16) -> ErrorCode {
     ErrorCode::known(family, number)
 }
 
-use ErrorFamily::{Auth, Data, Env, Idem, Link, Model, Perm, Quota, Val};
+use ErrorFamily::{Auth, Conflict, Data, Env, Idem, Internal, Link, Model, Perm, Quota, Res, Val};
 
 /// Every non-capability code with its title. `MRL-CAP` codes live in [`CapabilityRejection`].
 pub const REGISTRY: &[(ErrorCode, &str)] = &[
@@ -253,6 +265,70 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
     (
         code(Link, 6),
         "A machine in this group is low on disk space.",
+    ),
+    // Server request and startup errors (P07).
+    (code(Val, 8), "The server could not open its settings file."),
+    (
+        code(Val, 9),
+        "The server could not understand its settings file.",
+    ),
+    (code(Val, 10), "A server setting has a value it cannot use."),
+    (
+        code(Val, 11),
+        "A server setting from the environment could not be used.",
+    ),
+    (
+        code(Val, 12),
+        "The server could not use its certificate or key file.",
+    ),
+    (
+        code(Internal, 3),
+        "The server could not start because a required part is missing.",
+    ),
+    (
+        code(Internal, 4),
+        "Team mode could not start because no sign-in provider is set up.",
+    ),
+    (
+        code(Internal, 5),
+        "The server could not open a network port.",
+    ),
+    (code(Internal, 6), "The server stopped during startup."),
+    (
+        code(Internal, 7),
+        "The server could not set up trace export.",
+    ),
+    (code(Internal, 8), "The server took too long to stop."),
+    (
+        code(Internal, 9),
+        "A background job in the server stopped, so the server shut down.",
+    ),
+    (code(Res, 1), "The item you asked for could not be found."),
+    (code(Val, 4), "Some values in the request need a change."),
+    (
+        code(Val, 5),
+        "The page settings in the request could not be used.",
+    ),
+    (code(Val, 6), "The filter in the request could not be used."),
+    (code(Val, 7), "The request is too large."),
+    (
+        code(Conflict, 1),
+        "Someone changed this item after you opened it.",
+    ),
+    (
+        code(Conflict, 2),
+        "This change needs the version of the item you edited.",
+    ),
+    (code(Idem, 3), "The request key could not be used."),
+    (code(Res, 2), "There is nothing at this address."),
+    (code(Val, 13), "This address does not support that action."),
+    (
+        code(Internal, 1),
+        "The server hit a problem it did not expect.",
+    ),
+    (
+        code(Internal, 2),
+        "A service the server needs is not answering.",
     ),
 ];
 
