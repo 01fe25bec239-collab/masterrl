@@ -1,6 +1,20 @@
-//! Pure domain types for MasterRL: IDs, enums, state machines and validation rules.
+//! Pure domain types for MasterRL: IDs, state machines, failure classes, roles,
+//! error codes and resource requests.
 //!
-//! This crate does no IO. CI rejects tokio, sqlx, tonic and other IO crates here.
+//! This crate does no IO. CI rejects tokio, sqlx, tonic and other IO crates here
+//! (the optional `sqlx` feature adds `sqlx::Type` for IDs and is off by default).
+
+pub mod errors;
+pub mod failure;
+pub mod ids;
+pub mod rbac;
+pub mod resources;
+pub mod state;
+
+/// Capability checks. This crate holds only the rejection codes.
+pub mod capability {
+    pub mod codes;
+}
 
 /// The version of this crate, taken from its `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
