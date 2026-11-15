@@ -1,0 +1,178 @@
+---
+source: crates/mrl-domain/src/state/tests.rs
+expression: out
+---
+## job (created: job.created)
+initial: CREATED
+terminal: COMPLETED FAILED CANCELLED REJECTED
+CREATED          --job.submitted--> VALIDATING       by jobs
+VALIDATING       --job.queued--> QUEUED           by jobs
+VALIDATING       --job.rejected--> REJECTED         by jobs
+QUEUED           --job.placed--> ALLOCATING       by scheduler
+ALLOCATING       --job.launched--> PREPARING        by scheduler
+ALLOCATING       --job.requeued--> QUEUED           by scheduler
+PREPARING        --job.started--> RUNNING          by jobs
+RUNNING          --job.finished--> FINALIZING       by jobs
+FINALIZING       --job.completed--> COMPLETED        by artifacts_verifier
+ALLOCATING       --job.retry_scheduled--> RETRY_WAIT       by jobs
+PREPARING        --job.retry_scheduled--> RETRY_WAIT       by jobs
+RUNNING          --job.retry_scheduled--> RETRY_WAIT       by jobs
+FINALIZING       --job.retry_scheduled--> RETRY_WAIT       by jobs
+ALLOCATING       --job.failed--> FAILED           by jobs
+PREPARING        --job.failed--> FAILED           by jobs
+RUNNING          --job.failed--> FAILED           by jobs
+FINALIZING       --job.failed--> FAILED           by jobs
+PAUSING          --job.failed--> FAILED           by jobs
+RETRY_WAIT       --job.failed--> FAILED           by jobs
+RUNNING          --job.pause_requested--> PAUSING          by jobs
+PAUSING          --job.paused--> PAUSED           by jobs
+PAUSING          --job.pause_refused--> RUNNING          by jobs
+PAUSED           --job.resumed--> RESUMING         by jobs
+RESUMING         --job.requeued--> QUEUED           by jobs
+RETRY_WAIT       --job.retried--> QUEUED           by scheduler
+QUEUED           --job.cancel_requested--> CANCELLING       by jobs
+ALLOCATING       --job.cancel_requested--> CANCELLING       by jobs
+PREPARING        --job.cancel_requested--> CANCELLING       by jobs
+RUNNING          --job.cancel_requested--> CANCELLING       by jobs
+PAUSING          --job.cancel_requested--> CANCELLING       by jobs
+PAUSED           --job.cancel_requested--> CANCELLING       by jobs
+RESUMING         --job.cancel_requested--> CANCELLING       by jobs
+RETRY_WAIT       --job.cancel_requested--> CANCELLING       by jobs
+FINALIZING       --job.cancel_requested--> CANCELLING       by jobs
+CANCELLING       --job.cancelled--> CANCELLED        by jobs
+
+## attempt (created: attempt.created)
+initial: PENDING
+terminal: EXITED_OK EXITED_ERROR LOST KILLED
+PENDING          --attempt.acknowledged--> LAUNCHING        by jobs
+LAUNCHING        --attempt.started--> RUNNING          by jobs
+LAUNCHING        --attempt.succeeded--> EXITED_OK        by jobs
+RUNNING          --attempt.succeeded--> EXITED_OK        by jobs
+LAUNCHING        --attempt.errored--> EXITED_ERROR     by jobs
+RUNNING          --attempt.errored--> EXITED_ERROR     by jobs
+LAUNCHING        --attempt.lost--> LOST             by jobs
+RUNNING          --attempt.lost--> LOST             by jobs
+PENDING          --attempt.killed--> KILLED           by jobs
+LAUNCHING        --attempt.killed--> KILLED           by jobs
+RUNNING          --attempt.killed--> KILLED           by jobs
+
+## checkpoint (created: checkpoint.staged)
+initial: WRITING
+terminal: TOMBSTONED
+WRITING          --checkpoint.uploaded--> UPLOADED         by artifacts
+UPLOADED         --checkpoint.commit_requested--> VERIFYING        by artifacts
+VERIFYING        --checkpoint.committed--> COMMITTED        by artifacts
+WRITING          --checkpoint.corrupted--> CORRUPT          by artifacts
+UPLOADED         --checkpoint.corrupted--> CORRUPT          by artifacts
+VERIFYING        --checkpoint.corrupted--> CORRUPT          by artifacts
+COMMITTED        --checkpoint.corrupted--> CORRUPT          by artifacts
+COMMITTED        --checkpoint.tombstoned--> TOMBSTONED       by artifacts
+CORRUPT          --checkpoint.tombstoned--> TOMBSTONED       by artifacts
+
+## node (created: node.registered)
+initial: ENROLLING
+terminal: DECOMMISSIONED
+ENROLLING        --node.enrolled--> ONLINE           by nodes
+ONLINE           --node.degraded--> DEGRADED         by nodes
+DEGRADED         --node.recovered--> ONLINE           by nodes
+ONLINE           --node.disconnected--> OFFLINE          by nodes
+DEGRADED         --node.disconnected--> OFFLINE          by nodes
+OFFLINE          --node.reconnected--> ONLINE           by nodes
+ENROLLING        --node.drain_started--> DRAINING         by nodes
+ONLINE           --node.drain_started--> DRAINING         by nodes
+DEGRADED         --node.drain_started--> DRAINING         by nodes
+OFFLINE          --node.drain_started--> DRAINING         by nodes
+DRAINING         --node.decommissioned--> DECOMMISSIONED   by nodes
+
+## deployment_revision (created: deployment_revision.created)
+initial: PENDING
+terminal: STOPPED FAILED ROLLED_BACK
+PENDING          --deployment_revision.started--> STARTING         by deployments
+STARTING         --deployment_revision.became_healthy--> HEALTHY          by deployments
+DEGRADED         --deployment_revision.became_healthy--> HEALTHY          by deployments
+STARTING         --deployment_revision.failed--> FAILED           by deployments
+HEALTHY          --deployment_revision.degraded--> DEGRADED         by deployments
+HEALTHY          --deployment_revision.drain_started--> DRAINING         by deployments
+DEGRADED         --deployment_revision.drain_started--> DRAINING         by deployments
+HEALTHY          --deployment_revision.rolled_back--> ROLLED_BACK      by deployments
+DEGRADED         --deployment_revision.rolled_back--> ROLLED_BACK      by deployments
+DRAINING         --deployment_revision.stopped--> STOPPED          by deployments
+
+## policy_version (created: policy_version.proposed)
+initial: PROPOSED
+terminal: ORPHANED ABORTED
+PROPOSED         --policy_version.transfer_started--> TRANSFERRING     by weight_sync
+TRANSFERRING     --policy_version.acknowledged--> ACKED            by weight_sync
+ACKED            --policy_version.activated--> ACTIVE           by weight_sync
+ACTIVE           --policy_version.superseded--> SUPERSEDED       by weight_sync
+ACTIVE           --policy_version.orphaned--> ORPHANED         by weight_sync
+SUPERSEDED       --policy_version.orphaned--> ORPHANED         by weight_sync
+PROPOSED         --policy_version.aborted--> ABORTED          by weight_sync
+TRANSFERRING     --policy_version.aborted--> ABORTED          by weight_sync
+
+## reservation (created: reservation.held)
+initial: HELD
+terminal: RELEASED EXPIRED
+HELD             --reservation.activated--> ACTIVE           by scheduler
+HELD             --reservation.release_started--> RELEASING        by scheduler
+ACTIVE           --reservation.release_started--> RELEASING        by scheduler
+HELD             --reservation.expired--> EXPIRED          by scheduler
+ACTIVE           --reservation.quarantined--> QUARANTINED      by scheduler
+RELEASING        --reservation.released--> RELEASED         by scheduler
+QUARANTINED      --reservation.released--> RELEASED         by scheduler
+
+## model_version (created: model_version.created)
+initial: IMPORTING
+terminal: INVALID ARCHIVED
+IMPORTING        --model_version.imported--> READY            by models
+IMPORTING        --model_version.import_failed--> INVALID          by models
+READY            --model_version.archived--> ARCHIVED         by models
+
+## model_version (created: model_version.created)
+initial: EXPERIMENTAL
+terminal: ARCHIVED
+EXPERIMENTAL     --model_version.promotion_requested--> CANDIDATE        by promotions
+CANDIDATE        --model_version.promotion_approved--> APPROVED         by promotions
+EXPERIMENTAL     --model_version.stage_archived--> ARCHIVED         by promotions
+CANDIDATE        --model_version.stage_archived--> ARCHIVED         by promotions
+APPROVED         --model_version.stage_archived--> ARCHIVED         by promotions
+
+## dataset_version (created: dataset_version.created)
+initial: INGESTING
+terminal: INVALID ARCHIVED
+INGESTING        --dataset_version.ingested--> VALIDATING       by datasets
+VALIDATING       --dataset_version.validated--> READY            by datasets
+INGESTING        --dataset_version.validation_failed--> INVALID          by datasets
+VALIDATING       --dataset_version.validation_failed--> INVALID          by datasets
+READY            --dataset_version.archived--> ARCHIVED         by datasets
+
+## reward_version (created: reward_version.drafted)
+initial: DRAFT
+terminal: DEPRECATED
+DRAFT            --reward_version.tests_started--> TESTING          by rewards
+FAILED_TESTS     --reward_version.tests_started--> TESTING          by rewards
+TESTING          --reward_version.published--> PUBLISHED        by rewards
+TESTING          --reward_version.tests_failed--> FAILED_TESTS     by rewards
+PUBLISHED        --reward_version.deprecated--> DEPRECATED       by rewards
+
+## engine_version (created: engine_version.registered)
+initial: PENDING_APPROVAL
+terminal: REVOKED
+PENDING_APPROVAL --engine_version.approved--> PROBING          by engines
+PROBING          --engine_version.enabled--> ENABLED          by engines
+DISABLED         --engine_version.enabled--> ENABLED          by engines
+PROBING          --engine_version.disabled--> DISABLED         by engines
+ENABLED          --engine_version.disabled--> DISABLED         by engines
+PENDING_APPROVAL --engine_version.revoked--> REVOKED          by engines
+PROBING          --engine_version.revoked--> REVOKED          by engines
+ENABLED          --engine_version.revoked--> REVOKED          by engines
+DISABLED         --engine_version.revoked--> REVOKED          by engines
+
+## feedback_item (created: feedback_item.created)
+initial: PENDING
+terminal: RESOLVED
+PENDING          --feedback_item.assigned--> IN_PROGRESS      by feedback
+IN_PROGRESS      --feedback_item.released--> PENDING          by feedback
+IN_PROGRESS      --feedback_item.completed--> DONE             by feedback
+DONE             --feedback_item.disputed--> DISPUTED         by feedback
+DISPUTED         --feedback_item.resolved--> RESOLVED         by feedback
