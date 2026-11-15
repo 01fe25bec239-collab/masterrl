@@ -2428,6 +2428,154 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-STORE-001")),
+            ("title", Value::Str("The app refused a storage path.")),
+            ("why", Value::Str("The path points outside your workspace's storage area, or it has a part the app doesn't allow, like `..`.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Try the action again from the app."),
+                    Value::Str("If a script sent the request, use the paths the app gives you."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STORE-002")),
+            ("title", Value::Str("A name used for storage has characters the app doesn't allow.")),
+            ("why", Value::Str("Names in storage paths can use only letters, digits and the marks . _ - = + @ and commas.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Rename the item with only allowed characters, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STORE-003")),
+            ("title", Value::Str("The app could not find this file in storage.")),
+            ("why", Value::Str("The file was deleted, or it was never fully saved.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check that the item still exists in the app."),
+                    Value::Str("If you were uploading it, upload it again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STORE-004")),
+            ("title", Value::Str("The storage service did not respond as expected.")),
+            ("why", Value::Str("The app tried several times, but the storage service kept failing. It may be down or out of reach.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check your network connection."),
+                    Value::Str("Wait about 1–2 minutes, then try again."),
+                    Value::Str("If it keeps failing, ask your admin to check the storage service."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STORE-005")),
+            ("title", Value::Str("The app could not read or write a file on this computer.")),
+            ("why", Value::Str("The disk may be full, or the app may not have permission to use that folder.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Free up disk space, then try again."),
+                    Value::Str("Check that the app can write to the folder named in Details."),
+                ])),
+                ("windows", Value::List(&[
+                    Value::Str("Right-click the folder, open Properties, then check the Security tab."),
+                ])),
+                ("macos", Value::List(&[
+                    Value::Str("Open System Settings, then Privacy & Security, then Files and Folders."),
+                ])),
+                ("linux", Value::List(&[
+                    Value::Str("Run `ls -ld` on the folder to see who can write to it."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STORE-006")),
+            ("title", Value::Str("The storage settings need a change.")),
+            ("why", Value::Str("A storage setting is missing or has a value the app doesn't accept. Details names the setting.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Open the storage settings and fix the setting named in Details."),
+                    Value::Str("Restart the app, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STORE-007")),
+            ("title", Value::Str("The app refused this transfer link.")),
+            ("why", Value::Str("The link was changed, cut short or made by a different server. The app could not confirm it is real.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Ask the app for a new transfer link, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STORE-008")),
+            ("title", Value::Str("This transfer link has expired.")),
+            ("why", Value::Str("Transfer links work for 15 minutes at most, to keep your files safe.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Ask the app for a new transfer link, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STORE-009")),
+            ("title", Value::Str("This transfer link doesn't allow that.")),
+            ("why", Value::Str("Each link allows one action on one file, up to a set size. This request asked for more.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Ask the app for a new link for this exact action and file."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STORE-010")),
+            ("title", Value::Str("A file changed on its way through storage.")),
+            ("why", Value::Str("The content the app received doesn't match the content that was saved. The app deleted the damaged copy.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Try the download again."),
+                    Value::Str("If it fails again, upload the file again from the original."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STORE-011")),
+            ("title", Value::Str("Some files in storage don't match their file list.")),
+            ("why", Value::Str("Files are missing, have the wrong size or have different content. Details lists each file.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Open Details to see which files need attention."),
+                    Value::Str("Upload those files again, or save the item again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STORE-012")),
+            ("title", Value::Str("The app could not read this file list.")),
+            ("why", Value::Str("The file list is not in the format the app expects. Details names the field that needs a fix.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Save the item again so the app writes a new file list."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STORE-013")),
+            ("title", Value::Str("A file changed while the app was uploading it.")),
+            ("why", Value::Str("Something wrote to the file during the upload, so the copy in storage would not match.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Wait until nothing else is writing to the file."),
+                    Value::Str("Start the upload again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-VAL-001")),
             ("title", Value::Str("The app could not read this request.")),
             ("why", Value::Str("The request is not in a format the app understands. Part of it may be missing.")),

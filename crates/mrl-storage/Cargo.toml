@@ -1,0 +1,35 @@
+[package]
+name = "mrl-storage"
+description = "Object storage for MasterRL: backends, hashing, resumable transfer, tickets and manifests."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+gcs = ["object_store/gcp"]
+azure = ["object_store/azure"]
+
+[dependencies]
+object_store = { workspace = true, features = ["fs", "aws"] }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["rt", "fs", "sync", "time"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true, features = ["serde", "formatting", "parsing"] }
+uuid = { workspace = true }
+# Not pinned at the workspace yet, so exact versions live here.
+hmac = "=0.13.0"
+base64 = "=0.23.1"
+bytes = "=1.12.1"
+futures = { version = "=0.3.34", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "io-util"] }
+tempfile = "=3.27.0"
+
+[lints]
+workspace = true
