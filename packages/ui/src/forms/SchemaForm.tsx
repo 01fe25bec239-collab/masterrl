@@ -3,6 +3,7 @@ import { Button } from '../components/Button';
 import { Icon } from '../components/Icon';
 import { cn } from '../lib/cn';
 import {
+  fieldPointerFor,
   getIn,
   isActive,
   pointerOf,
@@ -508,11 +509,20 @@ export function SchemaForm({
   const [submitted, setSubmitted] = useState(false);
   const idBase = useId();
   const formRef = useRef<HTMLFormElement>(null);
-  const errors = useMemo(() => {
-    const e = validateValue(schema, value);
-    for (const [k, v] of Object.entries(externalErrors ?? {})) e.set(k, v);
-    return e;
+  // Every problem lands on the field that can show it; the rest are listed above the fields.
+  const { errors, orphans } = useMemo(() => {
+    const byField: FieldErrors = new Map();
+    const other: { pointer: string; message: string }[] = [];
+    const add = (pointer: string, message: string, replace: boolean) => {
+      const field = fieldPointerFor(schema, pointer);
+      if (field === null) other.push({ pointer, message });
+      else if (replace || !byField.has(field)) byField.set(field, message);
+    };
+    for (const [k, v] of validateValue(schema, value)) add(k, v, false);
+    for (const [k, v] of Object.entries(externalErrors ?? {})) add(k, v, true);
+    return { errors: byField, orphans: other };
   }, [schema, value, externalErrors]);
+  const problemCount = errors.size + orphans.length;
 
   const root = resolveRef(schema, schema);
   const ctx: FieldContext = {
@@ -549,6 +559,22 @@ export function SchemaForm({
           Switch to Advanced to fix {hidden === 1 ? 'it' : 'them'}.
         </p>
       )}
+      {orphans.length > 0 && (
+        <div role="alert" className="mb-4 rounded-md border border-danger p-3 text-fg">
+          <p className="flex items-center gap-2 font-medium text-danger">
+            <Icon name="alert" />
+            Other problems
+          </p>
+          <ul className="ml-6 list-disc text-sm">
+            {orphans.map((o) => (
+              <li key={`${o.pointer}:${o.message}`}>
+                {o.pointer ? `${o.pointer.slice(1).replace(/\//g, '.')}: ` : ''}
+                {o.message}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
       <ObjectFields schema={root} path={[]} ctx={ctx} />
     </>
   );
@@ -569,7 +595,7 @@ export function SchemaForm({
       onSubmit={(e) => {
         e.preventDefault();
         setSubmitted(true);
-        if (errors.size === 0) {
+        if (problemCount === 0) {
           onSubmit(value);
           return;
         }
@@ -578,12 +604,12 @@ export function SchemaForm({
         });
       }}
     >
-      {submitted && errors.size > 0 && (
+      {submitted && problemCount > 0 && (
         <p role="alert" className="mb-4 flex items-center gap-2 font-medium text-danger">
           <Icon name="alert" />
-          {errors.size === 1
+          {problemCount === 1
             ? '1 setting needs attention.'
-            : `${errors.size} settings need attention.`}
+            : `${problemCount} settings need attention.`}
         </p>
       )}
       {fields}

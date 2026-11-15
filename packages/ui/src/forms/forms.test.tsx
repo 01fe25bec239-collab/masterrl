@@ -290,6 +290,69 @@ describe('SchemaForm', () => {
   });
 });
 
+describe('every validator failure is reported', () => {
+  const strict: JsonSchema = {
+    type: 'object',
+    additionalProperties: false,
+    minProperties: 1,
+    properties: {
+      name: { type: 'string', title: 'Name' },
+      tags: { type: 'array', title: 'Tags', uniqueItems: true, items: { type: 'string' } },
+      lora: {
+        type: 'object',
+        title: 'LoRA',
+        additionalProperties: false,
+        properties: { r: { type: 'integer', title: 'Rank' } },
+      },
+    },
+  };
+
+  it('reports unknown keys, unmapped keywords and empty objects in plain words', () => {
+    const errors = validateValue(strict, {
+      name: 'a',
+      extra: 1,
+      tags: ['x', 'x'],
+      lora: { r: 8, alpha: 2 },
+    });
+    expect(Object.fromEntries(errors)).toEqual({
+      '/extra': '“extra” isn’t a setting this form knows. Remove it or check its spelling.',
+      '/lora/alpha': '“alpha” isn’t a setting this form knows. Remove it or check its spelling.',
+      '/tags': 'Remove the repeated items.',
+    });
+    expect(Object.fromEntries(validateValue(strict, {}))).toEqual({
+      '': 'This value isn’t allowed here. Check the help text.',
+    });
+  });
+
+  it('SchemaForm lists problems no field can show and blocks submit', async () => {
+    const user = userEvent.setup();
+    const onSubmit = vi.fn();
+    render(
+      <SchemaForm
+        label="Strict"
+        schema={strict}
+        value={{ name: 'a', extra: 1 }}
+        onChange={() => undefined}
+        level="advanced"
+        onSubmit={onSubmit}
+      />,
+    );
+    const other = screen.getByRole('alert');
+    expect(other.textContent).toContain('Other problems');
+    expect(other.textContent).toContain('extra: “extra” isn’t a setting this form knows.');
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    expect(onSubmit).not.toHaveBeenCalled();
+    expect(screen.getByText('1 setting needs attention.')).toBeDefined();
+  });
+
+  it('YAML diagnostics point at the unknown key', () => {
+    const r = yamlDiagnostics('name: a\nextra: 1\n', strict);
+    expect(r.diagnostics).toEqual([
+      expect.objectContaining({ line: 2, message: expect.stringContaining('“extra”') as string }),
+    ]);
+  });
+});
+
 describe('PresetPicker', () => {
   it('picks a preset and says when values were changed by hand', async () => {
     const user = userEvent.setup();

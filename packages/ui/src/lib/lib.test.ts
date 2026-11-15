@@ -140,6 +140,49 @@ describe('FileUpload', () => {
     expect(up.state.status).toBe('done');
   });
 
+  it('stays cancelled when cancel happens while the server completes', async () => {
+    const { t, complete } = transport();
+    const abort = vi.fn<NonNullable<UploadTransport['abort']>>(() => Promise.resolve());
+    t.abort = abort;
+    let finish: () => void = () => undefined;
+    complete.mockImplementation(
+      () =>
+        new Promise<void>((resolve) => {
+          finish = resolve;
+        }),
+    );
+    const up = new FileUpload(file, t);
+    const statuses: string[] = [];
+    up.subscribe(() => statuses.push(up.state.status));
+    const running = up.start();
+    await vi.waitFor(() => {
+      expect(complete).toHaveBeenCalled();
+    });
+    up.pause();
+    expect(up.state.status).toBe('uploading');
+    await up.cancel();
+    finish();
+    await running;
+    expect(up.state.status).toBe('cancelled');
+    expect(statuses).not.toContain('done');
+    expect(abort).toHaveBeenCalledOnce();
+  });
+
+  it('stays cancelled when cancel happens while the ticket is opening', async () => {
+    const { t, put } = transport();
+    const open = t.open.bind(t);
+    const holder: { up?: FileUpload } = {};
+    t.open = async (info) => {
+      await holder.up?.cancel();
+      return open(info);
+    };
+    const up = new FileUpload(file, t);
+    holder.up = up;
+    await up.start();
+    expect(up.state.status).toBe('cancelled');
+    expect(put).not.toHaveBeenCalled();
+  });
+
   it('pauses mid-upload and continues from the next part', async () => {
     const { t, put } = transport();
     const up = new FileUpload(file, t);

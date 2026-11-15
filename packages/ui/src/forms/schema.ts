@@ -42,6 +42,9 @@ export interface JsonSchema {
   pattern?: string;
   minItems?: number;
   maxItems?: number;
+  uniqueItems?: boolean;
+  minProperties?: number;
+  maxProperties?: number;
   'x-mrl-level'?: Level;
   'x-mrl-group'?: string;
   'x-mrl-widget'?: Widget;
@@ -139,8 +142,33 @@ export function isPathActive(root: JsonSchema, value: JsonValue, path: readonly 
 
 const unitSuffix = (s: JsonSchema) => (s['x-mrl-unit'] ? ` ${s['x-mrl-unit']}` : '');
 
-function plainMessage(keyword: string, s: JsonSchema): string | null {
+/** Keywords that only summarize failures already reported on a child location. */
+const SUMMARY_KEYWORDS = new Set([
+  'properties',
+  'patternProperties',
+  'additionalProperties',
+  'unevaluatedProperties',
+  'items',
+  'prefixItems',
+  'unevaluatedItems',
+  'contains',
+  'propertyNames',
+  '$ref',
+  '$dynamicRef',
+  'allOf',
+  'dependentSchemas',
+  'if',
+  'then',
+  'else',
+]);
+
+/** Plain words for one failed keyword. Every keyword gets a message; unknown ones a generic one. */
+function plainMessage(keyword: string, s: JsonSchema, key: string | undefined): string {
   switch (keyword) {
+    case 'false':
+      return key === undefined
+        ? 'This value isn’t allowed here.'
+        : `“${key}” isn’t a setting this form knows. Remove it or check its spelling.`;
     case 'type':
       return s.type === 'integer'
         ? 'Enter a whole number.'
@@ -174,8 +202,15 @@ function plainMessage(keyword: string, s: JsonSchema): string | null {
       return `Add at least ${s.minItems ?? ''} items.`;
     case 'maxItems':
       return `Use at most ${s.maxItems ?? ''} items.`;
+    case 'uniqueItems':
+      return 'Remove the repeated items.';
+    case 'oneOf':
+    case 'anyOf':
+      return 'This value doesn’t match any of the allowed kinds.';
+    case 'not':
+      return 'This value isn’t allowed here.';
     default:
-      return null;
+      return 'This value isn’t allowed here. Check the help text.';
   }
 }
 
@@ -189,10 +224,26 @@ function schemaAt(root: JsonSchema, path: readonly string[]): JsonSchema | undef
   return s;
 }
 
-/** Field errors keyed by JSON pointer, in plain words. One message per field. */
-export type FieldErrors = Map<string, string>;
-
 const decode = (seg: string) => seg.replace(/~1/g, '/').replace(/~0/g, '~');
+
+/**
+ * The form field that shows an error at `pointer`: the nearest leaf field at or above it.
+ * Null when no field can show it (an unknown key, or a rule on a whole object).
+ */
+export function fieldPointerFor(root: JsonSchema, pointer: string): string | null {
+  const path = pointer.split('/').slice(1).map(decode);
+  let s: JsonSchema = resolveRef(root, root);
+  for (let i = 0; i < path.length; i += 1) {
+    const child = s.properties?.[path[i] as string];
+    if (!child) return null;
+    s = resolveRef(child, root);
+    if (s.type !== 'object') return pointerOf(path.slice(0, i + 1));
+  }
+  return null;
+}
+
+/** Field errors keyed by JSON pointer, in plain words. One message per location. */
+export type FieldErrors = Map<string, string>;
 
 export function validateValue(schema: JsonSchema, value: JsonValue): FieldErrors {
   const validator = new Validator(schema, '2020-12', false);
@@ -207,10 +258,10 @@ export function validateValue(schema: JsonSchema, value: JsonValue): FieldErrors
       if (!errors.has(pointer)) errors.set(pointer, 'This is required.');
       continue;
     }
-    const s = schemaAt(schema, path);
-    const message = s ? plainMessage(unit.keyword, s) : null;
+    if (SUMMARY_KEYWORDS.has(unit.keyword)) continue;
+    const message = plainMessage(unit.keyword, schemaAt(schema, path) ?? {}, path.at(-1));
     const pointer = pointerOf(path);
-    if (message && !errors.has(pointer)) errors.set(pointer, message);
+    if (!errors.has(pointer)) errors.set(pointer, message);
   }
   for (const pointer of [...errors.keys()]) {
     if (!isPathActive(schema, value, pointer.split('/').slice(1).map(decode)))

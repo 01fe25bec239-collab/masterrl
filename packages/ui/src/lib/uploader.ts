@@ -73,6 +73,7 @@ export class FileUpload {
   private ticket: UploadTicket | null = null;
   private parts = new Map<number, UploadedPart>();
   private controller: AbortController | null = null;
+  private completing = false;
   private listeners = new Set<() => void>();
 
   constructor(
@@ -110,6 +111,8 @@ export class FileUpload {
     if (this.state.status === 'uploading' || this.state.status === 'done') return;
     const controller = new AbortController();
     this.controller = controller;
+    // A call, not a property read: TypeScript would wrongly keep `aborted` narrowed across awaits.
+    const stopped = () => controller.signal.aborted;
     this.set({ status: 'uploading', errorCode: undefined, errorDetail: undefined });
     try {
       this.ticket ??= await this.transport.open({
@@ -119,6 +122,7 @@ export class FileUpload {
         resumeKey: resumeKeyOf(this.file),
       });
       const ticket = this.ticket;
+      if (stopped()) return;
       for (const p of ticket.completedParts) this.parts.set(p.partNumber, p);
       this.set({ sentBytes: this.sentBytes(ticket.partSize) });
 
@@ -132,29 +136,37 @@ export class FileUpload {
             this.parts.set(n, await this.transport.putPart(ticket, n, body, controller.signal));
             break;
           } catch (err) {
-            if (controller.signal.aborted || attempt >= 2) throw err;
+            if (stopped() || attempt >= 2) throw err;
             attempt += 1;
             await sleep(this.retryDelayMs * 2 ** attempt, controller.signal);
           }
         }
         this.set({ sentBytes: this.sentBytes(ticket.partSize) });
         // Paused or cancelled while this part was in flight: keep it, stop before the next.
-        if (controller.signal.aborted) return;
+        if (stopped()) return;
       }
-      await this.transport.complete(
-        ticket,
-        [...this.parts.values()].sort((a, b) => a.partNumber - b.partNumber),
-      );
+      this.completing = true;
+      try {
+        await this.transport.complete(
+          ticket,
+          [...this.parts.values()].sort((a, b) => a.partNumber - b.partNumber),
+        );
+      } finally {
+        this.completing = false;
+      }
+      // Cancelled while the server was finishing: cancel() already aborted the ticket.
+      if (stopped()) return;
       this.set({ status: 'done', sentBytes: this.file.size });
     } catch (err) {
-      if (controller.signal.aborted) return;
+      if (stopped()) return;
       const info = errorInfo(err);
       this.set({ status: 'failed', errorCode: info.code, errorDetail: info.detail });
     }
   }
 
   pause(): void {
-    if (this.state.status !== 'uploading') return;
+    // Once the server is joining the parts there is nothing left to pause.
+    if (this.state.status !== 'uploading' || this.completing) return;
     this.controller?.abort(new DOMException('Paused', 'AbortError'));
     this.set({ status: 'paused' });
   }

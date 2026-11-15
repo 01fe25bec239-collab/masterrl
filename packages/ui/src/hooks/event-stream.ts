@@ -47,8 +47,14 @@ export class SseParser {
 
   constructor(private readonly emit: (event: StreamEvent) => void) {}
 
+  /** The last chunk ended in CR: a leading LF in the next chunk completes that CRLF. */
+  private endedWithCr = false;
+
   push(chunk: string): void {
-    this.buffer += chunk;
+    if (chunk === '') return;
+    const text = this.endedWithCr && chunk.startsWith('\n') ? chunk.slice(1) : chunk;
+    this.endedWithCr = chunk.endsWith('\r');
+    this.buffer += text;
     const lines = this.buffer.split(/\r\n|\r|\n/);
     this.buffer = lines.pop() ?? '';
     for (const line of lines) this.line(line);

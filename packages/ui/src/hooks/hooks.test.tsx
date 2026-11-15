@@ -21,6 +21,18 @@ describe('SseParser', () => {
     ]);
     expect(p.retry).toBe(1500);
   });
+
+  it('treats a CRLF split across chunks as one line break', () => {
+    const events: StreamEvent[] = [];
+    const p = new SseParser((e) => events.push(e));
+    p.push('data: first\r');
+    p.push('');
+    p.push('\ndata: second\r\n\r');
+    p.push('\n');
+    expect(events.map((e) => e.data)).toEqual(['first\nsecond']);
+    p.push('data: lone CR ends a line\r\rdata: next\n\n');
+    expect(events.map((e) => e.data)).toEqual(['first\nsecond', 'lone CR ends a line', 'next']);
+  });
 });
 
 /** Mock SSE server: each connection gets `script(connection, lastEventId)` lines, then closes. */
