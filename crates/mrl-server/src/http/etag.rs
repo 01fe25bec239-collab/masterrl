@@ -1,6 +1,6 @@
 //! `ETag` / `If-Match` helpers for optimistic concurrency.
 //!
-//! ```ignore
+//! ```text
 //! let current = etag::from_version(project.version);          // "\"7\""
 //! etag::check_if_match(&headers, &current, true)?;             // 428 if missing, 412 if stale
 //! Ok(([(header::ETAG, current)], Json(updated)))

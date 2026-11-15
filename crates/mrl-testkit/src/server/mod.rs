@@ -1,6 +1,6 @@
 //! Start a real server on loopback and send HTTP requests to it.
 //!
-//! ```ignore
+//! ```text
 //! let srv = TestServer::solo(vec![Box::new(TestModule::default())]).await;
 //! let res = srv.get_authed("/api/v1/ping").await;
 //! assert_eq!(res.status, 200);

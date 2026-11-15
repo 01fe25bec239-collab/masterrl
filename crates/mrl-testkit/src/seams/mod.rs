@@ -1,6 +1,6 @@
 //! Test implementations of the server seams: in memory and deterministic.
 //!
-//! ```ignore
+//! ```text
 //! let seams = mrl_testkit::seams::solo("secret").build(Mode::Solo)?;
 //! let seams = mrl_testkit::seams::team(&[("tok", user("usr_1", "org_1"))]).build(Mode::Team)?;
 //! ```

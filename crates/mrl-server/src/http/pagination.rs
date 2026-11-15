@@ -1,6 +1,6 @@
 //! Cursor pagination: `?limit=50&cursor=…` → `{ "items": [...], "next_cursor": "…" | null }`.
 //!
-//! ```ignore
+//! ```text
 //! async fn list(Query(q): Query<PageQuery>) -> Result<Json<Page<Run>>, ApiError> {
 //!     let page = q.resolve()?;                                  // limit 1–200, decoded cursor
 //!     let rows = repo.runs_after(page.after.as_deref(), page.fetch()).await?; // limit + 1 rows
