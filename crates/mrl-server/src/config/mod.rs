@@ -386,24 +386,33 @@ fn describe(e: &toml::de::Error, text: &str) -> String {
     format!("{at}{}", hide_values(e.message()))
 }
 
-/// Replaces `"…"` in a parser message (serde quotes values, backticks names).
+/// Drops every value from a parser message, keeping only setting names, grammar and
+/// the expected type.
+///
+/// serde puts values in its "invalid …" and "unknown variant" messages, as `"…"` with
+/// escapes or in backticks. Splitting on quotes cannot be made safe, so those messages
+/// keep only their final `, expected …` part, which comes from our types, never the file.
+/// Any other message that still has a quote is replaced whole.
 fn hide_values(msg: &str) -> String {
-    // A quote shown as a token (`"`) is grammar, not a value; keep it out of the split.
-    const QUOTE_TOKEN: &str = "`\"`";
-    let msg = msg.replace(QUOTE_TOKEN, "\u{0}");
-    let mut out = String::with_capacity(msg.len());
-    let mut parts = msg.split('"');
-    if let Some(first) = parts.next() {
-        out.push_str(first);
-    }
-    for (i, part) in parts.enumerate() {
-        if i % 2 == 0 {
-            out.push_str("\"<value hidden>\"");
-        } else {
-            out.push_str(part);
+    const HIDDEN: &str = "<value hidden>";
+    for prefix in [
+        "invalid type: ",
+        "invalid value: ",
+        "invalid length ",
+        "unknown variant ",
+    ] {
+        if let Some(rest) = msg.strip_prefix(prefix) {
+            // `rfind`: a value may itself contain ", expected ", but the real clause is last.
+            let expected = rest.rfind(", expected ").map_or("", |i| &rest[i..]);
+            return format!("{prefix}{HIDDEN}{expected}");
         }
     }
-    out.replace('\u{0}', QUOTE_TOKEN)
+    let without_tokens = msg.replace("`\"`", "").replace("`'`", "");
+    if without_tokens.contains(['"', '\'']) {
+        "the file has a typing mistake here".to_owned()
+    } else {
+        msg.to_owned()
+    }
 }
 
 fn is_http_url(s: &str) -> bool {
@@ -646,17 +655,85 @@ mod tests {
     }
 
     #[test]
-    fn hide_values_keeps_text_outside_quotes() {
-        assert_eq!(
-            hide_values(r#"invalid type: string "pw", expected u64"#),
-            r#"invalid type: string "<value hidden>", expected u64"#
+    fn hide_values_drops_every_value() {
+        let cases = [
+            (
+                r#"invalid type: string "pw", expected u64"#,
+                "invalid type: <value hidden>, expected u64",
+            ),
+            (
+                r#"invalid type: string "pre\"pw", expected u64"#,
+                "invalid type: <value hidden>, expected u64",
+            ),
+            (
+                r#"invalid type: string "pw, expected u64", expected u64"#,
+                "invalid type: <value hidden>, expected u64",
+            ),
+            (
+                "invalid type: floating point `1.5`, expected u64",
+                "invalid type: <value hidden>, expected u64",
+            ),
+            (
+                "invalid value: integer `7`, expected a port",
+                "invalid value: <value hidden>, expected a port",
+            ),
+            (
+                "unknown variant `pw`, expected `solo` or `team`",
+                "unknown variant <value hidden>, expected `solo` or `team`",
+            ),
+            (
+                "unknown field `bogus`, expected `mode`",
+                "unknown field `bogus`, expected `mode`",
+            ),
+            ("missing field `burst`", "missing field `burst`"),
+            (
+                "invalid basic string, expected `\"`",
+                "invalid basic string, expected `\"`",
+            ),
+            (
+                r#"something "pw" else"#,
+                "the file has a typing mistake here",
+            ),
+            ("odd 'pw", "the file has a typing mistake here"),
+        ];
+        for (raw, want) in cases {
+            assert_eq!(hide_values(raw), want, "{raw}");
+        }
+    }
+
+    #[test]
+    fn embedded_quotes_and_backticked_values_never_leak() {
+        const PW: &str = "review-password";
+        for text in [
+            "[server]\nshutdown_grace_seconds = 'prefix\"review-password'",
+            "[server]\nshutdown_grace_seconds = \"a\\\"review-password\"",
+            "[server]\nshutdown_grace_seconds = \"review-password, expected u64\"",
+            "[server]\nmode = \"review-password\"",
+            "[server]\nmode = 'x\"review-password'",
+            "[server]\nroles = ['review-password']",
+            "[server.listeners]\napi = \"review-password\"",
+            "[database]\nurl = 'review-password",
+            "[database]\nurl = [\"review-password\"]",
+        ] {
+            let err = parse(text).unwrap_err();
+            assert!(!err.detail.contains(PW), "leaked: {text} → {}", err.detail);
+            assert!(err.detail.starts_with("line 2, column "), "{}", err.detail);
+        }
+        let err = parse("[server]\nmode = \"review-password\"").unwrap_err();
+        assert!(
+            err.detail.contains("expected `solo` or `team`"),
+            "{}",
+            err.detail
         );
-        assert_eq!(hide_values("no quotes `x`"), "no quotes `x`");
-        assert_eq!(
-            hide_values("invalid basic string, expected `\"`"),
-            "invalid basic string, expected `\"`"
-        );
-        assert_eq!(hide_values(r#"odd "pw"#), r#"odd "<value hidden>""#);
+        for raw in ["x\"review-password", "'review-password", "review-password"] {
+            let env_err =
+                Config::from_toml_with_env("", env(&[("MRL_SERVER__MODE", raw)])).unwrap_err();
+            assert!(
+                !env_err.detail.contains(PW),
+                "leaked: {raw} → {}",
+                env_err.detail
+            );
+        }
     }
 
     #[test]
