@@ -4,7 +4,13 @@ version = "0.1.0"
 description = "MasterRL training runtime"
 license = "Apache-2.0"
 requires-python = ">=3.12,<3.13"
-dependencies = ["grpcio==1.85.1", "protobuf==7.36.2"]
+dependencies = [
+    "grpcio==1.85.1",
+    "protobuf==7.36.2",
+    # <mrl:deps P13> P13 dependencies go right below this line.
+
+    # <mrl:deps P15> P15 dependencies go right below this line.
+]
 
 [build-system]
 requires = ["uv_build==0.11.28"]
