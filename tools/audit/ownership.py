@@ -24,6 +24,9 @@ from pathlib import Path
 
 # Mirrors the local-only block in .gitignore.
 LOCAL_ONLY = ("docs/architecture/", "docs/implementation/", "AGENTS.md", "CLAUDE.md", "memory.md")
+# Generated files any lane may commit; the integrator regenerates them at merge (README §3.4).
+GENERATED = ("guidance/build/", "openapi/", "packages/api-client/src/generated/")
+LOCKFILES = ("Cargo.lock", "uv.lock", "pnpm-lock.yaml")
 
 
 def git(*args: str, cwd: Path | None = None) -> str:
@@ -145,10 +148,13 @@ def is_local_only(path: str) -> bool:
     return any(path == p or (p.endswith("/") and path.startswith(p)) for p in LOCAL_ONLY)
 
 
+def is_generated(path: str) -> bool:
+    return path.rsplit("/", 1)[-1] in LOCKFILES or path.startswith(GENERATED)
+
+
 def violations(changed: list[str], patterns: list[re.Pattern[str]]) -> list[str]:
-    return [
-        f for f in changed if not is_local_only(f) and not any(p.fullmatch(f) for p in patterns)
-    ]
+    skip = [f for f in changed if is_local_only(f) or is_generated(f)]
+    return [f for f in changed if f not in skip and not any(p.fullmatch(f) for p in patterns)]
 
 
 def parse_args(argv: list[str]) -> tuple[str, str | None, Path | None]:
