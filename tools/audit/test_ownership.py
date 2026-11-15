@@ -106,6 +106,11 @@ class OwnershipTest(unittest.TestCase):
         commit(self.root, ["docs/implementation/x.md", "memory.md"], "local")
         self.assertEqual(self.run_tool("PART=P09")[0], 0)
 
+    def test_generated_files_and_lockfiles_are_ignored(self):
+        files = ["Cargo.lock", "python/adapters/a/uv.lock", "guidance/build/catalog.rs"]
+        commit(self.root, files, "gen")
+        self.assertEqual(self.run_tool("PART=P09")[0], 0)
+
     def test_default_base_is_latest_wave_tag(self):
         commit(self.root, ["apps/x.ts"], "earlier")
         git(self.root, "tag", "wave-01-done")
