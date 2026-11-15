@@ -12,6 +12,11 @@ api = "0.0.0.0:8443"
 grpc = "0.0.0.0:9443"
 internal = "127.0.0.1:9090"
 
+# HTTPS for the team-mode api and grpc listeners (solo ignores it). PEM files.
+# [server.tls]
+# cert_path = "/etc/masterrl/tls/cert.pem"
+# key_path = "/etc/masterrl/tls/key.pem"
+
 [server.rate_limit.principal]
 per_second = 20
 burst = 40

@@ -21,5 +21,9 @@ tower = { workspace = true }
 utoipa = { workspace = true }
 uuid = { workspace = true }
 
+[dev-dependencies]
+rcgen = { workspace = true }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
+
 [lints]
 workspace = true

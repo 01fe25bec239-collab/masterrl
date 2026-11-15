@@ -153,6 +153,11 @@ impl App {
             m.grpc_services(&mut grpc);
         }
         let grpc = grpc.routes().into_axum_router();
+        // Solo is loopback-only plain HTTP; team uses HTTPS when `[server.tls]` is set.
+        let acceptor = match (&self.config.server.tls, solo) {
+            (Some(cfg), false) => Some(crate::http::tls::acceptor(cfg)?),
+            _ => None,
+        };
         let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
         let pick = |configured| if solo { loopback } else { configured };
 
@@ -180,42 +185,75 @@ impl App {
         let mut addrs = Addrs::default();
         let serve = |listener: TcpListener,
                      router: Router,
-                     name: &'static str|
-         -> Option<SocketAddr> {
+                     name: &'static str,
+                     tls: Option<&tokio_rustls::TlsAcceptor>|
+         -> Result<Option<SocketAddr>, ServerError> {
             let addr = listener.local_addr().ok();
             let (token, failure) = (token.clone(), failure.clone());
-            tracker.spawn(async move {
-                let shutdown = token.clone().cancelled_owned();
-                if let Err(e) = axum::serve(listener, router)
-                    .with_graceful_shutdown(shutdown)
-                    .await
-                {
-                    fail(
-                        &failure,
-                        &token,
-                        ServerError::new(ErrorCode::Bind, format!("{name} listener: {e}")),
-                    );
+            let shutdown = token.clone().cancelled_owned();
+            let shutdown_for_accept = token.clone();
+            let on_error = move |e: std::io::Error| {
+                fail(
+                    &failure,
+                    &token,
+                    ServerError::new(ErrorCode::Bind, format!("{name} listener: {e}")),
+                );
+            };
+            match tls {
+                None => {
+                    tracker.spawn(async move {
+                        let served = axum::serve(listener, router).with_graceful_shutdown(shutdown);
+                        if let Err(e) = served.await {
+                            on_error(e);
+                        }
+                    });
                 }
-            });
-            tracing::info!(listener = name, addr = %addr.map(|a| a.to_string()).unwrap_or_default(), "listening");
-            addr
+                Some(acceptor) => {
+                    let tls_listener = crate::http::tls::TlsListener::spawn(
+                        listener,
+                        acceptor.clone(),
+                        &tracker,
+                        shutdown_for_accept.clone(),
+                    )
+                    .map_err(|e| {
+                        ServerError::new(ErrorCode::Bind, format!("{name} listener: {e}"))
+                    })?;
+                    tracker.spawn(async move {
+                        let served =
+                            axum::serve(tls_listener, router).with_graceful_shutdown(shutdown);
+                        if let Err(e) = served.await {
+                            on_error(e);
+                        }
+                    });
+                }
+            }
+            let scheme = if tls.is_some() { "https" } else { "http" };
+            tracing::info!(listener = name, scheme, addr = %addr.map(|a| a.to_string()).unwrap_or_default(), "listening");
+            Ok(addr)
         };
         if let Some(l) = api {
             addrs.api = serve(
                 l,
                 crate::http::api_router(state.clone(), &self.modules, solo),
                 "api",
-            );
+                acceptor.as_ref(),
+            )?;
         }
         if let Some(l) = grpc_listener {
             addrs.grpc = serve(
                 l,
                 crate::http::grpc_router(grpc, state.clone(), solo),
                 "grpc",
-            );
+                acceptor.as_ref(),
+            )?;
         }
         if let Some(l) = internal {
-            addrs.internal = serve(l, crate::http::internal_router(state.clone()), "internal");
+            addrs.internal = serve(
+                l,
+                crate::http::internal_router(state.clone()),
+                "internal",
+                None,
+            )?;
         }
         for m in &self.modules {
             for task in m.background_tasks().into_iter().chain(m.event_consumers()) {

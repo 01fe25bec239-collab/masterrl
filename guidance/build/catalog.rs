@@ -2154,6 +2154,18 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-CFG-005")),
+            ("title", Value::Str("The server could not use its certificate or key file.")),
+            ("why", Value::Str("The file is not in the expected format, or the key does not match the certificate.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check `server.tls.cert_path` and `server.tls.key_path` in the settings file."),
+                    Value::Str("Use text files that start with `-----BEGIN`, with the certificate chain first."),
+                    Value::Str("Remove the `[server.tls]` section to run without a secure connection."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-CONFLICT-001")),
             ("title", Value::Str("Someone changed this item after you opened it.")),
             ("why", Value::Str("The version you edited is older than the saved one.")),

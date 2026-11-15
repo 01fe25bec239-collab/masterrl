@@ -44,12 +44,24 @@ async fn solo_boots_and_serves_health_metrics_openapi_and_module_route() {
         "no gRPC module, no gRPC port"
     );
 
-    assert_eq!(srv.get("/healthz").await.json()["status"], "ok");
-    let ready = srv.get("/readyz").await;
+    for path in [
+        "/healthz",
+        "/readyz",
+        "/api-docs/openapi.json",
+        "/api/v1/hello",
+        "/metrics",
+        "/nope",
+    ] {
+        let r = srv.get(path).await;
+        assert_eq!(r.status, 401, "{path} needs the launch secret in solo");
+        assert_eq!(r.json()["code"], "MRL-AUTH-001", "{path}");
+    }
+    assert_eq!(srv.get_authed("/healthz").await.json()["status"], "ok");
+    let ready = srv.get_authed("/readyz").await;
     assert_eq!(ready.status, 200);
     assert_eq!(ready.json()["checks"][0]["name"], "testkit");
 
-    let doc = srv.get("/api-docs/openapi.json").await;
+    let doc = srv.get_authed("/api-docs/openapi.json").await;
     assert_eq!(doc.status, 200);
     assert!(doc.json()["paths"]["/api/v1/ping"].is_object());
     assert!(doc.json()["paths"]["/healthz"].is_object());
@@ -58,13 +70,7 @@ async fn solo_boots_and_serves_health_metrics_openapi_and_module_route() {
     assert_eq!(denied.status, 401);
     assert_eq!(denied.json()["code"], "MRL-AUTH-001");
     assert_eq!(srv.get_authed("/api/v1/ping").await.json()["pong"], true);
-    assert_eq!(
-        srv.get("/api/v1/hello").await.text(),
-        "hello",
-        "public route needs no secret"
-    );
-
-    assert_eq!(srv.get("/metrics").await.status, 401);
+    assert_eq!(srv.get_authed("/api/v1/hello").await.text(), "hello");
     let metrics = srv.get_authed("/metrics").await.text();
     assert!(metrics.contains(
         "mrl_http_requests_total{method=\"GET\",route=\"/api/v1/ping\",status=\"200\"} 1"
@@ -270,7 +276,7 @@ async fn readyz_reports_failed_checks() {
         ..TestModule::default()
     }))
     .await;
-    let r = srv.get("/readyz").await;
+    let r = srv.get_authed("/readyz").await;
     assert_eq!(r.status, 503);
     assert_eq!(r.json()["checks"][0]["status"], "not_ready");
     srv.shutdown().await.unwrap();
@@ -332,7 +338,7 @@ async fn rate_limit_returns_429_with_retry_after() {
     assert_eq!(limited.headers["retry-after"], "1");
     assert_eq!(limited.json()["code"], "MRL-QUOTA-001");
     assert_eq!(
-        srv.get("/healthz").await.status,
+        srv.get_authed("/healthz").await.status,
         200,
         "health is never limited"
     );
@@ -406,4 +412,134 @@ async fn authorize_maps_decisions_to_errors() {
             .await;
         assert_eq!(got.err().map(|e| e.code), want, "{decision:?}");
     }
+}
+
+#[tokio::test]
+async fn oversized_body_over_the_wire_is_problem_413() {
+    let srv = TestServer::solo(module(TestModule::default())).await;
+    let big = "x".repeat(mrl_server::http::BODY_LIMIT + 1);
+    let len = big.len().to_string();
+    let headers = [
+        (LAUNCH_SECRET_HEADER, TEST_SECRET),
+        ("content-type", "application/json"),
+        ("content-length", len.as_str()),
+    ];
+    let r = srv
+        .request(Method::POST, "/api/v1/items", &headers, big)
+        .await;
+    assert_eq!(r.status, 413);
+    assert_eq!(r.headers["content-type"], "application/problem+json");
+    assert_eq!(r.json()["code"], "MRL-VAL-007");
+    assert_eq!(r.json()["trace_id"].as_str().unwrap().len(), 32);
+    srv.shutdown().await.unwrap();
+}
+
+/// Writes a throwaway self-signed `localhost` cert and key; returns (dir, cert DER).
+fn self_signed(tag: &str) -> (std::path::PathBuf, Vec<u8>) {
+    let ck = rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
+    let dir = std::env::temp_dir().join(format!("mrl-tls-{tag}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("cert.pem"), ck.cert.pem()).unwrap();
+    std::fs::write(dir.join("key.pem"), ck.signing_key.serialize_pem()).unwrap();
+    (dir, ck.cert.der().to_vec())
+}
+
+fn tls_config(dir: &std::path::Path) -> Config {
+    let mut c = team_config();
+    c.server.tls = Some(mrl_server::config::TlsConfig {
+        cert_path: dir.join("cert.pem"),
+        key_path: dir.join("key.pem"),
+    });
+    c
+}
+
+#[tokio::test]
+async fn team_mode_serves_https_when_tls_is_configured() {
+    use tokio_rustls::rustls;
+    let (dir, der) = self_signed("ok");
+    let srv = team_server(tls_config(&dir), TestModule::default()).await;
+    let api = srv.api();
+
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(der))
+        .unwrap();
+    let client = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .unwrap()
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+    let tcp = tokio::net::TcpStream::connect(api).await.unwrap();
+    let name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+    let tls = connector.connect(name, tcp).await.unwrap();
+    let res = TestServer::request_on(
+        tls,
+        "localhost",
+        Method::GET,
+        "/api/v1/ping",
+        &[("authorization", "Bearer tok-1")],
+        Body::empty(),
+    )
+    .await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.json()["pong"], true);
+
+    // Plain HTTP to the HTTPS port gets no HTTP answer.
+    let plain = tokio::net::TcpStream::connect(api).await.unwrap();
+    let mut sender =
+        hyper::client::conn::http1::handshake::<_, Body>(hyper_util::rt::TokioIo::new(plain))
+            .await
+            .map(|(s, conn)| {
+                tokio::spawn(conn);
+                s
+            })
+            .unwrap();
+    let req = Request::get("/healthz")
+        .header("host", "x")
+        .body(Body::empty())
+        .unwrap();
+    assert!(sender.send_request(req).await.is_err());
+
+    // The internal listener stays plain HTTP.
+    let internal = srv.running().internal_addr().unwrap();
+    let health =
+        TestServer::request_to(internal, Method::GET, "/healthz", &[], Body::empty()).await;
+    assert_eq!(health.status, 200);
+    srv.shutdown().await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn unusable_tls_files_stop_startup() {
+    let (dir, _) = self_signed("bad");
+    std::fs::write(dir.join("key.pem"), "not a key").unwrap();
+    let seams = ts::build(ts::team(&[]), Mode::Team);
+    let err = TestServer::start(tls_config(&dir), seams, module(TestModule::default()))
+        .await
+        .err()
+        .unwrap();
+    assert_eq!(err.code, ErrorCode::TlsFiles);
+    assert!(err.detail.contains("server.tls.key_path"), "{}", err.detail);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn solo_ignores_tls_and_stays_plain_loopback() {
+    let (dir, _) = self_signed("solo");
+    let mut config = tls_config(&dir);
+    config.server.mode = Mode::Solo;
+    let srv = TestServer::start(
+        config,
+        ts::build(ts::solo(TEST_SECRET), Mode::Solo),
+        module(TestModule::default()),
+    )
+    .await
+    .unwrap();
+    assert!(srv.api().ip().is_loopback());
+    assert_eq!(srv.get_authed("/healthz").await.status, 200);
+    srv.shutdown().await.unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
 }

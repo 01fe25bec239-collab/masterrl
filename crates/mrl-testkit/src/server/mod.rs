@@ -295,17 +295,31 @@ impl TestServer {
             Ok(s) => s,
             Err(e) => panic!("connect {addr}: {e}"),
         };
+        Self::request_on(stream, &addr.to_string(), method, path, headers, body).await
+    }
+
+    /// Sends one HTTP/1.1 request over an open connection (plain TCP or TLS).
+    pub async fn request_on<IO>(
+        io: IO,
+        host: &str,
+        method: Method,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: impl Into<Body>,
+    ) -> TestResponse
+    where
+        IO: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    {
         let (mut sender, conn) =
-            match hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(stream)).await
-            {
+            match hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(io)).await {
                 Ok(x) => x,
-                Err(e) => panic!("handshake {addr}: {e}"),
+                Err(e) => panic!("handshake {host}: {e}"),
             };
         tokio::spawn(conn);
         let mut req = Request::builder()
             .method(method)
             .uri(path)
-            .header("host", addr.to_string());
+            .header("host", host);
         for (k, v) in headers {
             req = req.header(*k, *v);
         }

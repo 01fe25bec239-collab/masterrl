@@ -2106,6 +2106,18 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-CFG-005",
+      "title": "The server could not use its certificate or key file.",
+      "why": "The file is not in the expected format, or the key does not match the certificate.",
+      "what_to_do": {
+        "steps": [
+          "Check `server.tls.cert_path` and `server.tls.key_path` in the settings file.",
+          "Use text files that start with `-----BEGIN`, with the certificate chain first.",
+          "Remove the `[server.tls]` section to run without a secure connection."
+        ]
+      }
+    },
+    {
       "code": "MRL-CONFLICT-001",
       "title": "Someone changed this item after you opened it.",
       "why": "The version you edited is older than the saved one.",

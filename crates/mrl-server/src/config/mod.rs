@@ -4,7 +4,7 @@
 use crate::error::{ErrorCode, ServerError};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Environment variables with this prefix and a `__` override settings.
 pub const ENV_PREFIX: &str = "MRL_";
@@ -80,6 +80,9 @@ pub struct ServerConfig {
     pub shutdown_grace_seconds: u64,
     /// Request rate limits.
     pub rate_limit: RateLimitConfig,
+    /// HTTPS for the team-mode api and grpc listeners. Unset: plain HTTP.
+    /// Solo mode ignores it (loopback only).
+    pub tls: Option<TlsConfig>,
 }
 
 impl Default for ServerConfig {
@@ -90,8 +93,19 @@ impl Default for ServerConfig {
             listeners: ListenersConfig::default(),
             shutdown_grace_seconds: 30,
             rate_limit: RateLimitConfig::default(),
+            tls: None,
         }
     }
+}
+
+/// `[server.tls]`: PEM files for HTTPS.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TlsConfig {
+    /// Certificate chain, leaf first.
+    pub cert_path: PathBuf,
+    /// Private key (PKCS#8, PKCS#1 or SEC1).
+    pub key_path: PathBuf,
 }
 
 /// `[server.listeners]`.
@@ -234,8 +248,9 @@ impl Config {
         text: &str,
         env: impl IntoIterator<Item = (String, String)>,
     ) -> Result<Config, ServerError> {
+        // Never `e.to_string()`: it quotes the source line, which may hold a password.
         let parse_err =
-            |e: toml::de::Error| ServerError::new(ErrorCode::ConfigParse, e.to_string());
+            |e: toml::de::Error| ServerError::new(ErrorCode::ConfigParse, describe(&e, text));
         // Parse once as typed config so file mistakes get file line numbers.
         toml::from_str::<Config>(text).map_err(parse_err)?;
         let mut table: toml::Table = toml::from_str(text).map_err(parse_err)?;
@@ -255,7 +270,7 @@ impl Config {
             .map_err(|e: toml::de::Error| {
                 ServerError::new(
                     ErrorCode::ConfigEnv,
-                    format!("{} ({})", e.message(), applied.join(", ")),
+                    format!("{} ({})", hide_values(e.message()), applied.join(", ")),
                 )
             })
     }
@@ -283,6 +298,16 @@ impl Config {
                 problems.push(
                     "server.listeners: api, grpc and internal need different addresses".to_owned(),
                 );
+            }
+        }
+        if let Some(tls) = &s.tls {
+            for (key, path) in [("cert_path", &tls.cert_path), ("key_path", &tls.key_path)] {
+                if !path.is_file() {
+                    problems.push(format!(
+                        "server.tls.{key}: {} is not a file the server can find",
+                        path.display()
+                    ));
+                }
             }
         }
         for (name, b) in [
@@ -345,6 +370,40 @@ impl Config {
     pub fn has_role(&self, role: Role) -> bool {
         self.server.roles.contains(&role)
     }
+}
+
+/// `line L, column C: <message>` with quoted values hidden.
+fn describe(e: &toml::de::Error, text: &str) -> String {
+    let at = e
+        .span()
+        .and_then(|r| text.get(..r.start))
+        .map(|before| {
+            let line = before.matches('\n').count() + 1;
+            let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+            format!("line {line}, column {col}: ")
+        })
+        .unwrap_or_default();
+    format!("{at}{}", hide_values(e.message()))
+}
+
+/// Replaces `"…"` in a parser message (serde quotes values, backticks names).
+fn hide_values(msg: &str) -> String {
+    // A quote shown as a token (`"`) is grammar, not a value; keep it out of the split.
+    const QUOTE_TOKEN: &str = "`\"`";
+    let msg = msg.replace(QUOTE_TOKEN, "\u{0}");
+    let mut out = String::with_capacity(msg.len());
+    let mut parts = msg.split('"');
+    if let Some(first) = parts.next() {
+        out.push_str(first);
+    }
+    for (i, part) in parts.enumerate() {
+        if i % 2 == 0 {
+            out.push_str("\"<value hidden>\"");
+        } else {
+            out.push_str(part);
+        }
+    }
+    out.replace('\u{0}', QUOTE_TOKEN)
 }
 
 fn is_http_url(s: &str) -> bool {
@@ -491,6 +550,35 @@ mod tests {
     }
 
     #[test]
+    fn tls_values() {
+        let file = std::env::temp_dir().join(format!("mrl-tls-cfg-{}.pem", std::process::id()));
+        std::fs::write(&file, "x").unwrap();
+        let ok = format!(
+            "[server.tls]\ncert_path = {:?}\nkey_path = {:?}",
+            file, file
+        );
+        assert!(parse(&ok).unwrap().server.tls.is_some());
+        let missing = "[server.tls]\ncert_path = \"/nope/cert.pem\"\nkey_path = \"/nope/key.pem\"";
+        let err = parse(missing).unwrap_err();
+        assert_eq!(err.code, ErrorCode::ConfigValue);
+        assert!(
+            err.detail.contains("server.tls.cert_path")
+                && err.detail.contains("server.tls.key_path")
+        );
+        assert_eq!(
+            code(parse("[server.tls]\ncert_path = \"/a\"")),
+            ErrorCode::ConfigParse
+        );
+        assert_eq!(
+            code(parse(
+                "[server.tls]\ncert_path = \"/a\"\nkey_path = \"/b\"\nca = 1"
+            )),
+            ErrorCode::ConfigParse
+        );
+        std::fs::remove_file(&file).unwrap();
+    }
+
+    #[test]
     fn shutdown_grace_values() {
         assert!(parse("[server]\nshutdown_grace_seconds = 1").is_ok());
         assert!(parse("[server]\nshutdown_grace_seconds = 300").is_ok());
@@ -524,6 +612,51 @@ mod tests {
             "password leaked: {}",
             err.detail
         );
+    }
+
+    #[test]
+    fn parse_errors_never_echo_values() {
+        for text in [
+            "[database]\nurl = \"postgres://u:hunter2@h/db",
+            "[database]\nurl = postgres://u:hunter2@h/db",
+            "[server]\nshutdown_grace_seconds = \"hunter2\"",
+            "[database]\nurl = [\"postgres://u:hunter2@h/db\"]",
+        ] {
+            let err = parse(text).unwrap_err();
+            assert_eq!(err.code, ErrorCode::ConfigParse, "{text}");
+            assert!(!err.detail.contains("hunter2"), "leaked: {}", err.detail);
+            assert!(err.detail.starts_with("line 2, column "), "{}", err.detail);
+        }
+        let env_err = Config::from_toml_with_env(
+            "",
+            env(&[("MRL_SERVER__SHUTDOWN_GRACE_SECONDS", "hunter2")]),
+        )
+        .unwrap_err();
+        assert!(
+            !env_err.detail.contains("hunter2"),
+            "leaked: {}",
+            env_err.detail
+        );
+        let unknown = parse("[server]\nbogus = 1").unwrap_err();
+        assert!(
+            unknown.detail.contains("bogus"),
+            "names stay: {}",
+            unknown.detail
+        );
+    }
+
+    #[test]
+    fn hide_values_keeps_text_outside_quotes() {
+        assert_eq!(
+            hide_values(r#"invalid type: string "pw", expected u64"#),
+            r#"invalid type: string "<value hidden>", expected u64"#
+        );
+        assert_eq!(hide_values("no quotes `x`"), "no quotes `x`");
+        assert_eq!(
+            hide_values("invalid basic string, expected `\"`"),
+            "invalid basic string, expected `\"`"
+        );
+        assert_eq!(hide_values(r#"odd "pw"#), r#"odd "<value hidden>""#);
     }
 
     #[test]

@@ -51,6 +51,8 @@ codes! {
     ConfigValue = "MRL-CFG-003", INTERNAL_SERVER_ERROR;
     /// An `MRL_*` environment override could not be used.
     ConfigEnv = "MRL-CFG-004", INTERNAL_SERVER_ERROR;
+    /// The TLS certificate or key file could not be used.
+    TlsFiles = "MRL-CFG-005", INTERNAL_SERVER_ERROR;
     /// A seam this mode needs has no implementation.
     SeamMissing = "MRL-SRV-001", INTERNAL_SERVER_ERROR;
     /// Team mode has no `IdentityProvider`.

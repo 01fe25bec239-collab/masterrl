@@ -1,14 +1,16 @@
 //! HTTP framework: router composition from modules and the middleware every request passes.
 //!
-//! Order, outermost first: request ids and trace → metrics → body limit (2 MiB) →
-//! compression → panic catcher → problem renderer → route. Module routes under `/api/v1`
-//! add, outermost first: authentication → rate limit → idempotency → problem renderer.
+//! Order, outermost first: request ids and trace → metrics → compression → problem
+//! renderer → (solo: launch-secret check on every path) → body limit (2 MiB) → panic
+//! catcher → route. Module routes under `/api/v1` add, outermost first: authentication
+//! (team; solo already checked) → rate limit → idempotency → problem renderer.
 
 pub mod etag;
 pub mod filter;
 pub mod idempotency;
 pub mod pagination;
 pub mod rate_limit;
+pub mod tls;
 
 use crate::app::{AppState, ServerModule};
 use crate::error::{ApiError, ErrorCode, Problem, PROBLEM_JSON};
@@ -47,8 +49,10 @@ pub fn api_router(state: AppState, modules: &[Box<dyn ServerModule>], solo: bool
         protected = protected
             .route_layer(from_fn(render_problems))
             .route_layer(from_fn_with_state(state.clone(), idempotency::middleware))
-            .route_layer(from_fn_with_state(state.clone(), rate_limit::middleware))
-            .route_layer(from_fn_with_state(state.clone(), authenticate));
+            .route_layer(from_fn_with_state(state.clone(), rate_limit::middleware));
+        if !solo {
+            protected = protected.route_layer(from_fn_with_state(state.clone(), authenticate));
+        }
     }
     let mut api = protected;
     for m in modules {
@@ -59,18 +63,19 @@ pub fn api_router(state: AppState, modules: &[Box<dyn ServerModule>], solo: bool
         root = root.nest(API_PREFIX, api);
     }
     if solo {
-        // Solo binds one loopback port; metrics share it, behind the launch secret.
-        root = root.route(
-            "/metrics",
-            get(metrics).route_layer(from_fn_with_state(state.clone(), authenticate)),
-        );
+        // Solo binds one loopback port; metrics share it. `finish` gates every path.
+        root = root.route("/metrics", get(metrics));
     }
-    finish(root, state)
+    finish(root, state, solo)
 }
 
 /// Builds the internal router (team mode, `:9090`): metrics and health, no auth.
 pub fn internal_router(state: AppState) -> Router {
-    finish(health_routes().route("/metrics", get(metrics)), state)
+    finish(
+        health_routes().route("/metrics", get(metrics)),
+        state,
+        false,
+    )
 }
 
 /// Wraps a gRPC router with the shared layers (and auth in solo mode).
@@ -90,8 +95,11 @@ fn health_routes() -> Router<AppState> {
         .route("/readyz", get(crate::telemetry::readyz))
 }
 
-fn finish(router: Router<AppState>, state: AppState) -> Router {
-    router
+/// Adds fallbacks and the shared layers. With `gate`, every path (health, docs, public
+/// routes, unknown paths) needs the authenticator to accept the request: solo mode's
+/// per-launch secret.
+fn finish(router: Router<AppState>, state: AppState, gate: bool) -> Router {
+    let router = router
         .fallback(|| async {
             ApiError::new(ErrorCode::RouteNotFound, "No endpoint has this path.")
         })
@@ -101,13 +109,20 @@ fn finish(router: Router<AppState>, state: AppState) -> Router {
                 "This endpoint does not take this method.",
             )
         })
-        .layer(from_fn(render_problems))
         .layer(tower_http::catch_panic::CatchPanicLayer::custom(|_| {
             ApiError::new(ErrorCode::Internal, "The server hit an internal problem.")
                 .into_response()
         }))
+        .layer(tower_http::limit::RequestBodyLimitLayer::new(BODY_LIMIT));
+    let router = if gate {
+        router.layer(from_fn_with_state(state.clone(), authenticate))
+    } else {
+        router
+    };
+    router
+        // Inside compression, so it can read the plain body of bare errors (like a 413).
+        .layer(from_fn(render_problems))
         .layer(tower_http::compression::CompressionLayer::new())
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(BODY_LIMIT))
         .layer(from_fn_with_state(state.clone(), track_request))
         .layer(from_fn_with_state(state.clone(), request_meta))
         .with_state(state)
@@ -328,6 +343,9 @@ pub(crate) mod tests {
                 )
                 .route("/boom", get(|| async { StatusCode::INTERNAL_SERVER_ERROR }))
         }
+        fn public_routes(&self) -> Router<AppState> {
+            Router::new().route("/hello", get(|| async { "hello" }))
+        }
     }
 
     pub fn app(config: Config) -> Router {
@@ -369,9 +387,7 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn unknown_route_is_problem_json() {
         let app = app(Config::default());
-        let r = axum::http::Request::get("/nope")
-            .body(Body::empty())
-            .unwrap();
+        let r = req(Method::GET, "/nope").body(Body::empty()).unwrap();
         let (status, headers, json, _) = send(&app, r).await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(headers[header::CONTENT_TYPE], PROBLEM_JSON);
@@ -468,7 +484,7 @@ pub(crate) mod tests {
     async fn traceparent_and_request_id_are_kept() {
         let app = app(Config::default());
         let tp = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
-        let r = axum::http::Request::get("/nope")
+        let r = req(Method::GET, "/nope")
             .header(TRACEPARENT, tp)
             .header(&REQUEST_ID, "req-1")
             .body(Body::empty())
@@ -496,11 +512,73 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn health_and_openapi_are_public() {
+    async fn solo_gates_every_path_on_the_launch_secret() {
         let app = app(Config::default());
-        for path in ["/healthz", "/readyz", "/api-docs/openapi.json"] {
+        let paths = [
+            ("/healthz", StatusCode::OK),
+            ("/readyz", StatusCode::OK),
+            ("/api-docs/openapi.json", StatusCode::OK),
+            ("/api/v1/hello", StatusCode::OK),
+            ("/nope", StatusCode::NOT_FOUND),
+        ];
+        for (path, with_secret) in paths {
+            for wrong in [None, Some("wrong")] {
+                let mut b = axum::http::Request::get(path);
+                if let Some(w) = wrong {
+                    b = b.header(LAUNCH_SECRET_HEADER, w);
+                }
+                let (status, _, json, _) = send(&app, b.body(Body::empty()).unwrap()).await;
+                assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} {wrong:?}");
+                assert_eq!(json["code"], "MRL-AUTH-001", "{path}");
+            }
+            let r = req(Method::GET, path).body(Body::empty()).unwrap();
+            assert_eq!(send(&app, r).await.0, with_secret, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn team_health_and_public_routes_need_no_sign_in() {
+        let seams = Seams::production(Mode::Team, "")
+            .identity(NoUsers)
+            .authorizer(crate::seams::LocalOwnerAuthorizer)
+            .build(Mode::Team)
+            .unwrap();
+        let modules: Vec<Box<dyn ServerModule>> = vec![Box::new(Echo)];
+        let state = AppState::new(Config::default(), seams, &modules).unwrap();
+        let app = api_router(state, &modules, false);
+        for path in ["/healthz", "/api-docs/openapi.json", "/api/v1/hello"] {
             let r = axum::http::Request::get(path).body(Body::empty()).unwrap();
             assert_eq!(send(&app, r).await.0, StatusCode::OK, "{path}");
         }
+        let r = axum::http::Request::post("/api/v1/echo")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&app, r).await.0, StatusCode::UNAUTHORIZED);
+    }
+
+    struct NoUsers;
+    #[async_trait::async_trait]
+    impl crate::seams::IdentityProvider for NoUsers {
+        async fn verify_bearer(
+            &self,
+            _: &str,
+        ) -> Result<Option<crate::seams::Principal>, crate::seams::SeamError> {
+            Ok(None)
+        }
+    }
+
+    #[tokio::test]
+    async fn declared_length_over_2_mib_is_problem_413() {
+        let app = app(Config::default());
+        // A declared Content-Length over the limit is refused before the body is read.
+        let r = req(Method::POST, "/api/v1/echo")
+            .header(header::CONTENT_LENGTH, BODY_LIMIT + 1)
+            .body(Body::from("x".repeat(BODY_LIMIT + 1)))
+            .unwrap();
+        let (status, headers, json, _) = send(&app, r).await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(headers[header::CONTENT_TYPE], PROBLEM_JSON);
+        assert_eq!(json["code"], "MRL-VAL-007");
+        assert_eq!(json["trace_id"].as_str().unwrap().len(), 32);
     }
 }
