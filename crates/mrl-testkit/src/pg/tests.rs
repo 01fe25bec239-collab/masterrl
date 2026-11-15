@@ -282,6 +282,62 @@ async fn a_running_key_moves_only_when_its_server_is_gone() {
 
 #[tokio::test]
 #[ignore = "needs DATABASE_URL"]
+async fn a_late_request_never_touches_a_newer_claim() {
+    let t = TestDb::new().await;
+    let store = PgIdempotencyStore::new(t.replica());
+    let other = PgIdempotencyStore::new(t.replica());
+    let fp = [9u8; 32];
+    let response = |body: &str| StoredResponse {
+        status: 201,
+        headers: Vec::new(),
+        body: body.as_bytes().to_vec(),
+    };
+    assert_eq!(
+        store.begin("usr_1", "k", fp).await.unwrap(),
+        IdempotencyBegin::Started
+    );
+    // The store's session ends while its request runs, the key expires and is swept.
+    cut_owner(&t, "usr_1").await;
+    t.seed("UPDATE idempotency_keys SET expires_at = now() - interval '1 day'")
+        .await;
+    assert_eq!(db::sweep_idempotency_keys(t.db()).await.unwrap(), 1);
+
+    // The same store does not claim a key its own request still runs with.
+    assert_eq!(
+        store.begin("usr_1", "k", fp).await.unwrap(),
+        IdempotencyBegin::InProgress
+    );
+    assert_eq!(t.count("idempotency_keys").await, 0);
+
+    // Another server claims it; the late request's complete and release leave that claim alone.
+    assert_eq!(
+        other.begin("usr_1", "k", fp).await.unwrap(),
+        IdempotencyBegin::Started
+    );
+    store
+        .complete("usr_1", "k", response("late"))
+        .await
+        .unwrap();
+    store.release("usr_1", "k").await.unwrap();
+    let state: String = sqlx::query_scalar("SELECT state FROM idempotency_keys")
+        .fetch_one(t.pool())
+        .await
+        .unwrap();
+    assert_eq!(state, "IN_PROGRESS");
+    assert_eq!(
+        store.begin("usr_1", "k", fp).await.unwrap(),
+        IdempotencyBegin::InProgress
+    );
+
+    other.complete("usr_1", "k", response("new")).await.unwrap();
+    assert_eq!(
+        store.begin("usr_1", "k", fp).await.unwrap(),
+        IdempotencyBegin::Replay(response("new"))
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
 async fn server_with_events_module_serves_idempotent_posts_and_is_ready() {
     let t = TestDb::new().await;
     let seams = crate::seams::build(
