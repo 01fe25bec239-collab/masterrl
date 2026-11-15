@@ -1,0 +1,50 @@
+---
+source: crates/mrl-domain/src/rbac.rs
+expression: "out.join(\"\\n\")"
+---
+action                   owner      maintainer researcher annotator  viewer     agent      worker
+auth.session             yes        yes        yes        yes        yes        -          -
+auth.manage_tokens       yes        yes        yes        -          -          -          -
+tenancy.read             yes        yes        yes        -          yes        -          -
+tenancy.manage_projects  yes        yes        -          -          -          -          -
+tenancy.manage_members   yes        -          -          -          -          -          -
+tenancy.manage_org       yes        -          -          -          -          -          -
+uploads.write            yes        yes        yes        -          -          -          -
+models.read              yes        yes        yes        -          yes        -          -
+models.import            yes        yes        yes        -          -          -          -
+models.export            yes        yes        yes        -          -          -          -
+datasets.read            yes        yes        yes        -          yes        -          -
+datasets.import          yes        yes        yes        -          -          -          -
+datasets.export          yes        yes        yes        -          -          -          -
+engines.read             yes        yes        yes        -          yes        -          -
+engines.manage           yes        -          -          -          -          -          -
+runs.read                yes        yes        yes        -          yes        -          -
+runs.submit              yes        yes        yes        -          -          -          -
+runs.cancel_own          yes        yes        yes        -          -          -          -
+runs.cancel_any          yes        yes        -          -          -          -          -
+metrics_logs.read        yes        yes        yes        -          yes        -          -
+metrics_logs.download    yes        yes        yes        -          -          -          -
+checkpoints.read         yes        yes        yes        -          yes        -          -
+checkpoints.write        yes        yes        yes        -          -          -          -
+checkpoints.export       yes        yes        yes        -          -          -          -
+rewards.read             yes        yes        yes        -          yes        -          -
+rewards.write            yes        yes        yes        -          -          -          -
+feedback.read            yes        yes        yes        -          yes        -          -
+feedback.manage          yes        yes        yes        -          -          -          -
+feedback.read_assigned   yes        yes        yes        yes        yes        -          -
+feedback.annotate        yes        yes        yes        yes        -          -          -
+compute.read             yes        yes        yes        -          yes        -          -
+compute.manage           yes        yes        -          -          -          -          -
+evaluations.read         yes        yes        yes        -          yes        -          -
+evaluations.run          yes        yes        yes        -          -          -          -
+promotions.read          yes        yes        yes        -          yes        -          -
+promotions.request       yes        yes        yes        -          -          -          -
+promotions.approve       yes        yes        -          -          -          -          -
+playground.use           yes        yes        -          -          -          -          -
+lineage.read             yes        yes        yes        -          yes        -          -
+admin.manage             yes        -          -          -          -          -          -
+secrets.manage           yes        yes        -          -          -          -          -
+audit.read               yes        yes        -          -          -          -          -
+streams.subscribe        yes        yes        yes        -          yes        -          -
+agent.gateway            -          -          -          -          -          yes        -
+worker.gateway           -          -          -          -          -          -          yes
