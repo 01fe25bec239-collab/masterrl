@@ -8,8 +8,9 @@ use axum::response::{IntoResponse, Response};
 use serde::Serialize;
 use std::sync::Arc;
 
-// The generated catalog is plain static data with no dependencies.
+// The generated catalog is plain static data with no dependencies. It is generated, so rustfmt skips it.
 #[allow(clippy::all)]
+#[rustfmt::skip]
 #[path = "../../../../guidance/build/catalog.rs"]
 mod catalog;
 

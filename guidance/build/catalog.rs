@@ -3538,9 +3538,7 @@ fn section(path: &[&str]) -> &'static [Value] {
 }
 
 fn find(path: &[&str], key: &str, value: &str) -> Option<&'static Value> {
-    section(path)
-        .iter()
-        .find(|item| item.str(key) == Some(value))
+    section(path).iter().find(|item| item.str(key) == Some(value))
 }
 
 pub fn error(code: &str) -> Option<&'static Value> {
@@ -3549,21 +3547,14 @@ pub fn error(code: &str) -> Option<&'static Value> {
 
 /// The entry for `code`, or the generic fallback when the code has none.
 pub fn explain_error(code: &str) -> &'static Value {
-    error(code).unwrap_or_else(|| {
-        CATALOG
-            .get("error_fallback")
-            .expect("catalog has a fallback")
-    })
+    error(code).unwrap_or_else(|| CATALOG.get("error_fallback").expect("catalog has a fallback"))
 }
 
 /// Case-insensitive; matches aliases too.
 pub fn term(name: &str) -> Option<&'static Value> {
     section(&["glossary"]).iter().find(|t| {
         let aliases = t.get("aliases").map_or(&[][..], Value::as_list);
-        t.str("term")
-            .into_iter()
-            .chain(aliases.iter().filter_map(Value::as_str))
-            .any(|n| n.eq_ignore_ascii_case(name))
+        t.str("term").into_iter().chain(aliases.iter().filter_map(Value::as_str)).any(|n| n.eq_ignore_ascii_case(name))
     })
 }
 
