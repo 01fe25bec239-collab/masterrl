@@ -99,8 +99,8 @@ impl TicketClaims {
     }
 }
 
-/// A ticket handed to a client: either a presigned URL (object stores that sign) or a
-/// path on the server-proxied endpoint.
+/// A ticket handed to a client: a presigned URL (GET on presign backends) or a path on the
+/// server-proxied endpoint (every PUT, and GET elsewhere).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TransferTicket {
     /// Allowed method.

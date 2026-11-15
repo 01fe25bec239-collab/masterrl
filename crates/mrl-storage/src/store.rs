@@ -242,7 +242,8 @@ impl Backend {
     }
 
     /// Sets the key that signs tickets for the server-proxied transfer endpoint.
-    /// Needed only by backends without `presign`.
+    /// Needed by every backend for PUT tickets, which always use the proxy, and by backends
+    /// without `presign` for GET tickets too.
     pub fn with_ticket_key(mut self, key: TicketKey) -> Self {
         self.ticket_key = Some(key);
         self
