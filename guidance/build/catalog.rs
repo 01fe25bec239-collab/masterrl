@@ -1851,6 +1851,38 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-AUTH-001")),
+            ("title", Value::Str("You need to sign in.")),
+            ("why", Value::Str("The app found no sign-in for this request, or your sign-in has ended.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Sign in again, then repeat the action."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-AUTH-002")),
+            ("title", Value::Str("The app could not sign you in with these details.")),
+            ("why", Value::Str("The user name and password don't match an account here.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check the user name and password, then try again."),
+                    Value::Str("Ask your org owner to reset your password if it still doesn't work."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-AUTH-003")),
+            ("title", Value::Str("This access token no longer works.")),
+            ("why", Value::Str("Someone revoked the token, or it reached its end date.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Create a new token in Settings."),
+                    Value::Str("Update the tool that uses the old token."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-CAP-001")),
             ("title", Value::Str("No engine here supports this method.")),
             ("why", Value::Str("The training engines on this machine can't run the method you picked.")),
@@ -2424,6 +2456,59 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Open the model page and read the license."),
                     Value::Str("Accept the license, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-PERM-001")),
+            ("title", Value::Str("Your role doesn't allow this action.")),
+            ("why", Value::Str("Each project role can do a set list of things. This action needs a different role.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Ask a project owner or maintainer to give you the role you need."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-PERM-002")),
+            ("title", Value::Str("This feedback task isn't assigned to you.")),
+            ("why", Value::Str("Annotators can open only the tasks assigned to them.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Pick a task from your own list."),
+                    Value::Str("Ask a maintainer to assign this task to you."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-QUOTA-001")),
+            ("title", Value::Str("Your team reached its limit on jobs or GPUs.")),
+            ("why", Value::Str("Your org limits how many jobs and GPUs a project can use at once.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Wait for a running job to finish, then submit again."),
+                    Value::Str("Ask your org owner to raise the limit."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-QUOTA-002")),
+            ("title", Value::Str("The compute budget for this period is used up.")),
+            ("why", Value::Str("Your org set a budget for this period, and this job would go over it.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Wait for the next budget period to start."),
+                    Value::Str("Ask your org owner to raise the budget."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-QUOTA-003")),
+            ("title", Value::Str("The app got too many requests from you in a short time.")),
+            ("why", Value::Str("The app limits how fast one account can send requests, so it stays fast for everyone.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Wait about 1 minute, then try again."),
                 ])),
             ])),
         ]),
