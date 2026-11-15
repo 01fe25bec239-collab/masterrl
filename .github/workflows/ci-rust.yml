@@ -83,7 +83,7 @@ jobs:
       - name: cross-target check (aarch64 Linux)
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends gcc-aarch64-linux-gnu libc6-dev-arm64-cross
           rustup target add aarch64-unknown-linux-gnu
           CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc cargo check --workspace --all-targets --locked --target aarch64-unknown-linux-gnu
       - name: cross-target check (x86_64 macOS)
