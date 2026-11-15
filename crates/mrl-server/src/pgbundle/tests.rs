@@ -240,7 +240,10 @@ async fn pg_upgrade_moves_the_data_to_the_new_major() {
         std::env::var_os("MRL_TEST_PG_NEW_BIN"),
     ) else {
         let why = "set MRL_TEST_PG_OLD_BIN and MRL_TEST_PG_NEW_BIN to two PostgreSQL bin folders";
-        assert!(std::env::var_os("CI").is_none(), "CI must run the upgrade test: {why}");
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CI must run the upgrade test: {why}"
+        );
         eprintln!("skipped: {why}");
         return;
     };

@@ -59,8 +59,7 @@ impl EventMetrics {
     }
 }
 
-// ponytail: P07's `ServerModule` has no metrics hook, so these live in the default registry;
-// /metrics shows them once P07's `Metrics::render` also gathers `prometheus::gather()`.
+// The default registry: `/metrics` renders it next to the server's own (`Metrics::render`).
 fn build() -> Result<Inner, prometheus::Error> {
     let inner = Inner {
         lag_seconds: Gauge::with_opts(Opts::new(

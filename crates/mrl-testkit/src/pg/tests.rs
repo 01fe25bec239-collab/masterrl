@@ -323,6 +323,27 @@ async fn server_with_events_module_serves_idempotent_posts_and_is_ready() {
     srv.shutdown().await.unwrap();
 }
 
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn metrics_endpoint_shows_outbox_metrics() {
+    let t = TestDb::new().await;
+    let seams = crate::seams::build(crate::seams::solo(TEST_SECRET), Mode::Solo);
+    let modules: Vec<Box<dyn mrl_server::ServerModule>> =
+        vec![Box::new(EventsModule::new(t.db().clone(), Vec::new()))];
+    let srv = TestServer::start(Config::default(), seams, modules)
+        .await
+        .unwrap();
+    let res = srv.get_authed("/metrics").await;
+    assert_eq!(res.status, 200);
+    let body = res.text();
+    assert!(body.contains("mrl_outbox_lag_seconds"), "{body}");
+    assert!(
+        body.contains("mrl_server_build_info"),
+        "server metrics still there"
+    );
+    srv.shutdown().await.unwrap();
+}
+
 /// Starts an election that marks `leading` while it leads.
 fn campaign(
     db: Db,
