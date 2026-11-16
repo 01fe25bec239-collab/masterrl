@@ -57,6 +57,7 @@ class Topology:
     devices: int = 1
     nodes: int = 1
     system_ram_gib: float | None = None
+    scratch_free_gib: float | None = None
 
     @property
     def data_parallel(self) -> int:

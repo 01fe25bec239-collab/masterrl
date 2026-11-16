@@ -18,6 +18,7 @@ from hypothesis import strategies as st
 from mrl_runtime.estimate import (
     Calibration,
     Component,
+    DeviceEstimate,
     DeviceSpec,
     Headroom,
     Range,
@@ -30,6 +31,7 @@ from mrl_runtime.estimate import (
     lora_params,
     verdict,
 )
+from mrl_runtime.estimate.storage import BANDWIDTH_GB_S
 from mrl_runtime.model import MrlError, inspect_model
 from mrl_runtime.model.headers import TensorInfo
 from mrl_runtime.model.inspection import GenerationDefaults, ModelInspection, Shape
@@ -144,6 +146,10 @@ def component(components: tuple[Component, ...], name: str) -> float:
     raise AssertionError(name)
 
 
+def update_of(device: DeviceEstimate) -> tuple[Component, ...]:
+    return next(p for p in device.phases if p.name == "update").components
+
+
 def assert_total(peak: Range, low: float, expected: float, high: float) -> None:
     assert close(peak.expected, expected, 0.06), (peak, expected)
     assert close(peak.low, low, 0.10), (peak, low)
@@ -181,7 +187,7 @@ def test_example_a(cfg: TrainConfig, total: tuple[float, float, float], want: st
     assert device.verdict == want
     assert est.verdict == want
     assert est.confidence == "medium"
-    comps = device.phases[-1].components
+    comps = update_of(device)
     base = 5.6 if cfg.method == "qlora" else 14.96
     assert close(component(comps, "base weights"), base, 0.02)
     lora = sum(component(comps, n) for n in ("LoRA weights", "gradients", "optimizer state"))
@@ -225,7 +231,7 @@ def test_example_b(
     assert_total(device.peak, *total)
     assert device.verdict == want
     assert est.confidence == confidence
-    comps = device.phases[-1].components
+    comps = update_of(device)
     policy = sum(component(comps, n) for n in ("weights", "gradients", "optimizer state"))
     assert close(policy, 22.9, 0.02)
     assert component(comps, "rollout engine") == pytest.approx(80 * u)
@@ -328,7 +334,7 @@ def test_apple_unified_budget(tmp_path: Path) -> None:
     device = est.devices[0]
     assert device.device == "unified memory"
     assert len(est.devices) == 1  # host RAM is the same budget
-    assert component(device.phases[-1].components, "data loading") == 2.0
+    assert component(update_of(device), "data loading") == 2.0
     assert device.usable_gib == pytest.approx(12.0)
     assert any("unified memory" in a for a in est.assumptions)
     big = estimate(LLAMA_8B, TrainConfig(), Topology(device_from_profile("apple-16gb")))
@@ -519,3 +525,137 @@ def test_calibration_scales_expected(cfg: TrainConfig, mu: float, sigma: float) 
     cal = estimate(QWEN_1_5B, cfg, H100, Calibration(mu, sigma, 25)).devices[0].peak
     assert cal.expected == pytest.approx(plain.expected * math.exp(mu), rel=1e-2, abs=0.01)
     assert cal.low <= cal.expected <= cal.high
+
+
+def test_every_phase_counts_toward_the_peak() -> None:
+    cfg = dataclasses.replace(B_BASE, rollout=RolloutConfig(64, 512, 1024, 0.30))
+    device = estimate(QWEN_1_5B, cfg, gpu(80)).devices[0]
+    phases = {p.name: p.total for p in device.phases}
+    assert list(phases) == ["load", "rollout", "update", "eval", "checkpoint"]
+    assert device.peak.expected == pytest.approx(max(t.expected for t in phases.values()), abs=0.01)
+    assert phases["load"].expected < phases["update"].expected
+    assert phases["eval"].expected < phases["update"].expected
+    load = next(p for p in device.phases if p.name == "load").components
+    assert not any(c.name in ("gradients", "optimizer state") for c in load)
+    assert any(c.name == "rollout engine" for c in load)  # the engine starts at load
+    released = dataclasses.replace(
+        B_BASE, rollout=RolloutConfig(64, 512, 1024, 0.30, released_during_update=True)
+    )
+    for p in estimate(QWEN_1_5B, released, gpu(80)).devices[0].phases:
+        has_engine = any(c.name == "rollout engine" for c in p.components)
+        assert has_engine == (p.name in ("load", "rollout")), p.name
+
+
+def test_a_phase_other_than_update_can_set_the_peak() -> None:
+    # Tiny micro-batch and short loss span: eval logits over the whole sequence dominate.
+    cfg = TrainConfig(seq_len=8192, loss_tokens=16, grad_checkpointing=True)
+    device = estimate(QWEN_1_5B, cfg, gpu(80)).devices[0]
+    totals = {p.name: p.total.expected for p in device.phases}
+    assert max(totals, key=totals.__getitem__) == "eval"
+    assert device.peak.expected == pytest.approx(totals["eval"], abs=0.01)
+
+
+def test_fsdp_checkpoint_gathers_one_unit() -> None:
+    est = estimate(QWEN_7B, _ppo(True, True), gpu(80, devices=8))
+    save = next(p for p in est.devices[0].phases if p.name == "checkpoint").components
+    assert close(component(save, "save gather"), 1.0, 0.05)  # half the 2 x unit transient
+
+
+def test_impossible_rollout_share_does_not_fit() -> None:
+    cfg = TrainConfig(grad_checkpointing=True, rollout=RolloutConfig(8, 512, 1024, 0.01))
+    est = estimate(LLAMA_8B, cfg, gpu(80))
+    assert est.recommended_gpu_memory_utilization is not None
+    assert est.recommended_gpu_memory_utilization > 0.2
+    assert est.devices[0].verdict == "does_not_fit"
+    assert est.verdict == "does_not_fit"
+    assert any("needs at least" in a for a in est.assumptions)
+    short = dataclasses.replace(
+        cfg, rollout=RolloutConfig(8, 512, 1024, est.recommended_gpu_memory_utilization - 0.02)
+    )
+    assert estimate(LLAMA_8B, short, gpu(80)).verdict == "tight"
+    enough = dataclasses.replace(cfg, rollout=RolloutConfig(8, 512, 1024))
+    assert estimate(LLAMA_8B, enough, gpu(80)).verdict == "fits"
+
+
+# Doc 07 §6.7 checkpoint table (GB).
+def test_checkpoint_storage_examples() -> None:
+    a = estimate(LLAMA_8B, TrainConfig(grad_checkpointing=True), gpu(24)).storage
+    assert a is not None
+    assert (round(a.checkpoint_weights_gb.low, 2), round(a.checkpoint_weights_gb.high, 2)) == (
+        0.08,
+        0.17,
+    )
+    assert 0.4 <= a.checkpoint_resumable_gb.low <= a.checkpoint_resumable_gb.high <= 0.52
+    b = estimate(QWEN_1_5B, B_BASE, gpu(80)).storage
+    assert b is not None
+    assert close(b.checkpoint_weights_gb.low, 3.1, 0.02)  # bf16
+    assert close(b.checkpoint_weights_gb.high, 6.2, 0.02)  # fp32
+    assert close(b.checkpoint_resumable_gb.low, 15.4, 0.03)
+    assert close(b.checkpoint_resumable_gb.high, 18.5, 0.02)
+    c = estimate(QWEN_7B, _ppo(True, True), gpu(80, devices=8)).storage
+    assert c is not None
+    assert close(c.checkpoint_weights_gb.low, 15.2, 0.02)  # actor, bf16
+    assert close(c.checkpoint_resumable_gb.high, 183, 0.02)  # 2 x 30.5 weights + 2 x 61 optimizer
+
+
+def test_retention_monthly_scratch_and_shm() -> None:
+    cfg = dataclasses.replace(
+        B_BASE,
+        keep_last=3,
+        keep_best=2,
+        checkpoints_per_month=30,
+        dataset_gb=5,
+        save_dtype="bfloat16",
+    )
+    topo = Topology(
+        device_from_profile("nvidia-32-80gb", 80), system_ram_gib=6, scratch_free_gib=55
+    )
+    est = estimate(QWEN_1_5B, cfg, topo)
+    s = est.storage
+    assert s is not None
+    assert s.checkpoint_weights_gb.low == s.checkpoint_weights_gb.high  # one save dtype
+    assert s.retention_gb.expected == pytest.approx(
+        3 * s.checkpoint_resumable_gb.expected + 2 * s.checkpoint_weights_gb.expected
+    )
+    assert s.monthly_gb is not None
+    assert s.monthly_gb.expected == pytest.approx(30 * s.checkpoint_resumable_gb.expected)
+    files = QWEN_1_5B.weight_bytes / 1e9
+    assert s.scratch_gb.expected == pytest.approx(
+        files + 5 + 2 * s.checkpoint_resumable_gb.expected + 15 + 1
+    )
+    assert s.shm_gib == 6  # max(8, 2 x workers), capped by system RAM
+    disk = next(d for d in est.devices if d.device == "disk")
+    assert disk.verdict == "tight"  # ~51 GiB expected, ~61 GiB high, 55 GiB free
+    roomy = estimate(QWEN_1_5B, cfg, dataclasses.replace(topo, scratch_free_gib=500))
+    assert next(d for d in roomy.devices if d.device == "disk").verdict == "fits"
+    assert any(
+        "Disk space was not checked" in a for a in estimate(QWEN_1_5B, cfg, gpu(80)).assumptions
+    )
+
+
+def test_interconnect_needs() -> None:
+    assert estimate(LLAMA_8B, TrainConfig(), gpu(24)).interconnect == ()
+    fsdp = TrainConfig(method="full", sharding="fsdp", seq_len=512)
+    one_node = estimate(QWEN_7B, fsdp, gpu(80, devices=8)).interconnect[0]
+    assert (one_node.role, one_node.preferred) == ("trainer", "nvlink")
+    assert one_node.classes == {"nvlink": "supported", "pcie": "experimental"}
+    nodes = Topology(device_from_profile("nvidia-32-80gb", 80), devices=8, nodes=2)
+    multi = estimate(QWEN_7B, fsdp, nodes).interconnect[0]
+    # Doc 07 §5.7: 7.6 B bf16 under FSDP over 100 GbE: >= 3-4 s; over 10 GbE >= 35 s.
+    assert close(multi.gb_per_step or 0, 3 * 15.23, 0.01)
+    assert 3 <= multi.seconds_per_step["rdma_100g"] <= 4
+    assert multi.seconds_per_step["eth_slow"] >= 35
+    assert multi.classes["eth_slow"] == "rejected"
+    lora = estimate(QWEN_7B, TrainConfig(seq_len=512), nodes).interconnect[0]
+    assert lora.parallelism == "data parallel"
+    assert lora.classes["eth_25g"] == "supported"
+    full_ddp = estimate(QWEN_7B, TrainConfig(method="full", seq_len=512), nodes).interconnect[0]
+    assert full_ddp.classes == {
+        "rdma_100g": "supported",
+        "eth_25g": "experimental",
+        "eth_slow": "rejected",
+    }
+    tp = dataclasses.replace(B_BASE, rollout=RolloutConfig(8, 64, 64, 0.3, tensor_parallel=2))
+    roles = {n.role: n for n in estimate(QWEN_1_5B, tp, gpu(80)).interconnect}
+    assert roles["rollout"].classes["nvlink"] == "supported"
+    assert set(BANDWIDTH_GB_S) >= set(multi.classes)

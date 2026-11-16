@@ -30,7 +30,7 @@ def test_jsonl_basics(tmp_path: Path) -> None:
         (4, None),
         (5, "not_object"),
         (6, "invalid_json"),
-        (7, None),
+        (7, "invalid_json"),  # overflows to infinity
     ]
     assert records[0].value == {"a": 1}
 
@@ -224,3 +224,45 @@ def test_max_records_and_unknown_suffix(tmp_path: Path) -> None:
         detect_format(tmp_path / "a.xlsx")
     with pytest.raises(MrlError):
         detect_format(tmp_path)
+
+
+def test_lone_surrogates_are_bad_utf8_in_every_reader(tmp_path: Path) -> None:
+    jsonl = tmp_path / "s.jsonl"
+    jsonl.write_text('{"text": "\\ud800"}\n{"\\udfff": "x"}\n{"text": "\\ud83d\\ude00"}\n')
+    assert _codes(jsonl) == ["bad_utf8", "bad_utf8", None]  # a valid pair is fine
+    array = tmp_path / "s.json"
+    array.write_text('[{"text": "\\ud800"}, {"text": "ok"}]')
+    assert _codes(array) == ["bad_utf8", None]
+    table = tmp_path / "s.csv"
+    table.write_text('meta,text\n"{""k"": ""\\ud800""}",hi\n')
+    assert _codes(table) == ["bad_utf8"]
+
+
+def test_csv_sizes_are_utf8_bytes(tmp_path: Path) -> None:
+    path = tmp_path / "m.csv"
+    path.write_text("text\n" + "é" * 8 + "\nok\n", encoding="utf-8")
+    records = _read(path, Limits(max_record_bytes=10))
+    assert [(r.defect, r.size) for r in records] == [("oversized_record", 17), (None, 3)]
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        '[{"text": "ok"}] trailing',
+        '[{"text": "ok"}][{"text": "again"}]',
+        '[{"a": 1}] {"b": 2}',
+        '[{"a": 1}',
+    ],
+)
+def test_json_array_must_end_the_file(tmp_path: Path, body: str) -> None:
+    path = tmp_path / "t.json"
+    path.write_text(body)
+    with pytest.raises(MrlError) as err:
+        _read(path)
+    assert err.value.code == "MRL-DATA-150"
+
+
+def test_json_array_trailing_whitespace_is_fine(tmp_path: Path) -> None:
+    path = tmp_path / "t.json"
+    path.write_text('[{"text": "ok"}]\n\n  \t')
+    assert _codes(path) == [None]

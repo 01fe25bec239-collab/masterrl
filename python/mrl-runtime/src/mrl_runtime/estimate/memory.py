@@ -15,11 +15,19 @@ from dataclasses import dataclass
 from typing import Literal
 
 from mrl_runtime.estimate.hardware import DeviceSpec, Topology
+from mrl_runtime.estimate.storage import (
+    InterconnectNeed,
+    Storage,
+    StoragePlan,
+    TrainedModel,
+    rollout_link,
+    storage,
+    trainer_link,
+)
+from mrl_runtime.estimate.units import GB, GIB, Range, total
 from mrl_runtime.model.errors import BAD_VALUE, MrlError
 from mrl_runtime.model.headers import TensorInfo
 from mrl_runtime.model.inspection import ModelInspection
-
-GIB = float(2**30)
 
 type Verdict = Literal["fits", "tight", "does_not_fit", "unknown"]
 type Confidence = Literal["low", "medium", "high"]
@@ -40,6 +48,7 @@ OPTIMIZER_BYTES: dict[str, tuple[float, float, float]] = {
 }
 KAPPA = (0.6, 1.0, 1.3)  # activation architecture factor (prior)
 LOGIT_FACTOR = (1.2, 2.0, 3.0)  # c: fp32 logits + log-softmax + gradient
+EVAL_LOGIT_FACTOR = (1.0, 1.5, 2.0)  # forward only: fp32 logits + log-softmax
 QLORA_META = (0.016, 0.0625)  # m_q bytes/param: double quantization .. plain
 QLORA_HIGH = 1.1  # quant-state and allocator rounding on the 4-bit base
 CKPT_LAYERS = (1.0, 1.5, 2.0)  # live per-layer terms with gradient checkpointing
@@ -53,49 +62,12 @@ SHARE_LOW_CONFIDENCE = 0.25
 
 
 @dataclass(frozen=True)
-class Range:
-    """A memory amount in GiB."""
-
-    low: float
-    expected: float
-    high: float
-
-    @staticmethod
-    def exact(gib: float) -> "Range":
-        return Range(gib, gib, gib)
-
-    @staticmethod
-    def of_bytes(low: float, expected: float, high: float) -> "Range":
-        return Range(low / GIB, expected / GIB, high / GIB)
-
-    @staticmethod
-    def exact_bytes(n: float) -> "Range":
-        return Range.exact(n / GIB)
-
-    def __add__(self, other: "Range") -> "Range":
-        return Range(self.low + other.low, self.expected + other.expected, self.high + other.high)
-
-    def scale(self, factor: float) -> "Range":
-        return Range(self.low * factor, self.expected * factor, self.high * factor)
-
-    def rounded(self, digits: int = 2) -> "Range":
-        return Range(
-            round(self.low, digits), round(self.expected, digits), round(self.high, digits)
-        )
-
-
-def _total(ranges: Iterable[Range]) -> Range:
-    out = Range.exact(0.0)
-    for r in ranges:
-        out = out + r
-    return out
-
-
-@dataclass(frozen=True)
 class RolloutConfig:
     """A generation engine (vLLM-class) on the same devices (Doc 07 §6.3 "Rollout engine").
 
     `gpu_memory_utilization` None means: claim the recommended share.
+    `released_during_update`: the engine frees its memory outside the rollout phase (update,
+    eval, checkpoint), as the engine declares; it always holds its share at load.
     """
 
     concurrent_sequences: int
@@ -139,6 +111,11 @@ class TrainConfig:
     reward_model_sharded: bool = False
     rollout: RolloutConfig | None = None
     dataloader_workers: int = 2
+    save_dtype: str | None = None  # None: report bfloat16 .. float32
+    keep_last: int = 2
+    keep_best: int = 1
+    checkpoints_per_month: float | None = None
+    dataset_gb: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -194,6 +171,8 @@ class Estimate:
     assumptions: tuple[str, ...]
     recommended_gpu_memory_utilization: float | None = None
     calibration: Calibration | None = None
+    storage: Storage | None = None
+    interconnect: tuple[InterconnectNeed, ...] = ()
 
     def to_dict(self) -> dict[str, object]:
         return dataclasses.asdict(self)
@@ -284,9 +263,14 @@ class _Builder:
     def __init__(self, m: _Model, cfg: TrainConfig, topo: Topology, notes: list[str]) -> None:
         self.m, self.cfg, self.topo, self.notes = m, cfg, topo, notes
         self.n = topo.data_parallel
-        self.static: list[Component] = []
+        self.weights: list[Component] = []  # held in every phase
+        self.state: list[Component] = []  # gradients and optimizer state: from the first step
         self.update: list[Component] = []
+        self.eval: list[Component] = []
+        self.save: list[Component] = []
         self.rollout: list[Component] = []
+        self.rollout_verdict: Verdict = "fits"
+        self.trained: list[TrainedModel] = []
 
     def shard(self, kind: Literal["w", "g", "o"]) -> float:
         divided = {
@@ -299,7 +283,8 @@ class _Builder:
         return 1 / self.n if kind in divided else 1.0
 
     def add_static(self, name: str, r: Range, kind: Literal["w", "g", "o"], note: str = "") -> None:
-        self.static.append(Component(name, r.scale(self.shard(kind)), note))
+        target = self.weights if kind == "w" else self.state
+        target.append(Component(name, r.scale(self.shard(kind)), note))
 
     def policy(self, prefix: str = "") -> None:
         cfg, m = self.cfg, self.m
@@ -320,6 +305,11 @@ class _Builder:
         self.add_static(f"{prefix}optimizer state", Range.of_bytes(*(p_t * x for x in k)), "o")
         if cfg.master_weights:
             self.add_static(f"{prefix}master weights", Range.exact_bytes(p_t * 4.0), "o")
+        save = (_bytes(cfg.save_dtype),) * 3 if cfg.save_dtype else (2.0, b_t, max(4.0, b_t))
+        master = 4.0 if cfg.master_weights else 0.0
+        opt = (k[0] + master, k[1] + master, k[2] + master)
+        saved = m.p if cfg.method == "full" else p_t
+        self.trained.append(TrainedModel(saved, p_t, opt, (save[0], save[1], save[2])))
 
     def _base(self) -> Range:
         cfg, m = self.cfg, self.m
@@ -351,6 +341,14 @@ class _Builder:
         self.update.append(
             Component("logits and loss", Range.of_bytes(*(c * logits for c in LOGIT_FACTOR)))
         )
+        live = Range.of_bytes(*(k * per_layer for k in CKPT_LAYERS)).scale(scale)
+        self.eval.append(
+            Component("eval activations", live, "forward only: one or two layers live")
+        )
+        forward = cfg.seq_len * cfg.micro_batch * m.vocab * 4.0
+        self.eval.append(
+            Component("eval logits", Range.of_bytes(*(c * forward for c in EVAL_LOGIT_FACTOR)))
+        )
 
     def fsdp_unit(self) -> None:
         if self.cfg.sharding not in ("zero3", "fsdp") or self.n == 1:
@@ -363,13 +361,22 @@ class _Builder:
                 "largest block during backward",
             )
         )
+        gather = Range.of_bytes(unit / 2, unit / 2, unit)
+        self.eval.append(Component("unsharded unit", gather, "largest block during forward"))
+        self.save.append(
+            Component(
+                "save gather",
+                Range.of_bytes(unit / 2, unit / 2, unit),
+                "one unit gathered at a time",
+            )
+        )
 
     def frozen_copies(self) -> None:
         cfg, m = self.cfg, self.m
         sharded = 1 / self.n if cfg.sharding in ("zero3", "fsdp") else 1.0
         if cfg.reference == "separate":
             ref = Range.exact_bytes(m.p * _bytes(cfg.reference_dtype)).scale(sharded)
-            self.static.append(Component("reference model", ref, "frozen copy"))
+            self.weights.append(Component("reference model", ref, "frozen copy"))
             sbh = cfg.seq_len * cfg.micro_batch * m.hidden * 34 * _bytes(cfg.activation_dtype) / 2
             self.update.append(
                 Component("reference forward", Range.of_bytes(sbh, 1.5 * sbh, 2 * sbh))
@@ -386,7 +393,7 @@ class _Builder:
         if cfg.reward_model_params:
             share = 1 / self.n if cfg.reward_model_sharded else 1.0
             rm = cfg.reward_model_params * _bytes(cfg.reward_model_dtype) * share
-            self.static.append(Component("reward model", Range.of_bytes(rm, rm, rm * 1.1)))
+            self.weights.append(Component("reward model", Range.of_bytes(rm, rm, rm * 1.1)))
 
     def rollout_engine(self, capacity: float | None) -> float | None:
         """Adds the engine's claim; returns the recommended gpu_memory_utilization."""
@@ -406,17 +413,26 @@ class _Builder:
         if capacity is None or u is None:
             raise _NoCapacityError
         claim = u * capacity
-        if recommended is not None and u < recommended:
+        minimum = (
+            m.p * _bytes(ro.weight_dtype) / tp
+            + ROLLOUT_OVERHEAD[0] * GIB
+            + (ro.prompt_tokens + ro.completion_tokens) * kv_per_token / tp
+        )
+        if claim * GIB < minimum:
+            self.rollout_verdict = "does_not_fit"
+            self.notes.append(
+                f"The rollout engine's share {u:.2f} gives {claim:.1f} GiB, but it needs at "
+                f"least {minimum / GIB:.1f} GiB for its weights and one sequence."
+            )
+        elif recommended is not None and u < recommended:
+            self.rollout_verdict = "tight"
             self.notes.append(
                 f"The rollout engine's share {u:.2f} is below the {recommended:.2f} it needs "
-                "for its weights and cache; generation may fail or run slowly."
+                "for all sequences at once; generation will run fewer at a time."
             )
-        component = Component(
-            "rollout engine", Range.exact(claim), f"gpu_memory_utilization {u:.2f}"
+        self.rollout.append(
+            Component("rollout engine", Range.exact(claim), f"gpu_memory_utilization {u:.2f}")
         )
-        self.rollout.append(component)
-        if not ro.released_during_update:
-            self.update.append(component)
         return recommended
 
     def overhead(self) -> Component:
@@ -429,13 +445,22 @@ class _Builder:
         )
 
     def phases(self, extra: list[Component]) -> tuple[Phase, ...]:
+        """load, rollout (if any), update, eval and checkpoint; the peak is their max."""
         over = self.overhead()
+        ro = self.cfg.rollout
+        held = [] if ro is not None and ro.released_during_update else self.rollout
+        plan: list[tuple[str, list[Component]]] = [("load", [*self.weights, *self.rollout])]
+        if ro is not None:
+            plan.append(("rollout", [*self.weights, *self.state, *self.rollout]))
+        plan += [
+            ("update", [*self.weights, *self.state, *self.update, *held]),
+            ("eval", [*self.weights, *self.state, *self.eval, *held]),
+            ("checkpoint", [*self.weights, *self.state, *self.save, *held]),
+        ]
         out: list[Phase] = []
-        if self.cfg.rollout is not None:
-            comps = (*self.static, *self.rollout, *extra, over)
-            out.append(Phase("rollout", comps, _total(c.gib for c in comps)))
-        comps = (*self.static, *self.update, *extra, over)
-        out.append(Phase("update", comps, _total(c.gib for c in comps)))
+        for name, comps in plan:
+            parts = (*comps, *extra, over)
+            out.append(Phase(name, parts, total(c.gib for c in parts)))
         return tuple(out)
 
 
@@ -504,7 +529,7 @@ def _host(m: _Model, cfg: TrainConfig, topo: Topology) -> DeviceEstimate | None:
     ]
     if cfg.rollout is not None:
         comps.append(Component("rollout process", Range.exact(2.0)))
-    phase = Phase("load", tuple(comps), _total(c.gib for c in comps))
+    phase = Phase("load", tuple(comps), total(c.gib for c in comps))
     ram = topo.system_ram_gib
     usable = topo.device.headroom.ram_usable(ram)
     return DeviceEstimate(
@@ -559,6 +584,7 @@ def estimate(
     analytic = _peak(phases)
     peak, cal_label = _calibrate(analytic, calibration)
     usable = spec.usable_gib()
+    memory_verdict = verdict(peak, spec.memory_gib, usable)
     device = DeviceEstimate(
         _device_name(spec),
         topology.devices,
@@ -566,7 +592,7 @@ def estimate(
         usable,
         phases,
         peak.rounded(),
-        verdict(peak, spec.memory_gib, usable),
+        _worst([memory_verdict, builder.rollout_verdict]),
     )
     devices = [device]
     host = _host(m, config, topology)
@@ -574,16 +600,67 @@ def estimate(
         devices.append(host)
     elif spec.kind == "gpu":
         notes.append("Host memory was not checked because the system RAM size is not known.")
-    overall = max(devices, key=lambda d: _ORDER[d.verdict]).verdict
+    disk = storage(builder.trained, _storage_plan(model, config, topology))
+    if topology.scratch_free_gib is not None:
+        devices.append(_disk(disk, topology.scratch_free_gib))
+    else:
+        notes.append("Disk space was not checked because the free scratch space is not known.")
     notes.extend(_standard_notes(config, spec))
     return Estimate(
         tuple(devices),
-        overall,
+        _worst([d.verdict for d in devices]),
         cal_label or _prior_confidence(config, phases, analytic),
         tuple(notes),
         recommended,
         calibration,
+        disk,
+        _links(m, config, topology),
     )
+
+
+def _worst(verdicts: Iterable[Verdict]) -> Verdict:
+    return max(verdicts, key=_ORDER.__getitem__)
+
+
+def _storage_plan(model: ModelInspection, cfg: TrainConfig, topo: Topology) -> StoragePlan:
+    files = sum(f.size for f in model.files) or model.weight_bytes
+    return StoragePlan(
+        cfg.keep_last,
+        cfg.keep_best,
+        cfg.checkpoints_per_month,
+        cfg.dataset_gb,
+        files / GB,
+        cfg.dataloader_workers,
+        topo.system_ram_gib,
+    )
+
+
+def _disk(disk: Storage, free_gib: float) -> DeviceEstimate:
+    """Scratch space on the node (GB converted to GiB to sit beside the memory devices)."""
+    need = disk.scratch_gb.scale(GB / GIB)
+    phase = Phase(
+        "scratch", (Component("scratch", need, "model, data, checkpoints, image, logs"),), need
+    )
+    return DeviceEstimate(
+        "disk", 1, free_gib, free_gib, (phase,), need.rounded(), verdict(need, free_gib, free_gib)
+    )
+
+
+def _links(m: _Model, cfg: TrainConfig, topo: Topology) -> tuple[InterconnectNeed, ...]:
+    b_w = _bytes(cfg.weight_dtype)
+    p_t = m.p if cfg.method == "full" else lora_params(m.tensors, cfg.lora_rank, cfg.lora_targets)
+    b_t = _bytes(cfg.trainable_dtype or (cfg.weight_dtype if cfg.method == "full" else "float32"))
+    needs = [
+        trainer_link(
+            devices=topo.devices,
+            nodes=topo.nodes,
+            sharding=cfg.sharding,
+            full_params_gb=m.p * b_w / GB,
+            gradients_gb=p_t * b_t / GB,
+        ),
+        rollout_link(cfg.rollout.tensor_parallel if cfg.rollout else 1),
+    ]
+    return tuple(n for n in needs if n is not None)
 
 
 def _prior_confidence(cfg: TrainConfig, phases: tuple[Phase, ...], peak: Range) -> Confidence:
@@ -593,7 +670,7 @@ def _prior_confidence(cfg: TrainConfig, phases: tuple[Phase, ...], peak: Range) 
         return "medium"
     if cfg.rollout.released_during_update:
         return "low"
-    update = next(p for p in phases if p.name == "update")
+    update = next(p for p in phases if p.name == "update")  # the phase with the wide terms
     wide = sum(
         c.gib.expected for c in update.components if c.name in ("activations", "logits and loss")
     )

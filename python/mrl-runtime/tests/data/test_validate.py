@@ -211,3 +211,12 @@ def test_schema_dir_is_found_or_named(tmp_path: Path) -> None:
     assert (find_schema_dir() / "sft.messages.v1.schema.json").is_file()
     with pytest.raises(MrlError):
         find_schema_dir(tmp_path / "x.py")
+
+
+def test_lone_surrogate_is_a_defect_not_a_crash(tmp_path: Path) -> None:
+    path = tmp_path / "s.jsonl"
+    path.write_text('{"text": "\\ud800"}\n{"text": "fine"}\n')
+    report = validate_dataset(path, "pretrain.text.v1")
+    assert report.defect_counts == {"bad_utf8": 1}
+    assert (report.valid, report.invalid) == (1, 1)
+    write_report(report, tmp_path / "out")

@@ -78,18 +78,37 @@ def detect_format(path: Path) -> FileFormat:
     return fmt
 
 
-def depth(value: object) -> int:
-    """Nesting depth of a parsed JSON value (scalars are 0), without recursion."""
-    deepest, stack = 0, [(value, 0)]
+def _utf8(text: str) -> bool:
+    """False for strings UTF-8 can't encode (lone surrogates from `\\ud800`-style escapes)."""
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:
+        return False
+    return True
+
+
+def check_value(value: object, max_depth: int) -> str | None:
+    """The defect of a parsed value, or None: `too_deep`, `bad_utf8` (in a key or a string)
+    or `invalid_json` (NaN / infinite numbers). Iterative, so deep input can't overflow."""
+    stack = [(value, 0)]
     while stack:
         node, level = stack.pop()
+        if isinstance(node, str):
+            if not _utf8(node):
+                return "bad_utf8"
+            continue
+        if isinstance(node, float) and not math.isfinite(node):
+            return "invalid_json"
         o = obj(node)
         children = list(o.values()) if o is not None else arr(node)
         if children is None:
             continue
-        deepest = max(deepest, level + 1)
+        if level + 1 > max_depth:
+            return "too_deep"
+        if o is not None and not all(_utf8(k) for k in o):
+            return "bad_utf8"
         stack.extend((child, level + 1) for child in children)
-    return deepest
+    return None
 
 
 def _reject_constant(name: str) -> float:
@@ -108,9 +127,8 @@ def parse_json(data: bytes | str, limits: Limits) -> tuple[Any, str | None]:
         return None, "too_deep"
     except ValueError:  # JSONDecodeError, NaN/Infinity, over-long integers
         return None, "invalid_json"
-    if depth(value) > limits.max_depth:
-        return None, "too_deep"
-    return value, None
+    defect = check_value(value, limits.max_depth)
+    return (None, defect) if defect else (value, None)
 
 
 def _record(number: int, value: Any, defect: str | None, size: int) -> RawRecord:
@@ -212,6 +230,8 @@ def read_json_array(path: Path, limits: Limits) -> Iterator[RawRecord]:
         stream.pos += 1
         number = 0
         while (char := stream.peek()) != "]":
+            if not char:
+                raise _unreadable(path, "the array is not closed")
             if number:
                 if char != ",":
                     raise _unreadable(path, f"expected a comma after record {number}")
@@ -221,28 +241,36 @@ def read_json_array(path: Path, limits: Limits) -> Iterator[RawRecord]:
             value, size = stream.value(number)
             if size > limits.max_record_bytes:
                 yield RawRecord(number, None, "oversized_record", size)
-            elif depth(value) > limits.max_depth:
-                yield RawRecord(number, None, "too_deep", size)
+            elif defect := check_value(value, limits.max_depth):
+                yield RawRecord(number, None, defect, size)
             else:
                 yield _record(number, value, None, size)
+        stream.pos += 1  # the closing bracket
+        if stream.peek():
+            raise _unreadable(path, "the file has more data after the closing bracket")
 
 
 class _BoundedLines:
-    """Text lines for csv.reader, each at most `limit` characters; counts characters read."""
+    """Text lines for csv.reader; counts the UTF-8 bytes read.
+
+    A line may be up to twice the record limit, so a record a little over the limit is
+    reported as `oversized_record`; a longer line stops the read (CSV can't resync).
+    """
 
     def __init__(self, f: IO[str], limit: int) -> None:
-        self.f, self.limit, self.chars = f, limit, 0
+        self.f, self.limit, self.bytes = f, limit, 0
 
     def __iter__(self) -> "_BoundedLines":
         return self
 
     def __next__(self) -> str:
-        line = self.f.readline(self.limit + 1)
+        line = self.f.readline(2 * self.limit + 1)
         if not line:
             raise StopIteration
-        if len(line) > self.limit:
+        size = len(line.encode("utf-8"))
+        if size > 2 * self.limit:
             raise csv.Error("a line is larger than the record limit")
-        self.chars += len(line)
+        self.bytes += size
         return line
 
 
@@ -263,7 +291,7 @@ def _csv_cell(cell: str) -> object:
 def read_csv(path: Path, limits: Limits, delimiter: str) -> Iterator[RawRecord]:
     """CSV/TSV with an explicit dialect: header row, `"` quoting, strict parsing."""
     # ponytail: csv.field_size_limit is process-wide; set for the read, restored after.
-    previous = csv.field_size_limit(limits.max_record_bytes)
+    previous = csv.field_size_limit(2 * limits.max_record_bytes)
     try:
         with path.open(encoding="utf-8-sig", newline="") as f:  # Excel adds a BOM
             lines = _BoundedLines(f, limits.max_record_bytes)
@@ -274,17 +302,17 @@ def read_csv(path: Path, limits: Limits, delimiter: str) -> Iterator[RawRecord]:
                     return
                 if len(set(header)) != len(header) or not all(header):
                     raise _unreadable(path, "the header row has empty or repeated column names")
-                start = lines.chars
+                start = lines.bytes
                 for number, row in enumerate(reader, 1):
-                    size, start = lines.chars - start, lines.chars
+                    size, start = lines.bytes - start, lines.bytes
                     if len(row) != len(header):
                         yield RawRecord(number, None, "invalid_csv", size)
                     elif size > limits.max_record_bytes:
                         yield RawRecord(number, None, "oversized_record", size)
                     else:
                         value = {k: _csv_cell(v) for k, v in zip(header, row, strict=True)}
-                        if depth(value) > limits.max_depth:
-                            yield RawRecord(number, None, "too_deep", size)
+                        if defect := check_value(value, limits.max_depth):
+                            yield RawRecord(number, None, defect, size)
                         else:
                             yield RawRecord(number, value, None, size)
             except csv.Error as exc:
@@ -339,20 +367,6 @@ def _check_schema(pa: Any, path: Path, schema: Any, limits: Limits) -> None:
             )
 
 
-def _finite(value: object) -> bool:
-    """False if a float anywhere in the value is NaN or infinite (not valid JSON)."""
-    stack = [value]
-    while stack:
-        node = stack.pop()
-        if isinstance(node, float) and not math.isfinite(node):
-            return False
-        if (o := obj(node)) is not None:
-            stack.extend(o.values())
-        elif (a := arr(node)) is not None:
-            stack.extend(a)
-    return True
-
-
 def _arrow_rows(
     pa: Any, path: Path, batches: Iterator[Any], limits: Limits, start: int
 ) -> Iterator[RawRecord]:
@@ -362,8 +376,8 @@ def _arrow_rows(
             rows: list[dict[str, Any]] = batch.to_pylist()
             for row in rows:
                 number += 1
-                if not _finite(row):
-                    yield RawRecord(number, None, "invalid_json", 0)
+                if defect := check_value(row, limits.max_depth):
+                    yield RawRecord(number, None, defect, 0)
                     continue
                 size = len(json.dumps(row, ensure_ascii=False).encode("utf-8"))
                 if size > limits.max_record_bytes:
