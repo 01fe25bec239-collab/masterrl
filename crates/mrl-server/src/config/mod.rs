@@ -72,6 +72,13 @@ pub struct Config {
     pub object_store: ObjectStoreConfig,
     /// Logs and traces.
     pub telemetry: TelemetryConfig,
+    // <mrl:config P16> P16 settings fields go right below this line.
+
+    // <mrl:config P17> P17 settings fields go right below this line.
+
+    // <mrl:config P18> P18 settings fields go right below this line.
+
+    // <mrl:config P19> P19 settings fields go right below this line.
 }
 
 /// `[server]`.
@@ -451,6 +458,13 @@ impl Config {
                 ));
             }
         }
+        // <mrl:validate P16> P16 checks (push to `problems`) go right below this line.
+
+        // <mrl:validate P17> P17 checks (push to `problems`) go right below this line.
+
+        // <mrl:validate P18> P18 checks (push to `problems`) go right below this line.
+
+        // <mrl:validate P19> P19 checks (push to `problems`) go right below this line.
         if problems.is_empty() {
             Ok(())
         } else {

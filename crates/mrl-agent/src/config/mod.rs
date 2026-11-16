@@ -52,6 +52,9 @@ pub struct AgentConfig {
     pub exec: ExecConfig,
     /// Transfer client settings.
     pub transfer: TransferConfig,
+    // <mrl:config P18> P18 settings fields go right below this line.
+
+    // <mrl:config P20> P20 settings fields go right below this line.
 }
 
 impl Default for AgentConfig {
@@ -64,6 +67,9 @@ impl Default for AgentConfig {
             sandbox: SandboxConfig::default(),
             exec: ExecConfig::default(),
             transfer: TransferConfig::default(),
+            // <mrl:config-default P18> P18 defaults go right below this line.
+
+            // <mrl:config-default P20> P20 defaults go right below this line.
         }
     }
 }

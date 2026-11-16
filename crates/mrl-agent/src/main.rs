@@ -78,6 +78,9 @@ enum Command {
         #[command(subcommand)]
         action: ServiceAction,
     },
+    // <mrl:cli-commands P18> P18 subcommands go right below this line.
+
+    // <mrl:cli-commands P20> P20 subcommands go right below this line.
 }
 
 #[derive(Debug, Subcommand)]
@@ -191,6 +194,9 @@ async fn dispatch(config: Option<PathBuf>, command: Command) -> Result<ExitCode,
             };
             run_local(cfg, &profile, limits, gpus, dir, cmd).await
         }
+        // <mrl:cli-dispatch P18> P18 match arms go right below this line.
+
+        // <mrl:cli-dispatch P20> P20 match arms go right below this line.
         Command::Service { action } => {
             let (cfg, file) = AgentConfig::load(config.as_deref())?;
             let state = mrl_agent::state::StateDir::open(&cfg.state_dir)?;

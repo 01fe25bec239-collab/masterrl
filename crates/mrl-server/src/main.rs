@@ -114,7 +114,7 @@ async fn run(cli: Cli) -> Result<(), Failure> {
     if let Some(Command::Openapi) = cli.command {
         // The document needs no database; this pool never connects.
         let db = Db::connect_lazy(&DatabaseConfig::default(), PgConnectOptions::new());
-        let yaml = openapi::document(&registry::modules(&db))
+        let yaml = openapi::document(&registry::modules(&db, &Config::default()))
             .to_yaml()
             .map_err(|e| ServerError::new(ErrorCode::Internal, format!("openapi document: {e}")))?;
         print!("{yaml}");
@@ -163,9 +163,8 @@ async fn serve(
     let seams = Seams::production(mode, &secret)
         .idempotency(PgIdempotencyStore::new(db.clone()))
         .build(mode)?;
-    let running = App::new(config, seams, registry::modules(&db))
-        .start()
-        .await?;
+    let modules = registry::modules(&db, &config);
+    let running = App::new(config, seams, modules).start().await?;
     if !headless {
         println!(
             "{}",

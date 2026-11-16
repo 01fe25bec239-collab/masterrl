@@ -14,15 +14,31 @@ pub fn consumers(db: &Db) -> Vec<Arc<dyn EventConsumer>> {
     let _ = db;
     vec![
         // <mrl:consumers>
+        // <mrl:consumers P16> P16 consumers go right below this line.
+
+        // <mrl:consumers P17> P17 consumers go right below this line.
+
+        // <mrl:consumers P18> P18 consumers go right below this line.
+
+        // <mrl:consumers P19> P19 consumers go right below this line.
         // </mrl:consumers>
     ]
 }
 
 /// Every registered module, in startup order. `events` comes first: it applies migrations.
-pub fn modules(db: &Db) -> Vec<Box<dyn ServerModule>> {
+/// Modules read their own settings from `config`.
+pub fn modules(db: &Db, config: &crate::Config) -> Vec<Box<dyn ServerModule>> {
+    let _ = config;
     vec![
         // <mrl:register>
         Box::new(EventsModule::new(db.clone(), consumers(db))),
+        // <mrl:register P16> P16 modules go right below this line.
+
+        // <mrl:register P17> P17 modules go right below this line.
+
+        // <mrl:register P18> P18 modules go right below this line.
+
+        // <mrl:register P19> P19 modules go right below this line.
         // </mrl:register>
     ]
 }

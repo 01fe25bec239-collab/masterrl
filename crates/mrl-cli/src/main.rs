@@ -1,6 +1,11 @@
 //! `mrl`, the MasterRL command-line client.
+//!
+//! Each part writes its subcommands in its own module and adds one line right below each of
+//! its markers (module, subcommand, dispatch), so parts never edit the same lines.
 
 use std::process::ExitCode;
+
+use clap::{Parser, Subcommand};
 
 const NAME: &str = env!("CARGO_BIN_NAME");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -10,66 +15,84 @@ const GIT_SHA: &str = git_version::git_version!(
     fallback = "unknown"
 );
 
+// <mrl:cli-mods P16> P16 `mod` lines go right below this line.
+
+// <mrl:cli-mods P17> P17 `mod` lines go right below this line.
+
+/// The MasterRL command-line client.
+#[derive(Debug, Parser)]
+#[command(name = "mrl", disable_version_flag = true)]
+struct Cli {
+    /// Show the version and git commit.
+    #[arg(short = 'V', long)]
+    version: bool,
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Show the version and git commit.
+    Version,
+    // <mrl:cli-commands P16> P16 subcommands go right below this line.
+
+    // <mrl:cli-commands P17> P17 subcommands go right below this line.
+}
+
+fn version_line() -> String {
+    format!("{NAME} {VERSION} ({GIT_SHA})")
+}
+
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args_os()
-        .skip(1)
-        .map(|arg| arg.to_string_lossy().into_owned())
-        .collect();
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    match reply(&args) {
-        Ok(text) => {
-            println!("{text}");
-            ExitCode::SUCCESS
-        }
-        Err(text) => {
-            eprintln!("{text}");
-            ExitCode::from(2)
+    let cli = Cli::parse();
+    if cli.version {
+        println!("{}", version_line());
+        return ExitCode::SUCCESS;
+    }
+    let Some(command) = cli.command else {
+        eprintln!("{NAME}: choose a command; run `{NAME} --help` to see them");
+        return ExitCode::from(2);
+    };
+    match run(command) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(message) => {
+            eprintln!("{NAME}: {message}");
+            ExitCode::FAILURE
         }
     }
 }
 
-// ponytail: same ~20 lines in each binary; move to a shared crate when a real CLI parser arrives.
-fn reply(args: &[&str]) -> Result<String, String> {
-    match args {
-        ["--version" | "-V"] => Ok(format!("{NAME} {VERSION} ({GIT_SHA})")),
-        ["--help" | "-h"] => Ok(usage()),
-        [] => Err(usage()),
-        _ => Err(format!(
-            "{NAME}: '{}' is not an option this program knows.\n\n{}",
-            args.join(" "),
-            usage()
-        )),
-    }
-}
+/// Runs one subcommand. An error is a plain-language message for the user.
+fn run(command: Command) -> Result<(), String> {
+    match command {
+        // <mrl:cli-dispatch P16> P16 match arms go right below this line.
 
-fn usage() -> String {
-    format!("Usage: {NAME} [--version | --help]\n\n  -V, --version  Show the version and git commit\n  -h, --help     Show this help")
+        // <mrl:cli-dispatch P17> P17 match arms go right below this line.
+        Command::Version => {
+            println!("{}", version_line());
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{reply, GIT_SHA, NAME, VERSION};
+    use super::{version_line, Cli, Command, GIT_SHA, NAME, VERSION};
+    use clap::Parser;
 
     #[test]
     fn version_shows_name_version_and_sha() {
-        let out = reply(&["--version"]).expect("--version succeeds");
-        assert_eq!(out, format!("{NAME} {VERSION} ({GIT_SHA})"));
+        assert_eq!(version_line(), format!("{NAME} {VERSION} ({GIT_SHA})"));
         assert!(!GIT_SHA.is_empty());
-        assert_eq!(reply(&["-V"]), Ok(out));
+        assert!(Cli::try_parse_from(["mrl", "--version"]).unwrap().version);
+        assert!(Cli::try_parse_from(["mrl", "-V"]).unwrap().version);
+        let sub = Cli::try_parse_from(["mrl", "version"]).unwrap();
+        assert!(matches!(sub.command, Some(Command::Version)));
     }
 
     #[test]
-    fn help_lists_options() {
-        let out = reply(&["--help"]).expect("--help succeeds");
-        assert!(out.contains("--version") && out.contains("--help"));
-    }
-
-    #[test]
-    fn unknown_or_missing_options_fail_with_usage() {
-        let err = reply(&["--bogus"]).expect_err("unknown option fails");
-        assert!(err.contains("'--bogus' is not an option"));
-        assert!(err.contains("Usage:"));
-        assert!(reply(&[]).is_err());
-        assert!(reply(&["--version", "--help"]).is_err());
+    fn unknown_options_fail_and_no_command_is_allowed_to_parse() {
+        assert!(Cli::try_parse_from(["mrl", "--bogus"]).is_err());
+        assert!(Cli::try_parse_from(["mrl"]).unwrap().command.is_none());
     }
 }

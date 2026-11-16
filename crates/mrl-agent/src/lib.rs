@@ -19,6 +19,10 @@ pub mod service;
 pub mod state;
 pub mod transfer;
 
+// <mrl:lib P18> P18 `pub mod` lines go right below this line.
+
+// <mrl:lib P20> P20 `pub mod` lines go right below this line.
+
 use std::path::PathBuf;
 use std::sync::Arc;
 

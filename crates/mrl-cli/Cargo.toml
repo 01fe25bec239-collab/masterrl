@@ -11,7 +11,12 @@ name = "mrl"
 path = "src/main.rs"
 
 [dependencies]
+clap = { version = "=4.6.7", features = ["derive"] }
 git-version = { workspace = true }
+
+# <mrl:deps P16> P16 dependencies go right below this line.
+
+# <mrl:deps P17> P17 dependencies go right below this line.
 
 [lints]
 workspace = true
