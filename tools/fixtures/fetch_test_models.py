@@ -21,7 +21,7 @@ REGISTRY = Path(__file__).resolve().parents[2] / "tests/fixtures/models/test-mod
 
 
 def load_registry(path: Path = REGISTRY) -> list[dict[str, Any]]:
-    return yaml.safe_load(path.read_text())["models"]
+    return yaml.safe_load(path.read_text(encoding="utf-8"))["models"]
 
 
 def sha256_file(path: Path) -> str:

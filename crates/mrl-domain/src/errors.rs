@@ -516,6 +516,15 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         code(Data, 151),
         "This dataset file has a column type the app doesn't read.",
     ),
+    // <mrl:errors P16> rows for P16 go right below this line.
+
+    // <mrl:errors P17> rows for P17 go right below this line.
+
+    // <mrl:errors P18> rows for P18 go right below this line.
+
+    // <mrl:errors P19> rows for P19 go right below this line.
+
+    // <mrl:errors P20> rows for P20 go right below this line.
 ];
 
 /// Every code with its title: the registry plus every capability rejection.

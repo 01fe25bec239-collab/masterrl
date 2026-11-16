@@ -31,7 +31,7 @@ def _pointer(doc: Any, pointer: str) -> tuple[Any, str | int]:
 
 
 def _patched(example: Path) -> dict[str, Any]:
-    patch = json.loads(example.read_text())
+    patch = json.loads(example.read_text(encoding="utf-8"))
     doc = copy.deepcopy(json.loads((EXAMPLES / patch["base"]).read_text()))
     for pointer, value in patch.get("set", {}).items():
         parent, key = _pointer(doc, pointer)
@@ -49,14 +49,14 @@ def test_vendored_schemas_match_repo_schemas() -> None:
 
 @pytest.mark.parametrize("example", sorted(EXAMPLES.glob("valid-*.json")), ids=lambda p: p.name)
 def test_valid_p09_examples_load(example: Path) -> None:
-    m = from_document(json.loads(example.read_text()))
+    m = from_document(json.loads(example.read_text(encoding="utf-8")))
     assert m.algorithms
     assert version_in_range(API_VERSION, m.adapter_api)
 
 
 @pytest.mark.parametrize("example", sorted(EXAMPLES.glob("invalid-*.json")), ids=lambda p: p.name)
 def test_invalid_p09_examples_are_refused(example: Path) -> None:
-    fails_at = json.loads(example.read_text())["fails_at"]
+    fails_at = json.loads(example.read_text(encoding="utf-8"))["fails_at"]
     with pytest.raises(MrlError) as err:
         from_document(_patched(example))
     assert err.value.code == MANIFEST_INVALID
