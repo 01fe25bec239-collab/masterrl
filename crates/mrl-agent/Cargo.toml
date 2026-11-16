@@ -1,5 +1,6 @@
 [package]
 name = "mrl-agent"
+description = "The MasterRL machine agent: hardware inventory, job execution, sandboxing, transfers and the node cache."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,6 +9,33 @@ publish.workspace = true
 
 [dependencies]
 git-version = { workspace = true }
+mrl-proto = { path = "../mrl-proto" }
+mrl-storage = { path = "../mrl-storage" }
+nvml-wrapper = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sysinfo = { workspace = true }
+thiserror = { workspace = true }
+time = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "fs", "io-util", "time", "signal", "sync"] }
+# Not pinned at the workspace yet, so exact versions live here.
+async-trait = "=0.1.92"
+clap = { version = "=4.6.7", features = ["derive"] }
+futures = { version = "=0.3.34", default-features = false, features = ["std"] }
+prost-types = "=0.14.6"
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "stream", "http2"] }
+tokio-util = { version = "=0.7.20", features = ["io"] }
+toml = "=1.2.0"
+
+[target.'cfg(unix)'.dependencies]
+nix = { version = "=0.31.3", features = ["signal", "user"] }
+
+[dev-dependencies]
+axum = { workspace = true }
+mrl-domain = { path = "../mrl-domain" }
+object_store = { workspace = true, features = ["aws"] }
+proptest = { workspace = true }
+tempfile = "=3.27.0"
 
 [lints]
 workspace = true

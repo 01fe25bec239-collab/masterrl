@@ -2126,6 +2126,16 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-CONFLICT-110",
+      "title": "Too many changes happened at the same time.",
+      "why": "Other changes to the same items kept getting in the way, so the server stopped trying.",
+      "what_to_do": {
+        "steps": [
+          "Try again in a few seconds."
+        ]
+      }
+    },
+    {
       "code": "MRL-DATA-001",
       "title": "Your dataset did not pass its checks.",
       "why": "Some rows are empty, are missing fields, or don't match the chosen format.",
@@ -2320,6 +2330,52 @@ export const catalog = deepFreeze({
       "docs_link": "https://docs.docker.com/get-started/get-docker/"
     },
     {
+      "code": "MRL-ENV-110",
+      "title": "The app's database programs are missing.",
+      "why": "The app could not find the PostgreSQL database programs it ships with.",
+      "what_to_do": {
+        "steps": [
+          "Reinstall the app.",
+          "If you set `pgbundle.bin_dir`, check that the folder holds `postgres`, `initdb`, `pg_ctl`, `pg_dump`, `pg_restore` and `pg_upgrade`."
+        ]
+      }
+    },
+    {
+      "code": "MRL-ENV-111",
+      "title": "Another copy of the app is already using this data folder.",
+      "why": "Only one server can use a data folder at a time, so your data stays safe.",
+      "what_to_do": {
+        "steps": [
+          "Close the other copy of the app, then try again.",
+          "If no other copy is open, restart your computer."
+        ]
+      }
+    },
+    {
+      "code": "MRL-ENV-112",
+      "title": "This data folder was made by a newer version of the app.",
+      "why": "The app's database programs are older than the ones that made this data folder.",
+      "what_to_do": {
+        "steps": [
+          "Install the newest version of the app."
+        ]
+      }
+    },
+    {
+      "code": "MRL-ENV-122",
+      "title": "The sandbox can't run on this computer.",
+      "why": "The sandbox tool (bubblewrap) is missing, or this system blocks the isolation it needs.",
+      "what_to_do": {
+        "steps": [
+          "Install bubblewrap, then try again.",
+          "If it is installed, ask your admin to allow unprivileged user namespaces."
+        ],
+        "linux": [
+          "Run `sudo apt install bubblewrap` on Ubuntu or Debian."
+        ]
+      }
+    },
+    {
       "code": "MRL-ENV-130",
       "title": "The training worker and the app use different protocol versions.",
       "why": "The software that runs training on this machine is older or newer than the app. They can't talk to each other.",
@@ -2481,6 +2537,76 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-INTERNAL-110",
+      "title": "The database needs an update before the server can start.",
+      "why": "This version of the server needs database changes. Automatic updates are turned off in its settings.",
+      "what_to_do": {
+        "steps": [
+          "Back up the database if your team needs a copy first.",
+          "Run `mrl-server migrate`, then start the server again.",
+          "To update on every start, set `database.auto_migrate = true`."
+        ]
+      }
+    },
+    {
+      "code": "MRL-INTERNAL-111",
+      "title": "The database update did not finish.",
+      "why": "One of the database changes failed. Details name the change and the reason.",
+      "what_to_do": {
+        "steps": [
+          "If Details say a backup was put back, your data is as it was before the update.",
+          "Start the previous version of the app to keep working.",
+          "Send the Details to support so they can fix the update."
+        ]
+      }
+    },
+    {
+      "code": "MRL-INTERNAL-112",
+      "title": "The app's database stopped and could not start again.",
+      "why": "The database program failed to start, or it kept stopping. Its log is in the data folder.",
+      "what_to_do": {
+        "steps": [
+          "Restart the app.",
+          "Check that the disk with the app data folder has free space.",
+          "If it happens again, send the file `postgres.log` from the data folder to support."
+        ]
+      }
+    },
+    {
+      "code": "MRL-INTERNAL-113",
+      "title": "The app could not back up its database.",
+      "why": "The backup program failed, or the backup folder is full or locked. Details give the reason.",
+      "what_to_do": {
+        "steps": [
+          "Free up disk space on the drive with the app data folder.",
+          "Restart the app to try again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-INTERNAL-114",
+      "title": "The app could not move its database to the new version.",
+      "why": "This app uses a newer database program, and moving your data to it failed. Your old data folder was not changed.",
+      "what_to_do": {
+        "steps": [
+          "Start the previous version of the app to keep working.",
+          "Free up disk space; the move needs about as much space again as your database.",
+          "Send the Details to support."
+        ]
+      }
+    },
+    {
+      "code": "MRL-INTERNAL-115",
+      "title": "The server set an event aside after it failed many times.",
+      "why": "A part of the server could not handle this event. The server kept going with the next events.",
+      "what_to_do": {
+        "steps": [
+          "Check the server log for the event id and the last error.",
+          "Send them to support so they can fix the cause and replay the event."
+        ]
+      }
+    },
+    {
       "code": "MRL-INTERNAL-130",
       "title": "The app and its training worker disagreed about the next step.",
       "why": "The training worker got a message it didn't expect at that point. This is a problem in the app, not in your settings.",
@@ -2603,6 +2729,55 @@ export const catalog = deepFreeze({
         "steps": [
           "Open the model page and read the license.",
           "Accept the license, then try again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-NODE-121",
+      "title": "The agent could not save or read its local files.",
+      "why": "The disk may be full, or the agent may not have permission to use its state folder.",
+      "what_to_do": {
+        "steps": [
+          "Free up disk space on the drive named in Details.",
+          "Make sure your account owns the agent's state folder.",
+          "Start the agent again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-NODE-123",
+      "title": "The agent could not start or stop the program.",
+      "why": "The program may be missing, or this computer may be out of processes or memory.",
+      "what_to_do": {
+        "steps": [
+          "Check the program name and path in Details.",
+          "Close programs you don't need, then try again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-NODE-124",
+      "title": "The agent could not read this computer's hardware.",
+      "why": "The GPU driver did not answer, or it stopped working while the agent read it.",
+      "what_to_do": {
+        "steps": [
+          "Restart the computer, then check again.",
+          "If it keeps failing, update or reinstall the GPU driver."
+        ],
+        "linux": [
+          "Run `nvidia-smi` to see whether the driver answers."
+        ]
+      }
+    },
+    {
+      "code": "MRL-NODE-125",
+      "title": "The agent could not set itself up to start with your computer.",
+      "why": "The system's service manager refused the change, or a path has characters it can't pass on.",
+      "what_to_do": {
+        "steps": [
+          "Read the command and its message in Details.",
+          "Run `mrl-agent service install` again.",
+          "If it still fails, start the agent by hand with `mrl-agent run`."
         ]
       }
     },
@@ -2965,6 +3140,29 @@ export const catalog = deepFreeze({
       "what_to_do": {
         "steps": [
           "Check which methods the endpoint takes in the reference at `/api-docs/openapi.json`."
+        ]
+      }
+    },
+    {
+      "code": "MRL-VAL-120",
+      "title": "The agent could not use its settings file.",
+      "why": "The file is missing, has a typing mistake, or has a value the agent can't use.",
+      "what_to_do": {
+        "steps": [
+          "Read the setting and the problem named in Details.",
+          "Fix the settings file, or remove the setting to use the default.",
+          "Start the agent again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-VAL-126",
+      "title": "The app doesn't know this name.",
+      "why": "A profile, job name or other name doesn't match any the agent knows.",
+      "what_to_do": {
+        "steps": [
+          "Pick one of the names listed in Details.",
+          "Check the spelling, then try again."
         ]
       }
     },
