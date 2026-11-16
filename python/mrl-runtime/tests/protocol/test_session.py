@@ -89,3 +89,34 @@ async def _mismatch(tmp_path: Path) -> None:
 
 def test_no_common_version_is_fatal(tmp_path: Path) -> None:
     asyncio.run(_mismatch(tmp_path))
+
+
+async def _heartbeats_during_writes(tmp_path: Path) -> None:
+    agent = _agent(tmp_path)
+    await agent.start()
+    session = WorkerSession(agent.target, pb.Hello(attempt_id="att_1"), Spool(tmp_path / "spool"))
+    session.start()
+
+    async def beat() -> None:
+        while True:
+            await session.send_live(pb.Heartbeat())
+            await asyncio.sleep(0)
+
+    beats = asyncio.create_task(beat())
+    try:
+        for i in range(200):
+            session.send(pb.LogChunk(data=b"x" * 2000, offset=i + 1))
+            await asyncio.sleep(0)
+        assert await session.wait_acked(10)
+        assert [m.log.offset for m in agent.received] == list(range(1, 201))
+        assert agent.protocol_errors == []
+    finally:
+        beats.cancel()
+        await session.close()
+        await agent.close()
+
+
+def test_heartbeats_never_collide_with_spooled_writes(tmp_path: Path) -> None:
+    # Regression: concurrent call.write() from the heartbeat task killed the writer silently.
+    for attempt in range(3):
+        asyncio.run(_heartbeats_during_writes(tmp_path / str(attempt)))

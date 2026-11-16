@@ -89,6 +89,7 @@ class WorkerSession:
         self._versions = tuple(versions)
         self._reconnect_max_s = reconnect_max_s
         self._wake = asyncio.Event()
+        self._write_lock = asyncio.Lock()  # gRPC allows one write at a time per stream
         self._acked = asyncio.Event()
         self._call: _Call | None = None
         self._task: asyncio.Task[None] | None = None
@@ -123,7 +124,8 @@ class WorkerSession:
         if call is None or not self.connected.is_set():
             return False
         with contextlib.suppress(*_STREAM_ERRORS):
-            await call.write(wrap(body))
+            async with self._write_lock:
+                await call.write(wrap(body))
             return True
         return False
 
@@ -191,12 +193,17 @@ class WorkerSession:
             self.connected.set()
             self._wake.set()
             writer = asyncio.create_task(self._write_loop(call))
+            reader = asyncio.create_task(self._read_loop(call))
             try:
-                await self._read_loop(call)
+                # Either side ending means the stream is gone: reconnect and replay.
+                done, _ = await asyncio.wait({reader, writer}, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    task.result()  # re-raise a stream error or a protocol violation
             finally:
-                writer.cancel()
+                for task in (reader, writer):
+                    task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, *_STREAM_ERRORS):
-                    await writer
+                    await asyncio.gather(reader, writer)
 
     async def _write_loop(self, call: _Call) -> None:
         while True:
@@ -205,7 +212,8 @@ class WorkerSession:
                 self._wake.clear()
                 await self._wake.wait()
                 continue
-            await call.write(msg)
+            async with self._write_lock:
+                await call.write(msg)
 
     async def _read_loop(self, call: _Call) -> None:
         while True:
