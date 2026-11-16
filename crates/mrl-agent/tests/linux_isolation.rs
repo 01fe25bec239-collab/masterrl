@@ -158,6 +158,46 @@ async fn kill_ends_the_whole_tree_even_after_setsid() {
 }
 
 #[tokio::test]
+#[ignore = "needs a delegated cgroup v2 root"]
+async fn cgroup_kills_an_escaped_orphan_with_an_empty_environment() {
+    let Some(exec) = cgroup_executor() else {
+        return;
+    };
+    assert!(exec.limit_support().contained);
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("escaped.pid");
+    // Fork after 200 ms, setsid, drop the whole environment (so no job token), exec sleep;
+    // its parent and the main process exit at once.
+    let script = format!(
+        r#"( sleep 0.2; perl -e 'use POSIX; POSIX::setsid() or die; %ENV = (); exec "/bin/sleep", "300"' & echo $! > {} ); exit 0"#,
+        f.display()
+    );
+    let report = exec
+        .spawn(ExecSpec::new(
+            "escape",
+            "/bin/sh",
+            &["-c", &script],
+            dir.path(),
+        ))
+        .await
+        .unwrap()
+        .wait()
+        .await
+        .unwrap();
+    assert!(report.success() && report.limits.contained, "{report:?}");
+    let pid: i32 = std::fs::read_to_string(&f).unwrap().trim().parse().unwrap();
+    let mut gone = false;
+    for _ in 0..200 {
+        if pid_gone(pid) {
+            gone = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(gone, "escaped orphan {pid} survived the cgroup kill");
+}
+
+#[tokio::test]
 #[ignore = "needs bubblewrap and user namespaces"]
 async fn data_prep_blocks_network_and_writes_outside_staging() {
     let Some(backend) = bwrap() else { return };

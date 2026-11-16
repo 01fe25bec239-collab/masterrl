@@ -104,20 +104,17 @@ impl Executor for ProcessExecutor {
         {
             match &self.cgroups {
                 Ok(c) => c.support().clone(),
-                // Without a cgroup the job token (readable in /proc) still finds every process.
+                // Without a cgroup, cleanup is best-effort (process group, job token, parent links).
                 Err(reason) => LimitSupport {
-                    contained: true,
-                    note: Some(reason.clone()),
+                    contained: false,
+                    note: Some(format!("{reason}. {BEST_EFFORT}")),
                     ..LimitSupport::default()
                 },
             }
         }
         #[cfg(not(target_os = "linux"))]
         LimitSupport {
-            note: Some(
-                "this OS has no cgroups, so CPU, memory and process limits are not enforced, and a process that detaches from its job and loses its parent within 0.5 s can outlive the job"
-                    .into(),
-            ),
+            note: Some(format!("This OS has no cgroups. {BEST_EFFORT}")),
             ..LimitSupport::default()
         }
     }
@@ -255,6 +252,9 @@ impl Executor for ProcessExecutor {
         }))
     }
 }
+
+/// The plain note for running without a cgroup.
+const BEST_EFFORT: &str = "Without a cgroup, CPU, memory and process limits are off, and stopping a job is best-effort: a process that detaches from the job can keep running";
 
 /// How often the process tree is rescanned when there is no cgroup.
 const TREE_SCAN: Duration = Duration::from_millis(500);
@@ -557,9 +557,9 @@ mod tests {
         );
     }
 
-    /// The case polling can't catch: after 200 ms the job forks a child that calls setsid,
-    /// and its parent and the job's main process exit at once. Linux only: macOS hides other
-    /// processes' environments, so there `limit_support().contained` is false (tested below).
+    /// Best-effort cleanup on Linux without a cgroup: after 200 ms the job forks a child that
+    /// calls setsid, and its parent and the job's main process exit at once. The job token
+    /// (readable in /proc) still finds it. Not a guarantee: see the empty-environment case.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_child_orphaned_right_before_exit_is_killed() {
@@ -575,6 +575,37 @@ mod tests {
         assert!(
             wait_gone(child).await,
             "orphaned setsid child {child} survived"
+        );
+    }
+
+    /// The escape case (fork after 200 ms, setsid, exec sleep with an empty environment) is
+    /// not guaranteed to be caught without a cgroup, so the report must say `contained: false`.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn without_a_cgroup_the_escape_case_is_reported_not_contained() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("escaped.pid");
+        let exec = executor();
+        assert!(!exec.limit_support().contained);
+        let script = format!(
+            r#"( sleep 0.2; perl -e 'use POSIX; POSIX::setsid() or die; %ENV = (); exec "/bin/sleep", "300"' & echo $! > {} ); exit 0"#,
+            f.display()
+        );
+        let report = exec
+            .spawn(shell(dir.path(), "escape", &script))
+            .await
+            .unwrap()
+            .wait()
+            .await
+            .unwrap();
+        assert!(report.success());
+        assert!(!report.limits.contained, "{report:?}");
+        assert!(report.limits.note.unwrap().contains("best-effort"));
+        // Clean up the escaped process if best-effort cleanup missed it.
+        let child = read_pid(&f).await;
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(child),
+            nix::sys::signal::Signal::SIGKILL,
         );
     }
 
@@ -618,10 +649,10 @@ mod tests {
     fn limits_are_reported_as_unsupported_without_cgroups() {
         let s = executor().limit_support();
         assert!(!s.cpu && !s.memory && !s.pids && !s.oom_detection);
-        assert!(!s.contained, "macOS can't contain detached orphans; say so");
+        assert!(!s.contained, "without a cgroup, containment is best-effort");
         let note = s.note.unwrap();
         assert!(
-            note.contains("not enforced") && note.contains("outlive"),
+            note.contains("limits are off") && note.contains("best-effort"),
             "{note}"
         );
     }

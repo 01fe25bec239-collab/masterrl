@@ -1,5 +1,5 @@
-//! Finds a job's processes where there are no cgroups (macOS, Windows, Linux without a
-//! delegated cgroup). A process group misses children that start their own session
+//! Best-effort cleanup where there are no cgroups (macOS, Windows, Linux without a delegated
+//! cgroup); only a cgroup v2 guarantees a whole-tree kill. A process group misses children that start their own session
 //! (`setsid`), and a child whose parent exits is re-parented to init and loses its parent
 //! link, so two marks are used:
 //!
@@ -8,7 +8,8 @@
 //!   carries the token is found, however fast it detached. This needs the OS to show other
 //!   processes' environments: Linux does (`/proc/<pid>/environ`); macOS does not, so there
 //!   only the parent-link scan works and a process that detaches and loses its parent within
-//!   one scan can outlive its job (reported as `LimitSupport::contained = false`).
+//!   one scan can outlive its job. A process that also clears its environment escapes on
+//!   Linux too. Both cases report `LimitSupport::contained = false`.
 //! - Parent links are also rescanned while the job runs, which catches a descendant that later
 //!   clears its environment.
 //!

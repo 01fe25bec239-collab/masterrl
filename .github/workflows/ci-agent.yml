@@ -67,14 +67,15 @@ jobs:
 
       # Moving a process into a cgroup needs write access at the common ancestor (the root),
       # so these run as root on a fresh, empty cgroup with the controllers handed down.
-      - name: cgroup limits, OOM and tree kill
+      - name: cgroup limits, OOM, tree kill and the escape case
         run: |
           set -euo pipefail
           echo "+cpu +memory +pids" | sudo tee /sys/fs/cgroup/cgroup.subtree_control
           sudo mkdir -p /sys/fs/cgroup/mrl-test
           sudo env MRL_TEST_CGROUP_ROOT=/sys/fs/cgroup/mrl-test MRL_TEST_CGROUP_REQUIRED=1 \
             "${{ steps.build.outputs.isolation }}" --ignored --exact \
-            memory_limit_is_enforced_and_oom_is_detected kill_ends_the_whole_tree_even_after_setsid
+            memory_limit_is_enforced_and_oom_is_detected kill_ends_the_whole_tree_even_after_setsid \
+            cgroup_kills_an_escaped_orphan_with_an_empty_environment
 
       - name: SeaweedFS logs
         if: failure()
