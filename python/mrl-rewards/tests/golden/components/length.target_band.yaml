@@ -1,0 +1,10 @@
+component: builtin/length.target_band@1
+params: {min_tokens: 100, max_tokens: 200}
+cases:
+  - {name: inside, tokens: 150, expect: {value: 1.0}}
+  - {name: low_edge, tokens: 100, expect: {value: 1.0}}
+  - {name: below_no_slack, tokens: 99, expect: {value: 0.0}}
+  - {name: above_with_slack, params: {min_tokens: 100, max_tokens: 200, slack_tokens: 100}, tokens: 250, expect: {value: 0.5}}
+  - {name: far_with_slack, params: {min_tokens: 100, max_tokens: 200, slack_tokens: 100}, tokens: 5000, expect: {value: 0.0}}
+  - {name: zero_tokens, tokens: 0, expect: {value: 0.0}}
+  - {name: min_above_max, params: {min_tokens: 5, max_tokens: 1}, tokens: 1, expect: {setup_error: MRL-RWD-143}}

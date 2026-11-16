@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.masterrl.dev/checkpoint-manifest/v1.schema.json",
+  "title": "CheckpointManifest v1",
+  "description": "Written by the harness next to a staged checkpoint; its sha256 is the CheckpointCommitRequest.manifest_sha256. Resume needs the same engine, format tag, adapter major version and base-model hash.",
+  "x-mrl-rules": {
+    "duplicate_path": "Each path appears once in files."
+  },
+  "type": "object",
+  "required": ["schema_version", "checkpoint_id", "run_id", "attempt_id", "step", "kind", "format", "engine", "base_model_sha256", "created_at", "is_final", "files"],
+  "properties": {
+    "schema_version": { "const": "checkpoint-manifest/v1" },
+    "checkpoint_id": { "type": "string", "pattern": "^ckpt_[0-9A-Za-z-]+$" },
+    "run_id": { "type": "string", "pattern": "^run_[0-9A-Za-z-]+$" },
+    "attempt_id": { "type": "string", "minLength": 1 },
+    "step": { "type": "integer", "minimum": 0 },
+    "kind": {
+      "description": "full_resume: weights + optimizer/scheduler/RNG state; weights_only: full weights; adapter_only: LoRA-style adapter.",
+      "enum": ["full_resume", "weights_only", "adapter_only"]
+    },
+    "format": { "description": "Format tag, e.g. hf-trainer-v1.", "type": "string", "pattern": "^[a-z0-9][a-z0-9.-]*-v[0-9]+$" },
+    "engine": {
+      "type": "object",
+      "required": ["name", "adapter_version"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "adapter_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+" }
+      },
+      "additionalProperties": false
+    },
+    "base_model_sha256": { "$ref": "#/$defs/sha256" },
+    "created_at": { "type": "string", "format": "date-time" },
+    "is_final": { "type": "boolean" },
+    "policy_version": { "description": "Online RL: the policy version these weights are.", "type": "integer", "minimum": 0 },
+    "parent_checkpoint_id": { "type": "string", "pattern": "^ckpt_[0-9A-Za-z-]+$" },
+    "metrics": { "type": "object", "additionalProperties": { "type": "number" } },
+    "adapter": {
+      "type": "object",
+      "required": ["method", "rank", "alpha", "target_modules"],
+      "properties": {
+        "method": { "enum": ["lora", "qlora", "dora"] },
+        "rank": { "type": "integer", "minimum": 1 },
+        "alpha": { "type": "number", "exclusiveMinimum": 0 },
+        "target_modules": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } }
+      },
+      "additionalProperties": false
+    },
+    "files": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["path", "size", "sha256", "role"],
+        "properties": {
+          "path": { "$ref": "../artifact-manifest/v1.schema.json#/$defs/relativePath" },
+          "size": { "type": "integer", "minimum": 0 },
+          "sha256": { "$ref": "#/$defs/sha256" },
+          "role": { "enum": ["weights", "adapter", "config", "tokenizer", "optimizer", "scheduler", "rng", "trainer_state", "other"] },
+          "format": { "type": "string" }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false,
+  "if": { "properties": { "kind": { "const": "adapter_only" } } },
+  "then": { "required": ["adapter"] },
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+  }
+}

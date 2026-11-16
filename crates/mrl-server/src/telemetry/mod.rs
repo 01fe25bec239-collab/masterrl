@@ -142,10 +142,14 @@ impl Metrics {
             .observe(took.as_secs_f64());
     }
 
-    /// Text exposition format.
+    /// Text exposition format: the server registry plus the process-wide default registry,
+    /// where modules register their own metrics.
     pub fn render(&self) -> String {
+        let mut families = self.registry.gather();
+        families.extend(prometheus::gather());
+        families.sort_by(|a, b| a.name().cmp(b.name()));
         let mut buf = Vec::new();
-        if let Err(e) = prometheus::TextEncoder::new().encode(&self.registry.gather(), &mut buf) {
+        if let Err(e) = prometheus::TextEncoder::new().encode(&families, &mut buf) {
             tracing::error!(error = %e, "could not render metrics");
         }
         String::from_utf8_lossy(&buf).into_owned()
@@ -267,6 +271,19 @@ mod tests {
         for family in m.registry.gather() {
             assert!(family.name().starts_with("mrl_"), "{}", family.name());
         }
+    }
+
+    #[test]
+    fn render_includes_metrics_from_the_default_registry() {
+        let c = prometheus::register_int_counter!(
+            "mrl_test_default_registry_total",
+            "Counter on the default registry."
+        )
+        .unwrap();
+        c.inc();
+        let text = Metrics::new().unwrap().render();
+        assert!(text.contains("mrl_test_default_registry_total 1"), "{text}");
+        assert!(text.contains("mrl_server_build_info"));
     }
 
     #[test]

@@ -8,7 +8,13 @@ use std::path::{Path, PathBuf};
 
 /// Environment variables with this prefix and a `__` override settings.
 pub const ENV_PREFIX: &str = "MRL_";
-const SECTIONS: [&str; 4] = ["server", "database", "object_store", "telemetry"];
+const SECTIONS: [&str; 5] = [
+    "server",
+    "database",
+    "pgbundle",
+    "object_store",
+    "telemetry",
+];
 
 /// How the server runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, clap::ValueEnum)]
@@ -60,6 +66,8 @@ pub struct Config {
     pub server: ServerConfig,
     /// Database connection.
     pub database: DatabaseConfig,
+    /// The PostgreSQL the server runs itself (solo mode without `database.url`).
+    pub pgbundle: PgBundleConfig,
     /// Object storage for artifacts.
     pub object_store: ObjectStoreConfig,
     /// Logs and traces.
@@ -166,18 +174,74 @@ pub struct BucketConfig {
 }
 
 /// `[database]`.
-#[derive(Clone, Default, PartialEq, Deserialize, Serialize)]
+#[derive(Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct DatabaseConfig {
     /// `postgres://…` URL. May hold a password, so it never appears in logs.
+    /// Unset in solo mode: the server runs its own PostgreSQL (`[pgbundle]`).
     pub url: Option<String>,
+    /// Most pooled connections per process (1–1000).
+    pub max_connections: u32,
+    /// Connections kept open when idle (0 to `max_connections`).
+    pub min_connections: u32,
+    /// How long a request waits for a free connection (1–300 s).
+    pub acquire_timeout_seconds: u64,
+    /// Longest a single statement may run (1–3600 s). Migrations have no limit.
+    pub statement_timeout_seconds: u64,
+    /// Apply pending migrations at startup. When false, the server refuses to start
+    /// until `mrl-server migrate` has run.
+    pub auto_migrate: bool,
+}
+
+impl Default for DatabaseConfig {
+    fn default() -> Self {
+        Self {
+            url: None,
+            max_connections: 10,
+            min_connections: 0,
+            acquire_timeout_seconds: 10,
+            statement_timeout_seconds: 30,
+            auto_migrate: true,
+        }
+    }
 }
 
 impl std::fmt::Debug for DatabaseConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DatabaseConfig")
             .field("url", &self.url.as_ref().map(|_| "<redacted>"))
+            .field("max_connections", &self.max_connections)
+            .field("min_connections", &self.min_connections)
+            .field("acquire_timeout_seconds", &self.acquire_timeout_seconds)
+            .field("statement_timeout_seconds", &self.statement_timeout_seconds)
+            .field("auto_migrate", &self.auto_migrate)
             .finish()
+    }
+}
+
+/// `[pgbundle]`: the PostgreSQL the server starts itself in solo mode.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PgBundleConfig {
+    /// Folder with `postgres`, `initdb`, `pg_ctl`, `pg_dump`, `pg_restore` and `pg_upgrade`.
+    /// Unset: next to the server program (`postgres/bin`), then `PATH`.
+    pub bin_dir: Option<PathBuf>,
+    /// Binaries of the previous major version, used once to upgrade an older data folder.
+    pub previous_bin_dir: Option<PathBuf>,
+    /// Where the database lives. Unset: the app data folder for this account.
+    pub data_dir: Option<PathBuf>,
+    /// Backups to keep (1–100).
+    pub backups_keep: u32,
+}
+
+impl Default for PgBundleConfig {
+    fn default() -> Self {
+        Self {
+            bin_dir: None,
+            previous_bin_dir: None,
+            data_dir: None,
+            backups_keep: 7,
+        }
     }
 }
 
@@ -328,6 +392,37 @@ impl Config {
                 problems
                     .push("database.url: must start with postgres:// or postgresql://".to_owned());
             }
+        }
+        let d = &self.database;
+        if !(1..=1000).contains(&d.max_connections) {
+            problems.push(format!(
+                "database.max_connections: {} is outside 1–1000",
+                d.max_connections
+            ));
+        }
+        if d.min_connections > d.max_connections {
+            problems.push(format!(
+                "database.min_connections: {} is more than database.max_connections ({})",
+                d.min_connections, d.max_connections
+            ));
+        }
+        if !(1..=300).contains(&d.acquire_timeout_seconds) {
+            problems.push(format!(
+                "database.acquire_timeout_seconds: {} is outside 1–300",
+                d.acquire_timeout_seconds
+            ));
+        }
+        if !(1..=3600).contains(&d.statement_timeout_seconds) {
+            problems.push(format!(
+                "database.statement_timeout_seconds: {} is outside 1–3600",
+                d.statement_timeout_seconds
+            ));
+        }
+        if !(1..=100).contains(&self.pgbundle.backups_keep) {
+            problems.push(format!(
+                "pgbundle.backups_keep: {} is outside 1–100",
+                self.pgbundle.backups_keep
+            ));
         }
         if let Some(url) = &self.object_store.url {
             if !(url.starts_with("s3://") || url.starts_with("file:///")) {
@@ -506,6 +601,7 @@ mod tests {
             "[server.listeners]\nbogus = \"1.2.3.4:1\"",
             "[server.rate_limit.org]\nper_second = 1\nburst = 1\nbogus = 1",
             "[database]\nbogus = 1",
+            "[pgbundle]\nbogus = 1",
             "[object_store]\nbogus = 1",
             "[telemetry]\nbogus = 1",
         ] {
@@ -609,6 +705,33 @@ mod tests {
         assert_eq!(code(parse(zero)), ErrorCode::ConfigValue);
         let missing = "[server.rate_limit.org]\nper_second = 5";
         assert_eq!(code(parse(missing)), ErrorCode::ConfigParse);
+    }
+
+    #[test]
+    fn database_pool_values() {
+        let c = parse("").unwrap();
+        assert_eq!(c.database.max_connections, 10);
+        assert!(c.database.auto_migrate);
+        assert_eq!(c.pgbundle.backups_keep, 7);
+        for bad in [
+            "[database]\nmax_connections = 0",
+            "[database]\nmax_connections = 2\nmin_connections = 3",
+            "[database]\nacquire_timeout_seconds = 0",
+            "[database]\nstatement_timeout_seconds = 3601",
+            "[pgbundle]\nbackups_keep = 0",
+        ] {
+            assert_eq!(code(parse(bad)), ErrorCode::ConfigValue, "{bad}");
+        }
+        let c = Config::from_toml_with_env(
+            "",
+            env(&[
+                ("MRL_DATABASE__AUTO_MIGRATE", "false"),
+                ("MRL_PGBUNDLE__DATA_DIR", "/data/mrl"),
+            ]),
+        )
+        .unwrap();
+        assert!(!c.database.auto_migrate);
+        assert_eq!(c.pgbundle.data_dir, Some(PathBuf::from("/data/mrl")));
     }
 
     #[test]

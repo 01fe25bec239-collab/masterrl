@@ -1,0 +1,10 @@
+component: builtin/format.regex_full@1
+params: {pattern: "[A-D]"}
+cases:
+  - {name: single_letter, completion: "B", expect: {value: 1.0}}
+  - {name: trimmed, completion: "  C\n", expect: {value: 1.0}}
+  - {name: not_trimmed, params: {pattern: "[A-D]", strip: false}, completion: " C", expect: {value: 0.0}}
+  - {name: extra_text, completion: "B because", expect: {value: 0.0}}
+  - {name: empty, completion: "", expect: {value: 0.0}}
+  - {name: multiline_dot, params: {pattern: "a.b", dot_matches_newline: true}, completion: "a\nb", expect: {value: 1.0}}
+  - {name: huge, completion: {repeat: "B", times: 300000}, expect: {value: 0.0, flags: [truncated_input]}}

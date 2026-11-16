@@ -1,0 +1,17 @@
+component: builtin/math.numeric_close@1
+params: {}
+cases:
+  - {name: last_number, completion: "so the total is 42.", reference: "42", expect: {value: 1.0}}
+  - {name: off, completion: "so the total is 41", reference: "42", expect: {value: 0.0}}
+  - {name: rel_tolerance, params: {rel_tolerance: 0.01}, completion: "1005", reference: "1000", expect: {value: 1.0}}
+  - {name: abs_default_tight, completion: "1005", reference: "1000", expect: {value: 0.0}}
+  - {name: no_number, completion: "no idea", reference: "1", expect: {value: 0.0, flags: [no_answer]}}
+  - {name: reference_not_number, completion: "1", reference: "one", expect: {status: INVALID_INPUT}}
+  - {name: tag_with_text, params: {answer_extractor: "tag:answer"}, completion: "<answer>about 3</answer>", reference: "3", expect: {value: 0.0, flags: [parse_failed]}}
+  - {name: overflow_is_zero, completion: "1e999", reference: "1", expect: {value: 0.0}}
+  - {name: negative, completion: "it is -2.5", reference: -2.5, expect: {value: 1.0}}
+  - {name: percent_is_its_value, params: {answer_extractor: "tag:answer"}, completion: "<answer>50%</answer>", reference: "0.5", expect: {value: 1.0}}
+  - {name: percent_is_not_the_bare_number, params: {answer_extractor: "tag:answer"}, completion: "<answer>50%</answer>", reference: "50", expect: {value: 0.0}}
+  - {name: last_number_keeps_percent, completion: "so about 50%", reference: 0.5, expect: {value: 1.0}}
+  - {name: last_number_percent_vs_bare, completion: "so about 50%", reference: 50, expect: {value: 0.0}}
+  - {name: reference_percent, completion: "0.25", reference: "25%", expect: {value: 1.0}}

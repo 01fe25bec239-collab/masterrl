@@ -44,4 +44,15 @@ jobs:
         run: |
           npm install --global pnpm@11.22.0
           pnpm install --frozen-lockfile
+      - name: Install PostgreSQL 16 and 17 binaries (pg_upgrade test)
+        run: |
+          # Binaries only: the service container above is the database; no apt clusters.
+          sudo mkdir -p /etc/postgresql-common/createcluster.d
+          echo "create_main_cluster = false" | sudo tee /etc/postgresql-common/createcluster.d/no-main.conf
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y --no-install-recommends postgresql-16 postgresql-17
       - run: just test-integration
+        env:
+          MRL_TEST_PG_OLD_BIN: /usr/lib/postgresql/16/bin
+          MRL_TEST_PG_NEW_BIN: /usr/lib/postgresql/17/bin

@@ -1,0 +1,17 @@
+component: builtin/format.think_answer_tags@1
+params: {}
+cases:
+  - name: well_formed
+    completion: "<think>12*12=144</think><answer>144</answer>"
+    expect: {value: 1.0, diagnostics: {answer_tag_found: true, think_tag_found: true, answer_count: 1}}
+  - {name: no_tags, completion: "144", expect: {value: 0.0, diagnostics: {answer_tag_found: false}}}
+  - {name: answer_only, completion: "<answer>144</answer>", expect: {value: 0.0, diagnostics: {answer_tag_found: true}}}
+  - {name: answer_only_think_optional, params: {require_think: false}, completion: "<answer>144</answer>", expect: {value: 1.0}}
+  - {name: wrong_order, completion: "<answer>1</answer><think>x</think>", expect: {value: 0.0}}
+  - {name: text_outside, completion: "Sure! <think>x</think><answer>1</answer>", expect: {value: 0.0, diagnostics: {text_outside_tags: true}}}
+  - {name: text_outside_allowed, params: {allow_text_outside: true}, completion: "Sure! <think>x</think><answer>1</answer>", expect: {value: 1.0}}
+  - name: answer_spam
+    completion: "<think>x</think><answer>144</answer><answer>143</answer>"
+    expect: {value: 0.0, diagnostics: {answer_tag_found: true, answer_count: 2}}
+  - {name: unclosed, completion: "<think>x</think><answer>144", expect: {value: 0.0, diagnostics: {answer_tag_found: false}}}
+  - {name: whitespace_around_ok, completion: "\n<think>a</think>\n<answer>b</answer>\n", expect: {value: 1.0}}

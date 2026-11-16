@@ -1040,6 +1040,11 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'what_to_do': {'steps': ['Pick a rollout engine that returns log-probabilities, like '
                                       'vLLM.',
                                       'Or use a reward that only reads the answer text.']}},
+            {'code': 'MRL-CAP-130',
+             'title': 'This built-in task is not installed.',
+             'why': "The job asked for a built-in task this version of the app doesn't have.",
+             'what_to_do': {'steps': ['Update the app on this machine, then start the job '
+                                      'again.']}},
             {'code': 'MRL-CONFLICT-001',
              'title': 'Someone changed this item after you opened it.',
              'why': 'The version you edited is older than the saved one.',
@@ -1051,6 +1056,11 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                     'version tag.',
              'what_to_do': {'steps': ['Load the item, then send its `ETag` value in the `If-Match` '
                                       'header.']}},
+            {'code': 'MRL-CONFLICT-110',
+             'title': 'Too many changes happened at the same time.',
+             'why': 'Other changes to the same items kept getting in the way, so the server '
+                    'stopped trying.',
+             'what_to_do': {'steps': ['Try again in a few seconds.']}},
             {'code': 'MRL-DATA-001',
              'title': 'Your dataset did not pass its checks.',
              'why': "Some rows are empty, are missing fields, or don't match the chosen format.",
@@ -1168,6 +1178,45 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                     'setups, which stay off without it.',
              'what_to_do': {'steps': ['Install Docker if you want those features.']},
              'docs_link': 'https://docs.docker.com/get-started/get-docker/'},
+            {'code': 'MRL-ENV-110',
+             'title': "The app's database programs are missing.",
+             'why': 'The app could not find the PostgreSQL database programs it ships with.',
+             'what_to_do': {'steps': ['Reinstall the app.',
+                                      'If you set `pgbundle.bin_dir`, check that the folder holds '
+                                      '`postgres`, `initdb`, `pg_ctl`, `pg_dump`, `pg_restore` and '
+                                      '`pg_upgrade`.']}},
+            {'code': 'MRL-ENV-111',
+             'title': 'Another copy of the app is already using this data folder.',
+             'why': 'Only one server can use a data folder at a time, so your data stays safe.',
+             'what_to_do': {'steps': ['Close the other copy of the app, then try again.',
+                                      'If no other copy is open, restart your computer.']}},
+            {'code': 'MRL-ENV-112',
+             'title': 'This data folder was made by a newer version of the app.',
+             'why': "The app's database programs are older than the ones that made this data "
+                    'folder.',
+             'what_to_do': {'steps': ['Install the newest version of the app.']}},
+            {'code': 'MRL-ENV-122',
+             'title': "The sandbox can't run on this computer.",
+             'why': 'The sandbox tool (bubblewrap) is missing, or this system blocks the isolation '
+                    'it needs.',
+             'what_to_do': {'steps': ['Install bubblewrap, then try again.',
+                                      'If it is installed, ask your admin to allow unprivileged '
+                                      'user namespaces.'],
+                            'linux': ['Run `sudo apt install bubblewrap` on Ubuntu or Debian.']}},
+            {'code': 'MRL-ENV-130',
+             'title': 'The training worker and the app use different protocol versions.',
+             'why': 'The software that runs training on this machine is older or newer than the '
+                    "app. They can't talk to each other.",
+             'what_to_do': {'steps': ['Update the app on this machine, then start the run again.',
+                                      'If the run uses a custom engine, ask its maintainer for a '
+                                      'version that matches the app.']}},
+            {'code': 'MRL-ENV-131',
+             'title': 'This engine needs a different version of the MasterRL runtime.',
+             'why': "The engine was built for a version of the runtime that this machine doesn't "
+                    'have.',
+             'what_to_do': {'steps': ['Update the app on this machine, then start the run again.',
+                                      "If that doesn't help, install a version of the engine made "
+                                      'for your app version.']}},
             {'code': 'MRL-IDEM-001',
              'title': 'This request is already running.',
              'why': 'A request with the same request key started earlier and has not finished.',
@@ -1243,6 +1292,58 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'what_to_do': {'steps': ['Read which job stopped in Details.',
                                       'Start the server again. If it happens again, report it with '
                                       'the diagnostics.']}},
+            {'code': 'MRL-INTERNAL-110',
+             'title': 'The database needs an update before the server can start.',
+             'why': 'This version of the server needs database changes. Automatic updates are '
+                    'turned off in its settings.',
+             'what_to_do': {'steps': ['Back up the database if your team needs a copy first.',
+                                      'Run `mrl-server migrate`, then start the server again.',
+                                      'To update on every start, set `database.auto_migrate = '
+                                      'true`.']}},
+            {'code': 'MRL-INTERNAL-111',
+             'title': 'The database update did not finish.',
+             'why': 'One of the database changes failed. Details name the change and the reason.',
+             'what_to_do': {'steps': ['If Details say a backup was put back, your data is as it '
+                                      'was before the update.',
+                                      'Start the previous version of the app to keep working.',
+                                      'Send the Details to support so they can fix the update.']}},
+            {'code': 'MRL-INTERNAL-112',
+             'title': "The app's database stopped and could not start again.",
+             'why': 'The database program failed to start, or it kept stopping. Its log is in the '
+                    'data folder.',
+             'what_to_do': {'steps': ['Restart the app.',
+                                      'Check that the disk with the app data folder has free '
+                                      'space.',
+                                      'If it happens again, send the file `postgres.log` from the '
+                                      'data folder to support.']}},
+            {'code': 'MRL-INTERNAL-113',
+             'title': 'The app could not back up its database.',
+             'why': 'The backup program failed, or the backup folder is full or locked. Details '
+                    'give the reason.',
+             'what_to_do': {'steps': ['Free up disk space on the drive with the app data folder.',
+                                      'Restart the app to try again.']}},
+            {'code': 'MRL-INTERNAL-114',
+             'title': 'The app could not move its database to the new version.',
+             'why': 'This app uses a newer database program, and moving your data to it failed. '
+                    'Your old data folder was not changed.',
+             'what_to_do': {'steps': ['Start the previous version of the app to keep working.',
+                                      'Free up disk space; the move needs about as much space '
+                                      'again as your database.',
+                                      'Send the Details to support.']}},
+            {'code': 'MRL-INTERNAL-115',
+             'title': 'The server set an event aside after it failed many times.',
+             'why': 'A part of the server could not handle this event. The server kept going with '
+                    'the next events.',
+             'what_to_do': {'steps': ['Check the server log for the event id and the last error.',
+                                      'Send them to support so they can fix the cause and replay '
+                                      'the event.']}},
+            {'code': 'MRL-INTERNAL-130',
+             'title': 'The app and its training worker disagreed about the next step.',
+             'why': "The training worker got a message it didn't expect at that point. This is a "
+                    'problem in the app, not in your settings.',
+             'what_to_do': {'steps': ['Start the run again. It resumes from the last saved '
+                                      'checkpoint.',
+                                      "If it happens again, send the run's log to your admin."]}},
             {'code': 'MRL-LINK-001',
              'title': "These machines can't share one training job.",
              'why': 'They use different kinds of chips, like a Mac and an NVIDIA computer. One job '
@@ -1322,6 +1423,33 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                     'Details says which.',
              'what_to_do': {'steps': ['Check that the model folder has a `tokenizer.json` file.',
                                       'Download the model again if the file is damaged.']}},
+            {'code': 'MRL-NODE-121',
+             'title': 'The agent could not save or read its local files.',
+             'why': 'The disk may be full, or the agent may not have permission to use its state '
+                    'folder.',
+             'what_to_do': {'steps': ['Free up disk space on the drive named in Details.',
+                                      "Make sure your account owns the agent's state folder.",
+                                      'Start the agent again.']}},
+            {'code': 'MRL-NODE-123',
+             'title': 'The agent could not start or stop the program.',
+             'why': 'The program may be missing, or this computer may be out of processes or '
+                    'memory.',
+             'what_to_do': {'steps': ['Check the program name and path in Details.',
+                                      "Close programs you don't need, then try again."]}},
+            {'code': 'MRL-NODE-124',
+             'title': "The agent could not read this computer's hardware.",
+             'why': 'The GPU driver did not answer, or it stopped working while the agent read it.',
+             'what_to_do': {'steps': ['Restart the computer, then check again.',
+                                      'If it keeps failing, update or reinstall the GPU driver.'],
+                            'linux': ['Run `nvidia-smi` to see whether the driver answers.']}},
+            {'code': 'MRL-NODE-125',
+             'title': 'The agent could not set itself up to start with your computer.',
+             'why': "The system's service manager refused the change, or a path has characters it "
+                    "can't pass on.",
+             'what_to_do': {'steps': ['Read the command and its message in Details.',
+                                      'Run `mrl-agent service install` again.',
+                                      'If it still fails, start the agent by hand with `mrl-agent '
+                                      'run`.']}},
             {'code': 'MRL-PERM-001',
              'title': "Your role doesn't allow this action.",
              'why': 'Each project role can do a set list of things. This action needs a different '
@@ -1357,6 +1485,78 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': 'The server has no endpoint at this path.',
              'what_to_do': {'steps': ['Check the path against the reference at '
                                       '`/api-docs/openapi.json`.']}},
+            {'code': 'MRL-RWD-140',
+             'title': 'The reward policy has a problem.',
+             'why': "A field in the policy is missing, has a value the app doesn't accept, or "
+                    'clashes with another field. Details names the field.',
+             'what_to_do': {'steps': ['Open the reward policy and fix the field named in Details.',
+                                      'Save the policy, then run its tests again.']}},
+            {'code': 'MRL-RWD-141',
+             'title': 'A condition in the reward policy could not be read.',
+             'why': "A `when` or `require` condition uses a word, sign or shape the app doesn't "
+                    'know. Details shows the condition and the spot.',
+             'what_to_do': {'steps': ['Use only field names, numbers, quoted text, `true`, `false` '
+                                      'and `null`.',
+                                      'Join conditions with `and`, `or` and `not`, and compare '
+                                      'with `==`, `!=`, `<` or `>`.',
+                                      'Start field names with `sample.` or `components.`.']}},
+            {'code': 'MRL-RWD-142',
+             'title': "The reward policy uses a component that isn't installed.",
+             'why': "The name or version after `use:` doesn't match any reward component here. "
+                    'Details lists the versions that exist.',
+             'what_to_do': {'steps': ['Check the spelling of the component name, like '
+                                      '`builtin/math.verify@1`.',
+                                      'Pick a version from the list in Details.']}},
+            {'code': 'MRL-RWD-143',
+             'title': "A reward component's settings need a change.",
+             'why': "One of the component's settings is missing or has a value it doesn't accept. "
+                    'Details names the component and setting.',
+             'what_to_do': {'steps': ["Open the component's settings in the policy.",
+                                      'Fix the setting named in Details, then save.']}},
+            {'code': 'MRL-RWD-144',
+             'title': 'Too many samples in a batch failed to get a reward.',
+             'why': 'More samples failed than the policy allows, or the policy stops the batch '
+                    'when any sample fails. The training step stopped so it would not learn from '
+                    'missing rewards.',
+             'what_to_do': {'steps': ['Open the reward details for this step to see which '
+                                      'component failed and why.',
+                                      'If a component took too long, raise its '
+                                      '`per_sample_timeout_ms`.',
+                                      'If a few failures are fine, raise `max_failure_rate` in the '
+                                      'policy.']}},
+            {'code': 'MRL-RWD-145',
+             'title': 'The reward service got a request for a different run or reward version.',
+             'why': "The request did not carry this run's key, or it asked for a reward version "
+                    'the service has not loaded.',
+             'what_to_do': {'steps': ['Restart the run so its reward service loads the right '
+                                      'version.',
+                                      'If it keeps happening, ask your admin to check the machine '
+                                      'running the run.']}},
+            {'code': 'MRL-RWD-146',
+             'title': "This reward's custom code can't run here yet.",
+             'why': 'Custom reward code runs only inside the reward sandbox, and this setup '
+                    "doesn't have it yet.",
+             'what_to_do': {'steps': ['Use built-in reward components for now.',
+                                      'Remove the `code/` folder from the reward files, then try '
+                                      'again.']}},
+            {'code': 'MRL-RWD-147',
+             'title': 'The app could not load the reward files.',
+             'why': 'A file the reward needs is missing, too large or broken. Details names the '
+                    'file.',
+             'what_to_do': {'steps': ['Check the file named in Details.',
+                                      'Fix or replace it, then upload the reward files again.']}},
+            {'code': 'MRL-RWD-148',
+             'title': "Step-by-step rewards aren't available yet.",
+             'why': 'The policy asks for one reward per step (`scalar.step`), but this version '
+                    'gives one reward per whole response.',
+             'what_to_do': {'steps': ["Set the policy's `signal` to `scalar.sequence`."]}},
+            {'code': 'MRL-RWD-149',
+             'title': 'The reward service could not start.',
+             'why': 'Its listen address, run key or network check failed. Details says which one.',
+             'what_to_do': {'steps': ['Restart the run.',
+                                      'If you started the service by hand, use a listen address '
+                                      'like `unix:/tmp/reward.sock`.',
+                                      'For local testing only, add `--allow-network`.']}},
             {'code': 'MRL-STORE-001',
              'title': 'The app refused a storage path.',
              'why': "The path points outside your workspace's storage area, or it has a part the "
@@ -1518,6 +1718,35 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': 'The endpoint exists, but not for this request method.',
              'what_to_do': {'steps': ['Check which methods the endpoint takes in the reference at '
                                       '`/api-docs/openapi.json`.']}},
+            {'code': 'MRL-VAL-120',
+             'title': 'The agent could not use its settings file.',
+             'why': "The file is missing, has a typing mistake, or has a value the agent can't "
+                    'use.',
+             'what_to_do': {'steps': ['Read the setting and the problem named in Details.',
+                                      'Fix the settings file, or remove the setting to use the '
+                                      'default.',
+                                      'Start the agent again.']}},
+            {'code': 'MRL-VAL-126',
+             'title': "The app doesn't know this name.",
+             'why': "A profile, job name or other name doesn't match any the agent knows.",
+             'what_to_do': {'steps': ['Pick one of the names listed in Details.',
+                                      'Check the spelling, then try again.']}},
+            {'code': 'MRL-VAL-130',
+             'title': 'The engine manifest has a problem.',
+             'why': "The engine's `mrl-engine.yaml` file, or one of its parts, doesn't match the "
+                    'format the app expects. Details names each field.',
+             'what_to_do': {'steps': ["Ask the engine's maintainer for a fixed version of the "
+                                      'engine.',
+                                      'If you build the engine yourself, fix the fields named in '
+                                      'Details, then install it again.']}},
+            {'code': 'MRL-VAL-131',
+             'title': "A built-in task got inputs it can't use.",
+             'why': "The job gave the task an input it doesn't expect, or left one out. Details "
+                    'names the input.',
+             'what_to_do': {'steps': ['Start the action again from the app, so it sends the inputs '
+                                      'the task needs.',
+                                      'If a script started the job, fix the input named in '
+                                      'Details.']}},
             {'code': 'NODE_LOST',
              'title': 'The app lost contact with a machine in this run.',
              'why': 'The machine may have shut down, gone to sleep or dropped off the network.',

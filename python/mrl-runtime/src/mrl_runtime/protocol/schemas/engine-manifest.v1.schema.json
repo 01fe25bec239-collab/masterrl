@@ -1,0 +1,459 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.masterrl.dev/engine-manifest/v1.schema.json",
+  "title": "EngineManifest v1 (mrl-engine.yaml)",
+  "description": "The only description of a training engine the control plane reads. Immutable per (name, version). v1 only gains optional fields.",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "mrl.dev/engine/v1" },
+    "kind": { "const": "EngineManifest" },
+    "metadata": {
+      "type": "object",
+      "required": ["name", "version", "displayName", "license"],
+      "properties": {
+        "name": { "description": "Adapter name, unique in the registry, e.g. trl.", "$ref": "#/$defs/slug" },
+        "version": { "description": "Adapter version (not the upstream version).", "$ref": "#/$defs/semver" },
+        "displayName": { "$ref": "#/$defs/text" },
+        "description": { "type": "string" },
+        "license": { "description": "Licence of the adapter; upstream licences go in spec.upstream.", "$ref": "#/$defs/text" },
+        "homepage": { "type": "string", "format": "uri" },
+        "maintainers": { "type": "array", "items": { "$ref": "#/$defs/text" } }
+      },
+      "additionalProperties": false
+    },
+    "spec": {
+      "type": "object",
+      "required": ["adapter", "upstream", "runtime", "runtimes", "capabilities", "topology", "algorithms", "checkpoint", "validate"],
+      "properties": {
+        "adapter": {
+          "type": "object",
+          "required": ["entrypoint", "adapterApi", "workerProtocol"],
+          "properties": {
+            "entrypoint": {
+              "description": "module:Class implementing TrainingEngine.",
+              "type": "string",
+              "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*:[A-Za-z_][A-Za-z0-9_]*$"
+            },
+            "adapterApi": { "description": "Required mrl_runtime.adapter API, semver range.", "$ref": "#/$defs/text" },
+            "workerProtocol": { "description": "Worker Protocol versions the harness speaks, range.", "$ref": "#/$defs/text" }
+          },
+          "additionalProperties": false
+        },
+        "upstream": {
+          "description": "Pinned upstream packages that define behaviour. The lockfile is authoritative.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["name", "version", "license", "source"],
+            "properties": {
+              "name": { "$ref": "#/$defs/text" },
+              "version": { "$ref": "#/$defs/text" },
+              "license": { "$ref": "#/$defs/text" },
+              "source": { "type": "string", "format": "uri" }
+            },
+            "additionalProperties": false
+          }
+        },
+        "runtime": {
+          "type": "object",
+          "required": ["environments"],
+          "properties": {
+            "environments": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/environment" } }
+          },
+          "additionalProperties": false
+        },
+        "runtimes": {
+          "description": "Which environment each process role runs in.",
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["role", "runtime_ref"],
+            "properties": {
+              "role": { "$ref": "#/$defs/runtimeRole" },
+              "runtime_ref": { "description": "An id from runtime.environments.", "$ref": "#/$defs/slug" }
+            },
+            "additionalProperties": false
+          }
+        },
+        "capabilities": { "$ref": "#/$defs/capabilities" },
+        "topology": { "$ref": "#/$defs/topology" },
+        "algorithms": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/algorithm" } },
+        "constraints": { "type": "array", "items": { "$ref": "#/$defs/constraint" } },
+        "checkpoint": {
+          "type": "object",
+          "required": ["format", "resumable", "portableWeights"],
+          "properties": {
+            "format": { "description": "Format tag and version, e.g. hf-trainer-v1.", "$ref": "#/$defs/slug" },
+            "resumable": { "type": "boolean" },
+            "portableWeights": { "type": "boolean" },
+            "stateFiles": {
+              "description": "Optimizer and RNG state: kept for resume, or stripped after completion.",
+              "enum": ["keep", "strip_after_completion"]
+            }
+          },
+          "additionalProperties": false
+        },
+        "metrics": {
+          "type": "object",
+          "properties": {
+            "namespaces": {
+              "description": "Engine metric name or prefix -> canonical name.",
+              "type": "object",
+              "additionalProperties": { "$ref": "#/$defs/text" }
+            }
+          },
+          "additionalProperties": false
+        },
+        "exports": {
+          "description": "Formats export() can produce.",
+          "type": "array",
+          "items": { "enum": ["hf-safetensors", "hf-peft-adapter", "merged-safetensors", "gguf", "mlx", "onnx"] }
+        },
+        "validate": {
+          "type": "object",
+          "required": ["l1"],
+          "properties": {
+            "l1": { "description": "true if the adapter implements validate() (L1 checks beyond constraints).", "type": "boolean" }
+          },
+          "additionalProperties": false
+        },
+        "hardware": { "$ref": "#/$defs/hardware" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "text": { "type": "string", "minLength": 1 },
+    "slug": { "type": "string", "pattern": "^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$" },
+    "semver": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\\+[0-9A-Za-z.-]+)?$"
+    },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "maturity": { "enum": ["stable", "beta", "experimental"] },
+    "runtimeRole": { "enum": ["trainer", "rollout", "scorer", "reward_exec", "ray_head", "ray_worker"] },
+    "datasetSchema": {
+      "enum": [
+        "pretrain.text.v1", "sft.messages.v1", "sft.prompt_completion.v1", "pref.pairwise.v1", "pref.unpaired.v1",
+        "rm.pairwise.v1", "rm.process.v1", "rm.pointwise.v1", "rl.prompt.v1", "rl.rollout.v1",
+        "agent.multiturn.v1", "distill.v1", "eval.v1", "mm.messages.v1"
+      ]
+    },
+    "algorithmId": {
+      "anyOf": [
+        {
+          "description": "Canonical algorithm id (baseline §7.1).",
+          "enum": [
+            "pretrain_clm", "cpt", "sft", "dpo", "ipo", "kto", "orpo", "simpo", "cpo", "online_dpo",
+            "reward_model", "prm", "ppo", "grpo", "dr_grpo", "dapo", "gspo", "rloo", "reinforce", "reinforce_pp",
+            "distill_offline", "distill_logit", "eval", "merge", "quantize", "convert"
+          ]
+        },
+        { "$ref": "#/$defs/extensionId" }
+      ]
+    },
+    "extensionId": {
+      "description": "Engine-specific algorithm: x-<engine>.<name>. Always experimental.",
+      "type": "string",
+      "pattern": "^x-[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(_[a-z0-9]+)*$"
+    },
+    "environment": {
+      "type": "object",
+      "required": ["id", "kind", "lockfile", "lockSha256", "python", "platform", "mrlRuntime"],
+      "properties": {
+        "id": { "description": "e.g. cuda12-oci, cuda12-uv.", "$ref": "#/$defs/slug" },
+        "kind": { "description": "oci = container image; uv = locked virtualenv built on the node.", "enum": ["oci", "uv"] },
+        "image": {
+          "description": "registry/repo@sha256:<digest>. Tags are rejected.",
+          "type": "string",
+          "pattern": "^[^@\\s]+@sha256:[0-9a-f]{64}$"
+        },
+        "lockfile": { "$ref": "#/$defs/text" },
+        "lockSha256": { "$ref": "#/$defs/sha256" },
+        "python": { "description": "Exact minor version.", "type": "string", "pattern": "^3\\.[0-9]+$" },
+        "platform": { "enum": ["linux/amd64", "linux/arm64", "darwin/arm64", "windows/amd64"] },
+        "accelerator": { "$ref": "#/$defs/accelerator" },
+        "mrlRuntime": { "description": "Exact mrl-runtime version in the environment.", "$ref": "#/$defs/semver" },
+        "sbom": { "description": "Reference to the SBOM artifact.", "$ref": "#/$defs/text" }
+      },
+      "additionalProperties": false,
+      "if": { "properties": { "kind": { "const": "oci" } } },
+      "then": { "required": ["image"] }
+    },
+    "accelerator": {
+      "type": "object",
+      "required": ["vendor"],
+      "properties": {
+        "vendor": { "enum": ["nvidia", "amd", "apple", "cpu"] },
+        "runtime": { "description": "e.g. cuda12, rocm6, mps, mlx.", "$ref": "#/$defs/text" },
+        "minDriver": { "$ref": "#/$defs/text" },
+        "minComputeCapability": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+$" }
+      },
+      "additionalProperties": false
+    },
+    "capabilities": {
+      "type": "object",
+      "required": ["updateStrategies", "precision", "parallelism", "multiNode", "execution", "resume", "pause", "onDemandCheckpoint", "trustRemoteCode"],
+      "properties": {
+        "updateStrategies": { "type": "array", "items": { "enum": ["full", "lora", "qlora", "dora", "freeze"] } },
+        "precision": { "type": "array", "minItems": 1, "items": { "enum": ["bf16", "fp16", "fp32"] } },
+        "quantizedTraining": { "type": "array", "items": { "enum": ["bnb-4bit", "bnb-8bit"] } },
+        "parallelism": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "enum": ["single", "ddp", "deepspeed-zero2", "deepspeed-zero3", "fsdp", "fsdp2"] }
+        },
+        "multiNode": { "type": "boolean" },
+        "multimodal": { "type": "array", "items": { "enum": ["image", "video", "audio"] } },
+        "execution": {
+          "type": "object",
+          "required": ["modes"],
+          "properties": {
+            "modes": { "type": "array", "minItems": 1, "items": { "enum": ["offline", "on_policy_sync", "on_policy_async"] } }
+          },
+          "additionalProperties": false
+        },
+        "rollout": {
+          "type": "object",
+          "properties": {
+            "providers": { "type": "array", "items": { "enum": ["hf-generate", "vllm-colocate", "vllm-server", "sglang", "mlx"] } }
+          },
+          "additionalProperties": false
+        },
+        "liveWeightSync": { "type": "array", "items": { "enum": ["shared", "nccl", "lora-adapter"] } },
+        "resume": { "type": "boolean" },
+        "pause": { "type": "boolean" },
+        "onDemandCheckpoint": { "type": "boolean" },
+        "gradientCheckpointing": { "type": "boolean" },
+        "streamingDatasets": { "type": "boolean" },
+        "trustRemoteCode": { "enum": ["never", "policy"] },
+        "rl": {
+          "type": "object",
+          "properties": {
+            "version_label": { "enum": ["native", "adapter", "none"] },
+            "tool_output_masking": { "type": "boolean" },
+            "max_policy_lag_supported": { "type": "integer", "minimum": 0 },
+            "in_flight_modes": { "type": "array", "items": { "enum": ["finish", "abort", "keep"] } },
+            "on_stale_modes": { "type": "array", "items": { "enum": ["drop", "keep", "importance_correct"] } }
+          },
+          "additionalProperties": false
+        },
+        "reward": {
+          "type": "object",
+          "properties": {
+            "multi_component": { "type": "boolean" },
+            "per_sample_mask": { "type": "boolean" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "topology": {
+      "type": "object",
+      "required": ["roles", "primary", "network", "launcher"],
+      "properties": {
+        "roles": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["id", "kind", "environment", "count", "reportsVia"],
+            "properties": {
+              "id": { "$ref": "#/$defs/slug" },
+              "kind": { "enum": ["trainer", "rollout_server", "ray_head", "ray_worker", "reward_exec", "scorer"] },
+              "environment": { "description": "An id from runtime.environments.", "$ref": "#/$defs/slug" },
+              "count": { "type": "integer", "minimum": 1 },
+              "gpus": { "description": "GPUs per process.", "type": "integer", "minimum": 0 },
+              "colocatedWith": { "$ref": "#/$defs/slug" },
+              "reportsVia": { "enum": ["worker_protocol", "logs_only"] }
+            },
+            "additionalProperties": false
+          }
+        },
+        "primary": { "description": "Role id whose harness reports metrics, checkpoints and the ExitReport.", "$ref": "#/$defs/slug" },
+        "network": { "enum": ["none", "job-internal"] },
+        "launcher": { "enum": ["inprocess", "accelerate", "torchrun", "ray"] }
+      },
+      "additionalProperties": false
+    },
+    "constraint": {
+      "description": "A rejection rule: a JSON Schema fragment over the validation document (Doc 05 §10.6).",
+      "type": "object",
+      "required": ["id", "appliesTo", "schema", "error"],
+      "properties": {
+        "id": { "$ref": "#/$defs/slug" },
+        "appliesTo": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/algorithmId" } },
+        "schema": { "description": "JSON Schema 2020-12 fragment.", "type": "object", "x-mrl-open": "a JSON Schema fragment" },
+        "error": {
+          "type": "object",
+          "required": ["code", "message", "hint"],
+          "properties": {
+            "code": { "description": "Guidance error code.", "type": "string", "pattern": "^MRL-[A-Z0-9]+-[0-9]{3}$" },
+            "message": { "$ref": "#/$defs/text" },
+            "hint": { "$ref": "#/$defs/text" }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "hardware": {
+      "description": "Where the engine can run at all; per-environment accelerators narrow it further.",
+      "type": "object",
+      "properties": {
+        "os": { "type": "array", "minItems": 1, "items": { "enum": ["linux", "macos", "windows"] } },
+        "accelerators": { "type": "array", "minItems": 1, "items": { "enum": ["nvidia", "amd", "apple", "cpu"] } },
+        "apple_silicon": { "description": "Runs on Apple Silicon (MPS or MLX).", "type": "boolean" },
+        "wsl2": { "description": "Runs inside WSL2 on Windows.", "type": "boolean" },
+        "minGpus": { "type": "integer", "minimum": 0 },
+        "maxGpus": { "type": "integer", "minimum": 1 },
+        "minGpuMemoryGib": { "type": "number", "minimum": 0 },
+        "minHostMemoryGib": { "type": "number", "minimum": 0 }
+      },
+      "additionalProperties": false
+    },
+    "algorithm": {
+      "description": "AlgorithmDefinition (Doc 05 §10.3).",
+      "type": "object",
+      "required": ["id", "displayName", "summary", "parent", "upstreamStatus", "maturity", "fidelity", "requires", "metrics", "resume", "pause"],
+      "properties": {
+        "id": { "$ref": "#/$defs/algorithmId" },
+        "displayName": { "$ref": "#/$defs/text" },
+        "summary": { "$ref": "#/$defs/text" },
+        "paper": { "type": "string" },
+        "objective": { "description": "Axis-1 objective class.", "$ref": "#/$defs/text" },
+        "parent": { "description": "Upstream trainer or entry point, e.g. trl.GRPOTrainer.", "$ref": "#/$defs/text" },
+        "switch": {
+          "description": "Algorithm-defining fields the adapter pins; users cannot override them.",
+          "type": "object",
+          "x-mrl-open": "engine-native config keys"
+        },
+        "defaults": { "description": "Recommended, overridable values.", "type": "object", "x-mrl-open": "engine-native config keys" },
+        "upstreamStatus": { "enum": ["stable", "experimental"] },
+        "maturity": { "$ref": "#/$defs/maturity" },
+        "fidelity": { "enum": ["full", "partial", "approximation"] },
+        "fidelityNote": { "$ref": "#/$defs/text" },
+        "requires": {
+          "type": "object",
+          "required": ["datasetSchemas", "signals"],
+          "properties": {
+            "datasetSchemas": {
+              "description": "Accepted dataset schemas per dataset role (alternatives).",
+              "type": "object",
+              "required": ["train"],
+              "properties": {
+                "train": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/datasetSchema" } },
+                "eval": { "type": "array", "items": { "$ref": "#/$defs/datasetSchema" } }
+              },
+              "additionalProperties": false
+            },
+            "signals": {
+              "type": "object",
+              "required": ["reward", "reference", "critic", "rolloutEngine", "teacher"],
+              "properties": {
+                "reward": { "enum": ["required", "optional", "none"] },
+                "rewardGranularity": { "enum": ["sequence", "step"] },
+                "reference": { "enum": ["required", "optional", "none"] },
+                "referenceModel": { "enum": ["implicit", "explicit", "none"] },
+                "critic": { "enum": ["required", "none"] },
+                "rolloutEngine": { "enum": ["required", "optional", "none"] },
+                "teacher": { "enum": ["required", "none"] }
+              },
+              "additionalProperties": false
+            },
+            "modelFamilies": { "type": "array", "items": { "enum": ["decoder", "decoder-moe", "encoder", "encoder-decoder", "vlm"] } }
+          },
+          "additionalProperties": false
+        },
+        "supports": {
+          "description": "Per-algorithm narrowing of engine capabilities.",
+          "type": "object",
+          "properties": {
+            "updateStrategies": { "$ref": "#/$defs/capabilities/properties/updateStrategies" },
+            "parallelism": { "$ref": "#/$defs/capabilities/properties/parallelism" },
+            "multimodal": { "$ref": "#/$defs/capabilities/properties/multimodal" },
+            "execution": { "$ref": "#/$defs/capabilities/properties/execution" },
+            "rollout": { "$ref": "#/$defs/capabilities/properties/rollout" }
+          },
+          "additionalProperties": false
+        },
+        "config": {
+          "type": "object",
+          "required": ["schema"],
+          "properties": {
+            "schema": { "description": "Path to the generated JSON Schema 2020-12.", "$ref": "#/$defs/text" },
+            "uiSchema": { "$ref": "#/$defs/text" },
+            "presets": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["id", "title", "tier", "patch"],
+                "properties": {
+                  "id": { "$ref": "#/$defs/slug" },
+                  "title": { "$ref": "#/$defs/text" },
+                  "tier": { "enum": ["beginner", "advanced"] },
+                  "when": { "description": "Condition under which the preset is offered.", "type": "string" },
+                  "patch": { "description": "JSON Merge Patch over the config.", "type": "object", "x-mrl-open": "a JSON Merge Patch" }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "metrics": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "kind", "required"],
+            "properties": {
+              "name": { "description": "Canonical metric name.", "$ref": "#/$defs/text" },
+              "source": { "description": "Engine-side name.", "type": "string" },
+              "unit": { "type": "string" },
+              "kind": { "enum": ["live", "sampled", "delayed"] },
+              "required": { "type": "boolean" },
+              "when": { "type": "string" }
+            },
+            "additionalProperties": false
+          }
+        },
+        "samples": {
+          "type": "object",
+          "required": ["emitted"],
+          "properties": {
+            "emitted": { "type": "boolean" },
+            "fields": { "type": "array", "items": { "$ref": "#/$defs/text" } }
+          },
+          "additionalProperties": false
+        },
+        "resume": { "type": "boolean" },
+        "pause": { "description": "pause implies resume.", "type": "boolean" },
+        "estimator": { "type": "string" }
+      },
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": { "properties": { "id": { "$ref": "#/$defs/extensionId" } } },
+          "then": { "properties": { "maturity": { "const": "experimental" } } }
+        },
+        {
+          "if": { "properties": { "fidelity": { "enum": ["partial", "approximation"] } } },
+          "then": { "required": ["fidelityNote"] }
+        },
+        {
+          "if": { "properties": { "pause": { "const": true } } },
+          "then": { "properties": { "resume": { "const": true } } }
+        },
+        {
+          "if": { "properties": { "upstreamStatus": { "const": "experimental" } } },
+          "then": { "properties": { "maturity": { "const": "experimental" } } }
+        }
+      ]
+    }
+  }
+}

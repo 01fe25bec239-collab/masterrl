@@ -2143,6 +2143,16 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-CAP-130")),
+            ("title", Value::Str("This built-in task is not installed.")),
+            ("why", Value::Str("The job asked for a built-in task this version of the app doesn't have.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Update the app on this machine, then start the job again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-CONFLICT-001")),
             ("title", Value::Str("Someone changed this item after you opened it.")),
             ("why", Value::Str("The version you edited is older than the saved one.")),
@@ -2160,6 +2170,16 @@ pub static CATALOG: Value = Value::Map(&[
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Load the item, then send its `ETag` value in the `If-Match` header."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CONFLICT-110")),
+            ("title", Value::Str("Too many changes happened at the same time.")),
+            ("why", Value::Str("Other changes to the same items kept getting in the way, so the server stopped trying.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Try again in a few seconds."),
                 ])),
             ])),
         ]),
@@ -2380,6 +2400,74 @@ pub static CATALOG: Value = Value::Map(&[
             ("docs_link", Value::Str("https://docs.docker.com/get-started/get-docker/")),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-ENV-110")),
+            ("title", Value::Str("The app's database programs are missing.")),
+            ("why", Value::Str("The app could not find the PostgreSQL database programs it ships with.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Reinstall the app."),
+                    Value::Str("If you set `pgbundle.bin_dir`, check that the folder holds `postgres`, `initdb`, `pg_ctl`, `pg_dump`, `pg_restore` and `pg_upgrade`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-ENV-111")),
+            ("title", Value::Str("Another copy of the app is already using this data folder.")),
+            ("why", Value::Str("Only one server can use a data folder at a time, so your data stays safe.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Close the other copy of the app, then try again."),
+                    Value::Str("If no other copy is open, restart your computer."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-ENV-112")),
+            ("title", Value::Str("This data folder was made by a newer version of the app.")),
+            ("why", Value::Str("The app's database programs are older than the ones that made this data folder.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Install the newest version of the app."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-ENV-122")),
+            ("title", Value::Str("The sandbox can't run on this computer.")),
+            ("why", Value::Str("The sandbox tool (bubblewrap) is missing, or this system blocks the isolation it needs.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Install bubblewrap, then try again."),
+                    Value::Str("If it is installed, ask your admin to allow unprivileged user namespaces."),
+                ])),
+                ("linux", Value::List(&[
+                    Value::Str("Run `sudo apt install bubblewrap` on Ubuntu or Debian."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-ENV-130")),
+            ("title", Value::Str("The training worker and the app use different protocol versions.")),
+            ("why", Value::Str("The software that runs training on this machine is older or newer than the app. They can't talk to each other.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Update the app on this machine, then start the run again."),
+                    Value::Str("If the run uses a custom engine, ask its maintainer for a version that matches the app."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-ENV-131")),
+            ("title", Value::Str("This engine needs a different version of the MasterRL runtime.")),
+            ("why", Value::Str("The engine was built for a version of the runtime that this machine doesn't have.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Update the app on this machine, then start the run again."),
+                    Value::Str("If that doesn't help, install a version of the engine made for your app version."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-IDEM-001")),
             ("title", Value::Str("This request is already running.")),
             ("why", Value::Str("A request with the same request key started earlier and has not finished.")),
@@ -2515,6 +2603,87 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Read which job stopped in Details."),
                     Value::Str("Start the server again. If it happens again, report it with the diagnostics."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-INTERNAL-110")),
+            ("title", Value::Str("The database needs an update before the server can start.")),
+            ("why", Value::Str("This version of the server needs database changes. Automatic updates are turned off in its settings.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Back up the database if your team needs a copy first."),
+                    Value::Str("Run `mrl-server migrate`, then start the server again."),
+                    Value::Str("To update on every start, set `database.auto_migrate = true`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-INTERNAL-111")),
+            ("title", Value::Str("The database update did not finish.")),
+            ("why", Value::Str("One of the database changes failed. Details name the change and the reason.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("If Details say a backup was put back, your data is as it was before the update."),
+                    Value::Str("Start the previous version of the app to keep working."),
+                    Value::Str("Send the Details to support so they can fix the update."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-INTERNAL-112")),
+            ("title", Value::Str("The app's database stopped and could not start again.")),
+            ("why", Value::Str("The database program failed to start, or it kept stopping. Its log is in the data folder.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Restart the app."),
+                    Value::Str("Check that the disk with the app data folder has free space."),
+                    Value::Str("If it happens again, send the file `postgres.log` from the data folder to support."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-INTERNAL-113")),
+            ("title", Value::Str("The app could not back up its database.")),
+            ("why", Value::Str("The backup program failed, or the backup folder is full or locked. Details give the reason.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Free up disk space on the drive with the app data folder."),
+                    Value::Str("Restart the app to try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-INTERNAL-114")),
+            ("title", Value::Str("The app could not move its database to the new version.")),
+            ("why", Value::Str("This app uses a newer database program, and moving your data to it failed. Your old data folder was not changed.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Start the previous version of the app to keep working."),
+                    Value::Str("Free up disk space; the move needs about as much space again as your database."),
+                    Value::Str("Send the Details to support."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-INTERNAL-115")),
+            ("title", Value::Str("The server set an event aside after it failed many times.")),
+            ("why", Value::Str("A part of the server could not handle this event. The server kept going with the next events.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check the server log for the event id and the last error."),
+                    Value::Str("Send them to support so they can fix the cause and replay the event."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-INTERNAL-130")),
+            ("title", Value::Str("The app and its training worker disagreed about the next step.")),
+            ("why", Value::Str("The training worker got a message it didn't expect at that point. This is a problem in the app, not in your settings.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Start the run again. It resumes from the last saved checkpoint."),
+                    Value::Str("If it happens again, send the run's log to your admin."),
                 ])),
             ])),
         ]),
@@ -2667,6 +2836,55 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-NODE-121")),
+            ("title", Value::Str("The agent could not save or read its local files.")),
+            ("why", Value::Str("The disk may be full, or the agent may not have permission to use its state folder.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Free up disk space on the drive named in Details."),
+                    Value::Str("Make sure your account owns the agent's state folder."),
+                    Value::Str("Start the agent again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-NODE-123")),
+            ("title", Value::Str("The agent could not start or stop the program.")),
+            ("why", Value::Str("The program may be missing, or this computer may be out of processes or memory.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check the program name and path in Details."),
+                    Value::Str("Close programs you don't need, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-NODE-124")),
+            ("title", Value::Str("The agent could not read this computer's hardware.")),
+            ("why", Value::Str("The GPU driver did not answer, or it stopped working while the agent read it.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Restart the computer, then check again."),
+                    Value::Str("If it keeps failing, update or reinstall the GPU driver."),
+                ])),
+                ("linux", Value::List(&[
+                    Value::Str("Run `nvidia-smi` to see whether the driver answers."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-NODE-125")),
+            ("title", Value::Str("The agent could not set itself up to start with your computer.")),
+            ("why", Value::Str("The system's service manager refused the change, or a path has characters it can't pass on.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Read the command and its message in Details."),
+                    Value::Str("Run `mrl-agent service install` again."),
+                    Value::Str("If it still fails, start the agent by hand with `mrl-agent run`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-PERM-001")),
             ("title", Value::Str("Your role doesn't allow this action.")),
             ("why", Value::Str("Each project role can do a set list of things. This action needs a different role.")),
@@ -2736,6 +2954,118 @@ pub static CATALOG: Value = Value::Map(&[
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Check the path against the reference at `/api-docs/openapi.json`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-140")),
+            ("title", Value::Str("The reward policy has a problem.")),
+            ("why", Value::Str("A field in the policy is missing, has a value the app doesn't accept, or clashes with another field. Details names the field.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Open the reward policy and fix the field named in Details."),
+                    Value::Str("Save the policy, then run its tests again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-141")),
+            ("title", Value::Str("A condition in the reward policy could not be read.")),
+            ("why", Value::Str("A `when` or `require` condition uses a word, sign or shape the app doesn't know. Details shows the condition and the spot.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Use only field names, numbers, quoted text, `true`, `false` and `null`."),
+                    Value::Str("Join conditions with `and`, `or` and `not`, and compare with `==`, `!=`, `<` or `>`."),
+                    Value::Str("Start field names with `sample.` or `components.`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-142")),
+            ("title", Value::Str("The reward policy uses a component that isn't installed.")),
+            ("why", Value::Str("The name or version after `use:` doesn't match any reward component here. Details lists the versions that exist.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check the spelling of the component name, like `builtin/math.verify@1`."),
+                    Value::Str("Pick a version from the list in Details."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-143")),
+            ("title", Value::Str("A reward component's settings need a change.")),
+            ("why", Value::Str("One of the component's settings is missing or has a value it doesn't accept. Details names the component and setting.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Open the component's settings in the policy."),
+                    Value::Str("Fix the setting named in Details, then save."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-144")),
+            ("title", Value::Str("Too many samples in a batch failed to get a reward.")),
+            ("why", Value::Str("More samples failed than the policy allows, or the policy stops the batch when any sample fails. The training step stopped so it would not learn from missing rewards.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Open the reward details for this step to see which component failed and why."),
+                    Value::Str("If a component took too long, raise its `per_sample_timeout_ms`."),
+                    Value::Str("If a few failures are fine, raise `max_failure_rate` in the policy."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-145")),
+            ("title", Value::Str("The reward service got a request for a different run or reward version.")),
+            ("why", Value::Str("The request did not carry this run's key, or it asked for a reward version the service has not loaded.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Restart the run so its reward service loads the right version."),
+                    Value::Str("If it keeps happening, ask your admin to check the machine running the run."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-146")),
+            ("title", Value::Str("This reward's custom code can't run here yet.")),
+            ("why", Value::Str("Custom reward code runs only inside the reward sandbox, and this setup doesn't have it yet.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Use built-in reward components for now."),
+                    Value::Str("Remove the `code/` folder from the reward files, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-147")),
+            ("title", Value::Str("The app could not load the reward files.")),
+            ("why", Value::Str("A file the reward needs is missing, too large or broken. Details names the file.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check the file named in Details."),
+                    Value::Str("Fix or replace it, then upload the reward files again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-148")),
+            ("title", Value::Str("Step-by-step rewards aren't available yet.")),
+            ("why", Value::Str("The policy asks for one reward per step (`scalar.step`), but this version gives one reward per whole response.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Set the policy's `signal` to `scalar.sequence`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-149")),
+            ("title", Value::Str("The reward service could not start.")),
+            ("why", Value::Str("Its listen address, run key or network check failed. Details says which one.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Restart the run."),
+                    Value::Str("If you started the service by hand, use a listen address like `unix:/tmp/reward.sock`."),
+                    Value::Str("For local testing only, add `--allow-network`."),
                 ])),
             ])),
         ]),
@@ -3025,6 +3355,51 @@ pub static CATALOG: Value = Value::Map(&[
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Check which methods the endpoint takes in the reference at `/api-docs/openapi.json`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-120")),
+            ("title", Value::Str("The agent could not use its settings file.")),
+            ("why", Value::Str("The file is missing, has a typing mistake, or has a value the agent can't use.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Read the setting and the problem named in Details."),
+                    Value::Str("Fix the settings file, or remove the setting to use the default."),
+                    Value::Str("Start the agent again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-126")),
+            ("title", Value::Str("The app doesn't know this name.")),
+            ("why", Value::Str("A profile, job name or other name doesn't match any the agent knows.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Pick one of the names listed in Details."),
+                    Value::Str("Check the spelling, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-130")),
+            ("title", Value::Str("The engine manifest has a problem.")),
+            ("why", Value::Str("The engine's `mrl-engine.yaml` file, or one of its parts, doesn't match the format the app expects. Details names each field.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Ask the engine's maintainer for a fixed version of the engine."),
+                    Value::Str("If you build the engine yourself, fix the fields named in Details, then install it again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-131")),
+            ("title", Value::Str("A built-in task got inputs it can't use.")),
+            ("why", Value::Str("The job gave the task an input it doesn't expect, or left one out. Details names the input.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Start the action again from the app, so it sends the inputs the task needs."),
+                    Value::Str("If a script started the job, fix the input named in Details."),
                 ])),
             ])),
         ]),

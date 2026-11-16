@@ -1,0 +1,17 @@
+component: builtin/format.json_schema@1
+params:
+  schema: {type: object, required: [name], properties: {name: {type: string}, age: {type: integer, minimum: 0}}}
+cases:
+  - {name: valid, completion: '{"name": "Ada", "age": 36}', expect: {value: 1.0, diagnostics: {valid: true}}}
+  - {name: missing_field, completion: '{"age": 3}', expect: {value: 0.0, diagnostics: {valid: false}}}
+  - {name: wrong_type, completion: '{"name": "x", "age": -1}', expect: {value: 0.0}}
+  - {name: not_json, completion: "name: Ada", expect: {value: 0.0}}
+  - {name: empty, completion: "", expect: {value: 0.0}}
+  - {name: code_fence, params: {answer_extractor: code_fence}, completion: "Here:\n```json\n{\"name\": \"Ada\"}\n```", expect: {value: 1.0}}
+  - {name: deep_nesting, completion: {repeat: "[", times: 100000}, expect: {value: 0.0}}
+  - {name: too_large, params: {max_bytes: 10}, completion: '{"name": "Ada Lovelace"}', expect: {value: 0.0, diagnostics: {error: too_large}}}
+  - {name: remote_ref_refused, params: {schema: {"$ref": "https://example.com/s.json"}}, completion: "{}", expect: {setup_error: MRL-RWD-143}}
+  - name: local_ref_works
+    params: {schema: {"$defs": {n: {type: integer}}, type: object, properties: {a: {"$ref": "#/$defs/n"}}}}
+    completion: '{"a": "x"}'
+    expect: {value: 0.0}

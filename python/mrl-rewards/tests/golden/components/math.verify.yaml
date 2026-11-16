@@ -1,0 +1,25 @@
+component: builtin/math.verify@1
+params: {}
+cases:
+  - {name: integer, completion: "<answer>144</answer>", reference: "144", expect: {value: 1.0, diagnostics: {method: number}}}
+  - {name: wrong, completion: "<answer>143</answer>", reference: "144", expect: {value: 0.0}}
+  - {name: decimal_equals_fraction, completion: "<answer>0.5</answer>", reference: "1/2", expect: {value: 1.0}}
+  - {name: latex_frac, completion: "<answer>\\frac{3}{4}</answer>", reference: "0.75", expect: {value: 1.0}}
+  - {name: dollars_and_commas, completion: "<answer>$1,234</answer>", reference: "1234", expect: {value: 1.0}}
+  - {name: percent, completion: "<answer>50\\%</answer>", reference: "0.5", expect: {value: 1.0}}
+  - {name: units_word, completion: "<answer>18 dollars</answer>", reference: "18", expect: {value: 1.0}}
+  - {name: assignment, completion: "<answer>x = 5</answer>", reference: "5", expect: {value: 1.0}}
+  - {name: boxed, params: {answer_extractor: boxed}, completion: "so \\boxed{\\frac{1}{3}}", reference: "1/3", expect: {value: 1.0}}
+  - {name: answer_spam, completion: "<answer>144</answer><answer>143</answer><answer>145</answer>", reference: "144", expect: {value: 0.0, flags: [multiple_answers]}}
+  - {name: same_answer_twice_is_fine, completion: "<answer>144</answer><answer> 144 </answer>", reference: "144", expect: {value: 1.0}}
+  - {name: no_answer, completion: "144", reference: "144", expect: {value: 0.0, flags: [no_answer]}}
+  - {name: text_answer, completion: "<answer>\\text{Paris}</answer>", reference: "paris", expect: {value: 1.0, flags: [parse_fallback]}}
+  - {name: tolerance, params: {numeric_tolerance: 0.01}, completion: "<answer>3.141</answer>", reference: "3.14159", expect: {value: 1.0}}
+  - {name: exact_without_tolerance, completion: "<answer>3.141</answer>", reference: "3.14159", expect: {value: 0.0}}
+  - {name: missing_reference, completion: "<answer>1</answer>", reference: {question: "?"}, expect: {status: INVALID_INPUT}}
+  - {name: huge_exponent, completion: "<answer>1e999</answer>", reference: "1", expect: {value: 0.0}}
+  - {name: divide_by_zero, completion: "<answer>1/0</answer>", reference: "1", expect: {value: 0.0}}
+  - {name: percent_is_its_value, completion: "<answer>50%</answer>", reference: "0.5", expect: {value: 1.0}}
+  - {name: percent_is_not_the_bare_number, completion: "<answer>50%</answer>", reference: "50", expect: {value: 0.0}}
+  - {name: bare_number_is_not_a_percent, completion: "<answer>50</answer>", reference: "50%", expect: {value: 0.0}}
+  - {name: percent_both_sides, completion: "<answer>50\\%</answer>", reference: "50%", expect: {value: 1.0}}
