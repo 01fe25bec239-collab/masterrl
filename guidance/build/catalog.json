@@ -2105,6 +2105,16 @@
       }
     },
     {
+      "code": "MRL-CONFLICT-110",
+      "title": "Too many changes happened at the same time.",
+      "why": "Other changes to the same items kept getting in the way, so the server stopped trying.",
+      "what_to_do": {
+        "steps": [
+          "Try again in a few seconds."
+        ]
+      }
+    },
+    {
       "code": "MRL-DATA-001",
       "title": "Your dataset did not pass its checks.",
       "why": "Some rows are empty, are missing fields, or don't match the chosen format.",
@@ -2299,6 +2309,38 @@
       "docs_link": "https://docs.docker.com/get-started/get-docker/"
     },
     {
+      "code": "MRL-ENV-110",
+      "title": "The app's database programs are missing.",
+      "why": "The app could not find the PostgreSQL database programs it ships with.",
+      "what_to_do": {
+        "steps": [
+          "Reinstall the app.",
+          "If you set `pgbundle.bin_dir`, check that the folder holds `postgres`, `initdb`, `pg_ctl`, `pg_dump`, `pg_restore` and `pg_upgrade`."
+        ]
+      }
+    },
+    {
+      "code": "MRL-ENV-111",
+      "title": "Another copy of the app is already using this data folder.",
+      "why": "Only one server can use a data folder at a time, so your data stays safe.",
+      "what_to_do": {
+        "steps": [
+          "Close the other copy of the app, then try again.",
+          "If no other copy is open, restart your computer."
+        ]
+      }
+    },
+    {
+      "code": "MRL-ENV-112",
+      "title": "This data folder was made by a newer version of the app.",
+      "why": "The app's database programs are older than the ones that made this data folder.",
+      "what_to_do": {
+        "steps": [
+          "Install the newest version of the app."
+        ]
+      }
+    },
+    {
       "code": "MRL-ENV-122",
       "title": "The sandbox can't run on this computer.",
       "why": "The sandbox tool (bubblewrap) is missing, or this system blocks the isolation it needs.",
@@ -2448,6 +2490,76 @@
         "steps": [
           "Read which job stopped in Details.",
           "Start the server again. If it happens again, report it with the diagnostics."
+        ]
+      }
+    },
+    {
+      "code": "MRL-INTERNAL-110",
+      "title": "The database needs an update before the server can start.",
+      "why": "This version of the server needs database changes. Automatic updates are turned off in its settings.",
+      "what_to_do": {
+        "steps": [
+          "Back up the database if your team needs a copy first.",
+          "Run `mrl-server migrate`, then start the server again.",
+          "To update on every start, set `database.auto_migrate = true`."
+        ]
+      }
+    },
+    {
+      "code": "MRL-INTERNAL-111",
+      "title": "The database update did not finish.",
+      "why": "One of the database changes failed. Details name the change and the reason.",
+      "what_to_do": {
+        "steps": [
+          "If Details say a backup was put back, your data is as it was before the update.",
+          "Start the previous version of the app to keep working.",
+          "Send the Details to support so they can fix the update."
+        ]
+      }
+    },
+    {
+      "code": "MRL-INTERNAL-112",
+      "title": "The app's database stopped and could not start again.",
+      "why": "The database program failed to start, or it kept stopping. Its log is in the data folder.",
+      "what_to_do": {
+        "steps": [
+          "Restart the app.",
+          "Check that the disk with the app data folder has free space.",
+          "If it happens again, send the file `postgres.log` from the data folder to support."
+        ]
+      }
+    },
+    {
+      "code": "MRL-INTERNAL-113",
+      "title": "The app could not back up its database.",
+      "why": "The backup program failed, or the backup folder is full or locked. Details give the reason.",
+      "what_to_do": {
+        "steps": [
+          "Free up disk space on the drive with the app data folder.",
+          "Restart the app to try again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-INTERNAL-114",
+      "title": "The app could not move its database to the new version.",
+      "why": "This app uses a newer database program, and moving your data to it failed. Your old data folder was not changed.",
+      "what_to_do": {
+        "steps": [
+          "Start the previous version of the app to keep working.",
+          "Free up disk space; the move needs about as much space again as your database.",
+          "Send the Details to support."
+        ]
+      }
+    },
+    {
+      "code": "MRL-INTERNAL-115",
+      "title": "The server set an event aside after it failed many times.",
+      "why": "A part of the server could not handle this event. The server kept going with the next events.",
+      "what_to_do": {
+        "steps": [
+          "Check the server log for the event id and the last error.",
+          "Send them to support so they can fix the cause and replay the event."
         ]
       }
     },

@@ -2,4 +2,5 @@
 //! and registers its module in `registry.rs`.
 
 // <mrl:modules>
+pub mod events;
 // </mrl:modules>

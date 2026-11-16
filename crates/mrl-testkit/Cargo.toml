@@ -21,6 +21,8 @@ tower = { workspace = true }
 utoipa = { workspace = true }
 uuid = { workspace = true }
 # <mrl:deps P11> P11 dependencies go right below this line.
+sha2 = { workspace = true }
+sqlx = { workspace = true }
 
 # <mrl:deps P12> P12 dependencies go right below this line.
 mrl-agent = { path = "../mrl-agent" }
