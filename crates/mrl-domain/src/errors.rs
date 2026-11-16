@@ -392,6 +392,23 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
     // <mrl:errors P14> rows for P14 go right below this line.
 
     // <mrl:errors P15> rows for P15 go right below this line.
+    (
+        code(Model, 150),
+        "The app could not read this model's files.",
+    ),
+    (
+        code(Model, 151),
+        "This model can answer prompts, but the app can't train it.",
+    ),
+    (
+        code(Model, 152),
+        "The app could not use this model's tokenizer or chat template.",
+    ),
+    (code(Data, 150), "The app could not read this dataset file."),
+    (
+        code(Data, 151),
+        "This dataset file has a column type the app doesn't read.",
+    ),
 ];
 
 /// Every code with its title: the registry plus every capability rejection.

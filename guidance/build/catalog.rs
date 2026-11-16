@@ -2185,6 +2185,28 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-DATA-150")),
+            ("title", Value::Str("The app could not read this dataset file.")),
+            ("why", Value::Str("The file type is not one the app reads, or the file is damaged or cut short. Details says where reading stopped.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Use a `.jsonl`, `.json`, `.csv`, `.tsv`, `.parquet` or `.arrow` file."),
+                    Value::Str("Save the file again from the program that made it, then upload it again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-DATA-151")),
+            ("title", Value::Str("This dataset file has a column type the app doesn't read.")),
+            ("why", Value::Str("The app reads text, numbers, true or false values, lists and nested records. Raw bytes, dates and other types are refused.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Convert the column named in Details to text, then upload the file again."),
+                    Value::Str("For images, store a reference to each image file instead of its bytes."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-ENV-001")),
             ("title", Value::Str("The app doesn't support this version of your operating system.")),
             ("why", Value::Str("The training tools need a newer version of your OS.")),
@@ -2608,6 +2630,39 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Open the model page and read the license."),
                     Value::Str("Accept the license, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-MODEL-150")),
+            ("title", Value::Str("The app could not read this model's files.")),
+            ("why", Value::Str("A weight file or a settings file is damaged, cut short, or not in a format the app knows. Details names the file.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Download the model again, then add it again."),
+                    Value::Str("If you made the files yourself, save the weights as `.safetensors` files."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-MODEL-151")),
+            ("title", Value::Str("This model can answer prompts, but the app can't train it.")),
+            ("why", Value::Str("Its weights are compressed for running only, like `.gguf`, `.onnx` or 4-bit files. Training needs the full weights.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Use this model for chat and evaluation only."),
+                    Value::Str("To train, pick the original model with full `.safetensors` weights."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-MODEL-152")),
+            ("title", Value::Str("The app could not use this model's tokenizer or chat template.")),
+            ("why", Value::Str("The tokenizer file is missing or damaged, or the chat template has an error. Details says which.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check that the model folder has a `tokenizer.json` file."),
+                    Value::Str("Download the model again if the file is damaged."),
                 ])),
             ])),
         ]),

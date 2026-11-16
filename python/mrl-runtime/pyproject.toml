@@ -10,6 +10,12 @@ dependencies = [
     # <mrl:deps P13> P13 dependencies go right below this line.
 
     # <mrl:deps P15> P15 dependencies go right below this line.
+    "jinja2==3.1.6",
+    "jsonschema==4.26.0",
+    "pyarrow==26.0.1",
+    "tokenizers==0.23.3",
+    # Test-only (property tests); A1 may move it to the root dev group.
+    "hypothesis==6.170.15",
 ]
 
 [build-system]
