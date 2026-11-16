@@ -2903,6 +2903,118 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-RWD-140")),
+            ("title", Value::Str("The reward policy has a problem.")),
+            ("why", Value::Str("A field in the policy is missing, has a value the app doesn't accept, or clashes with another field. Details names the field.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Open the reward policy and fix the field named in Details."),
+                    Value::Str("Save the policy, then run its tests again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-141")),
+            ("title", Value::Str("A condition in the reward policy could not be read.")),
+            ("why", Value::Str("A `when` or `require` condition uses a word, sign or shape the app doesn't know. Details shows the condition and the spot.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Use only field names, numbers, quoted text, `true`, `false` and `null`."),
+                    Value::Str("Join conditions with `and`, `or` and `not`, and compare with `==`, `!=`, `<` or `>`."),
+                    Value::Str("Start field names with `sample.` or `components.`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-142")),
+            ("title", Value::Str("The reward policy uses a component that isn't installed.")),
+            ("why", Value::Str("The name or version after `use:` doesn't match any reward component here. Details lists the versions that exist.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check the spelling of the component name, like `builtin/math.verify@1`."),
+                    Value::Str("Pick a version from the list in Details."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-143")),
+            ("title", Value::Str("A reward component's settings need a change.")),
+            ("why", Value::Str("One of the component's settings is missing or has a value it doesn't accept. Details names the component and setting.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Open the component's settings in the policy."),
+                    Value::Str("Fix the setting named in Details, then save."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-144")),
+            ("title", Value::Str("Too many samples in a batch failed to get a reward.")),
+            ("why", Value::Str("More samples failed than the policy allows, or the policy stops the batch when any sample fails. The training step stopped so it would not learn from missing rewards.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Open the reward details for this step to see which component failed and why."),
+                    Value::Str("If a component took too long, raise its `per_sample_timeout_ms`."),
+                    Value::Str("If a few failures are fine, raise `max_failure_rate` in the policy."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-145")),
+            ("title", Value::Str("The reward service got a request for a different run or reward version.")),
+            ("why", Value::Str("The request did not carry this run's key, or it asked for a reward version the service has not loaded.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Restart the run so its reward service loads the right version."),
+                    Value::Str("If it keeps happening, ask your admin to check the machine running the run."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-146")),
+            ("title", Value::Str("This reward's custom code can't run here yet.")),
+            ("why", Value::Str("Custom reward code runs only inside the reward sandbox, and this setup doesn't have it yet.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Use built-in reward components for now."),
+                    Value::Str("Remove the `code/` folder from the reward files, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-147")),
+            ("title", Value::Str("The app could not load the reward files.")),
+            ("why", Value::Str("A file the reward needs is missing, too large or broken. Details names the file.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check the file named in Details."),
+                    Value::Str("Fix or replace it, then upload the reward files again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-148")),
+            ("title", Value::Str("Step-by-step rewards aren't available yet.")),
+            ("why", Value::Str("The policy asks for one reward per step (`scalar.step`), but this version gives one reward per whole response.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Set the policy's `signal` to `scalar.sequence`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-149")),
+            ("title", Value::Str("The reward service could not start.")),
+            ("why", Value::Str("Its listen address, run key or network check failed. Details says which one.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Restart the run."),
+                    Value::Str("If you started the service by hand, use a listen address like `unix:/tmp/reward.sock`."),
+                    Value::Str("For local testing only, add `--allow-network`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-STORE-001")),
             ("title", Value::Str("The app refused a storage path.")),
             ("why", Value::Str("The path points outside your workspace's storage area, or it has a part the app doesn't allow, like `..`.")),

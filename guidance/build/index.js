@@ -2855,6 +2855,118 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-RWD-140",
+      "title": "The reward policy has a problem.",
+      "why": "A field in the policy is missing, has a value the app doesn't accept, or clashes with another field. Details names the field.",
+      "what_to_do": {
+        "steps": [
+          "Open the reward policy and fix the field named in Details.",
+          "Save the policy, then run its tests again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-RWD-141",
+      "title": "A condition in the reward policy could not be read.",
+      "why": "A `when` or `require` condition uses a word, sign or shape the app doesn't know. Details shows the condition and the spot.",
+      "what_to_do": {
+        "steps": [
+          "Use only field names, numbers, quoted text, `true`, `false` and `null`.",
+          "Join conditions with `and`, `or` and `not`, and compare with `==`, `!=`, `<` or `>`.",
+          "Start field names with `sample.` or `components.`."
+        ]
+      }
+    },
+    {
+      "code": "MRL-RWD-142",
+      "title": "The reward policy uses a component that isn't installed.",
+      "why": "The name or version after `use:` doesn't match any reward component here. Details lists the versions that exist.",
+      "what_to_do": {
+        "steps": [
+          "Check the spelling of the component name, like `builtin/math.verify@1`.",
+          "Pick a version from the list in Details."
+        ]
+      }
+    },
+    {
+      "code": "MRL-RWD-143",
+      "title": "A reward component's settings need a change.",
+      "why": "One of the component's settings is missing or has a value it doesn't accept. Details names the component and setting.",
+      "what_to_do": {
+        "steps": [
+          "Open the component's settings in the policy.",
+          "Fix the setting named in Details, then save."
+        ]
+      }
+    },
+    {
+      "code": "MRL-RWD-144",
+      "title": "Too many samples in a batch failed to get a reward.",
+      "why": "More samples failed than the policy allows, or the policy stops the batch when any sample fails. The training step stopped so it would not learn from missing rewards.",
+      "what_to_do": {
+        "steps": [
+          "Open the reward details for this step to see which component failed and why.",
+          "If a component took too long, raise its `per_sample_timeout_ms`.",
+          "If a few failures are fine, raise `max_failure_rate` in the policy."
+        ]
+      }
+    },
+    {
+      "code": "MRL-RWD-145",
+      "title": "The reward service got a request for a different run or reward version.",
+      "why": "The request did not carry this run's key, or it asked for a reward version the service has not loaded.",
+      "what_to_do": {
+        "steps": [
+          "Restart the run so its reward service loads the right version.",
+          "If it keeps happening, ask your admin to check the machine running the run."
+        ]
+      }
+    },
+    {
+      "code": "MRL-RWD-146",
+      "title": "This reward's custom code can't run here yet.",
+      "why": "Custom reward code runs only inside the reward sandbox, and this setup doesn't have it yet.",
+      "what_to_do": {
+        "steps": [
+          "Use built-in reward components for now.",
+          "Remove the `code/` folder from the reward files, then try again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-RWD-147",
+      "title": "The app could not load the reward files.",
+      "why": "A file the reward needs is missing, too large or broken. Details names the file.",
+      "what_to_do": {
+        "steps": [
+          "Check the file named in Details.",
+          "Fix or replace it, then upload the reward files again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-RWD-148",
+      "title": "Step-by-step rewards aren't available yet.",
+      "why": "The policy asks for one reward per step (`scalar.step`), but this version gives one reward per whole response.",
+      "what_to_do": {
+        "steps": [
+          "Set the policy's `signal` to `scalar.sequence`."
+        ]
+      }
+    },
+    {
+      "code": "MRL-RWD-149",
+      "title": "The reward service could not start.",
+      "why": "Its listen address, run key or network check failed. Details says which one.",
+      "what_to_do": {
+        "steps": [
+          "Restart the run.",
+          "If you started the service by hand, use a listen address like `unix:/tmp/reward.sock`.",
+          "For local testing only, add `--allow-network`."
+        ]
+      }
+    },
+    {
       "code": "MRL-STORE-001",
       "title": "The app refused a storage path.",
       "why": "The path points outside your workspace's storage area, or it has a part the app doesn't allow, like `..`.",

@@ -1,0 +1,9 @@
+# Build context is the repo root; send only what the image needs.
+*
+!pyproject.toml
+!uv.lock
+!python/mrl-runtime/pyproject.toml
+!python/mrl-sdk/pyproject.toml
+!python/mrl-rewards/pyproject.toml
+!python/mrl-rewards/src/
+**/__pycache__

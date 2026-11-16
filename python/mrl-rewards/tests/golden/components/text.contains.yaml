@@ -1,0 +1,11 @@
+component: builtin/text.contains@1
+params: {}
+cases:
+  - {name: reference_inside, completion: "it is 144, I think", reference: "144", expect: {value: 1.0}}
+  - {name: reference_missing, completion: "it is 145", reference: "144", expect: {value: 0.0}}
+  - {name: no_texts_no_reference, completion: "x", reference: null, expect: {status: INVALID_INPUT}}
+  - {name: any_mode, params: {texts: ["cat", "dog"]}, completion: "a dog", expect: {value: 1.0, diagnostics: {matched: 1}}}
+  - {name: all_mode_partial, params: {texts: ["cat", "dog"], mode: all}, completion: "a dog", expect: {value: 0.0}}
+  - {name: all_mode_full, params: {texts: ["cat", "dog"], mode: all}, completion: "cat and dog", expect: {value: 1.0}}
+  - {name: case_insensitive, params: {texts: ["DOG"], normalize: {case: true}}, completion: "a dog", expect: {value: 1.0}}
+  - {name: unicode, params: {texts: ["日本"]}, completion: "日本語です", expect: {value: 1.0}}

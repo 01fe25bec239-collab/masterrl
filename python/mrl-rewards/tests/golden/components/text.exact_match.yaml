@@ -1,0 +1,21 @@
+component: builtin/text.exact_match@1
+params: {}
+cases:
+  - {name: equal, completion: "quartz rabbit", reference: "quartz rabbit", expect: {value: 1.0}}
+  - {name: extra_spaces_collapsed, completion: "  quartz   rabbit\n", reference: "quartz rabbit", expect: {value: 1.0}}
+  - {name: case_matters_by_default, completion: "Quartz Rabbit", reference: "quartz rabbit", expect: {value: 0.0}}
+  - {name: nfkc_fullwidth, completion: "ｑｕａｒｔｚ", reference: "quartz", expect: {value: 1.0}}
+  - {name: answer_key_in_object, completion: "144", reference: {answer: "144"}, expect: {value: 1.0}}
+  - {name: empty_completion, completion: "", reference: "x", expect: {value: 0.0}}
+  - {name: no_reference, completion: "x", reference: null, expect: {status: INVALID_INPUT}}
+  - {name: huge_input_truncated, completion: {repeat: "a", times: 300000}, reference: "a", expect: {value: 0.0, flags: [truncated_input]}}
+  - name: case_folded_with_tag
+    params: {answer_extractor: "tag:answer", normalize: {case: true}}
+    completion: "<answer>QUARTZ</answer>"
+    reference: "quartz"
+    expect: {value: 1.0}
+  - name: answer_spam
+    params: {answer_extractor: "tag:answer"}
+    completion: "<answer>a</answer><answer>b</answer>"
+    reference: "a"
+    expect: {value: 0.0, flags: [multiple_answers]}

@@ -1,0 +1,13 @@
+component: builtin/text.regex@1
+params: {pattern: "\\d{3}"}
+cases:
+  - {name: found, completion: "answer 144", expect: {value: 1.0}}
+  - {name: not_found, completion: "answer 14", expect: {value: 0.0}}
+  - {name: empty, completion: "", expect: {value: 0.0}}
+  - {name: inverted, params: {pattern: "sorry", invert: true}, completion: "sure", expect: {value: 1.0}}
+  - {name: ignore_case, params: {pattern: "sorry", ignore_case: true}, completion: "SORRY", expect: {value: 1.0}}
+  - name: redos_shape_is_linear
+    params: {pattern: "(a+)+$"}
+    completion: {repeat: "a", times: 50000, then: "!"}
+    expect: {value: 0.0}
+  - {name: bad_pattern_backreference, params: {pattern: "(a)\\1"}, completion: "aa", expect: {setup_error: MRL-RWD-143}}

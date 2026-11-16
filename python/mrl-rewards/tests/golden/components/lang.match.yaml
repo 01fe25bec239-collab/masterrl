@@ -1,0 +1,12 @@
+component: builtin/lang.match@1
+params: {}
+cases:
+  - {name: english, completion: "The answer is four.", reference: {lang: en}, expect: {value: 1.0, diagnostics: {top_script: LATIN}}}
+  - {name: russian_expected_english, completion: "Ответ четыре.", reference: {lang: en}, expect: {value: 0.0}}
+  - {name: russian, completion: "Ответ четыре.", reference: {lang: ru}, expect: {value: 1.0}}
+  - {name: chinese, completion: "答案是四。", reference: {lang: zh}, expect: {value: 1.0}}
+  - {name: japanese_needs_kana, completion: "答案是四。", reference: {lang: ja}, expect: {value: 0.0}}
+  - {name: japanese, completion: "答えは四です。", reference: {lang: ja}, expect: {value: 1.0}}
+  - {name: no_letters, completion: "1234 !!", reference: {lang: en}, expect: {value: 0.0, flags: [no_letters]}}
+  - {name: missing_lang, completion: "hi", reference: "hi", expect: {status: INVALID_INPUT}}
+  - {name: param_overrides, params: {expected: ko}, completion: "답은 넷입니다", reference: {lang: en}, expect: {value: 1.0}}
