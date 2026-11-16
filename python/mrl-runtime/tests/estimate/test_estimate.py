@@ -659,3 +659,23 @@ def test_interconnect_needs() -> None:
     roles = {n.role: n for n in estimate(QWEN_1_5B, tp, gpu(80)).interconnect}
     assert roles["rollout"].classes["nvlink"] == "supported"
     assert set(BANDWIDTH_GB_S) >= set(multi.classes)
+
+
+def test_rollout_tensor_parallel_must_fit_one_node() -> None:
+    cfg = dataclasses.replace(B_BASE, rollout=RolloutConfig(64, 512, 1024, tensor_parallel=8))
+    one_gpu = estimate(QWEN_1_5B, cfg, gpu(80))
+    assert one_gpu.verdict == "does_not_fit"
+    assert any("splits the model over 8 GPUs" in a for a in one_gpu.assumptions)
+    # Two nodes of 4 GPUs still can't host a group of 8.
+    two_nodes = Topology(device_from_profile("nvidia-32-80gb", 80), devices=4, nodes=2)
+    assert estimate(QWEN_1_5B, cfg, two_nodes).verdict == "does_not_fit"
+    eight = estimate(QWEN_1_5B, cfg, gpu(80, devices=8))
+    assert eight.devices[0].verdict != "does_not_fit"
+    assert not any("splits the model" in a for a in eight.assumptions)
+    with pytest.raises(MrlError) as err:
+        estimate(
+            QWEN_1_5B,
+            dataclasses.replace(B_BASE, rollout=RolloutConfig(8, 64, 64, tensor_parallel=0)),
+            gpu(80),
+        )
+    assert err.value.code == "MRL-VAL-003"

@@ -400,7 +400,18 @@ class _Builder:
         ro, m = self.cfg.rollout, self.m
         if ro is None:
             return None
-        tp = max(1, ro.tensor_parallel)
+        tp = ro.tensor_parallel
+        if tp < 1:
+            raise MrlError(
+                BAD_VALUE, "The rollout tensor-parallel size must be at least 1.", str(tp)
+            )
+        if tp > self.topo.devices:
+            # Doc 07 §5.7: a tensor-parallel group stays inside one node.
+            self.rollout_verdict = "does_not_fit"
+            self.notes.append(
+                f"The rollout engine splits the model over {tp} GPUs, but each machine has "
+                f"{self.topo.devices}; the group must fit on one machine."
+            )
         kv_per_token = 2 * m.layers * m.kv_heads * m.head_dim * _bytes(ro.kv_dtype)
         tokens = ro.concurrent_sequences * (ro.prompt_tokens + ro.completion_tokens) * KV_SAFETY
         need = (
