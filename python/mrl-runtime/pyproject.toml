@@ -8,9 +8,31 @@ dependencies = [
     "grpcio==1.85.1",
     "protobuf==7.36.2",
     # <mrl:deps P13> P13 dependencies go right below this line.
+    "jsonschema==4.26.0",
+    "pyyaml==6.0.3",
 
     # <mrl:deps P15> P15 dependencies go right below this line.
+    "jinja2==3.1.6",
+    "pyarrow==26.0.1",
+    "tokenizers==0.23.3",
 ]
+
+[project.scripts]
+mrl-worker = "mrl_runtime.harness.main:main"
+mrl-conformance = "mrl_runtime.testkit.cli:main"
+
+[project.entry-points."mrl_runtime.engines"]
+builtin = "mrl_runtime.builtin.engine:manifest"
+fake = "mrl_runtime.testkit.fake:manifest"
+
+[project.entry-points."mrl_runtime.conformance"]
+fake = "mrl_runtime.testkit.fake:conformance_profile"
+
+[project.entry-points."mrl_runtime.builtin_tasks"]
+hash_files = "mrl_runtime.builtin.tasks:HASH_FILES"
+
+[dependency-groups]
+dev = ["hypothesis==6.170.14"]
 
 [build-system]
 requires = ["uv_build==0.11.28"]

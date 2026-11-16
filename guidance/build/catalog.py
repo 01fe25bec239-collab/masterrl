@@ -1040,6 +1040,11 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'what_to_do': {'steps': ['Pick a rollout engine that returns log-probabilities, like '
                                       'vLLM.',
                                       'Or use a reward that only reads the answer text.']}},
+            {'code': 'MRL-CAP-130',
+             'title': 'This built-in task is not installed.',
+             'why': "The job asked for a built-in task this version of the app doesn't have.",
+             'what_to_do': {'steps': ['Update the app on this machine, then start the job '
+                                      'again.']}},
             {'code': 'MRL-CONFLICT-001',
              'title': 'Someone changed this item after you opened it.',
              'why': 'The version you edited is older than the saved one.',
@@ -1065,6 +1070,22 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'title': 'Your dataset is not ready yet.',
              'why': 'The app is still checking or preparing it.',
              'what_to_do': {'steps': ['Wait until the dataset shows Ready, then try again.']}},
+            {'code': 'MRL-DATA-150',
+             'title': 'The app could not read this dataset file.',
+             'why': 'The file type is not one the app reads, or the file is damaged or cut short. '
+                    'Details says where reading stopped.',
+             'what_to_do': {'steps': ['Use a `.jsonl`, `.json`, `.csv`, `.tsv`, `.parquet` or '
+                                      '`.arrow` file.',
+                                      'Save the file again from the program that made it, then '
+                                      'upload it again.']}},
+            {'code': 'MRL-DATA-151',
+             'title': "This dataset file has a column type the app doesn't read.",
+             'why': 'The app reads text, numbers, true or false values, lists and nested records. '
+                    'Raw bytes, dates and other types are refused.',
+             'what_to_do': {'steps': ['Convert the column named in Details to text, then upload '
+                                      'the file again.',
+                                      'For images, store a reference to each image file instead of '
+                                      'its bytes.']}},
             {'code': 'MRL-ENV-001',
              'title': "The app doesn't support this version of your operating system.",
              'why': 'The training tools need a newer version of your OS.',
@@ -1182,6 +1203,20 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                                       'If it is installed, ask your admin to allow unprivileged '
                                       'user namespaces.'],
                             'linux': ['Run `sudo apt install bubblewrap` on Ubuntu or Debian.']}},
+            {'code': 'MRL-ENV-130',
+             'title': 'The training worker and the app use different protocol versions.',
+             'why': 'The software that runs training on this machine is older or newer than the '
+                    "app. They can't talk to each other.",
+             'what_to_do': {'steps': ['Update the app on this machine, then start the run again.',
+                                      'If the run uses a custom engine, ask its maintainer for a '
+                                      'version that matches the app.']}},
+            {'code': 'MRL-ENV-131',
+             'title': 'This engine needs a different version of the MasterRL runtime.',
+             'why': "The engine was built for a version of the runtime that this machine doesn't "
+                    'have.',
+             'what_to_do': {'steps': ['Update the app on this machine, then start the run again.',
+                                      "If that doesn't help, install a version of the engine made "
+                                      'for your app version.']}},
             {'code': 'MRL-IDEM-001',
              'title': 'This request is already running.',
              'why': 'A request with the same request key started earlier and has not finished.',
@@ -1302,6 +1337,13 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'what_to_do': {'steps': ['Check the server log for the event id and the last error.',
                                       'Send them to support so they can fix the cause and replay '
                                       'the event.']}},
+            {'code': 'MRL-INTERNAL-130',
+             'title': 'The app and its training worker disagreed about the next step.',
+             'why': "The training worker got a message it didn't expect at that point. This is a "
+                    'problem in the app, not in your settings.',
+             'what_to_do': {'steps': ['Start the run again. It resumes from the last saved '
+                                      'checkpoint.',
+                                      "If it happens again, send the run's log to your admin."]}},
             {'code': 'MRL-LINK-001',
              'title': "These machines can't share one training job.",
              'why': 'They use different kinds of chips, like a Mac and an NVIDIA computer. One job '
@@ -1361,6 +1403,26 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': "The model's owner asks you to accept its license before you download it.",
              'what_to_do': {'steps': ['Open the model page and read the license.',
                                       'Accept the license, then try again.']}},
+            {'code': 'MRL-MODEL-150',
+             'title': "The app could not read this model's files.",
+             'why': 'A weight file or a settings file is damaged, cut short, or not in a format '
+                    'the app knows. Details names the file.',
+             'what_to_do': {'steps': ['Download the model again, then add it again.',
+                                      'If you made the files yourself, save the weights as '
+                                      '`.safetensors` files.']}},
+            {'code': 'MRL-MODEL-151',
+             'title': "This model can answer prompts, but the app can't train it.",
+             'why': 'Its weights are compressed for running only, like `.gguf`, `.onnx` or 4-bit '
+                    'files. Training needs the full weights.',
+             'what_to_do': {'steps': ['Use this model for chat and evaluation only.',
+                                      'To train, pick the original model with full `.safetensors` '
+                                      'weights.']}},
+            {'code': 'MRL-MODEL-152',
+             'title': "The app could not use this model's tokenizer or chat template.",
+             'why': 'The tokenizer file is missing or damaged, or the chat template has an error. '
+                    'Details says which.',
+             'what_to_do': {'steps': ['Check that the model folder has a `tokenizer.json` file.',
+                                      'Download the model again if the file is damaged.']}},
             {'code': 'MRL-NODE-121',
              'title': 'The agent could not save or read its local files.',
              'why': 'The disk may be full, or the agent may not have permission to use its state '
@@ -1423,6 +1485,78 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': 'The server has no endpoint at this path.',
              'what_to_do': {'steps': ['Check the path against the reference at '
                                       '`/api-docs/openapi.json`.']}},
+            {'code': 'MRL-RWD-140',
+             'title': 'The reward policy has a problem.',
+             'why': "A field in the policy is missing, has a value the app doesn't accept, or "
+                    'clashes with another field. Details names the field.',
+             'what_to_do': {'steps': ['Open the reward policy and fix the field named in Details.',
+                                      'Save the policy, then run its tests again.']}},
+            {'code': 'MRL-RWD-141',
+             'title': 'A condition in the reward policy could not be read.',
+             'why': "A `when` or `require` condition uses a word, sign or shape the app doesn't "
+                    'know. Details shows the condition and the spot.',
+             'what_to_do': {'steps': ['Use only field names, numbers, quoted text, `true`, `false` '
+                                      'and `null`.',
+                                      'Join conditions with `and`, `or` and `not`, and compare '
+                                      'with `==`, `!=`, `<` or `>`.',
+                                      'Start field names with `sample.` or `components.`.']}},
+            {'code': 'MRL-RWD-142',
+             'title': "The reward policy uses a component that isn't installed.",
+             'why': "The name or version after `use:` doesn't match any reward component here. "
+                    'Details lists the versions that exist.',
+             'what_to_do': {'steps': ['Check the spelling of the component name, like '
+                                      '`builtin/math.verify@1`.',
+                                      'Pick a version from the list in Details.']}},
+            {'code': 'MRL-RWD-143',
+             'title': "A reward component's settings need a change.",
+             'why': "One of the component's settings is missing or has a value it doesn't accept. "
+                    'Details names the component and setting.',
+             'what_to_do': {'steps': ["Open the component's settings in the policy.",
+                                      'Fix the setting named in Details, then save.']}},
+            {'code': 'MRL-RWD-144',
+             'title': 'Too many samples in a batch failed to get a reward.',
+             'why': 'More samples failed than the policy allows, or the policy stops the batch '
+                    'when any sample fails. The training step stopped so it would not learn from '
+                    'missing rewards.',
+             'what_to_do': {'steps': ['Open the reward details for this step to see which '
+                                      'component failed and why.',
+                                      'If a component took too long, raise its '
+                                      '`per_sample_timeout_ms`.',
+                                      'If a few failures are fine, raise `max_failure_rate` in the '
+                                      'policy.']}},
+            {'code': 'MRL-RWD-145',
+             'title': 'The reward service got a request for a different run or reward version.',
+             'why': "The request did not carry this run's key, or it asked for a reward version "
+                    'the service has not loaded.',
+             'what_to_do': {'steps': ['Restart the run so its reward service loads the right '
+                                      'version.',
+                                      'If it keeps happening, ask your admin to check the machine '
+                                      'running the run.']}},
+            {'code': 'MRL-RWD-146',
+             'title': "This reward's custom code can't run here yet.",
+             'why': 'Custom reward code runs only inside the reward sandbox, and this setup '
+                    "doesn't have it yet.",
+             'what_to_do': {'steps': ['Use built-in reward components for now.',
+                                      'Remove the `code/` folder from the reward files, then try '
+                                      'again.']}},
+            {'code': 'MRL-RWD-147',
+             'title': 'The app could not load the reward files.',
+             'why': 'A file the reward needs is missing, too large or broken. Details names the '
+                    'file.',
+             'what_to_do': {'steps': ['Check the file named in Details.',
+                                      'Fix or replace it, then upload the reward files again.']}},
+            {'code': 'MRL-RWD-148',
+             'title': "Step-by-step rewards aren't available yet.",
+             'why': 'The policy asks for one reward per step (`scalar.step`), but this version '
+                    'gives one reward per whole response.',
+             'what_to_do': {'steps': ["Set the policy's `signal` to `scalar.sequence`."]}},
+            {'code': 'MRL-RWD-149',
+             'title': 'The reward service could not start.',
+             'why': 'Its listen address, run key or network check failed. Details says which one.',
+             'what_to_do': {'steps': ['Restart the run.',
+                                      'If you started the service by hand, use a listen address '
+                                      'like `unix:/tmp/reward.sock`.',
+                                      'For local testing only, add `--allow-network`.']}},
             {'code': 'MRL-STORE-001',
              'title': 'The app refused a storage path.',
              'why': "The path points outside your workspace's storage area, or it has a part the "
@@ -1597,6 +1731,22 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': "A profile, job name or other name doesn't match any the agent knows.",
              'what_to_do': {'steps': ['Pick one of the names listed in Details.',
                                       'Check the spelling, then try again.']}},
+            {'code': 'MRL-VAL-130',
+             'title': 'The engine manifest has a problem.',
+             'why': "The engine's `mrl-engine.yaml` file, or one of its parts, doesn't match the "
+                    'format the app expects. Details names each field.',
+             'what_to_do': {'steps': ["Ask the engine's maintainer for a fixed version of the "
+                                      'engine.',
+                                      'If you build the engine yourself, fix the fields named in '
+                                      'Details, then install it again.']}},
+            {'code': 'MRL-VAL-131',
+             'title': "A built-in task got inputs it can't use.",
+             'why': "The job gave the task an input it doesn't expect, or left one out. Details "
+                    'names the input.',
+             'what_to_do': {'steps': ['Start the action again from the app, so it sends the inputs '
+                                      'the task needs.',
+                                      'If a script started the job, fix the input named in '
+                                      'Details.']}},
             {'code': 'NODE_LOST',
              'title': 'The app lost contact with a machine in this run.',
              'why': 'The machine may have shut down, gone to sleep or dropped off the network.',

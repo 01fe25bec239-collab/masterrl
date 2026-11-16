@@ -1,0 +1,11 @@
+component: builtin/length.soft_overlong@1
+params: {max_tokens: 2048, cache_tokens: 256}
+cases:
+  - {name: short, tokens: 100, expect: {value: 0.0}}
+  - {name: at_start_of_band, tokens: 1792, expect: {value: 0.0}}
+  - {name: inside_band, tokens: 1920, expect: {value: -0.5}}
+  - {name: at_max, tokens: 2048, expect: {value: -1.0}}
+  - {name: over, tokens: 3000, expect: {value: -1.0, flags: [overlong]}}
+  - {name: zero, tokens: 0, expect: {value: 0.0}}
+  - {name: cache_above_max, params: {max_tokens: 10, cache_tokens: 20}, tokens: 1, expect: {setup_error: MRL-RWD-143}}
+  - {name: missing_param, params: {max_tokens: 10}, tokens: 1, expect: {setup_error: MRL-RWD-143}}

@@ -2143,6 +2143,16 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-CAP-130")),
+            ("title", Value::Str("This built-in task is not installed.")),
+            ("why", Value::Str("The job asked for a built-in task this version of the app doesn't have.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Update the app on this machine, then start the job again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-CONFLICT-001")),
             ("title", Value::Str("Someone changed this item after you opened it.")),
             ("why", Value::Str("The version you edited is older than the saved one.")),
@@ -2191,6 +2201,28 @@ pub static CATALOG: Value = Value::Map(&[
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Wait until the dataset shows Ready, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-DATA-150")),
+            ("title", Value::Str("The app could not read this dataset file.")),
+            ("why", Value::Str("The file type is not one the app reads, or the file is damaged or cut short. Details says where reading stopped.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Use a `.jsonl`, `.json`, `.csv`, `.tsv`, `.parquet` or `.arrow` file."),
+                    Value::Str("Save the file again from the program that made it, then upload it again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-DATA-151")),
+            ("title", Value::Str("This dataset file has a column type the app doesn't read.")),
+            ("why", Value::Str("The app reads text, numbers, true or false values, lists and nested records. Raw bytes, dates and other types are refused.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Convert the column named in Details to text, then upload the file again."),
+                    Value::Str("For images, store a reference to each image file instead of its bytes."),
                 ])),
             ])),
         ]),
@@ -2414,6 +2446,28 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-ENV-130")),
+            ("title", Value::Str("The training worker and the app use different protocol versions.")),
+            ("why", Value::Str("The software that runs training on this machine is older or newer than the app. They can't talk to each other.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Update the app on this machine, then start the run again."),
+                    Value::Str("If the run uses a custom engine, ask its maintainer for a version that matches the app."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-ENV-131")),
+            ("title", Value::Str("This engine needs a different version of the MasterRL runtime.")),
+            ("why", Value::Str("The engine was built for a version of the runtime that this machine doesn't have.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Update the app on this machine, then start the run again."),
+                    Value::Str("If that doesn't help, install a version of the engine made for your app version."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-IDEM-001")),
             ("title", Value::Str("This request is already running.")),
             ("why", Value::Str("A request with the same request key started earlier and has not finished.")),
@@ -2623,6 +2677,17 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-INTERNAL-130")),
+            ("title", Value::Str("The app and its training worker disagreed about the next step.")),
+            ("why", Value::Str("The training worker got a message it didn't expect at that point. This is a problem in the app, not in your settings.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Start the run again. It resumes from the last saved checkpoint."),
+                    Value::Str("If it happens again, send the run's log to your admin."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-LINK-001")),
             ("title", Value::Str("These machines can't share one training job.")),
             ("why", Value::Str("They use different kinds of chips, like a Mac and an NVIDIA computer. One job needs one kind.")),
@@ -2734,6 +2799,39 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Open the model page and read the license."),
                     Value::Str("Accept the license, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-MODEL-150")),
+            ("title", Value::Str("The app could not read this model's files.")),
+            ("why", Value::Str("A weight file or a settings file is damaged, cut short, or not in a format the app knows. Details names the file.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Download the model again, then add it again."),
+                    Value::Str("If you made the files yourself, save the weights as `.safetensors` files."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-MODEL-151")),
+            ("title", Value::Str("This model can answer prompts, but the app can't train it.")),
+            ("why", Value::Str("Its weights are compressed for running only, like `.gguf`, `.onnx` or 4-bit files. Training needs the full weights.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Use this model for chat and evaluation only."),
+                    Value::Str("To train, pick the original model with full `.safetensors` weights."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-MODEL-152")),
+            ("title", Value::Str("The app could not use this model's tokenizer or chat template.")),
+            ("why", Value::Str("The tokenizer file is missing or damaged, or the chat template has an error. Details says which.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check that the model folder has a `tokenizer.json` file."),
+                    Value::Str("Download the model again if the file is damaged."),
                 ])),
             ])),
         ]),
@@ -2856,6 +2954,118 @@ pub static CATALOG: Value = Value::Map(&[
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Check the path against the reference at `/api-docs/openapi.json`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-140")),
+            ("title", Value::Str("The reward policy has a problem.")),
+            ("why", Value::Str("A field in the policy is missing, has a value the app doesn't accept, or clashes with another field. Details names the field.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Open the reward policy and fix the field named in Details."),
+                    Value::Str("Save the policy, then run its tests again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-141")),
+            ("title", Value::Str("A condition in the reward policy could not be read.")),
+            ("why", Value::Str("A `when` or `require` condition uses a word, sign or shape the app doesn't know. Details shows the condition and the spot.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Use only field names, numbers, quoted text, `true`, `false` and `null`."),
+                    Value::Str("Join conditions with `and`, `or` and `not`, and compare with `==`, `!=`, `<` or `>`."),
+                    Value::Str("Start field names with `sample.` or `components.`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-142")),
+            ("title", Value::Str("The reward policy uses a component that isn't installed.")),
+            ("why", Value::Str("The name or version after `use:` doesn't match any reward component here. Details lists the versions that exist.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check the spelling of the component name, like `builtin/math.verify@1`."),
+                    Value::Str("Pick a version from the list in Details."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-143")),
+            ("title", Value::Str("A reward component's settings need a change.")),
+            ("why", Value::Str("One of the component's settings is missing or has a value it doesn't accept. Details names the component and setting.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Open the component's settings in the policy."),
+                    Value::Str("Fix the setting named in Details, then save."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-144")),
+            ("title", Value::Str("Too many samples in a batch failed to get a reward.")),
+            ("why", Value::Str("More samples failed than the policy allows, or the policy stops the batch when any sample fails. The training step stopped so it would not learn from missing rewards.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Open the reward details for this step to see which component failed and why."),
+                    Value::Str("If a component took too long, raise its `per_sample_timeout_ms`."),
+                    Value::Str("If a few failures are fine, raise `max_failure_rate` in the policy."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-145")),
+            ("title", Value::Str("The reward service got a request for a different run or reward version.")),
+            ("why", Value::Str("The request did not carry this run's key, or it asked for a reward version the service has not loaded.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Restart the run so its reward service loads the right version."),
+                    Value::Str("If it keeps happening, ask your admin to check the machine running the run."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-146")),
+            ("title", Value::Str("This reward's custom code can't run here yet.")),
+            ("why", Value::Str("Custom reward code runs only inside the reward sandbox, and this setup doesn't have it yet.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Use built-in reward components for now."),
+                    Value::Str("Remove the `code/` folder from the reward files, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-147")),
+            ("title", Value::Str("The app could not load the reward files.")),
+            ("why", Value::Str("A file the reward needs is missing, too large or broken. Details names the file.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check the file named in Details."),
+                    Value::Str("Fix or replace it, then upload the reward files again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-148")),
+            ("title", Value::Str("Step-by-step rewards aren't available yet.")),
+            ("why", Value::Str("The policy asks for one reward per step (`scalar.step`), but this version gives one reward per whole response.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Set the policy's `signal` to `scalar.sequence`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-149")),
+            ("title", Value::Str("The reward service could not start.")),
+            ("why", Value::Str("Its listen address, run key or network check failed. Details says which one.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Restart the run."),
+                    Value::Str("If you started the service by hand, use a listen address like `unix:/tmp/reward.sock`."),
+                    Value::Str("For local testing only, add `--allow-network`."),
                 ])),
             ])),
         ]),
@@ -3168,6 +3378,28 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Pick one of the names listed in Details."),
                     Value::Str("Check the spelling, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-130")),
+            ("title", Value::Str("The engine manifest has a problem.")),
+            ("why", Value::Str("The engine's `mrl-engine.yaml` file, or one of its parts, doesn't match the format the app expects. Details names each field.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Ask the engine's maintainer for a fixed version of the engine."),
+                    Value::Str("If you build the engine yourself, fix the fields named in Details, then install it again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-131")),
+            ("title", Value::Str("A built-in task got inputs it can't use.")),
+            ("why", Value::Str("The job gave the task an input it doesn't expect, or left one out. Details names the input.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Start the action again from the app, so it sends the inputs the task needs."),
+                    Value::Str("If a script started the job, fix the input named in Details."),
                 ])),
             ])),
         ]),

@@ -1,0 +1,41 @@
+# P15 model and dataset inspection errors (python/mrl-runtime: model, data).
+errors:
+  - code: MRL-MODEL-150
+    title: The app could not read this model's files.
+    why: A weight file or a settings file is damaged, cut short, or not in a format the app knows. Details names the file.
+    what_to_do:
+      steps:
+        - Download the model again, then add it again.
+        - If you made the files yourself, save the weights as `.safetensors` files.
+
+  - code: MRL-MODEL-151
+    title: This model can answer prompts, but the app can't train it.
+    why: Its weights are compressed for running only, like `.gguf`, `.onnx` or 4-bit files. Training needs the full weights.
+    what_to_do:
+      steps:
+        - Use this model for chat and evaluation only.
+        - To train, pick the original model with full `.safetensors` weights.
+
+  - code: MRL-MODEL-152
+    title: The app could not use this model's tokenizer or chat template.
+    why: The tokenizer file is missing or damaged, or the chat template has an error. Details says which.
+    what_to_do:
+      steps:
+        - Check that the model folder has a `tokenizer.json` file.
+        - Download the model again if the file is damaged.
+
+  - code: MRL-DATA-150
+    title: The app could not read this dataset file.
+    why: The file type is not one the app reads, or the file is damaged or cut short. Details says where reading stopped.
+    what_to_do:
+      steps:
+        - Use a `.jsonl`, `.json`, `.csv`, `.tsv`, `.parquet` or `.arrow` file.
+        - Save the file again from the program that made it, then upload it again.
+
+  - code: MRL-DATA-151
+    title: This dataset file has a column type the app doesn't read.
+    why: The app reads text, numbers, true or false values, lists and nested records. Raw bytes, dates and other types are refused.
+    what_to_do:
+      steps:
+        - Convert the column named in Details to text, then upload the file again.
+        - For images, store a reference to each image file instead of its bytes.
