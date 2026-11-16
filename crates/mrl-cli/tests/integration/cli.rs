@@ -1,7 +1,8 @@
 //! The `mrl` binary against a real team-mode test server with PostgreSQL.
 //! The tenancy endpoints come from [`TenancyDouble`] until a real tenancy API exists.
 
-use crate::support::{runs_server, test_user, TenancyDouble};
+use crate::support::{call, runs_server, test_user, TenancyDouble};
+use axum::http::Method;
 use mrl_domain::ids::{DatasetVersionId, ModelVersionId, OrgId};
 use mrl_domain::rbac::Role;
 use mrl_server::modules::jobs::Chains;
@@ -112,6 +113,17 @@ fn seed_then_submit_returns_a_rejected_run_with_code_and_hint() {
         "the second seed created nothing"
     );
     assert!(again.contains("signed in as usr_admin (user)"));
+    // Like the real API, the fake refuses a second `dev` with 409 (the seed reads that as "already there").
+    let body = serde_json::json!({"slug": "dev", "name": "dev"});
+    let dup = rt.block_on(call(
+        &srv,
+        Method::POST,
+        "/api/v1/orgs",
+        "tok",
+        None,
+        Some(&body),
+    ));
+    assert_eq!(dup.status, 409);
 
     // Submit: the default chains reject it with MRL-CAP-001 and a hint.
     let model = ModelVersionId::new().to_string();

@@ -40,6 +40,21 @@ pub fn explain(code: &str, detail: &str) -> String {
     out
 }
 
+/// A failed call: the HTTP status when the server answered, and the plain-language message.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Failure {
+    /// The status, or `None` when nothing answered.
+    pub status: Option<u16>,
+    /// Code, title, details and steps.
+    pub message: String,
+}
+
+impl From<Failure> for String {
+    fn from(f: Failure) -> Self {
+        f.message
+    }
+}
+
 /// A signed-in connection to one server.
 pub struct Api {
     base: String,
@@ -80,7 +95,7 @@ impl Api {
     }
 
     /// `GET /api/v1{path}`.
-    pub fn get(&self, path: &str) -> Result<Value, String> {
+    pub fn get(&self, path: &str) -> Result<Value, Failure> {
         self.send(reqwest::Method::GET, path, None, None)
     }
 
@@ -90,7 +105,7 @@ impl Api {
         path: &str,
         body: Option<&Value>,
         key: Option<&str>,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, Failure> {
         self.send(reqwest::Method::POST, path, body, key)
     }
 
@@ -100,7 +115,11 @@ impl Api {
         path: &str,
         body: Option<&Value>,
         key: Option<&str>,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, Failure> {
+        let unreachable = |detail: String| Failure {
+            status: None,
+            message: explain(UNREACHABLE, &detail),
+        };
         let url = format!("{}/api/v1{path}", self.base);
         let mut req = self.http.request(method, &url);
         if let Some(t) = &self.token {
@@ -123,12 +142,12 @@ impl Api {
             } else {
                 "Nothing answered"
             };
-            explain(UNREACHABLE, &format!("{what} at {}.", self.base))
+            unreachable(format!("{what} at {}.", self.base))
         })?;
         let status = res.status();
         let text = res
             .text()
-            .map_err(|e| explain(UNREACHABLE, &format!("The answer broke off: {e}.")))?;
+            .map_err(|e| unreachable(format!("The answer broke off: {e}.")))?;
         let json: Value = if text.is_empty() {
             Value::Null
         } else {
@@ -137,7 +156,10 @@ impl Api {
         if status.is_success() {
             return Ok(json);
         }
-        Err(problem(status.as_u16(), &json))
+        Err(Failure {
+            status: Some(status.as_u16()),
+            message: problem(status.as_u16(), &json),
+        })
     }
 }
 

@@ -158,7 +158,7 @@ struct Tenancy {
 /// An in-memory stand-in for the tenancy API `mrl dev seed` and `mrl projects` call:
 /// P16's `GET /auth/me` and Doc 09 §6.3's `GET/POST /orgs`, `GET/POST
 /// /orgs/{org}/workspaces`, `GET/POST /workspaces/{ws}/projects`, `GET /projects/{prj}`.
-/// Lists are paged (`?cursor=`) with a settable page size.
+/// Lists are paged (`?cursor=`) with a settable page size; a duplicate slug gets 409.
 #[derive(Clone)]
 pub struct TenancyDouble(Arc<Mutex<Tenancy>>);
 
@@ -205,7 +205,17 @@ fn page(items: &[Value], size: usize, q: &Cursor) -> Json<Value> {
     Json(json!({ "items": items.get(start..end).unwrap_or(&[]), "next_cursor": next }))
 }
 
-fn create(list: &mut Vec<Value>, item: Value) -> (StatusCode, Json<Value>) {
+/// Adds `item` unless an item with its slug already exists in the same scope (`scope` key):
+/// then 409 with a problem document, like a unique constraint would.
+fn create(list: &mut Vec<Value>, item: Value, scope: &str) -> (StatusCode, Json<Value>) {
+    let dup = list
+        .iter()
+        .any(|i| i["slug"] == item["slug"] && i.get(scope) == item.get(scope));
+    if dup {
+        let problem =
+            json!({"code": "MRL-CONFLICT-001", "status": 409, "detail": "That slug is taken."});
+        return (StatusCode::CONFLICT, Json(problem));
+    }
     list.push(item.clone());
     (StatusCode::CREATED, Json(item))
 }
@@ -231,7 +241,7 @@ impl ServerModule for TenancyDouble {
                 })
                 .post(move |Json(b): Json<Value>| async move {
                     let item = json!({"id": OrgId::new().to_string(), "slug": b["slug"], "name": b["name"]});
-                    create(&mut t2.lock().orgs, item)
+                    create(&mut t2.lock().orgs, item, "none")
                 }),
             )
             .route(
@@ -244,7 +254,7 @@ impl ServerModule for TenancyDouble {
                 })
                 .post(move |Path(org): Path<String>, Json(b): Json<Value>| async move {
                     let item = json!({"id": WorkspaceId::new().to_string(), "org_id": org, "slug": b["slug"], "name": b["name"]});
-                    create(&mut t4.lock().workspaces, item)
+                    create(&mut t4.lock().workspaces, item, "org_id")
                 }),
             )
             .route(
@@ -257,7 +267,7 @@ impl ServerModule for TenancyDouble {
                 })
                 .post(move |Path(ws): Path<String>, Json(b): Json<Value>| async move {
                     let item = json!({"id": ProjectId::new().to_string(), "workspace_id": ws, "slug": b["slug"], "name": b["name"]});
-                    create(&mut t6.lock().projects, item)
+                    create(&mut t6.lock().projects, item, "workspace_id")
                 }),
             )
             .route(
