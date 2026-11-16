@@ -21,7 +21,7 @@ from mrl_runtime.adapter import (
     ValidationRequest,
 )
 from mrl_runtime.harness import HarnessOptions
-from mrl_runtime.logs import MAX_LINE, LogStream
+from mrl_runtime.logs import HOLD_CAP, MAX_LINE, LogStream
 from mrl_runtime.redact import MASK, Redactor
 from mrl_runtime.testkit.agent import AgentScript
 from mrl_runtime.testkit.fake import FakeEngine, manifest
@@ -117,6 +117,41 @@ def test_unterminated_private_key_is_masked_at_flush() -> None:
     assert chunks == []  # held: the END line has not arrived
     stream.flush()
     assert PEM_BODY.encode() not in _joined(chunks)
+
+
+def test_unicode_secret_split_inside_a_character_is_masked() -> None:
+    known = "canary-café-0123456789"
+    stream, chunks = _stream([known])
+    raw = known.encode()
+    split = raw.index("é".encode()) + 1  # between the two bytes of é
+    stream.write(b"start " + raw[:split])
+    stream.write(raw[split:] + b" end\n")
+    stream.write(b"bad \xff byte\n")
+    stream.flush()
+    data = _joined(chunks)
+    assert raw not in data
+    assert raw[:split] not in data
+    assert data == f"start {MASK} end\n".encode() + b"bad \xff byte\n"
+
+
+def test_private_key_longer_than_the_hold_cap_stays_masked() -> None:
+    stream, chunks = _stream([])
+    begin, _, _, end = PEM.split("\n")
+    early, late = "Q" * 63 + "\n", "Z" * 63 + "\n"
+    stream.write(begin.encode() + b"\n")
+    for _ in range(HOLD_CAP // len(early) + 2):  # past the cap: the stream must flush
+        stream.write(early.encode())
+    assert chunks  # it really was forced out
+    for _ in range(50):
+        stream.write(late.encode())
+    stream.write(end[:10].encode())  # END line split across writes
+    stream.write(end[10:].encode() + b"\nafter the key\n")
+    stream.flush()
+    data = _joined(chunks)
+    assert b"QQQQ" not in data
+    assert b"ZZZZ" not in data
+    assert MASK.encode() in data
+    assert data.endswith(b"after the key\n")
 
 
 def test_known_values_and_env() -> None:
