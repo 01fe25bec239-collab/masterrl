@@ -73,7 +73,8 @@ pub struct Config {
     /// Logs and traces.
     pub telemetry: TelemetryConfig,
     // <mrl:config P16> P16 settings fields go right below this line.
-
+    /// Sign-in (Supabase) and access tokens.
+    pub auth: crate::modules::auth::AuthConfig,
     // <mrl:config P17> P17 settings fields go right below this line.
 
     // <mrl:config P18> P18 settings fields go right below this line.
@@ -459,6 +460,7 @@ impl Config {
             }
         }
         // <mrl:validate P16> P16 checks (push to `problems`) go right below this line.
+        problems.extend(self.auth.problems());
 
         // <mrl:validate P17> P17 checks (push to `problems`) go right below this line.
 

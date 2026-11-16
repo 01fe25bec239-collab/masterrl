@@ -374,8 +374,9 @@ impl Seams {
         SeamsBuilder::default()
     }
 
-    /// The seams production uses for `mode`. Team mode has no identity provider yet (P16),
-    /// so `build(Mode::Team)` on this fails with MRL-INTERNAL-004.
+    /// The database-free base seams for `mode`. `main` adds the production ones on top
+    /// (P16: `CoreAuthenticator`, `Rbac`, `PgAuditSink`, `SupabaseIdentity`, the keychain);
+    /// without an identity provider, `build(Mode::Team)` fails with MRL-INTERNAL-004.
     pub fn production(mode: Mode, launch_secret: &str) -> SeamsBuilder {
         let ids: Arc<dyn IdGenerator> = Arc::new(UuidV7Ids);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -460,6 +461,16 @@ impl SeamsBuilder {
     /// Sets the secret store.
     pub fn secrets(mut self, v: impl SecretStore + 'static) -> Self {
         self.secrets = Some(Arc::new(v));
+        self
+    }
+    /// Sets the identity provider from a shared handle.
+    pub fn identity_arc(mut self, v: Arc<dyn IdentityProvider>) -> Self {
+        self.identity = Some(v);
+        self
+    }
+    /// Sets the secret store from a shared handle.
+    pub fn secrets_arc(mut self, v: Arc<dyn SecretStore>) -> Self {
+        self.secrets = Some(v);
         self
     }
 

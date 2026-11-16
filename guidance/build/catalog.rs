@@ -1896,6 +1896,49 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-AUTH-160")),
+            ("title", Value::Str("Your sign-in has expired.")),
+            ("why", Value::Str("The sign-in service no longer accepts this computer's session. Your local work keeps running; only setup sync and teams need a fresh sign-in.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Sign in again from Settings, or run `mrl login`."),
+                    Value::Str("Then repeat what you were doing, like `mrl sync push`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-AUTH-161")),
+            ("title", Value::Str("The sign-in did not finish.")),
+            ("why", Value::Str("The sign-in took longer than 10 minutes, was used twice, or the sign-in service refused it.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Start the sign-in again and finish it in the browser within 10 minutes."),
+                    Value::Str("If it keeps failing, close other sign-in tabs and try once more."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-AUTH-162")),
+            ("title", Value::Str("Sign-in isn't set up in this app.")),
+            ("why", Value::Str("This app has no address for the sign-in service. Local work does not need it.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Keep working offline, or ask whoever runs this app to set `auth.supabase_url` and `auth.supabase_anon_key`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-AUTH-163")),
+            ("title", Value::Str("This app is signed in to a different account.")),
+            ("why", Value::Str("One computer links to one account at a time. Another account is signed in right now.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Sign out first with `mrl logout` or in Settings."),
+                    Value::Str("Then sign in with the account you want."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-CAP-001")),
             ("title", Value::Str("No engine here supports this method.")),
             ("why", Value::Str("The training engines on this machine can't run the method you picked.")),
@@ -2468,6 +2511,38 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-ENV-160")),
+            ("title", Value::Str("This computer has no keychain service.")),
+            ("why", Value::Str("The app keeps secrets in your system keychain. This computer has none running, so secrets go to an encrypted file instead.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("You can keep working. Anyone who can read the app's data folder could read these secrets."),
+                ])),
+                ("linux", Value::List(&[
+                    Value::Str("Install and start a Secret Service keyring, like the `gnome-keyring` package, then restart the app."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-ENV-161")),
+            ("title", Value::Str("The app could not use this computer's keychain.")),
+            ("why", Value::Str("The keychain is locked, or it refused the app access.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Unlock your keychain, then try again."),
+                ])),
+                ("macos", Value::List(&[
+                    Value::Str("Open Keychain Access and allow MasterRL when it asks."),
+                ])),
+                ("windows", Value::List(&[
+                    Value::Str("Open Credential Manager and check that it works."),
+                ])),
+                ("linux", Value::List(&[
+                    Value::Str("Unlock your login keyring, for example with the `seahorse` app."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-IDEM-001")),
             ("title", Value::Str("This request is already running.")),
             ("why", Value::Str("A request with the same request key started earlier and has not finished.")),
@@ -2770,6 +2845,17 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-LINK-160")),
+            ("title", Value::Str("The app could not reach the sign-in service.")),
+            ("why", Value::Str("This computer is offline, or the sign-in service did not answer. Local work keeps running.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check your internet connection, then try again."),
+                    Value::Str("Your setup stays on this computer until you can sync it."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-MODEL-001")),
             ("title", Value::Str("The app did not load this model's files, to keep your computer safe.")),
             ("why", Value::Str("The weights use the pickle format, which can run hidden code. The app allows only safetensors files.")),
@@ -2958,6 +3044,17 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-RES-160")),
+            ("title", Value::Str("There is no saved setup to restore.")),
+            ("why", Value::Str("This account has no saved setup yet, or not the copy you asked for.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Run `mrl sync status` to see the saved copies."),
+                    Value::Str("On the computer that has your setup, run `mrl sync push` first."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-RWD-140")),
             ("title", Value::Str("The reward policy has a problem.")),
             ("why", Value::Str("A field in the policy is missing, has a value the app doesn't accept, or clashes with another field. Details names the field.")),
@@ -3066,6 +3163,17 @@ pub static CATALOG: Value = Value::Map(&[
                     Value::Str("Restart the run."),
                     Value::Str("If you started the service by hand, use a listen address like `unix:/tmp/reward.sock`."),
                     Value::Str("For local testing only, add `--allow-network`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STATE-160")),
+            ("title", Value::Str("Setup sync isn't turned on yet.")),
+            ("why", Value::Str("Sync needs a passphrase first. The app locks your setup with it before it leaves this computer.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Run `mrl sync setup` or turn on sync in Settings."),
+                    Value::Str("Save the recovery key it shows in a safe place."),
                 ])),
             ])),
         ]),
@@ -3400,6 +3508,18 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Start the action again from the app, so it sends the inputs the task needs."),
                     Value::Str("If a script started the job, fix the input named in Details."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-160")),
+            ("title", Value::Str("This passphrase or recovery key doesn't open your saved setup.")),
+            ("why", Value::Str("The saved setup is locked with your sync passphrase. The app can't read it with a different one.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check for typing mistakes and the right letter case."),
+                    Value::Str("Use the recovery key you saved when you turned on sync."),
+                    Value::Str("Without either one, nobody can open the saved setup. Set up this computer again by hand."),
                 ])),
             ])),
         ]),

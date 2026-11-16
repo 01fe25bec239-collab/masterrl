@@ -2,13 +2,16 @@
 
 use clap::{Parser, Subcommand};
 use mrl_server::config::{Config, DatabaseConfig, Mode, Overrides, Role};
-use mrl_server::db::{self, Db, DbError, PgIdempotencyStore};
+use mrl_server::db::{self, Db, DbError};
 use mrl_server::error::{ErrorCode, ServerError};
+use mrl_server::modules::auth::production_seams;
+use mrl_server::modules::keychain::KeychainStore;
 use mrl_server::pgbundle::{
-    self, BundleError, BundleOptions, FileSecretStore, PgBinaries, PgBundle,
+    self, BundleError, BundleOptions, FileSecretStore, PgBinaries, PgBundle, PASSWORD_SECRET,
 };
-use mrl_server::seams::{Seams, LAUNCH_SECRET_ENV};
+use mrl_server::seams::{SecretStore, LAUNCH_SECRET_ENV};
 use mrl_server::{app, openapi, registry, telemetry, App};
+use sha2::{Digest, Sha256};
 use sqlx::postgres::PgConnectOptions;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -138,10 +141,16 @@ async fn run(cli: Cli) -> Result<(), Failure> {
         .into());
     }
     let telemetry = telemetry::init(&config.telemetry)?;
-    let (db, bundle) = open_database(&config, &env).await?;
+    let secrets_dir = pgbundle::data_dir(&config.pgbundle)?.join("secrets");
+    let (db, bundle) = open_database(&config, &env, &secrets_dir).await?;
     let result = match cli.command {
         Some(Command::Migrate { dry_run }) => migrate(&db, dry_run).await,
-        _ => serve(config, &env, cli.headless, db, bundle.as_ref()).await,
+        _ => {
+            let service = &config.auth.keychain_service;
+            let secrets: Arc<dyn SecretStore> =
+                Arc::new(KeychainStore::open(service, &secrets_dir).await);
+            serve(config, &env, cli.headless, db, bundle.as_ref(), secrets).await
+        }
     };
     let stopped = match bundle {
         Some(b) => b.stop().await.map_err(Failure::from),
@@ -157,11 +166,12 @@ async fn serve(
     headless: bool,
     db: Db,
     bundle: Option<&PgBundle>,
+    secrets: Arc<dyn SecretStore>,
 ) -> Result<(), Failure> {
     let mode = config.server.mode;
     let (secret, generated) = launch_secret(env);
-    let seams = Seams::production(mode, &secret)
-        .idempotency(PgIdempotencyStore::new(db.clone()))
+    let seams = production_seams(&config, &db, secrets, &secret)
+        .await?
         .build(mode)?;
     let modules = registry::modules(&db, &config);
     let running = App::new(config, seams, modules).start().await?;
@@ -207,6 +217,7 @@ async fn migrate(db: &Db, dry_run: bool) -> Result<(), Failure> {
 async fn open_database(
     config: &Config,
     env: &[(String, String)],
+    secrets_dir: &std::path::Path,
 ) -> Result<(Db, Option<PgBundle>), Failure> {
     let lazy = |url: &str| -> Result<Db, Failure> {
         let options: PgConnectOptions = url.parse().map_err(|_| {
@@ -245,13 +256,42 @@ async fn open_database(
         }
         Err(e) => return Err(e.into()),
     };
-    // ponytail: the password sits in the data folder until P16's keychain `SecretStore`.
-    let secrets = Arc::new(FileSecretStore::new(pgbundle::data_dir(p)?.join("secrets")));
+    let secrets = bundle_secrets(
+        &config.auth.keychain_service,
+        &pgbundle::data_dir(p)?,
+        secrets_dir,
+    )
+    .await?;
     let options = BundleOptions::from_config(p, binaries, secrets).await?;
     let bundle = PgBundle::start(options).await?;
     let db =
         Db::connect_lazy(&config.database, bundle.connect_options()).with_backups(bundle.backups());
     Ok((db, Some(bundle)))
+}
+
+/// The bundled database's password lives in the keychain under a service named after the
+/// data folder, so two data folders never share one. A password an older build kept in
+/// `<data>/secrets/` moves to the keychain once.
+async fn bundle_secrets(
+    service: &str,
+    data_dir: &std::path::Path,
+    secrets_dir: &std::path::Path,
+) -> Result<Arc<dyn SecretStore>, Failure> {
+    let digest = Sha256::digest(data_dir.to_string_lossy().as_bytes());
+    let tag: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
+    let store = KeychainStore::open(&format!("{service}-db-{tag}"), secrets_dir).await;
+    let fail = |e: mrl_server::seams::SeamError| {
+        ServerError::new(ErrorCode::StartupStep, format!("database password: {e}"))
+    };
+    let old = FileSecretStore::new(secrets_dir);
+    if store.get(PASSWORD_SECRET).await.map_err(fail)?.is_none() {
+        if let Some(p) = old.get(PASSWORD_SECRET).await.map_err(fail)? {
+            store.set(PASSWORD_SECRET, p).await.map_err(fail)?;
+            old.delete(PASSWORD_SECRET).await.map_err(fail)?;
+            tracing::info!("moved the database password into the keychain");
+        }
+    }
+    Ok(Arc::new(store))
 }
 
 /// The desktop app passes the secret in `MRL_LAUNCH_SECRET`. Started by hand (development),
