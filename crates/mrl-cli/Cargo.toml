@@ -17,6 +17,19 @@ git-version = { workspace = true }
 # <mrl:deps P16> P16 dependencies go right below this line.
 
 # <mrl:deps P17> P17 dependencies go right below this line.
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "blocking"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = "=1.2.0"
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+mrl-domain = { path = "../mrl-domain" }
+mrl-server = { path = "../mrl-server" }
+mrl-testkit = { path = "../mrl-testkit" }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+uuid = { workspace = true, features = ["v4"] }
 
 [lints]
 workspace = true

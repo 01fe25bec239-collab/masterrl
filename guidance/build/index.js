@@ -1848,6 +1848,18 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-AUTH-170",
+      "title": "The `mrl` command has no access token yet.",
+      "why": "The command signs in to the server with a personal access token. None is saved on this computer, and `MRL_TOKEN` is not set.",
+      "what_to_do": {
+        "steps": [
+          "Create a personal access token in the app under your profile.",
+          "Run `mrl config set-token` and paste the token when asked.",
+          "Or set the `MRL_TOKEN` environment variable for this terminal."
+        ]
+      }
+    },
+    {
       "code": "MRL-CAP-001",
       "title": "No engine here supports this method.",
       "why": "The training engines on this machine can't run the method you picked.",
@@ -2136,6 +2148,28 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-CONFLICT-170",
+      "title": "The job changed while the app was updating it.",
+      "why": "Something else changed the job a moment ago. The app stopped so it would not overwrite that change.",
+      "what_to_do": {
+        "steps": [
+          "Refresh to see the latest state.",
+          "Try again if the change still makes sense."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CONFLICT-171",
+      "title": "An experiment with this name already exists in this project.",
+      "why": "Experiment names are unique inside a project, so lists and links stay clear.",
+      "what_to_do": {
+        "steps": [
+          "Pick another name.",
+          "Or add your runs to the experiment that already has this name."
+        ]
+      }
+    },
+    {
       "code": "MRL-DATA-001",
       "title": "Your dataset did not pass its checks.",
       "why": "Some rows are empty, are missing fields, or don't match the chosen format.",
@@ -2420,6 +2454,18 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-ENV-170",
+      "title": "The `mrl` command could not reach the server.",
+      "why": "Nothing answered at the server address the command uses, or the connection broke.",
+      "what_to_do": {
+        "steps": [
+          "Check the address with `mrl config show`.",
+          "Make sure the server or the desktop app is running.",
+          "Change the address with `mrl config set-server <address>`."
+        ]
+      }
+    },
+    {
       "code": "MRL-IDEM-001",
       "title": "This request is already running.",
       "why": "A request with the same request key started earlier and has not finished.",
@@ -2447,6 +2493,17 @@ export const catalog = deepFreeze({
       "what_to_do": {
         "steps": [
           "Send a shorter key, such as a random one made for this request."
+        ]
+      }
+    },
+    {
+      "code": "MRL-IDEM-170",
+      "title": "Submitting a run needs a request key.",
+      "why": "The `Idempotency-Key` header lets the app spot a repeated submit, so a retry never starts a second run.",
+      "what_to_do": {
+        "steps": [
+          "Send an `Idempotency-Key` header with a new random value for each new run.",
+          "The `mrl` command and the Python package add this header for you."
         ]
       }
     },
@@ -3018,6 +3075,17 @@ export const catalog = deepFreeze({
           "Restart the run.",
           "If you started the service by hand, use a listen address like `unix:/tmp/reward.sock`.",
           "For local testing only, add `--allow-network`."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STATE-170",
+      "title": "This job can't take that step right now.",
+      "why": "A job moves through set steps, like queued, running and finished. The step you asked for doesn't fit the step the job is in now.",
+      "what_to_do": {
+        "steps": [
+          "Refresh to see the job's current state.",
+          "A finished job never changes again. To try again, submit a new run."
         ]
       }
     },

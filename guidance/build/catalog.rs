@@ -1896,6 +1896,18 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-AUTH-170")),
+            ("title", Value::Str("The `mrl` command has no access token yet.")),
+            ("why", Value::Str("The command signs in to the server with a personal access token. None is saved on this computer, and `MRL_TOKEN` is not set.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Create a personal access token in the app under your profile."),
+                    Value::Str("Run `mrl config set-token` and paste the token when asked."),
+                    Value::Str("Or set the `MRL_TOKEN` environment variable for this terminal."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-CAP-001")),
             ("title", Value::Str("No engine here supports this method.")),
             ("why", Value::Str("The training engines on this machine can't run the method you picked.")),
@@ -2184,6 +2196,28 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-CONFLICT-170")),
+            ("title", Value::Str("The job changed while the app was updating it.")),
+            ("why", Value::Str("Something else changed the job a moment ago. The app stopped so it would not overwrite that change.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Refresh to see the latest state."),
+                    Value::Str("Try again if the change still makes sense."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CONFLICT-171")),
+            ("title", Value::Str("An experiment with this name already exists in this project.")),
+            ("why", Value::Str("Experiment names are unique inside a project, so lists and links stay clear.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Pick another name."),
+                    Value::Str("Or add your runs to the experiment that already has this name."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-DATA-001")),
             ("title", Value::Str("Your dataset did not pass its checks.")),
             ("why", Value::Str("Some rows are empty, are missing fields, or don't match the chosen format.")),
@@ -2468,6 +2502,18 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-ENV-170")),
+            ("title", Value::Str("The `mrl` command could not reach the server.")),
+            ("why", Value::Str("Nothing answered at the server address the command uses, or the connection broke.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check the address with `mrl config show`."),
+                    Value::Str("Make sure the server or the desktop app is running."),
+                    Value::Str("Change the address with `mrl config set-server <address>`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-IDEM-001")),
             ("title", Value::Str("This request is already running.")),
             ("why", Value::Str("A request with the same request key started earlier and has not finished.")),
@@ -2495,6 +2541,17 @@ pub static CATALOG: Value = Value::Map(&[
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Send a shorter key, such as a random one made for this request."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-IDEM-170")),
+            ("title", Value::Str("Submitting a run needs a request key.")),
+            ("why", Value::Str("The `Idempotency-Key` header lets the app spot a repeated submit, so a retry never starts a second run.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Send an `Idempotency-Key` header with a new random value for each new run."),
+                    Value::Str("The `mrl` command and the Python package add this header for you."),
                 ])),
             ])),
         ]),
@@ -3066,6 +3123,17 @@ pub static CATALOG: Value = Value::Map(&[
                     Value::Str("Restart the run."),
                     Value::Str("If you started the service by hand, use a listen address like `unix:/tmp/reward.sock`."),
                     Value::Str("For local testing only, add `--allow-network`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STATE-170")),
+            ("title", Value::Str("This job can't take that step right now.")),
+            ("why", Value::Str("A job moves through set steps, like queued, running and finished. The step you asked for doesn't fit the step the job is in now.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Refresh to see the job's current state."),
+                    Value::Str("A finished job never changes again. To try again, submit a new run."),
                 ])),
             ])),
         ]),

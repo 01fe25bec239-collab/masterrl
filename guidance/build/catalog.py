@@ -908,6 +908,15 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': 'Someone revoked the token, or it reached its end date.',
              'what_to_do': {'steps': ['Create a new token in Settings.',
                                       'Update the tool that uses the old token.']}},
+            {'code': 'MRL-AUTH-170',
+             'title': 'The `mrl` command has no access token yet.',
+             'why': 'The command signs in to the server with a personal access token. None is '
+                    'saved on this computer, and `MRL_TOKEN` is not set.',
+             'what_to_do': {'steps': ['Create a personal access token in the app under your '
+                                      'profile.',
+                                      'Run `mrl config set-token` and paste the token when asked.',
+                                      'Or set the `MRL_TOKEN` environment variable for this '
+                                      'terminal.']}},
             {'code': 'MRL-CAP-001',
              'title': 'No engine here supports this method.',
              'why': "The training engines on this machine can't run the method you picked.",
@@ -1061,6 +1070,18 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': 'Other changes to the same items kept getting in the way, so the server '
                     'stopped trying.',
              'what_to_do': {'steps': ['Try again in a few seconds.']}},
+            {'code': 'MRL-CONFLICT-170',
+             'title': 'The job changed while the app was updating it.',
+             'why': 'Something else changed the job a moment ago. The app stopped so it would not '
+                    'overwrite that change.',
+             'what_to_do': {'steps': ['Refresh to see the latest state.',
+                                      'Try again if the change still makes sense.']}},
+            {'code': 'MRL-CONFLICT-171',
+             'title': 'An experiment with this name already exists in this project.',
+             'why': 'Experiment names are unique inside a project, so lists and links stay clear.',
+             'what_to_do': {'steps': ['Pick another name.',
+                                      'Or add your runs to the experiment that already has this '
+                                      'name.']}},
             {'code': 'MRL-DATA-001',
              'title': 'Your dataset did not pass its checks.',
              'why': "Some rows are empty, are missing fields, or don't match the chosen format.",
@@ -1217,6 +1238,14 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'what_to_do': {'steps': ['Update the app on this machine, then start the run again.',
                                       "If that doesn't help, install a version of the engine made "
                                       'for your app version.']}},
+            {'code': 'MRL-ENV-170',
+             'title': 'The `mrl` command could not reach the server.',
+             'why': 'Nothing answered at the server address the command uses, or the connection '
+                    'broke.',
+             'what_to_do': {'steps': ['Check the address with `mrl config show`.',
+                                      'Make sure the server or the desktop app is running.',
+                                      'Change the address with `mrl config set-server '
+                                      '<address>`.']}},
             {'code': 'MRL-IDEM-001',
              'title': 'This request is already running.',
              'why': 'A request with the same request key started earlier and has not finished.',
@@ -1232,6 +1261,14 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': 'The `Idempotency-Key` header must be 1 to 255 visible characters.',
              'what_to_do': {'steps': ['Send a shorter key, such as a random one made for this '
                                       'request.']}},
+            {'code': 'MRL-IDEM-170',
+             'title': 'Submitting a run needs a request key.',
+             'why': 'The `Idempotency-Key` header lets the app spot a repeated submit, so a retry '
+                    'never starts a second run.',
+             'what_to_do': {'steps': ['Send an `Idempotency-Key` header with a new random value '
+                                      'for each new run.',
+                                      'The `mrl` command and the Python package add this header '
+                                      'for you.']}},
             {'code': 'MRL-INTERNAL-001',
              'title': 'The server hit a problem it did not expect.',
              'why': 'Something inside the server went wrong while handling the request.',
@@ -1557,6 +1594,13 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                                       'If you started the service by hand, use a listen address '
                                       'like `unix:/tmp/reward.sock`.',
                                       'For local testing only, add `--allow-network`.']}},
+            {'code': 'MRL-STATE-170',
+             'title': "This job can't take that step right now.",
+             'why': 'A job moves through set steps, like queued, running and finished. The step '
+                    "you asked for doesn't fit the step the job is in now.",
+             'what_to_do': {'steps': ["Refresh to see the job's current state.",
+                                      'A finished job never changes again. To try again, submit a '
+                                      'new run.']}},
             {'code': 'MRL-STORE-001',
              'title': 'The app refused a storage path.',
              'why': "The path points outside your workspace's storage area, or it has a part the "
