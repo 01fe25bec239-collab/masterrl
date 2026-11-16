@@ -2095,6 +2095,16 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-CAP-130",
+      "title": "This built-in task is not installed.",
+      "why": "The job asked for a built-in task this version of the app doesn't have.",
+      "what_to_do": {
+        "steps": [
+          "Update the app on this machine, then start the job again."
+        ]
+      }
+    },
+    {
       "code": "MRL-CONFLICT-001",
       "title": "Someone changed this item after you opened it.",
       "why": "The version you edited is older than the saved one.",
@@ -2366,6 +2376,28 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-ENV-130",
+      "title": "The training worker and the app use different protocol versions.",
+      "why": "The software that runs training on this machine is older or newer than the app. They can't talk to each other.",
+      "what_to_do": {
+        "steps": [
+          "Update the app on this machine, then start the run again.",
+          "If the run uses a custom engine, ask its maintainer for a version that matches the app."
+        ]
+      }
+    },
+    {
+      "code": "MRL-ENV-131",
+      "title": "This engine needs a different version of the MasterRL runtime.",
+      "why": "The engine was built for a version of the runtime that this machine doesn't have.",
+      "what_to_do": {
+        "steps": [
+          "Update the app on this machine, then start the run again.",
+          "If that doesn't help, install a version of the engine made for your app version."
+        ]
+      }
+    },
+    {
       "code": "MRL-IDEM-001",
       "title": "This request is already running.",
       "why": "A request with the same request key started earlier and has not finished.",
@@ -2571,6 +2603,17 @@ export const catalog = deepFreeze({
         "steps": [
           "Check the server log for the event id and the last error.",
           "Send them to support so they can fix the cause and replay the event."
+        ]
+      }
+    },
+    {
+      "code": "MRL-INTERNAL-130",
+      "title": "The app and its training worker disagreed about the next step.",
+      "why": "The training worker got a message it didn't expect at that point. This is a problem in the app, not in your settings.",
+      "what_to_do": {
+        "steps": [
+          "Start the run again. It resumes from the last saved checkpoint.",
+          "If it happens again, send the run's log to your admin."
         ]
       }
     },
@@ -3120,6 +3163,28 @@ export const catalog = deepFreeze({
         "steps": [
           "Pick one of the names listed in Details.",
           "Check the spelling, then try again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-VAL-130",
+      "title": "The engine manifest has a problem.",
+      "why": "The engine's `mrl-engine.yaml` file, or one of its parts, doesn't match the format the app expects. Details names each field.",
+      "what_to_do": {
+        "steps": [
+          "Ask the engine's maintainer for a fixed version of the engine.",
+          "If you build the engine yourself, fix the fields named in Details, then install it again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-VAL-131",
+      "title": "A built-in task got inputs it can't use.",
+      "why": "The job gave the task an input it doesn't expect, or left one out. Details names the input.",
+      "what_to_do": {
+        "steps": [
+          "Start the action again from the app, so it sends the inputs the task needs.",
+          "If a script started the job, fix the input named in Details."
         ]
       }
     },

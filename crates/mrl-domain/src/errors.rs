@@ -439,7 +439,24 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
     ),
     (code(Val, 126), "The app doesn't know this name."),
     // <mrl:errors P13> rows for P13 go right below this line.
-
+    (code(Val, 130), "The engine manifest has a problem."),
+    (code(Val, 131), "A built-in task got inputs it can't use."),
+    (
+        code(ErrorFamily::Cap, 130),
+        "This built-in task is not installed.",
+    ),
+    (
+        code(Env, 130),
+        "The training worker and the app use different protocol versions.",
+    ),
+    (
+        code(Env, 131),
+        "This engine needs a different version of the MasterRL runtime.",
+    ),
+    (
+        code(Internal, 130),
+        "The app and its training worker disagreed about the next step.",
+    ),
     // <mrl:errors P14> rows for P14 go right below this line.
 
     // <mrl:errors P15> rows for P15 go right below this line.
