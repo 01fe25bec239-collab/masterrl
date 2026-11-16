@@ -630,3 +630,29 @@ def test_property_full_float_range_is_masked_or_finite(
         else:
             assert math.isfinite(s.total)
             assert -1 <= s.total <= 1
+
+
+@pytest.mark.parametrize(
+    ("value", "want"), [(0.0, 0.5), (-1e308, 0.0), (1e308, 1.0), (5e307, 0.75)]
+)
+def test_minmax_with_a_range_wider_than_a_float(value: float, want: float) -> None:
+    d = doc(
+        [{"id": "a", "range": [-1e308, 1e308]}],
+        normalization={"per_component": "minmax", "final": "none"},
+    )
+    (s,) = score(d, {"a": value})
+    assert (s.status, s.resolution) == (Status.OK, Resolution.SCORED)
+    assert s.total == pytest.approx(want)
+
+
+def test_final_minmax_with_a_batch_wider_than_a_float() -> None:
+    d = doc([{"id": "a"}], normalization={"per_component": "none", "final": "minmax"})
+    out = score(d, {"a": -1e308}, {"a": 0.0}, {"a": 1e308})
+    assert [s.total for s in out] == pytest.approx([0.0, 0.5, 1.0])
+
+
+def test_shaping_with_extreme_weights_interpolates_without_overflow() -> None:
+    sched = [{"from_step": 0, "weight": -1e308}, {"from_step": 100, "weight": 1e308}]
+    d = doc([{"id": "a"}], shaping=[{"id": "s", "component": "a", "schedule": sched}])
+    (s,) = score(d, {"a": 1}, step=50)
+    assert (s.status, s.total) == (Status.OK, 0.0)

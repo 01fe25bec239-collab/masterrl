@@ -176,6 +176,15 @@ def _rank_in_group(values: Mapping[int, float], groups: Mapping[int, str]) -> di
     return out
 
 
+def _minmax(v: float, lo: float, hi: float) -> float:
+    """(v - lo) / (hi - lo), also when hi - lo overflows (e.g. range [-1e308, 1e308])."""
+    if hi == lo:
+        return 0.5
+    if math.isfinite(hi - lo):
+        return (v - lo) / (hi - lo)  # v in [lo, hi], so v - lo can't overflow either
+    return (v / 2 - lo / 2) / (hi / 2 - lo / 2)  # halving is exact at this magnitude
+
+
 def _normalize(  # noqa: PLR0913 (keyword-only inputs)
     method: Normalization,
     values: dict[int, float],
@@ -189,7 +198,7 @@ def _normalize(  # noqa: PLR0913 (keyword-only inputs)
         return values
     if method is Normalization.MINMAX:
         lo, hi = bounds or (min(values.values()), max(values.values()))
-        return {i: 0.5 if hi == lo else (v - lo) / (hi - lo) for i, v in values.items()}
+        return {i: _minmax(v, lo, hi) for i, v in values.items()}
     if method is Normalization.ZSCORE_RUNNING:
         if not state.update(key, [values[i] for i in sorted(values)]):
             return dict.fromkeys(values, math.nan)  # the callers fail these samples

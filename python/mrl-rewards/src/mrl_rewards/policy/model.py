@@ -89,7 +89,8 @@ class Shaping:
             return points[0][1]
         for (s0, w0), (s1, w1) in pairwise(points):
             if step <= s1:
-                return w0 + (w1 - w0) * (step - s0) / (s1 - s0)
+                t = (step - s0) / (s1 - s0)
+                return w0 * (1 - t) + w1 * t  # no w1 - w0, which can overflow
         return points[-1][1]
 
 
