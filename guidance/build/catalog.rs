@@ -2143,6 +2143,16 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-CAP-130")),
+            ("title", Value::Str("This built-in task is not installed.")),
+            ("why", Value::Str("The job asked for a built-in task this version of the app doesn't have.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Update the app on this machine, then start the job again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-CONFLICT-001")),
             ("title", Value::Str("Someone changed this item after you opened it.")),
             ("why", Value::Str("The version you edited is older than the saved one.")),
@@ -2358,6 +2368,28 @@ pub static CATALOG: Value = Value::Map(&[
             ("docs_link", Value::Str("https://docs.docker.com/get-started/get-docker/")),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-ENV-130")),
+            ("title", Value::Str("The training worker and the app use different protocol versions.")),
+            ("why", Value::Str("The software that runs training on this machine is older or newer than the app. They can't talk to each other.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Update the app on this machine, then start the run again."),
+                    Value::Str("If the run uses a custom engine, ask its maintainer for a version that matches the app."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-ENV-131")),
+            ("title", Value::Str("This engine needs a different version of the MasterRL runtime.")),
+            ("why", Value::Str("The engine was built for a version of the runtime that this machine doesn't have.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Update the app on this machine, then start the run again."),
+                    Value::Str("If that doesn't help, install a version of the engine made for your app version."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-IDEM-001")),
             ("title", Value::Str("This request is already running.")),
             ("why", Value::Str("A request with the same request key started earlier and has not finished.")),
@@ -2493,6 +2525,17 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Read which job stopped in Details."),
                     Value::Str("Start the server again. If it happens again, report it with the diagnostics."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-INTERNAL-130")),
+            ("title", Value::Str("The app and its training worker disagreed about the next step.")),
+            ("why", Value::Str("The training worker got a message it didn't expect at that point. This is a problem in the app, not in your settings.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Start the run again. It resumes from the last saved checkpoint."),
+                    Value::Str("If it happens again, send the run's log to your admin."),
                 ])),
             ])),
         ]),
@@ -2970,6 +3013,28 @@ pub static CATALOG: Value = Value::Map(&[
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Check which methods the endpoint takes in the reference at `/api-docs/openapi.json`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-130")),
+            ("title", Value::Str("The engine manifest has a problem.")),
+            ("why", Value::Str("The engine's `mrl-engine.yaml` file, or one of its parts, doesn't match the format the app expects. Details names each field.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Ask the engine's maintainer for a fixed version of the engine."),
+                    Value::Str("If you build the engine yourself, fix the fields named in Details, then install it again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-131")),
+            ("title", Value::Str("A built-in task got inputs it can't use.")),
+            ("why", Value::Str("The job gave the task an input it doesn't expect, or left one out. Details names the input.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Start the action again from the app, so it sends the inputs the task needs."),
+                    Value::Str("If a script started the job, fix the input named in Details."),
                 ])),
             ])),
         ]),
