@@ -1,0 +1,65 @@
+# P12 agent errors (crates/mrl-agent). The agent also reuses MRL-ENV-004 (cache full) and
+# MRL-STORE-003/004/005/007/008/009/010/013 (transfers).
+errors:
+  - code: MRL-VAL-120
+    title: The agent could not use its settings file.
+    why: The file is missing, has a typing mistake, or has a value the agent can't use.
+    what_to_do:
+      steps:
+        - Read the setting and the problem named in Details.
+        - Fix the settings file, or remove the setting to use the default.
+        - Start the agent again.
+
+  - code: MRL-NODE-121
+    title: The agent could not save or read its local files.
+    why: The disk may be full, or the agent may not have permission to use its state folder.
+    what_to_do:
+      steps:
+        - Free up disk space on the drive named in Details.
+        - Make sure your account owns the agent's state folder.
+        - Start the agent again.
+
+  - code: MRL-ENV-122
+    title: The sandbox can't run on this computer.
+    why: The sandbox tool (bubblewrap) is missing, or this system blocks the isolation it needs.
+    what_to_do:
+      steps:
+        - Install bubblewrap, then try again.
+        - If it is installed, ask your admin to allow unprivileged user namespaces.
+      linux:
+        - Run `sudo apt install bubblewrap` on Ubuntu or Debian.
+
+  - code: MRL-NODE-123
+    title: The agent could not start or stop the program.
+    why: The program may be missing, or this computer may be out of processes or memory.
+    what_to_do:
+      steps:
+        - Check the program name and path in Details.
+        - Close programs you don't need, then try again.
+
+  - code: MRL-NODE-124
+    title: The agent could not read this computer's hardware.
+    why: The GPU driver did not answer, or it stopped working while the agent read it.
+    what_to_do:
+      steps:
+        - Restart the computer, then check again.
+        - If it keeps failing, update or reinstall the GPU driver.
+      linux:
+        - Run `nvidia-smi` to see whether the driver answers.
+
+  - code: MRL-NODE-125
+    title: The agent could not set itself up to start with your computer.
+    why: The system's service manager refused the change, or a path has characters it can't pass on.
+    what_to_do:
+      steps:
+        - Read the command and its message in Details.
+        - Run `mrl-agent service install` again.
+        - If it still fails, start the agent by hand with `mrl-agent run`.
+
+  - code: MRL-VAL-126
+    title: The app doesn't know this name.
+    why: A profile, job name or other name doesn't match any the agent knows.
+    what_to_do:
+      steps:
+        - Pick one of the names listed in Details.
+        - Check the spelling, then try again.

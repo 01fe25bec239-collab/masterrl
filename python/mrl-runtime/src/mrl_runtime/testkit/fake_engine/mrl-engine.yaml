@@ -1,0 +1,69 @@
+# FakeEngine: deterministic, CPU-only, no ML libraries. Used by harness tests and the
+# conformance suite. mrl-engine.d/ adds the metric name mapping (exercises fragment merging).
+apiVersion: mrl.dev/engine/v1
+kind: EngineManifest
+metadata:
+  name: fake
+  version: 0.1.0
+  displayName: Fake engine (testkit)
+  description: Counts steps, emits a falling loss, writes small checkpoints.
+  license: Apache-2.0
+spec:
+  adapter:
+    entrypoint: mrl_runtime.testkit.fake:FakeEngine
+    adapterApi: ">=1.0,<2"
+    workerProtocol: ">=1.0,<2"
+  upstream:
+    - name: mrl-runtime
+      version: 0.1.0
+      license: Apache-2.0
+      source: https://masterrl.dev
+  runtime:
+    environments:
+      - id: cpu-uv
+        kind: uv
+        lockfile: uv.lock
+        lockSha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+        python: "3.12"
+        platform: linux/amd64
+        accelerator: { vendor: cpu }
+        mrlRuntime: 0.1.0
+  runtimes:
+    - { role: trainer, runtime_ref: cpu-uv }
+  capabilities:
+    updateStrategies: [full]
+    precision: [fp32]
+    parallelism: [single]
+    multiNode: false
+    execution: { modes: [offline] }
+    resume: true
+    pause: true
+    onDemandCheckpoint: true
+    trustRemoteCode: never
+  topology:
+    roles:
+      - { id: trainer, kind: trainer, environment: cpu-uv, count: 1, reportsVia: worker_protocol }
+    primary: trainer
+    network: none
+    launcher: inprocess
+  algorithms:
+    - id: x-fake.steps
+      displayName: Fake steps
+      summary: Counts steps and emits a loss that falls with each step.
+      parent: mrl_runtime.testkit.fake.FakeEngine
+      upstreamStatus: stable
+      maturity: experimental
+      fidelity: full
+      requires:
+        datasetSchemas: { train: [sft.messages.v1] }
+        signals: { reward: none, reference: none, critic: none, rolloutEngine: none, teacher: none }
+      metrics:
+        - { name: train/loss, source: loss, kind: live, required: true }
+        - { name: train/learning_rate, kind: sampled, required: true }
+      samples: { emitted: true, fields: [prompt, completion] }
+      resume: true
+      pause: true
+  checkpoint: { format: fake-v1, resumable: true, portableWeights: false }
+  exports: [hf-safetensors]
+  validate: { l1: true }
+  hardware: { os: [linux, macos, windows], accelerators: [cpu] }

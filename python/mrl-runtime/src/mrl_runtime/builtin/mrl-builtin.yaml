@@ -1,0 +1,19 @@
+# The built-in utility engine: non-training job kinds, run by mrl-worker like any engine.
+# Each job kind names the sandbox profile the server copies into the attempt spec.
+# Tasks register through the `mrl_runtime.builtin_tasks` entry-point group and must serve a
+# job kind listed here.
+apiVersion: mrl.dev/builtin/v1
+kind: BuiltinManifest
+metadata:
+  name: mrl-builtin
+  version: 0.1.0
+  displayName: Built-in utilities
+  license: Apache-2.0
+spec:
+  adapter:
+    entrypoint: mrl_runtime.builtin.engine:BuiltinEngine
+    adapterApi: ">=1.0,<2"
+    workerProtocol: ">=1.0,<2"
+  jobKinds:
+    - kind: DATA_PREP
+      sandbox: data_prep   # no network, no secrets, no GPU

@@ -1,0 +1,49 @@
+{
+  "driver_version": "550.54.15",
+  "cuda_driver_version": 12040,
+  "devices": [
+    {
+      "index": 0,
+      "uuid": "GPU-5b0e8f1c-9a2d-4c3e-8f71-2d9b6a4e1c01",
+      "name": "NVIDIA A100-SXM4-80GB",
+      "pci_bus_id": "00000000:07:00.0",
+      "compute_capability": [8, 0],
+      "memory_total": 85899345920,
+      "memory_free": 12884901888,
+      "memory_used": 73014444032,
+      "utilization_gpu": 87,
+      "temperature_c": 61,
+      "power_mw": 312500,
+      "ecc_enabled": true,
+      "ecc_uncorrected": 0,
+      "ecc_corrected": 3,
+      "throttle_reasons": 1,
+      "nvlink_remote_bus_ids": ["00000000:0F:00.0", "00000000:0f:00.0"],
+      "mig_mode": [0, 0],
+      "mig_devices": []
+    },
+    {
+      "index": 1,
+      "uuid": "GPU-a71c3d20-44be-4f0a-9e13-7c5d0b8f2e02",
+      "name": "NVIDIA A100-SXM4-80GB",
+      "pci_bus_id": "00000000:0F:00.0",
+      "compute_capability": [8, 0],
+      "memory_total": 85899345920,
+      "memory_free": 80000000000,
+      "memory_used": null,
+      "utilization_gpu": 4,
+      "temperature_c": null,
+      "power_mw": 61000,
+      "ecc_enabled": true,
+      "ecc_uncorrected": 2,
+      "ecc_corrected": 0,
+      "throttle_reasons": 64,
+      "nvlink_remote_bus_ids": ["00000000:07:00.0", "00000000:C1:00.0"],
+      "mig_mode": [1, 1],
+      "mig_devices": [
+        ["MIG-0c2f6a9e-1b3d-5e7f-9a1c-3e5f7a9b1d01", 10200547328],
+        ["MIG-0c2f6a9e-1b3d-5e7f-9a1c-3e5f7a9b1d02", 10200547328]
+      ]
+    }
+  ]
+}

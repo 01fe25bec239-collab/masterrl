@@ -1,0 +1,6 @@
+# Engine-side names -> canonical names. "lr" is exact; "debug/" is a prefix.
+spec:
+  metrics:
+    namespaces:
+      lr: train/learning_rate
+      debug/: fake/debug/

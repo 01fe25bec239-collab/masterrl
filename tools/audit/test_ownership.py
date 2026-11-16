@@ -119,6 +119,14 @@ class OwnershipTest(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("wave-01-done", out)
 
+    def test_main_merged_into_a_lane_is_not_counted(self):
+        commit(self.root, ["apps/x.ts"], "a1 change on main")
+        git(self.root, "update-ref", "refs/remotes/origin/main", "HEAD")
+        commit(self.root, ["justfile"], "lane change")
+        code, out = self.run_tool("PART=P09")
+        self.assertEqual(code, 0)
+        self.assertIn("origin/main", out)
+
     def test_unknown_part_is_an_error(self):
         self.assertEqual(self.run_tool("PART=P42")[0], 2)
         with self.assertRaises(SystemExit):

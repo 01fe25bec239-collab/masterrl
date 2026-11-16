@@ -384,11 +384,79 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         "A file changed while the app was uploading it.",
     ),
     // <mrl:errors P11> rows for P11 go right below this line.
-
+    (
+        code(Internal, 110),
+        "The database needs an update before the server can start.",
+    ),
+    (code(Internal, 111), "The database update did not finish."),
+    (
+        code(Internal, 112),
+        "The app's database stopped and could not start again.",
+    ),
+    (
+        code(Internal, 113),
+        "The app could not back up its database.",
+    ),
+    (
+        code(Internal, 114),
+        "The app could not move its database to the new version.",
+    ),
+    (
+        code(Internal, 115),
+        "The server set an event aside after it failed many times.",
+    ),
+    (code(Env, 110), "The app's database programs are missing."),
+    (
+        code(Env, 111),
+        "Another copy of the app is already using this data folder.",
+    ),
+    (
+        code(Env, 112),
+        "This data folder was made by a newer version of the app.",
+    ),
+    (
+        code(Conflict, 110),
+        "Too many changes happened at the same time.",
+    ),
     // <mrl:errors P12> rows for P12 go right below this line.
-
+    (code(Val, 120), "The agent could not use its settings file."),
+    (
+        code(ErrorFamily::Node, 121),
+        "The agent could not save or read its local files.",
+    ),
+    (code(Env, 122), "The sandbox can't run on this computer."),
+    (
+        code(ErrorFamily::Node, 123),
+        "The agent could not start or stop the program.",
+    ),
+    (
+        code(ErrorFamily::Node, 124),
+        "The agent could not read this computer's hardware.",
+    ),
+    (
+        code(ErrorFamily::Node, 125),
+        "The agent could not set itself up to start with your computer.",
+    ),
+    (code(Val, 126), "The app doesn't know this name."),
     // <mrl:errors P13> rows for P13 go right below this line.
-
+    (code(Val, 130), "The engine manifest has a problem."),
+    (code(Val, 131), "A built-in task got inputs it can't use."),
+    (
+        code(ErrorFamily::Cap, 130),
+        "This built-in task is not installed.",
+    ),
+    (
+        code(Env, 130),
+        "The training worker and the app use different protocol versions.",
+    ),
+    (
+        code(Env, 131),
+        "This engine needs a different version of the MasterRL runtime.",
+    ),
+    (
+        code(Internal, 130),
+        "The app and its training worker disagreed about the next step.",
+    ),
     // <mrl:errors P14> rows for P14 go right below this line.
     (
         code(ErrorFamily::Rwd, 140),
