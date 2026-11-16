@@ -167,7 +167,7 @@ impl SandboxBackend for Bubblewrap {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))] // bubblewrap is Linux-only; the expected paths use `/`.
 mod tests {
     use super::super::{data_prep, worker};
     use super::*;
