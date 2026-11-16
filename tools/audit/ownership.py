@@ -13,7 +13,8 @@ below it.
 
 Usage: ownership.py PART=P04 [BASE=ref] [--plan DIR]
        (PART and BASE may also be given positionally)
-BASE defaults to the latest wave-*-done tag reachable from HEAD.
+BASE defaults to origin/main (the diff starts at the merge-base, so main's own
+commits merged into a lane are not counted), else the latest wave-*-done tag.
 """
 
 import itertools
@@ -177,6 +178,13 @@ def parse_args(argv: list[str]) -> tuple[str, str | None, Path | None]:
     return part, base or None, plan
 
 
+def default_base() -> str:
+    probe = ["git", "rev-parse", "--verify", "-q", "origin/main"]
+    if subprocess.run(probe, check=False, capture_output=True).returncode == 0:
+        return "origin/main"
+    return git("describe", "--tags", "--abbrev=0", "--match", "wave-*-done", "HEAD")
+
+
 def main(argv: list[str]) -> int:
     part, base, plan = parse_args(argv)
     plan = plan or main_folder() / "docs" / "implementation"
@@ -187,7 +195,7 @@ def main(argv: list[str]) -> int:
     if not patterns:
         print(f"ownership: no owned paths found for {part} in {plan}", file=sys.stderr)
         return 2
-    base = base or git("describe", "--tags", "--abbrev=0", "--match", "wave-*-done", "HEAD")
+    base = base or default_base()
     changed = git("diff", "--name-only", f"{base}...HEAD").splitlines()
     bad = violations(changed, patterns)
     for path in bad:
