@@ -528,6 +528,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // launchd is macOS-only; the expected paths use `/`.
     fn launchd_plan_bootstraps_an_escaped_plist() {
         let mut t = target();
         t.exe = "/Users/me/A&B/mrl-agent".into();
