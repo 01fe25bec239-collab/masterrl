@@ -587,18 +587,27 @@ version = "0.1.0"
 source = { editable = "../../mrl-runtime" }
 dependencies = [
     { name = "grpcio" },
+    { name = "jinja2" },
     { name = "jsonschema" },
     { name = "protobuf" },
+    { name = "pyarrow" },
     { name = "pyyaml" },
+    { name = "tokenizers" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "grpcio", specifier = "==1.85.1" },
+    { name = "jinja2", specifier = "==3.1.6" },
     { name = "jsonschema", specifier = "==4.26.0" },
     { name = "protobuf", specifier = "==7.36.2" },
+    { name = "pyarrow", specifier = "==26.0.1" },
     { name = "pyyaml", specifier = "==6.0.3" },
+    { name = "tokenizers", specifier = "==0.23.3" },
 ]
+
+[package.metadata.requires-dev]
+dev = [{ name = "hypothesis", specifier = "==6.170.14" }]
 
 [[package]]
 name = "multidict"
