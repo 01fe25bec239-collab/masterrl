@@ -1,11 +1,11 @@
 //! The `mrl` binary against a real team-mode test server with PostgreSQL.
-//! The tenancy endpoints come from `mrl_testkit::runs::TenancyDouble` until P16 ships them.
+//! The tenancy endpoints come from [`TenancyDouble`] until a real tenancy API exists.
 
+use crate::support::{runs_server, test_user, TenancyDouble};
 use mrl_domain::ids::{DatasetVersionId, ModelVersionId, OrgId};
 use mrl_domain::rbac::Role;
 use mrl_server::modules::jobs::Chains;
 use mrl_testkit::pg::TestDb;
-use mrl_testkit::runs::{runs_server, test_user, TenancyDouble};
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -60,7 +60,9 @@ fn seed_then_submit_returns_a_rejected_run_with_code_and_hint() {
         .enable_all()
         .build()
         .unwrap();
-    let tenancy = TenancyDouble::default();
+    // One item per page, with another org first: the seed must page to find `dev` again.
+    let tenancy = TenancyDouble::new(1);
+    tenancy.add_org("other");
     let (db, srv) = rt.block_on(async {
         let db = TestDb::new().await;
         let users = [test_user("tok", "usr_admin", OrgId::new(), Role::Owner)];
@@ -104,8 +106,12 @@ fn seed_then_submit_returns_a_rejected_run_with_code_and_hint() {
     assert!(first.contains("created project `demo`"), "{first}");
     let again = cli.ok(&["dev", "seed"]);
     assert!(again.contains("exists  project `demo`"), "{again}");
-    assert_eq!(tenancy.counts(), (1, 1, 1));
-    assert!(again.contains("signed in as usr_admin"));
+    assert_eq!(
+        tenancy.counts(),
+        (2, 1, 1),
+        "the second seed created nothing"
+    );
+    assert!(again.contains("signed in as usr_admin (user)"));
 
     // Submit: the default chains reject it with MRL-CAP-001 and a hint.
     let model = ModelVersionId::new().to_string();

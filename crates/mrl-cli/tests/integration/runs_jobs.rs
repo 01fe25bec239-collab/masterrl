@@ -1,11 +1,20 @@
 //! Runs and jobs against PostgreSQL and a real team-mode server.
 
-use super::sequences::{ops, World};
-use super::*;
+use crate::support::sequences::{ops, World};
+use crate::support::*;
+use axum::body::Body;
+use axum::http::Method;
 use mrl_domain::failure::{FailureClass, FailureCode};
 use mrl_domain::ids::{JobId, RunId};
+use mrl_domain::ids::{OrgId, ProjectId};
+use mrl_domain::rbac::Role;
 use mrl_domain::state::{JobAttemptEvent, JobEvent, Owner};
 use mrl_server::modules::jobs::{AttemptChange, JobChange, JobTransitions};
+use mrl_server::modules::jobs::{Chains, JobRow};
+use mrl_testkit::pg::TestDb;
+use mrl_testkit::server::{TestResponse, TestServer};
+use serde_json::{json, Value};
+use std::collections::HashMap;
 
 struct Env {
     db: TestDb,
@@ -869,4 +878,201 @@ fn random_sequences_keep_the_invariants() {
     if let Err(e) = result {
         panic!("{e}");
     }
+}
+
+/// Forces `job` into `state` behind `JobTransitions`' back (test set-up only).
+async fn force_job(db: &TestDb, job: uuid::Uuid, state: &str) {
+    sqlx::query("UPDATE jobs SET state = $2 WHERE id = $1")
+        .bind(job)
+        .bind(state)
+        .execute(db.pool())
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn every_transition_matches_the_p06_tables() {
+    use mrl_domain::state::{Job, JobAttempt, JobState, StateMachine};
+    let e = env(true).await;
+    let org = e.org.as_uuid();
+    let run = e.submit("res", "k", &submission("rules")).await.json();
+    let job_id = run["job_id"]
+        .as_str()
+        .unwrap()
+        .parse::<JobId>()
+        .unwrap()
+        .as_uuid();
+    let owners = [Owner::Jobs, Owner::Scheduler, Owner::ArtifactsVerifier];
+    let special = [JobEvent::Launch, JobEvent::Complete, JobEvent::Interrupt];
+    let mut checked = 0;
+    for &from in Job::STATES {
+        force_job(&e.db, job_id, from.as_str()).await;
+        for &event in Job::EVENTS {
+            for by in owners {
+                let mut tx = e.db.db().begin().await.unwrap();
+                let row = JobTransitions::lock(&mut tx, org, job_id)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let got =
+                    JobTransitions::apply(&mut tx, &row, event, by, JobChange::default()).await;
+                let want = Job::transition(from, event)
+                    .filter(|t| t.owner == by && !special.contains(&event));
+                match (got, want) {
+                    (Ok(next), Some(t)) => {
+                        assert_eq!(next.state, t.to.as_str(), "{from} {event:?} by {by}")
+                    }
+                    (Err(err), None) => {
+                        assert_eq!(err.code(), "MRL-STATE-170", "{from} {event:?} by {by}")
+                    }
+                    (got, want) => {
+                        panic!("{from} {event:?} by {by}: got {got:?}, P06 says {want:?}")
+                    }
+                }
+                checked += 1;
+                drop(tx); // roll back
+            }
+        }
+        // The special steps, through their own methods.
+        let mut tx = e.db.db().begin().await.unwrap();
+        let row = JobTransitions::lock(&mut tx, org, job_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let launched = JobTransitions::launch(&mut tx, &row, None).await;
+        assert_eq!(
+            launched.is_ok(),
+            from == JobState::Allocating,
+            "launch from {from}"
+        );
+        drop(tx);
+        let mut tx = e.db.db().begin().await.unwrap();
+        let verified = JobTransitions::verify_completion(&mut tx, &row, &accepting_chains()).await;
+        assert_eq!(
+            verified.is_ok(),
+            from == JobState::Finalizing,
+            "verify from {from}"
+        );
+        drop(tx);
+    }
+    assert_eq!(
+        checked,
+        Job::STATES.len() * Job::EVENTS.len() * owners.len()
+    );
+
+    // Attempts: an attempt in every state, at the job's epoch, against every event.
+    force_job(&e.db, job_id, "ALLOCATING").await;
+    let mut tx = e.db.db().begin().await.unwrap();
+    let row = JobTransitions::lock(&mut tx, org, job_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, att) = JobTransitions::launch(&mut tx, &row, None).await.unwrap();
+    tx.commit().await.unwrap();
+    for &from in JobAttempt::STATES {
+        sqlx::query("UPDATE job_attempts SET state = $2 WHERE id = $1")
+            .bind(att.id)
+            .bind(from.as_str())
+            .execute(e.db.pool())
+            .await
+            .unwrap();
+        for &event in JobAttempt::EVENTS {
+            let mut tx = e.db.db().begin().await.unwrap();
+            let a = JobTransitions::lock_attempt(&mut tx, org, att.id)
+                .await
+                .unwrap()
+                .unwrap();
+            let got =
+                JobTransitions::apply_attempt(&mut tx, &a, event, AttemptChange::default()).await;
+            match (got, JobAttempt::transition(from, event)) {
+                (Ok(next), Some(t)) => assert_eq!(next.state, t.to.as_str(), "{from} {event:?}"),
+                (Err(err), None) => assert_eq!(err.code(), "MRL-STATE-170", "{from} {event:?}"),
+                (got, want) => panic!("attempt {from} {event:?}: got {got:?}, P06 says {want:?}"),
+            }
+            drop(tx);
+        }
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_second_live_attempt_is_always_refused() {
+    let e = env(true).await;
+    let org = e.org.as_uuid();
+    let run = e.submit("res", "k", &submission("two")).await.json();
+    let mut job = e.job_row(run["job_id"].as_str().unwrap()).await;
+    let mut tx = e.db.db().begin().await.unwrap();
+    job = JobTransitions::apply(
+        &mut tx,
+        &job,
+        JobEvent::Place,
+        Owner::Scheduler,
+        JobChange::default(),
+    )
+    .await
+    .unwrap();
+    let (j, first) = JobTransitions::launch(&mut tx, &job, None).await.unwrap();
+    // The job goes back to ALLOCATING while its first attempt is still PENDING.
+    let lost = FailureCode::class_only(FailureClass::NodeLost);
+    job = JobTransitions::fail_or_retry(&mut tx, &j, lost, "node gone")
+        .await
+        .unwrap();
+    assert_eq!(job.state, "RETRY_WAIT");
+    job = JobTransitions::apply(
+        &mut tx,
+        &job,
+        JobEvent::Retry,
+        Owner::Scheduler,
+        JobChange::default(),
+    )
+    .await
+    .unwrap();
+    job = JobTransitions::apply(
+        &mut tx,
+        &job,
+        JobEvent::Place,
+        Owner::Scheduler,
+        JobChange::default(),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let mut tx = e.db.db().begin().await.unwrap();
+    let err = JobTransitions::launch(&mut tx, &job, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "MRL-STATE-170");
+    assert!(err.to_string().contains("already has an attempt"), "{err}");
+    drop(tx);
+    // A writer going around JobTransitions hits the database rule too.
+    let raw = sqlx::query(
+        "INSERT INTO job_attempts (id, org_id, job_id, attempt_no, epoch, state) \
+         VALUES ($1, $2, $3, 99, $4, 'RUNNING')",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(org)
+    .bind(job.id)
+    .bind(job.epoch)
+    .execute(e.db.pool())
+    .await
+    .unwrap_err();
+    let db_err = raw.as_database_error().unwrap();
+    assert_eq!(db_err.constraint(), Some("one_live_attempt"));
+    // Once the first attempt ends, the next launch works.
+    let mut tx = e.db.db().begin().await.unwrap();
+    let a = JobTransitions::lock_attempt(&mut tx, org, first.id)
+        .await
+        .unwrap()
+        .unwrap();
+    JobTransitions::apply_attempt(&mut tx, &a, JobAttemptEvent::Kill, AttemptChange::default())
+        .await
+        .unwrap();
+    let job = JobTransitions::lock(&mut tx, org, job.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, second) = JobTransitions::launch(&mut tx, &job, None).await.unwrap();
+    assert_eq!((second.attempt_no, second.epoch), (2, 2));
 }

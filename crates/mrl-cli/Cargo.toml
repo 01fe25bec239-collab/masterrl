@@ -24,10 +24,14 @@ toml = "=1.2.0"
 uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
+async-trait = "=0.1.92"
+axum = { workspace = true }
 mrl-domain = { path = "../mrl-domain" }
 mrl-server = { path = "../mrl-server" }
 mrl-testkit = { path = "../mrl-testkit" }
+proptest = { workspace = true }
 serde_json = { workspace = true }
+sqlx = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 uuid = { workspace = true, features = ["v4"] }
 

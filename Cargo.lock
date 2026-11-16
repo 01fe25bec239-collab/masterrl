@@ -1729,14 +1729,18 @@ dependencies = [
 name = "mrl-cli"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "axum",
  "clap",
  "git-version",
  "mrl-domain",
  "mrl-server",
  "mrl-testkit",
+ "proptest",
  "reqwest",
  "serde",
  "serde_json",
+ "sqlx",
  "tokio",
  "toml",
  "uuid",
@@ -1835,9 +1839,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "mrl-agent",
- "mrl-domain",
  "mrl-server",
- "proptest",
  "rcgen",
  "serde_json",
  "sha2 0.11.1",

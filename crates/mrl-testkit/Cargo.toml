@@ -31,8 +31,6 @@ tempfile = "=3.27.0"
 # <mrl:deps P16> P16 dependencies go right below this line.
 
 # <mrl:deps P17> P17 dependencies go right below this line.
-mrl-domain = { path = "../mrl-domain" }
-proptest = { workspace = true }
 
 # <mrl:deps P18> P18 dependencies go right below this line.
 

@@ -15,7 +15,6 @@ pub mod agent;
 // <mrl:testkit P16> P16 `pub mod` lines go right below this line.
 
 // <mrl:testkit P17> P17 `pub mod` lines go right below this line.
-pub mod runs;
 
 // <mrl:testkit P18> P18 `pub mod` lines go right below this line.
 

@@ -213,7 +213,7 @@ fn query(pairs: &[(&str, Option<String>)]) -> String {
 }
 
 /// Percent-encodes everything but unreserved characters.
-fn encode(v: &str) -> String {
+pub fn encode(v: &str) -> String {
     v.bytes()
         .map(|b| match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
