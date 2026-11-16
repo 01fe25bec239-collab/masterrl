@@ -41,7 +41,13 @@ impl RotatingLog {
     async fn rotate(&mut self) -> std::io::Result<()> {
         self.file.flush().await?;
         if self.keep == 0 {
-            self.file.set_len(0).await?;
+            // Reopen truncated: Windows refuses set_len on an append-only handle.
+            self.file = tokio::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&self.path)
+                .await?;
         } else {
             let _ = tokio::fs::remove_file(Self::numbered(&self.path, self.keep)).await;
             for n in (1..self.keep).rev() {
