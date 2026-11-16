@@ -19,7 +19,10 @@ use std::str::FromStr;
 use std::sync::Arc;
 use uuid::Uuid;
 
-/// Startup work for tenancy: in solo mode, the personal org and its local owner.
+mod routes;
+
+/// Orgs, workspaces and projects (`/orgs`, `/orgs/{org}/workspaces`,
+/// `/workspaces/{ws}/projects`), and in solo mode the personal org and its local owner.
 pub struct TenancyModule {
     db: Db,
     mode: Mode,
@@ -35,6 +38,14 @@ impl TenancyModule {
 impl ServerModule for TenancyModule {
     fn name(&self) -> &'static str {
         "tenancy"
+    }
+
+    fn routes(&self) -> axum::Router<crate::AppState> {
+        routes::router(self.db.clone())
+    }
+
+    fn openapi(&self) -> utoipa::openapi::OpenApi {
+        routes::doc()
     }
 
     fn startup_steps(&self) -> Vec<Arc<dyn StartupStep>> {
@@ -253,24 +264,27 @@ pub async fn bind_role(
     Ok(())
 }
 
-/// The roles `user` holds over `project` (or over the whole org when `project` is `None`).
+/// The roles `user` holds over `project` or `workspace` (only org-wide roles when both are
+/// `None`). A workspace role covers the workspace and its projects.
 pub async fn roles(
     db: &Db,
     user: UserId,
     org: OrgId,
     project: Option<ProjectId>,
+    workspace: Option<WorkspaceId>,
 ) -> Result<Vec<Role>, DbError> {
     let names: Vec<String> = sqlx::query_scalar(
         "SELECT DISTINCT rb.role FROM role_bindings rb \
          WHERE rb.principal_kind = 'user' AND rb.principal_id = $1 AND rb.org_id = $2 AND ( \
            rb.scope_kind = 'org' \
            OR (rb.scope_kind = 'project' AND rb.scope_id = $3) \
-           OR (rb.scope_kind = 'workspace' AND rb.scope_id = \
-               (SELECT workspace_id FROM projects WHERE id = $3 AND org_id = $2)))",
+           OR (rb.scope_kind = 'workspace' AND (rb.scope_id = $4 OR rb.scope_id = \
+               (SELECT workspace_id FROM projects WHERE id = $3 AND org_id = $2))))",
     )
     .bind(user.as_uuid())
     .bind(org.as_uuid())
     .bind(project.map(|p| p.as_uuid()))
+    .bind(workspace.map(|w| w.as_uuid()))
     .fetch_all(db.pool())
     .await?;
     Ok(names.iter().filter_map(|n| role_from_str(n)).collect())
@@ -351,7 +365,16 @@ impl Rbac {
             .as_deref()
             .or(ctx.project.as_deref())
             .and_then(|p| ProjectId::from_str(p).ok());
-        let held = roles(&self.db, user, org, project).await?;
+        // A `workspace` resource (by id) also counts roles bound to that workspace.
+        let workspace = (resource.kind == "workspace")
+            .then(|| {
+                resource
+                    .id
+                    .as_deref()
+                    .and_then(|w| WorkspaceId::from_str(w).ok())
+            })
+            .flatten();
+        let held = roles(&self.db, user, org, project, workspace).await?;
         // No role over this resource (another org, or a project they are not on): 404.
         if held.is_empty() {
             return Ok(Decision::Hide);

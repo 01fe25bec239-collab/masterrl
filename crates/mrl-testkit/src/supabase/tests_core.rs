@@ -397,8 +397,8 @@ async fn rbac_matches_the_p06_matrix_for_every_role_and_action() {
 #[tokio::test]
 #[ignore = "needs DATABASE_URL"]
 async fn every_route_answers_by_role_in_team_mode() {
-    // (method, path, action, body). Every signed-in route must be listed here.
-    let routes: &[(Method, &str, Action, Option<Value>)] = &[
+    // (method, path, action, body). Every signed-in route must be listed here or below.
+    let base: &[(Method, &str, Action, Option<Value>)] = &[
         (Method::GET, "/api/v1/auth/me", Action::AuthSession, None),
         (
             Method::POST,
@@ -472,6 +472,63 @@ async fn every_route_answers_by_role_in_team_mode() {
     let public = ["/api/v1/auth/login", "/api/v1/auth/callback"];
     let sb = MockSupabase::start().await;
     let core = CoreServer::start(Mode::Team, &sb, TestDb::new().await, Arc::default()).await;
+    let (org, ws) = (OrgId::new(), WorkspaceId::new());
+    core.db
+        .seed(&format!(
+            "INSERT INTO organizations (id, slug, name, kind) VALUES ('{o}', 'lab', 'Lab', 'team');
+             INSERT INTO workspaces (id, org_id, slug, name) VALUES ('{w}', '{o}', 'main', 'Main');",
+            o = org.as_uuid(),
+            w = ws.as_uuid()
+        ))
+        .await;
+    let mut routes: Vec<(Method, String, Action, Option<Value>)> = base
+        .iter()
+        .map(|(m, p, a, b)| (m.clone(), (*p).to_owned(), *a, b.clone()))
+        .collect();
+    // Taken slugs answer 409 once allowed, so only a refusal is a 403.
+    routes.extend([
+        (
+            Method::GET,
+            "/api/v1/orgs".to_owned(),
+            Action::AuthSession,
+            None,
+        ),
+        (
+            Method::POST,
+            "/api/v1/orgs".to_owned(),
+            Action::AdminManage,
+            Some(json!({"slug": "lab", "name": "Lab"})),
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/orgs/{org}/workspaces"),
+            Action::TenancyRead,
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/orgs/{org}/workspaces"),
+            Action::TenancyManageProjects,
+            Some(json!({"slug": "main", "name": "Main"})),
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/workspaces/{ws}/projects"),
+            Action::TenancyRead,
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/workspaces/{ws}/projects"),
+            Action::TenancyManageProjects,
+            Some(json!({"slug": "taken", "name": "Taken"})),
+        ),
+    ]);
+    let matches = |pattern: &str, path: &str| {
+        let (a, b): (Vec<&str>, Vec<&str>) =
+            (pattern.split('/').collect(), path.split('/').collect());
+        a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| x.starts_with('{') || x == y)
+    };
     // The table covers every route in the OpenAPI document (health and docs aside).
     let doc: Value = core
         .call(Method::GET, "/api-docs/openapi.json", &Auth::None, None)
@@ -482,20 +539,12 @@ async fn every_route_answers_by_role_in_team_mode() {
             continue;
         }
         for method in ops.as_object().unwrap().keys() {
-            let listed = routes.iter().any(|(m, p, _, _)| {
-                m.as_str().eq_ignore_ascii_case(method)
-                    && (p == path || p.starts_with(&path.replace("{id}", "")))
-            });
+            let listed = routes
+                .iter()
+                .any(|(m, p, _, _)| m.as_str().eq_ignore_ascii_case(method) && matches(path, p));
             assert!(listed, "{method} {path} has no row in the role table");
         }
     }
-    let org = OrgId::new();
-    core.db
-        .seed(&format!(
-            "INSERT INTO organizations (id, slug, name, kind) VALUES ('{}', 'lab', 'Lab', 'team')",
-            org.as_uuid()
-        ))
-        .await;
     for role in Role::ALL.into_iter().filter(|r| r.is_human()) {
         let person = MockUser::new(&format!("{role}@example.com"), role.as_str());
         let jwt = sb.access_token(&person, 600);
@@ -521,8 +570,8 @@ async fn every_route_answers_by_role_in_team_mode() {
             .await
             .unwrap();
         tx.commit().await.unwrap();
-        for (method, path, action, body) in routes {
-            if *method == Method::POST && *path == "/api/v1/auth/logout" {
+        for (method, path, action, body) in &routes {
+            if *method == Method::POST && path == "/api/v1/auth/logout" {
                 continue; // checked last: it would end nothing here, but keep the table honest
             }
             let r = core
@@ -1173,4 +1222,312 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
     fn make_writer(&'a self) -> Self::Writer {
         self.clone()
     }
+}
+
+async fn member(core: &CoreServer, sb: &MockSupabase, name: &str) -> (String, UserId) {
+    let person = MockUser::new(&format!("{name}@example.com"), name);
+    let jwt = sb.access_token(&person, 600);
+    let me = core
+        .call(
+            Method::GET,
+            "/api/v1/auth/me",
+            &Auth::Bearer(jwt.clone()),
+            None,
+        )
+        .await;
+    assert_eq!(me.status, 200, "{}", me.text());
+    let user: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE supabase_user_id = $1")
+        .bind(person.id)
+        .fetch_one(core.db.pool())
+        .await
+        .unwrap();
+    (jwt, UserId::from_uuid(user))
+}
+
+async fn grant(core: &CoreServer, org: OrgId, user: UserId, role: Role, scope: Scope) {
+    let mut tx = core.db.db().begin().await.unwrap();
+    tenancy::bind_role(&mut tx, org, user, role, scope)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn tenancy_endpoints_create_list_refuse_duplicates_in_solo_mode() {
+    let sb = MockSupabase::start().await;
+    let core = solo(&sb).await;
+    let post = |path: String, slug: &str| {
+        let body = json!({"slug": slug, "name": format!("{slug} name")});
+        let core = &core;
+        async move {
+            core.call(Method::POST, &path, &Auth::Launch, Some(body))
+                .await
+        }
+    };
+    let get = |path: String| {
+        let core = &core;
+        async move { core.call(Method::GET, &path, &Auth::Launch, None).await }
+    };
+    let org = post("/api/v1/orgs".into(), "vision").await;
+    assert_eq!(org.status, 201, "{}", org.text());
+    let org = org.json();
+    assert_eq!(
+        (org["slug"].as_str(), org["kind"].as_str()),
+        (Some("vision"), Some("team"))
+    );
+    let org_id = org["id"].as_str().unwrap().to_owned();
+    assert!(org_id.starts_with("org_"));
+    let orgs = get("/api/v1/orgs".into()).await.json();
+    let slugs: Vec<&str> = orgs["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["slug"].as_str().unwrap())
+        .collect();
+    assert_eq!(slugs, vec!["personal", "vision"]);
+    assert!(orgs["next_cursor"].is_null());
+    let first = get("/api/v1/orgs?limit=1".into()).await.json();
+    let next = get(format!(
+        "/api/v1/orgs?limit=1&cursor={}",
+        first["next_cursor"].as_str().unwrap()
+    ))
+    .await
+    .json();
+    assert_eq!(next["items"][0]["slug"], "vision");
+
+    for (level, path) in [("org", "/api/v1/orgs".to_owned())] {
+        let dup = post(path.clone(), "vision").await;
+        assert_eq!(dup.status, 409, "{level}: {}", dup.text());
+        assert_eq!(dup.headers["content-type"], "application/problem+json");
+        let p = dup.json();
+        assert_eq!(p["code"], "MRL-CONFLICT-160");
+        assert_eq!(p["title"], "This short name is already used here.");
+        assert_eq!(p["instance"], "/api/v1/orgs");
+        assert!(!p["trace_id"].as_str().unwrap().is_empty());
+        assert_eq!(
+            post(path, "personal").await.status,
+            409,
+            "the personal org's slug is taken too"
+        );
+    }
+    for bad in ["Bad Slug", "-x", "", &"a".repeat(64)] {
+        assert_eq!(
+            post("/api/v1/orgs".into(), bad).await.status,
+            422,
+            "{bad:?}"
+        );
+    }
+
+    let ws_path = format!("/api/v1/orgs/{org_id}/workspaces");
+    let ws = post(ws_path.clone(), "research").await;
+    assert_eq!(ws.status, 201, "{}", ws.text());
+    let ws = ws.json();
+    assert_eq!(ws["org_id"], org_id.as_str());
+    let ws_id = ws["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        post(ws_path.clone(), "research").await.json()["code"],
+        "MRL-CONFLICT-160"
+    );
+    assert_eq!(
+        get(ws_path).await.json()["items"].as_array().unwrap().len(),
+        1
+    );
+
+    let prj_path = format!("/api/v1/workspaces/{ws_id}/projects");
+    let prj = post(prj_path.clone(), "grpo-math").await;
+    assert_eq!(prj.status, 201, "{}", prj.text());
+    let prj = prj.json();
+    assert_eq!(
+        (prj["workspace_id"].as_str(), prj["org_id"].as_str()),
+        (Some(ws_id.as_str()), Some(org_id.as_str()))
+    );
+    assert!(prj["id"].as_str().unwrap().starts_with("prj_"));
+    assert_eq!(post(prj_path.clone(), "grpo-math").await.status, 409);
+    let listed = get(prj_path).await.json();
+    assert_eq!(listed["items"][0]["slug"], "grpo-math");
+    assert_eq!(listed["items"].as_array().unwrap().len(), 1);
+    // The same slug is fine in another workspace.
+    let other = post(format!("/api/v1/orgs/{org_id}/workspaces"), "other")
+        .await
+        .json();
+    assert_eq!(
+        post(
+            format!(
+                "/api/v1/workspaces/{}/projects",
+                other["id"].as_str().unwrap()
+            ),
+            "grpo-math"
+        )
+        .await
+        .status,
+        201
+    );
+
+    // Unknown or malformed ids are 404.
+    assert_eq!(
+        get(format!("/api/v1/orgs/{}/workspaces", OrgId::new()))
+            .await
+            .status,
+        404
+    );
+    assert_eq!(
+        get("/api/v1/orgs/nonsense/workspaces".into()).await.status,
+        404
+    );
+    assert_eq!(
+        post(
+            format!("/api/v1/workspaces/{}/projects", WorkspaceId::new()),
+            "x"
+        )
+        .await
+        .status,
+        404
+    );
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE action = 'tenancy.manage_projects'",
+    )
+    .fetch_one(core.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(audited, 5, "every create is audited");
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn tenancy_endpoints_follow_roles_and_hide_other_orgs_in_team_mode() {
+    let sb = MockSupabase::start().await;
+    let core = CoreServer::start(Mode::Team, &sb, TestDb::new().await, Arc::default()).await;
+    let (lab, rival, ws) = (OrgId::new(), OrgId::new(), WorkspaceId::new());
+    core.db
+        .seed(&format!(
+            "INSERT INTO organizations (id, slug, name, kind) VALUES ('{a}', 'lab', 'Lab', 'team'), ('{b}', 'rival', 'Rival', 'team');
+             INSERT INTO workspaces (id, org_id, slug, name) VALUES ('{w}', '{a}', 'main', 'Main');",
+            a = lab.as_uuid(), b = rival.as_uuid(), w = ws.as_uuid()
+        ))
+        .await;
+    let (alice, a) = member(&core, &sb, "alice").await;
+    let (bob, b) = member(&core, &sb, "bob").await;
+    let (carol, c) = member(&core, &sb, "carol").await;
+    let (dave, d) = member(&core, &sb, "dave").await;
+    let (eve, e) = member(&core, &sb, "eve").await;
+    let (nobody, _) = member(&core, &sb, "nobody").await;
+    grant(&core, lab, a, Role::Owner, Scope::Org).await;
+    grant(&core, lab, b, Role::Researcher, Scope::Org).await;
+    grant(&core, lab, c, Role::Maintainer, Scope::Org).await;
+    grant(&core, lab, d, Role::Maintainer, Scope::Workspace(ws)).await;
+    grant(&core, rival, e, Role::Owner, Scope::Org).await;
+    let call = |jwt: &str, method: Method, path: String, body: Option<Value>| {
+        let (core, auth) = (&core, Auth::Bearer(jwt.to_owned()));
+        async move { core.call(method, &path, &auth, body).await }
+    };
+    let item = |slug: &str| Some(json!({"slug": slug, "name": slug}));
+    let workspaces = format!("/api/v1/orgs/{lab}/workspaces");
+    let projects = format!("/api/v1/workspaces/{ws}/projects");
+
+    // Creating an org needs the platform owner (admin.manage).
+    assert_eq!(
+        call(
+            &alice,
+            Method::POST,
+            "/api/v1/orgs".into(),
+            item("alice-org")
+        )
+        .await
+        .status,
+        201
+    );
+    for jwt in [&bob, &carol, &nobody] {
+        let r = call(jwt, Method::POST, "/api/v1/orgs".into(), item("nope")).await;
+        assert_eq!(r.status, 403, "{}", r.text());
+    }
+    let alices: Vec<String> = call(&alice, Method::GET, "/api/v1/orgs".into(), None)
+        .await
+        .json()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["slug"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(alices.len(), 2, "lab and the org alice made: {alices:?}");
+    assert_eq!(
+        call(&nobody, Method::GET, "/api/v1/orgs".into(), None)
+            .await
+            .json()["items"],
+        json!([])
+    );
+
+    // A researcher reads but may not create; owner and maintainer may.
+    assert_eq!(
+        call(&bob, Method::GET, workspaces.clone(), None)
+            .await
+            .status,
+        200
+    );
+    let denied = call(&bob, Method::POST, workspaces.clone(), item("bobs")).await;
+    assert_eq!(denied.status, 403);
+    assert!(code_in(&denied.json(), "MRL-PERM-001"));
+    assert_eq!(
+        call(&bob, Method::POST, projects.clone(), item("bobs"))
+            .await
+            .status,
+        403
+    );
+    assert_eq!(
+        call(&carol, Method::POST, workspaces.clone(), item("carols"))
+            .await
+            .status,
+        201
+    );
+    assert_eq!(
+        call(&alice, Method::POST, projects.clone(), item("alices"))
+            .await
+            .status,
+        201
+    );
+    // A workspace maintainer creates projects there but sees nothing org-wide.
+    assert_eq!(
+        call(&dave, Method::POST, projects.clone(), item("daves"))
+            .await
+            .status,
+        201
+    );
+    assert_eq!(
+        call(&dave, Method::GET, projects.clone(), None)
+            .await
+            .json()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        call(&dave, Method::GET, workspaces.clone(), None)
+            .await
+            .status,
+        404
+    );
+
+    // Another org's owner gets 404 everywhere in this org, the same as for an unknown id.
+    for (method, path, body) in [
+        (Method::GET, workspaces.clone(), None),
+        (Method::POST, workspaces.clone(), item("eves")),
+        (Method::GET, projects.clone(), None),
+        (Method::POST, projects.clone(), item("eves")),
+    ] {
+        let r = call(&eve, method.clone(), path.clone(), body).await;
+        assert_eq!(r.status, 404, "{method} {path}: {}", r.text());
+        assert!(code_in(&r.json(), "MRL-RES-001"));
+    }
+    let eves: Vec<String> = call(&eve, Method::GET, "/api/v1/orgs".into(), None)
+        .await
+        .json()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|o| o["slug"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(eves, vec!["rival"]);
+    core.stop().await;
 }

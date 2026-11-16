@@ -1,4 +1,4 @@
-//! Encryption for setup sync and the keychain fallback: XChaCha20-Poly1305 with a random
+//! Encryption for setup sync and for the encrypted-file vault: XChaCha20-Poly1305 with a random
 //! 24-byte nonce, and 32-byte keys from Argon2id.
 
 use base64::engine::general_purpose::STANDARD;

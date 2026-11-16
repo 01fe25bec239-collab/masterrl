@@ -2227,6 +2227,17 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-CONFLICT-160")),
+            ("title", Value::Str("This short name is already used here.")),
+            ("why", Value::Str("Each org, workspace and project needs its own short name for addresses. Another one at this level already uses it.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Pick a different short name, like `vision-lab-2`."),
+                    Value::Str("To use the existing one instead, find it in the list at this level."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-DATA-001")),
             ("title", Value::Str("Your dataset did not pass its checks.")),
             ("why", Value::Str("Some rows are empty, are missing fields, or don't match the chosen format.")),

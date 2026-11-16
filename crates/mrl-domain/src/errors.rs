@@ -542,6 +542,7 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         code(Env, 161),
         "The app could not use this computer's keychain.",
     ),
+    (code(Conflict, 160), "This short name is already used here."),
     // <mrl:errors P17> rows for P17 go right below this line.
 
     // <mrl:errors P18> rows for P18 go right below this line.

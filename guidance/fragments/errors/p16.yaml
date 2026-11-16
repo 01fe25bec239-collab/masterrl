@@ -85,3 +85,11 @@ errors:
         - Open Credential Manager and check that it works.
       linux:
         - Unlock your login keyring, for example with the `seahorse` app.
+
+  - code: MRL-CONFLICT-160
+    title: This short name is already used here.
+    why: Each org, workspace and project needs its own short name for addresses. Another one at this level already uses it.
+    what_to_do:
+      steps:
+        - Pick a different short name, like `vision-lab-2`.
+        - To use the existing one instead, find it in the list at this level.

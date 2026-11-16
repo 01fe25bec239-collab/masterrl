@@ -1086,6 +1086,13 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': 'Other changes to the same items kept getting in the way, so the server '
                     'stopped trying.',
              'what_to_do': {'steps': ['Try again in a few seconds.']}},
+            {'code': 'MRL-CONFLICT-160',
+             'title': 'This short name is already used here.',
+             'why': 'Each org, workspace and project needs its own short name for addresses. '
+                    'Another one at this level already uses it.',
+             'what_to_do': {'steps': ['Pick a different short name, like `vision-lab-2`.',
+                                      'To use the existing one instead, find it in the list at '
+                                      'this level.']}},
             {'code': 'MRL-DATA-001',
              'title': 'Your dataset did not pass its checks.',
              'why': "Some rows are empty, are missing fields, or don't match the chosen format.",

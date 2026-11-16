@@ -198,6 +198,130 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /api/v1/orgs:
+    get:
+      tags:
+      - tenancy
+      operationId: list_orgs
+      parameters:
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Orgs you hold a role in.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_Org'
+    post:
+      tags:
+      - tenancy
+      operationId: create_org
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NewItem'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Org'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/orgs/{org}/workspaces:
+    get:
+      tags:
+      - tenancy
+      operationId: list_workspaces
+      parameters:
+      - name: org
+        in: path
+        description: '`org_…`'
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_Workspace'
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    post:
+      tags:
+      - tenancy
+      operationId: create_workspace
+      parameters:
+      - name: org
+        in: path
+        description: '`org_…`'
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NewItem'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Workspace'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/sync/profile:
     get:
       tags:
@@ -311,6 +435,79 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SyncStatus'
+  /api/v1/workspaces/{ws}/projects:
+    get:
+      tags:
+      - tenancy
+      operationId: list_projects
+      parameters:
+      - name: ws
+        in: path
+        description: '`ws_…`'
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_Project'
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    post:
+      tags:
+      - tenancy
+      operationId: create_project
+      parameters:
+      - name: ws
+        in: path
+        description: '`ws_…`'
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NewItem'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /healthz:
     get:
       tags:
@@ -579,6 +776,20 @@ components:
           - $ref: '#/components/schemas/UserInfo'
             description: The person (absent for an unknown principal).
           - type: 'null'
+    NewItem:
+      type: object
+      description: A new org, workspace or project.
+      required:
+      - slug
+      - name
+      properties:
+        name:
+          type: string
+          description: Display name, 1–100 characters.
+        slug:
+          type: string
+          description: 'Short name used in addresses: 1–63 lower-case letters, digits and `-`, starting with a letter or digit.'
+      additionalProperties: false
     NewToken:
       type: object
       description: A token, shown once.
@@ -603,6 +814,32 @@ components:
         token:
           type: string
           description: '`mrl_pat_…`. Store it now; it is never shown again.'
+    Org:
+      type: object
+      description: An org.
+      required:
+      - id
+      - slug
+      - name
+      - kind
+      - created_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+          description: Created.
+        id:
+          type: string
+          description: '`org_…`.'
+        kind:
+          type: string
+          description: '`personal` or `team`.'
+        name:
+          type: string
+          description: Name.
+        slug:
+          type: string
+          description: Slug, unique on this core.
     Page_AuditRecord:
       type: object
       description: One page of results.
@@ -665,6 +902,90 @@ components:
           - string
           - 'null'
           description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_Org:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: An org.
+            required:
+            - id
+            - slug
+            - name
+            - kind
+            - created_at
+            properties:
+              created_at:
+                type: string
+                format: date-time
+                description: Created.
+              id:
+                type: string
+                description: '`org_…`.'
+              kind:
+                type: string
+                description: '`personal` or `team`.'
+              name:
+                type: string
+                description: Name.
+              slug:
+                type: string
+                description: Slug, unique on this core.
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_Project:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: A project.
+            required:
+            - id
+            - org_id
+            - workspace_id
+            - slug
+            - name
+            - created_at
+            properties:
+              created_at:
+                type: string
+                format: date-time
+                description: Created.
+              id:
+                type: string
+                description: '`prj_…`.'
+              name:
+                type: string
+                description: Name.
+              org_id:
+                type: string
+                description: '`org_…`.'
+              slug:
+                type: string
+                description: Slug, unique in the workspace.
+              workspace_id:
+                type: string
+                description: '`ws_…`.'
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
     Page_TokenInfo:
       type: object
       description: One page of results.
@@ -713,6 +1034,46 @@ components:
           - string
           - 'null'
           description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_Workspace:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: A workspace.
+            required:
+            - id
+            - org_id
+            - slug
+            - name
+            - created_at
+            properties:
+              created_at:
+                type: string
+                format: date-time
+                description: Created.
+              id:
+                type: string
+                description: '`ws_…`.'
+              name:
+                type: string
+                description: Name.
+              org_id:
+                type: string
+                description: '`org_…`.'
+              slug:
+                type: string
+                description: Slug, unique in the org.
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
     Problem:
       type: object
       description: RFC 9457 problem document.
@@ -753,6 +1114,36 @@ components:
         type:
           type: string
           description: '`https://docs.masterrl.dev/errors/<code>`.'
+    Project:
+      type: object
+      description: A project.
+      required:
+      - id
+      - org_id
+      - workspace_id
+      - slug
+      - name
+      - created_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+          description: Created.
+        id:
+          type: string
+          description: '`prj_…`.'
+        name:
+          type: string
+          description: Name.
+        org_id:
+          type: string
+          description: '`org_…`.'
+        slug:
+          type: string
+          description: Slug, unique in the workspace.
+        workspace_id:
+          type: string
+          description: '`ws_…`.'
     Pushed:
       type: object
       description: A copy was saved.
@@ -1079,9 +1470,37 @@ components:
         id:
           type: string
           description: '`usr_…`.'
+    Workspace:
+      type: object
+      description: A workspace.
+      required:
+      - id
+      - org_id
+      - slug
+      - name
+      - created_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+          description: Created.
+        id:
+          type: string
+          description: '`ws_…`.'
+        name:
+          type: string
+          description: Name.
+        org_id:
+          type: string
+          description: '`org_…`.'
+        slug:
+          type: string
+          description: Slug, unique in the org.
 tags:
 - name: health
   description: Liveness and readiness.
+- name: tenancy
+  description: Orgs, workspaces and projects.
 - name: audit
   description: The audit log.
 - name: auth
