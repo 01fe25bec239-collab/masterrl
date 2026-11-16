@@ -21,6 +21,7 @@ import math
 import re
 from collections.abc import Collection, Mapping
 from dataclasses import dataclass
+from typing import cast
 
 from mrl_rewards.types import EXPR_INVALID, JSONValue, RewardError
 
@@ -202,8 +203,12 @@ class _Parser:
             return node
         if kind == "num":
             value = float(text) if any(ch in text for ch in ".eE") else int(text)
-            if not math.isfinite(value):
-                raise ExprError(self.text, f"the number {text} is too large")
+            try:
+                fits = math.isfinite(value)
+            except OverflowError:  # an int beyond the float range
+                fits = False
+            if not fits:
+                raise ExprError(self.text, f"the number {text[:20]}… is too large")
             return Lit(value)
         if kind == "str":
             return Lit(text)
@@ -261,13 +266,13 @@ def _equal(a: JSONValue, b: JSONValue) -> bool:
 def _order(op: str, a: JSONValue, b: JSONValue) -> bool:
     if isinstance(a, bool) or isinstance(b, bool):
         return False
-    if isinstance(a, int | float) and isinstance(b, int | float):
-        x, y = float(a), float(b)
-    elif isinstance(a, str) and isinstance(b, str):
-        return {"<": a < b, "<=": a <= b, ">": a > b, ">=": a >= b}[op]
-    else:
-        return False
-    return {"<": x < y, "<=": x <= y, ">": x > y, ">=": x >= y}[op]
+    # Python compares int and float exactly, so huge ints from data never go through float().
+    if (isinstance(a, int | float) and isinstance(b, int | float)) or (
+        isinstance(a, str) and isinstance(b, str)
+    ):
+        x, y = cast("float", a), cast("float", b)
+        return {"<": x < y, "<=": x <= y, ">": x > y, ">=": x >= y}[op]
+    return False
 
 
 def _truth(v: JSONValue) -> bool:

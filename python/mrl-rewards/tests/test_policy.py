@@ -19,6 +19,7 @@ from mrl_rewards.policy import (
     PolicyRuntime,
     load_policy,
 )
+from mrl_rewards.policy.runtime import check_result
 from mrl_rewards.registry import Registry, builtin_registry
 from mrl_rewards.types import (
     ComponentSpec,
@@ -532,3 +533,100 @@ def test_build_rejections() -> None:
     with pytest.raises(RewardError) as err:
         runtime(d)
     assert err.value.code == "MRL-RWD-143"
+
+
+# --- overflow regressions (A3 review) ---------------------------------------------------------
+
+HUGE = [{"a": 1e308}, {"a": -1e308}, {"a": 1e308}]
+
+
+@pytest.mark.parametrize("where", ["final", "per_component"])
+def test_zscore_overflow_fails_samples_instead_of_nan(where: str) -> None:
+    norm = {"per_component": "none", "final": "none", where: "zscore_running"}
+    d = doc([{"id": "a"}], normalization=norm, clipping={"min": -1, "max": 1})
+    state = NormalizerState()
+    out = runtime(d).score(RewardBatch(samples(*HUGE)), state=state)
+    for s in out:
+        assert s.total is None  # never NaN, never a clipped NaN
+        assert (s.status, s.resolution) == (Status.ERROR, Resolution.MASKED)
+    flag = "total_not_finite" if where == "final" else "normalization_not_finite:a"
+    assert all(flag in s.flags for s in out)
+    assert state.to_dict() == {}  # overflowing stats were not kept
+
+
+def test_zscore_overflow_counts_toward_max_failure_rate() -> None:
+    d = doc(
+        [{"id": "a"}],
+        normalization={"per_component": "none", "final": "zscore_running"},
+        clipping={"min": -1, "max": 1},
+        failure={
+            "on_timeout": {"action": "mask"},
+            "on_error": {"action": "mask"},
+            "max_failure_rate": 0.5,
+        },
+    )
+    with pytest.raises(BatchFailedError) as err:
+        score(d, *HUGE)
+    assert err.value.failures_by_status == {"ERROR": 3}
+
+
+@pytest.mark.parametrize("action", ["mask", "fallback", "fail_batch"])
+@pytest.mark.parametrize(
+    ("method", "weights", "flag"),
+    [
+        ("weighted_sum", [1.0, 1.0], "total_not_finite"),  # math.fsum raises OverflowError
+        ("product", [1.0, 1.0], "total_not_finite"),
+        ("min", [10.0, 1.0], "weighted_not_finite:a"),  # min() would hide the inf
+    ],
+)
+def test_aggregation_overflow_follows_on_error(
+    method: str, weights: list[float], flag: str, action: str
+) -> None:
+    comps = [{"id": "a", "weight": weights[0]}, {"id": "b", "weight": weights[1]}]
+    d = doc(comps, method=method, failure=failure_policy(action))
+    batch = [{"a": 1e308, "b": 1e308}, {"a": 1, "b": 1}]
+    if action == "fail_batch":
+        with pytest.raises(BatchFailedError) as err:
+            score(d, *batch)
+        assert err.value.failures_by_status == {"ERROR": 1}
+        return
+    bad, good = score(d, *batch)
+    assert good.resolution == Resolution.SCORED
+    assert flag in bad.flags
+    assert bad.status == Status.ERROR
+    if action == "mask":
+        assert (bad.total, bad.resolution) == (None, Resolution.MASKED)
+    else:
+        assert (bad.total, bad.resolution) == (-1.0, Resolution.FALLBACK_APPLIED)
+
+
+def test_huge_int_component_value_is_invalid_output() -> None:
+    r = check_result(RewardResult(10**400, Status.OK), (-1e308, 1e308))
+    assert r.status == Status.INVALID_OUTPUT
+    assert "non_finite" in r.flags
+
+
+@settings(max_examples=400, deadline=None)
+@given(
+    values=st.lists(st.floats(allow_nan=False, allow_infinity=False), min_size=1, max_size=3),
+    method=st.sampled_from(["weighted_sum", "product", "min"]),
+    norm=st.sampled_from(["none", "minmax", "rank_in_group", "zscore_running"]),
+    final=st.sampled_from(["none", "minmax", "rank_in_group", "zscore_running"]),
+)
+def test_property_full_float_range_is_masked_or_finite(
+    values: list[float], method: str, norm: str, final: str
+) -> None:
+    comps = [{"id": f"c{i}", "weight": 2.0} for i in range(len(values))]
+    d = doc(
+        comps,
+        method=method,
+        normalization={"per_component": norm, "final": final},
+        clipping={"min": -1, "max": 1},
+    )
+    refs = [{f"c{i}": v for i, v in enumerate(values)}, {f"c{i}": -v for i, v in enumerate(values)}]
+    for s in score(d, *refs):
+        if s.total is None:
+            assert s.resolution == Resolution.MASKED
+        else:
+            assert math.isfinite(s.total)
+            assert -1 <= s.total <= 1

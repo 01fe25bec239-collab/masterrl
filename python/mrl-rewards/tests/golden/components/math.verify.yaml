@@ -19,3 +19,7 @@ cases:
   - {name: missing_reference, completion: "<answer>1</answer>", reference: {question: "?"}, expect: {status: INVALID_INPUT}}
   - {name: huge_exponent, completion: "<answer>1e999</answer>", reference: "1", expect: {value: 0.0}}
   - {name: divide_by_zero, completion: "<answer>1/0</answer>", reference: "1", expect: {value: 0.0}}
+  - {name: percent_is_its_value, completion: "<answer>50%</answer>", reference: "0.5", expect: {value: 1.0}}
+  - {name: percent_is_not_the_bare_number, completion: "<answer>50%</answer>", reference: "50", expect: {value: 0.0}}
+  - {name: bare_number_is_not_a_percent, completion: "<answer>50</answer>", reference: "50%", expect: {value: 0.0}}
+  - {name: percent_both_sides, completion: "<answer>50\\%</answer>", reference: "50%", expect: {value: 1.0}}

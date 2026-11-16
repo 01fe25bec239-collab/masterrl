@@ -151,3 +151,18 @@ def test_evaluation_never_raises_on_any_context(value: Any) -> None:
         "sample.reference.0 != 'x'",
     ):
         assert isinstance(parse(text).evaluate(ctx), bool)
+
+
+def test_huge_literals_are_expr_errors() -> None:
+    for text in ("sample.x > " + "1" * 400, "sample.x == -" + "9" * 400, "1" * 400 + ".0 == 1"):
+        with pytest.raises(ExprError) as err:
+            parse(text)
+        assert "too large" in err.value.message
+
+
+def test_huge_ints_in_data_compare_exactly() -> None:
+    ctx: dict[str, Any] = {"sample": {"reference": 10**400}}
+    assert parse("sample.reference > 0").evaluate(ctx) is True
+    assert parse("sample.reference < 1e300").evaluate(ctx) is False
+    assert parse("sample.reference == 1e300").evaluate(ctx) is False
+    assert parse("sample.reference >= -5").evaluate(ctx) is True

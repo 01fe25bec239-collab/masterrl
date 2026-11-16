@@ -130,13 +130,19 @@ class NormalizerState:
 
     stats: dict[str, _Running] = field(default_factory=dict[str, _Running])
 
-    def update(self, key: str, values: Sequence[float]) -> None:
-        s = self.stats.setdefault(key, _Running())
-        for v in values:  # Welford
+    def update(self, key: str, values: Sequence[float]) -> bool:
+        """Add values (Welford). Returns False, changing nothing, if the stats would overflow."""
+        old = self.stats.get(key, _Running())
+        s = _Running(old.n, old.mean, old.m2)
+        for v in values:
             s.n += 1
             d = v - s.mean
             s.mean += d / s.n
             s.m2 += d * (v - s.mean)
+        if not (math.isfinite(s.mean) and math.isfinite(s.m2)):
+            return False
+        self.stats[key] = s
+        return True
 
     def zscore(self, key: str, v: float) -> float:
         s = self.stats.get(key, _Running())
@@ -185,14 +191,19 @@ def _normalize(  # noqa: PLR0913 (keyword-only inputs)
         lo, hi = bounds or (min(values.values()), max(values.values()))
         return {i: 0.5 if hi == lo else (v - lo) / (hi - lo) for i, v in values.items()}
     if method is Normalization.ZSCORE_RUNNING:
-        state.update(key, [values[i] for i in sorted(values)])
+        if not state.update(key, [values[i] for i in sorted(values)]):
+            return dict.fromkeys(values, math.nan)  # the callers fail these samples
         return {i: state.zscore(key, v) for i, v in values.items()}
     return _rank_in_group(values, groups)
 
 
 def _aggregate(method: Aggregation, weighted: Sequence[float]) -> float:
+    """The combined value; NaN or inf when it doesn't fit in a float (callers fail the sample)."""
     if method is Aggregation.WEIGHTED_SUM:
-        return math.fsum(weighted)
+        try:
+            return math.fsum(weighted)
+        except (OverflowError, ValueError):  # intermediate overflow, or inf + -inf
+            return math.nan
     if method is Aggregation.MIN:
         return min(weighted)
     return math.prod(weighted)
@@ -361,19 +372,8 @@ class PolicyRuntime:
         out = _Composed()
         for i in healthy:
             self._compose(batch, i, res, normed, out)
+        totals = self._finalize(out, groups, state)
         failed |= out.not_finite
-        totals = {
-            **_normalize(
-                p.final, out.totals, key=FINAL_KEY, bounds=None, groups=groups, state=state
-            ),
-            **out.gated,
-        }
-        if p.clipping:
-            lo, hi = p.clipping
-            for i, t in totals.items():
-                if not lo <= t <= hi:
-                    totals[i] = min(max(t, lo), hi)
-                    out.flags[i].append("clipped")
 
         scores: list[SampleScore] = []
         fail_batch: list[str] = []
@@ -419,6 +419,27 @@ class PolicyRuntime:
             )
         return scores
 
+    def _finalize(
+        self, out: _Composed, groups: Mapping[int, str], state: NormalizerState
+    ) -> dict[int, float]:
+        """Final normalization and clipping. A non-finite result fails its sample."""
+        p = self.policy
+        finals = _normalize(
+            p.final, out.totals, key=FINAL_KEY, bounds=None, groups=groups, state=state
+        )
+        for i, t in finals.items():
+            if not math.isfinite(t):
+                out.not_finite.add(i)
+                out.flags[i].append("total_not_finite")
+        totals = {**{i: t for i, t in finals.items() if i not in out.not_finite}, **out.gated}
+        if p.clipping:
+            lo, hi = p.clipping
+            for i, t in totals.items():
+                if not lo <= t <= hi:
+                    totals[i] = min(max(t, lo), hi)
+                    out.flags[i].append("clipped")
+        return totals
+
     def _compose(
         self,
         batch: RewardBatch,
@@ -427,22 +448,33 @@ class PolicyRuntime:
         normed: Mapping[str, Mapping[int, float]],
         out: _Composed,
     ) -> None:
-        """Gates, then the weighted aggregate, for one healthy sample."""
+        """Gates, then the weighted aggregate, for one healthy sample. Any value that isn't a
+        finite number (overflowing normalization or aggregate) fails the sample, gate or not."""
         p = self.policy
         view = self._gate_view(batch.samples[i], i, res)
         gate = next((g for g in p.gates if not g.require.evaluate(view)), None)
         weighted: list[float] = []
+        broken: list[str] = []
         for c in p.components:
             if res[(i, c.id)].status is not Status.OK:
                 continue
             w = self.weight(c, batch.trainer_step)
             v = normed[c.id][i]
+            if not math.isfinite(v):
+                broken.append(f"normalization_not_finite:{c.id}")
+                continue
+            if not math.isfinite(w * v):
+                broken.append(f"weighted_not_finite:{c.id}")
+                continue
             weighted.append(w * v)
             if c.id in self._shaping:
                 out.extra[(i, c.id)]["policy.weight"] = w
             if p.per_component is not Normalization.NONE:
                 out.extra[(i, c.id)]["policy.normalized"] = v
-        if gate is not None:
+        if broken:
+            out.not_finite.add(i)
+            out.flags[i] += broken
+        elif gate is not None:
             out.gated[i] = gate.else_value
             out.flags[i] += ["gated", f"gated:{gate.id}"]
         elif not weighted:

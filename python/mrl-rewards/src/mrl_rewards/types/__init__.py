@@ -159,7 +159,13 @@ class RewardResult:
 
 
 def is_finite_number(value: object) -> bool:
-    return isinstance(value, int | float) and not isinstance(value, bool) and math.isfinite(value)
+    """A real int/float (not bool) that fits a finite float."""
+    if not isinstance(value, int | float) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:  # an int beyond the float range
+        return False
 
 
 @dataclass(frozen=True)

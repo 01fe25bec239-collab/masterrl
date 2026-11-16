@@ -10,3 +10,8 @@ cases:
   - {name: tag_with_text, params: {answer_extractor: "tag:answer"}, completion: "<answer>about 3</answer>", reference: "3", expect: {value: 0.0, flags: [parse_failed]}}
   - {name: overflow_is_zero, completion: "1e999", reference: "1", expect: {value: 0.0}}
   - {name: negative, completion: "it is -2.5", reference: -2.5, expect: {value: 1.0}}
+  - {name: percent_is_its_value, params: {answer_extractor: "tag:answer"}, completion: "<answer>50%</answer>", reference: "0.5", expect: {value: 1.0}}
+  - {name: percent_is_not_the_bare_number, params: {answer_extractor: "tag:answer"}, completion: "<answer>50%</answer>", reference: "50", expect: {value: 0.0}}
+  - {name: last_number_keeps_percent, completion: "so about 50%", reference: 0.5, expect: {value: 1.0}}
+  - {name: last_number_percent_vs_bare, completion: "so about 50%", reference: 50, expect: {value: 0.0}}
+  - {name: reference_percent, completion: "0.25", reference: "25%", expect: {value: 1.0}}
