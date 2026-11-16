@@ -57,7 +57,7 @@ class PlaceholdersTest(unittest.TestCase):
         self.assertEqual(placeholders.scan(root), [])
 
     def test_does_not_flag_itself(self):
-        source = Path(placeholders.__file__).read_text()
+        source = Path(placeholders.__file__).read_text(encoding="utf-8")
         self.assertFalse(any(p in source for p in placeholders.PATTERNS))
 
 

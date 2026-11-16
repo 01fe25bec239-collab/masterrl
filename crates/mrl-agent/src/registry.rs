@@ -22,6 +22,9 @@ pub trait AgentService: Send + Sync {
 pub fn services() -> Vec<Box<dyn AgentService>> {
     vec![
         // <mrl:register>
+        // <mrl:register P18> P18 services go right below this line.
+
+        // <mrl:register P20> P20 services go right below this line.
         // </mrl:register>
     ]
 }

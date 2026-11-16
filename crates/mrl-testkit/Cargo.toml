@@ -28,6 +28,16 @@ sqlx = { workspace = true }
 mrl-agent = { path = "../mrl-agent" }
 tempfile = "=3.27.0"
 
+# <mrl:deps P16> P16 dependencies go right below this line.
+
+# <mrl:deps P17> P17 dependencies go right below this line.
+
+# <mrl:deps P18> P18 dependencies go right below this line.
+
+# <mrl:deps P19> P19 dependencies go right below this line.
+
+# <mrl:deps P20> P20 dependencies go right below this line.
+
 [dev-dependencies]
 rcgen = { workspace = true }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }

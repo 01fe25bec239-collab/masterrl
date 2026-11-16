@@ -125,5 +125,9 @@ impl RunningAgent {
     }
 }
 
+// <mrl:testkit-agent P18> P18 `pub mod` lines go right below this line.
+
+// <mrl:testkit-agent P20> P20 `pub mod` lines go right below this line.
+
 #[cfg(test)]
 mod tests;

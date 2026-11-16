@@ -26,7 +26,12 @@ from pathlib import Path
 # Mirrors the local-only block in .gitignore.
 LOCAL_ONLY = ("docs/architecture/", "docs/implementation/", "AGENTS.md", "CLAUDE.md", "memory.md")
 # Generated files any lane may commit; the integrator regenerates them at merge (README §3.4).
-GENERATED = ("guidance/build/", "openapi/", "packages/api-client/src/generated/")
+GENERATED = (
+    "guidance/build/",
+    "openapi/",
+    "packages/api-client/src/generated/",
+    "python/mrl-sdk/src/mrl_sdk/_generated/",
+)
 LOCKFILES = ("Cargo.lock", "uv.lock", "pnpm-lock.yaml")
 
 

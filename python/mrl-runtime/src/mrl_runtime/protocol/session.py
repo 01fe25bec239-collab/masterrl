@@ -11,7 +11,6 @@ import contextlib
 import logging
 from collections.abc import Sequence
 
-import grpc
 import grpc.aio
 from google.protobuf.message import Message
 

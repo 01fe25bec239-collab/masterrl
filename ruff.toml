@@ -5,6 +5,10 @@ extend-exclude = ["tests/fixtures/models/.cache", "guidance/build"] # guidance/b
 [lint]
 select = ["E", "W", "F", "I", "B", "UP", "N", "SIM", "PTH", "RUF", "PL", "C4", "PIE", "PT", "RET", "TID"]
 ignore = ["PLR2004"] # magic numbers are fine in tests and fixtures
+# Text files must name their encoding: Windows defaults to cp1252, which breaks UTF-8 files.
+preview = true
+explicit-preview-rules = true
+extend-select = ["PLW1514"]
 
 [lint.isort]
 known-first-party = ["mrl_runtime", "mrl_rewards", "mrl_sdk", "mrl_adapter_trl", "mrl_adapter_lmeval", "mrl_adapter_mlx"]
