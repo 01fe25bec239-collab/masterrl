@@ -2184,6 +2184,27 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-CONFLICT-190")),
+            ("title", Value::Str("This name is already used here.")),
+            ("why", Value::Str("Another artifact or secret in this place already has this name.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Pick a different name, then try again."),
+                    Value::Str("To replace the old one, delete it first."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CONFLICT-191")),
+            ("title", Value::Str("This upload is already finished.")),
+            ("why", Value::Str("The upload was completed, cancelled, or it expired after 24 hours. It takes no more changes.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Start a new upload for the file."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-DATA-001")),
             ("title", Value::Str("Your dataset did not pass its checks.")),
             ("why", Value::Str("Some rows are empty, are missing fields, or don't match the chosen format.")),
@@ -2464,6 +2485,17 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Update the app on this machine, then start the run again."),
                     Value::Str("If that doesn't help, install a version of the engine made for your app version."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-ENV-190")),
+            ("title", Value::Str("This server has no place to keep secret values.")),
+            ("why", Value::Str("The server was started without a secret store, so it can't save or read secret values.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Start the server from the desktop app, which keeps secrets in your computer's keychain."),
+                    Value::Str("Or use a secret read from an environment variable."),
                 ])),
             ])),
         ]),
@@ -2906,6 +2938,17 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-PERM-190")),
+            ("title", Value::Str("This secret can't be used for this.")),
+            ("why", Value::Str("The secret's settings list the uses it allows, and this use is not one of them.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Add this use to the secret's allowed uses, if your team agrees."),
+                    Value::Str("Or pick a secret made for this use."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-QUOTA-001")),
             ("title", Value::Str("Your team reached its limit on jobs or GPUs.")),
             ("why", Value::Str("Your org limits how many jobs and GPUs a project can use at once.")),
@@ -2954,6 +2997,17 @@ pub static CATALOG: Value = Value::Map(&[
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Check the path against the reference at `/api-docs/openapi.json`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RES-190")),
+            ("title", Value::Str("This secret has no value yet.")),
+            ("why", Value::Str("The secret exists, but nobody saved its value. Or its environment variable is not set on the server.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Save the secret's value in the app, then try again."),
+                    Value::Str("For a secret read from an environment variable, set that variable and restart the server."),
                 ])),
             ])),
         ]),
@@ -3214,6 +3268,17 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Wait until nothing else is writing to the file."),
                     Value::Str("Start the upload again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STORE-190")),
+            ("title", Value::Str("Some parts of this upload are missing or the wrong size.")),
+            ("why", Value::Str("The app can finish an upload only when every part has arrived at its full size. Details list the parts.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Send the parts listed in Details again."),
+                    Value::Str("Then finish the upload again."),
                 ])),
             ])),
         ]),

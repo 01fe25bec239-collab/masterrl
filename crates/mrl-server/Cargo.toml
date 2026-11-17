@@ -50,6 +50,8 @@ utoipa = { workspace = true, features = ["yaml"] }
 # <mrl:deps P18> P18 dependencies go right below this line.
 
 # <mrl:deps P19> P19 dependencies go right below this line.
+mrl-domain = { path = "../mrl-domain" }
+mrl-storage = { path = "../mrl-storage" }
 
 [dev-dependencies]
 mrl-domain = { path = "../mrl-domain" }

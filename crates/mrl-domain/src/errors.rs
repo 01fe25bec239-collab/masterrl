@@ -523,7 +523,18 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
     // <mrl:errors P18> rows for P18 go right below this line.
 
     // <mrl:errors P19> rows for P19 go right below this line.
-
+    (code(Conflict, 190), "This name is already used here."),
+    (code(Conflict, 191), "This upload is already finished."),
+    (
+        code(Store, 190),
+        "Some parts of this upload are missing or the wrong size.",
+    ),
+    (code(Perm, 190), "This secret can't be used for this."),
+    (code(Res, 190), "This secret has no value yet."),
+    (
+        code(Env, 190),
+        "This server has no place to keep secret values.",
+    ),
     // <mrl:errors P20> rows for P20 go right below this line.
 ];
 

@@ -465,6 +465,17 @@ impl Config {
         // <mrl:validate P18> P18 checks (push to `problems`) go right below this line.
 
         // <mrl:validate P19> P19 checks (push to `problems`) go right below this line.
+        if let Some(url) = &self.object_store.url {
+            let bucket = url
+                .strip_prefix("s3://")
+                .map(|r| r.split('/').next().unwrap_or_default());
+            if bucket == Some("") {
+                problems.push(
+                    "object_store.url: an s3:// address needs a bucket name, like s3://masterrl"
+                        .to_owned(),
+                );
+            }
+        }
         if problems.is_empty() {
             Ok(())
         } else {

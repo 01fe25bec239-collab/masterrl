@@ -7,6 +7,473 @@ info:
     identifier: Apache-2.0
   version: 0.1.0
 paths:
+  /api/v1/artifacts:
+    get:
+      tags:
+      - artifacts
+      summary: Lists committed artifacts, newest last.
+      operationId: list
+      parameters:
+      - name: kind
+        in: query
+        description: Only this kind.
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: '`{items: [Artifact], next_cursor}`'
+          content:
+            application/json:
+              schema:
+                type: object
+    post:
+      tags:
+      - artifacts
+      summary: Registers an artifact.
+      operationId: register
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NewArtifact'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Artifact'
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/artifacts/{art}:
+    get:
+      tags:
+      - artifacts
+      summary: Reads one artifact.
+      operationId: get_one
+      parameters:
+      - name: art
+        in: path
+        description: '`art_…`'
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Artifact'
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/artifacts/{art}:download:
+    post:
+      tags:
+      - artifacts
+      summary: '`POST /artifacts/{art}:download` → a GET ticket for one file of a committed artifact.'
+      operationId: action
+      parameters:
+      - name: art
+        in: path
+        description: '`art_…`'
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DownloadRequest'
+        required: true
+      responses:
+        '200':
+          description: 'A transfer ticket: `{method, key, max_size, expires_at, url, presigned, headers}`.'
+          content:
+            application/json:
+              schema:
+                type: object
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/lineage/{id}:
+    get:
+      tags:
+      - lineage
+      summary: Reads the lineage graph around a node.
+      operationId: query
+      parameters:
+      - name: id
+        in: path
+        description: A typed id, like `run_…`.
+        required: true
+        schema:
+          type: string
+      - name: direction
+        in: query
+        description: '`upstream`, `downstream` or `both` (default).'
+        required: false
+        schema:
+          type: string
+      - name: depth
+        in: query
+        description: Steps to walk, 1–10 (default 3).
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Graph'
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/secrets:
+    get:
+      tags:
+      - secrets
+      summary: Lists secret references.
+      operationId: list
+      responses:
+        '200':
+          description: '`{items: [SecretMeta]}`'
+          content:
+            application/json:
+              schema:
+                type: object
+    post:
+      tags:
+      - secrets
+      summary: Creates a secret reference (no value).
+      operationId: create
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NewSecret'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SecretMeta'
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/secrets/{sec}:
+    get:
+      tags:
+      - secrets
+      summary: Reads one secret reference.
+      operationId: get
+      parameters:
+      - name: sec
+        in: path
+        description: '`sec_…`'
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SecretMeta'
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    delete:
+      tags:
+      - secrets
+      summary: Deletes a secret reference, its value and its grants.
+      operationId: delete
+      parameters:
+      - name: sec
+        in: path
+        description: '`sec_…`'
+        required: true
+        schema:
+          type: string
+      responses:
+        '204':
+          description: Deleted.
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/secrets/{sec}/grants:
+    post:
+      tags:
+      - secrets
+      summary: Lets a run receive the secret.
+      operationId: grant
+      parameters:
+      - name: sec
+        in: path
+        description: '`sec_…`'
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NewGrant'
+        required: true
+      responses:
+        '204':
+          description: Granted.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/secrets/{sec}/value:
+    put:
+      tags:
+      - secrets
+      summary: 'Saves a secret''s value. Write-only: the answer has no body.'
+      operationId: set_value
+      parameters:
+      - name: sec
+        in: path
+        description: '`sec_…`'
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: '`{"value": "…"}`'
+        content:
+          application/json:
+            schema:
+              type: object
+        required: true
+      responses:
+        '204':
+          description: Saved.
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/transfer/{ticket}:
+    get:
+      tags:
+      - artifacts
+      summary: Downloads one object with a GET ticket. Supports `Range`.
+      operationId: download
+      parameters:
+      - name: ticket
+        in: path
+        description: The ticket token.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The object bytes.
+        '206':
+          description: Part of the object.
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '416':
+          description: The range starts past the end.
+    put:
+      tags:
+      - artifacts
+      summary: Uploads one object with a PUT ticket.
+      operationId: upload
+      parameters:
+      - name: ticket
+        in: path
+        description: The ticket token.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/octet-stream:
+            schema:
+              type: array
+              items:
+                type: integer
+                format: int32
+                minimum: 0
+        required: true
+      responses:
+        '200':
+          description: '`{key, size, sha256}`'
+          content:
+            application/json:
+              schema:
+                type: object
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '413':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/uploads:
+    post:
+      tags:
+      - uploads
+      summary: Opens an upload.
+      operationId: create
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NewUpload'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Upload'
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/uploads/{up}:
+    get:
+      tags:
+      - uploads
+      summary: Reads an upload and the parts that arrived.
+      operationId: get
+      parameters:
+      - name: up
+        in: path
+        description: '`up_…`'
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Upload'
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/uploads/{up}/parts/{n}:
+    put:
+      tags:
+      - uploads
+      summary: Stores one part. With `x-mrl-content-sha256`, the part must match it.
+      operationId: put_part
+      parameters:
+      - name: up
+        in: path
+        description: '`up_…`'
+        required: true
+        schema:
+          type: string
+      - name: n
+        in: path
+        description: Part number from 0.
+        required: true
+        schema:
+          type: integer
+          format: int64
+          minimum: 0
+      requestBody:
+        content:
+          application/octet-stream:
+            schema:
+              type: array
+              items:
+                type: integer
+                format: int32
+                minimum: 0
+        required: true
+      responses:
+        '200':
+          description: '`{part, size, sha256}`'
+          content:
+            application/json:
+              schema:
+                type: object
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/uploads/{up}:complete:
+    post:
+      tags:
+      - uploads
+      summary: '`POST /uploads/{up}:complete`, `:abort` or `:presign`.'
+      operationId: action
+      parameters:
+      - name: up
+        in: path
+        description: '`up_…`'
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Upload'
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /healthz:
     get:
       tags:
@@ -41,6 +508,59 @@ paths:
                 $ref: '#/components/schemas/Readiness'
 components:
   schemas:
+    Artifact:
+      type: object
+      description: A registered artifact.
+      required:
+      - id
+      - name
+      - kind
+      - prefix
+      - state
+      - size_bytes
+      - manifest
+      - created_by
+      - created_at
+      - committed_at
+      properties:
+        committed_at:
+          type: string
+          format: date-time
+          description: When it committed.
+        created_at:
+          type: string
+          format: date-time
+          description: When it was registered.
+        created_by:
+          type: string
+          description: Who registered it.
+        id:
+          type: string
+          description: '`art_…`.'
+        kind:
+          type: string
+          description: '`model`, `dataset`, `checkpoint`, `eval`, `export` or `other`.'
+        manifest:
+          type: object
+          description: The manifest.
+        name:
+          type: string
+          description: Name.
+        prefix:
+          type: string
+          description: Full key prefix of the files.
+        project_id:
+          type:
+          - string
+          - 'null'
+          description: Project.
+        size_bytes:
+          type: integer
+          format: int64
+          description: Total bytes.
+        state:
+          type: string
+          description: '`PENDING`, `COMMITTED` or `FAILED`.'
     CheckResult:
       type: object
       description: One readiness check result.
@@ -59,6 +579,33 @@ components:
         status:
           type: string
           description: '`ready` or `not_ready`.'
+    DownloadRequest:
+      type: object
+      description: '`POST /artifacts/{art}:download` body.'
+      required:
+      - path
+      properties:
+        path:
+          type: string
+          description: A file path from the manifest.
+      additionalProperties: false
+    Edge:
+      type: object
+      description: An edge in the answer; `from` and `to` are node ids from `nodes`.
+      required:
+      - from
+      - relation
+      - to
+      properties:
+        from:
+          type: string
+          description: Source node id.
+        relation:
+          $ref: '#/components/schemas/Relation'
+          description: Relation.
+        to:
+          type: string
+          description: Target node id.
     FieldError:
       type: object
       description: One field problem inside a 422 response.
@@ -80,6 +627,31 @@ components:
         path:
           type: string
           description: JSON Pointer to the field, like `/config/peft/r`.
+    Graph:
+      type: object
+      description: A lineage graph around one node.
+      required:
+      - root
+      - nodes
+      - edges
+      - truncated
+      properties:
+        edges:
+          type: array
+          items:
+            $ref: '#/components/schemas/Edge'
+          description: Every edge between them.
+        nodes:
+          type: array
+          items:
+            $ref: '#/components/schemas/Node'
+          description: Every node reached.
+        root:
+          type: string
+          description: The node asked about.
+        truncated:
+          type: boolean
+          description: True when the walk stopped at the edge limit (1000).
     Health:
       type: object
       description: '`/healthz` body.'
@@ -89,6 +661,182 @@ components:
         status:
           type: string
           description: '`ok`.'
+    NewArtifact:
+      type: object
+      description: '`POST /artifacts` body.'
+      required:
+      - name
+      - manifest
+      properties:
+        links:
+          type: array
+          items:
+            $ref: '#/components/schemas/NewLink'
+          description: Lineage links written when the artifact commits.
+        manifest:
+          type: object
+          description: The `artifact-manifest/v1` document.
+        name:
+          type: string
+          description: Unique name in the org (or project).
+        prefix:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Folder of the files, relative to the org, ending in `/` (like `exports/exp1/`).
+            Default: `artifacts/{id}/`.
+        project_id:
+          type:
+          - string
+          - 'null'
+          description: Project, if the artifact belongs to one.
+      additionalProperties: false
+    NewGrant:
+      type: object
+      description: '`POST /secrets/{sec}/grants` body.'
+      required:
+      - run_id
+      - mount
+      properties:
+        mount:
+          type: string
+          description: '`env` (an environment variable) or `file` (a file in the run''s folder).'
+        run_id:
+          type: string
+          description: '`run_…`.'
+      additionalProperties: false
+    NewLink:
+      type: object
+      description: |-
+        A lineage link given when registering: this artifact `relation` `to`, or `from` `relation`
+        this artifact. Exactly one of `from` and `to` is set.
+      required:
+      - relation
+      properties:
+        from:
+          type:
+          - string
+          - 'null'
+          description: The other entity, when it points at this artifact (like a run that `produced` it).
+        relation:
+          $ref: '#/components/schemas/Relation'
+          description: How the two are related.
+        to:
+          type:
+          - string
+          - 'null'
+          description: The other entity, when this artifact points at it (like `derived_from` a checkpoint).
+      additionalProperties: false
+    NewSecret:
+      type: object
+      description: '`POST /secrets` body.'
+      required:
+      - name
+      - kind
+      - allowed_uses
+      properties:
+        allowed_uses:
+          type: array
+          items:
+            type: string
+          description: What the secret may be used for, like `run` or `model_download`.
+        env_var:
+          type:
+          - string
+          - 'null'
+          description: Read the value from this environment variable of the server instead of storing it.
+        kind:
+          type: string
+          description: '`hf_token`, `cloud_credentials`, `s3`, `oidc` or `generic`.'
+        name:
+          type: string
+          description: Unique name in the org (or project).
+        project_id:
+          type:
+          - string
+          - 'null'
+          description: Project, if the secret belongs to one.
+      additionalProperties: false
+    NewUpload:
+      type: object
+      description: '`POST /uploads` body.'
+      required:
+      - filename
+      - size
+      - sha256
+      properties:
+        filename:
+          type: string
+          description: File name, shown to people (1–255 characters, no `/` or `\`).
+        part_size:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Bytes per part, 1–2 MiB (default 2 MiB).
+          minimum: 0
+        project_id:
+          type:
+          - string
+          - 'null'
+          description: Project, if the upload belongs to one.
+        sha256:
+          type: string
+          description: sha256 of the whole file, lowercase hex.
+        size:
+          type: integer
+          format: int64
+          description: Total size in bytes.
+          minimum: 0
+      additionalProperties: false
+    Node:
+      type: object
+      description: A node in the answer.
+      required:
+      - id
+      - redacted
+      properties:
+        id:
+          type: string
+          description: The typed id, or `hidden-N` for a node the caller may not see.
+        kind:
+          type:
+          - string
+          - 'null'
+          description: Kind (id prefix); `null` when redacted.
+        redacted:
+          type: boolean
+          description: True when the caller may not see this node.
+    PartTicket:
+      type: object
+      description: One PUT ticket per part.
+      required:
+      - part
+      - ticket
+      properties:
+        part:
+          type: integer
+          format: int64
+          description: Part number.
+          minimum: 0
+        ticket:
+          type: object
+          description: 'The ticket: `PUT` its `url` with the part''s bytes.'
+    PresignRequest:
+      type: object
+      description: '`POST /uploads/{up}:presign` body.'
+      properties:
+        parts:
+          type:
+          - array
+          - 'null'
+          items:
+            type: integer
+            format: int64
+            minimum: 0
+          description: 'Part numbers; default: every part not received yet (at most 1000).'
+      additionalProperties: false
     Problem:
       type: object
       description: RFC 9457 problem document.
@@ -144,6 +892,146 @@ components:
         status:
           type: string
           description: '`ready`, `not_ready` or `draining`.'
+    Relation:
+      type: string
+      description: How two entities are related (Doc 09 §3.10).
+      enum:
+      - derived_from
+      - trained_on
+      - rewarded_by
+      - produced
+      - promoted_to
+      - deployed_as
+      - evaluated_by
+      - exported_as
+      - labelled_from
+      - generated_by
+    SecretMeta:
+      type: object
+      description: A secret reference. Never has the value.
+      required:
+      - id
+      - name
+      - kind
+      - backend
+      - allowed_uses
+      - created_by
+      - created_at
+      - rotated_at
+      properties:
+        allowed_uses:
+          type: array
+          items:
+            type: string
+          description: Allowed uses.
+        backend:
+          type: string
+          description: '`secret_store` or `env`.'
+        created_at:
+          type: string
+          format: date-time
+          description: When it was made.
+        created_by:
+          type: string
+          description: Who made it.
+        env_var:
+          type:
+          - string
+          - 'null'
+          description: The environment variable, for `env` secrets.
+        id:
+          type: string
+          description: '`sec_…`.'
+        kind:
+          type: string
+          description: Kind.
+        name:
+          type: string
+          description: Name.
+        project_id:
+          type:
+          - string
+          - 'null'
+          description: Project.
+        rotated_at:
+          type: string
+          format: date-time
+          description: When its value was last saved; `null` if never.
+    Upload:
+      type: object
+      description: An upload and its progress.
+      required:
+      - id
+      - filename
+      - size
+      - sha256
+      - part_size
+      - part_count
+      - state
+      - parts_received
+      - created_at
+      - expires_at
+      properties:
+        blob_key:
+          type:
+          - string
+          - 'null'
+          description: The finished file's key (completed uploads only).
+        created_at:
+          type: string
+          format: date-time
+          description: When it was opened.
+        expires_at:
+          type: string
+          format: date-time
+          description: An open upload expires at this time.
+        filename:
+          type: string
+          description: File name.
+        id:
+          type: string
+          description: '`up_…`.'
+        part_count:
+          type: integer
+          format: int64
+          description: Number of parts.
+          minimum: 0
+        part_size:
+          type: integer
+          format: int64
+          description: Bytes per part.
+          minimum: 0
+        parts_received:
+          type: array
+          items:
+            type: integer
+            format: int64
+            minimum: 0
+          description: Parts already stored (open uploads only).
+        project_id:
+          type:
+          - string
+          - 'null'
+          description: Project.
+        sha256:
+          type: string
+          description: Expected sha256.
+        size:
+          type: integer
+          format: int64
+          description: Total size in bytes.
+          minimum: 0
+        state:
+          type: string
+          description: '`OPEN`, `COMPLETED`, `ABORTED` or `EXPIRED`.'
 tags:
 - name: health
   description: Liveness and readiness.
+- name: artifacts
+  description: Generic artifacts and the transfer endpoint.
+- name: uploads
+  description: 'Resumable uploads. Also `POST /uploads/{up}:abort` and `POST /uploads/{up}:presign` (body `PresignRequest`, answer `{tickets: [PartTicket]}`).'
+- name: lineage
+  description: Where entities came from and what came from them.
+- name: secrets
+  description: Secret references. Values are write-only.
