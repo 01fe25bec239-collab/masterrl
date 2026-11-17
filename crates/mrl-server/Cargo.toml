@@ -48,6 +48,15 @@ utoipa = { workspace = true, features = ["yaml"] }
 # <mrl:deps P17> P17 dependencies go right below this line.
 
 # <mrl:deps P18> P18 dependencies go right below this line.
+mrl-domain = { path = "../mrl-domain" }
+mrl-proto = { path = "../mrl-proto" }
+prost = { workspace = true }
+prost-types = "=0.14.6"
+rcgen = { workspace = true, features = ["x509-parser"] }
+webpki = { package = "rustls-webpki", version = "=0.103.17", default-features = false, features = ["ring", "std"] }
+russh = { version = "=0.65.1", default-features = false, features = ["ring", "rsa", "flate2"] }
+tokio-stream = "=0.1.19"
+hyper-util = { version = "=0.1.21", features = ["tokio"] }
 
 # <mrl:deps P19> P19 dependencies go right below this line.
 

@@ -2770,6 +2770,41 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-LINK-184")),
+            ("title", Value::Str("The app and this machine can't reach each other.")),
+            ("why", Value::Str("The address may be wrong, the other side may not be running, or a network rule may block it.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Read the failing step in Details."),
+                    Value::Str("Check that the agent and the app are both running."),
+                    Value::Str("Run `mrl-agent connection-test` on the machine for a step-by-step check."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-LINK-185")),
+            ("title", Value::Str("Confirm this machine's key before the first connection.")),
+            ("why", Value::Str("This is the first remote sign-in (`ssh`) to this machine. The app checks its key so nobody can pretend to be it.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("On the machine, run `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`."),
+                    Value::Str("Confirm in the app only if the fingerprint matches the one in Details."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-LINK-186")),
+            ("title", Value::Str("This machine's sign-in key changed.")),
+            ("why", Value::Str("The key differs from the one you confirmed. Someone may be intercepting the connection, or the machine was reinstalled.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Don't connect until you know why the key changed."),
+                    Value::Str("If the machine was reinstalled, remove its old entry from the app's known hosts file named in Details."),
+                    Value::Str("Connect again and confirm the new key."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-MODEL-001")),
             ("title", Value::Str("The app did not load this model's files, to keep your computer safe.")),
             ("why", Value::Str("The weights use the pickle format, which can run hidden code. The app allows only safetensors files.")),
@@ -2881,6 +2916,85 @@ pub static CATALOG: Value = Value::Map(&[
                     Value::Str("Read the command and its message in Details."),
                     Value::Str("Run `mrl-agent service install` again."),
                     Value::Str("If it still fails, start the agent by hand with `mrl-agent run`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-NODE-180")),
+            ("title", Value::Str("The join token can't be used.")),
+            ("why", Value::Str("Each token adds one machine and works for a short time. This one is unknown, used or expired.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("In the app, open Machines and create a new join token."),
+                    Value::Str("Run the enroll command again with the new token."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-NODE-181")),
+            ("title", Value::Str("The app did not accept this machine's certificate.")),
+            ("why", Value::Str("The certificate was revoked, has expired, or belongs to another machine. The machine may also have been removed.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Read the reason in Details."),
+                    Value::Str("If the machine was removed by mistake, create a new join token and enroll it again."),
+                    Value::Str("Run `mrl-agent enroll --force` with the new token on that machine."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-NODE-182")),
+            ("title", Value::Str("This machine has not joined the app yet.")),
+            ("why", Value::Str("The agent needs its own certificate before it can connect, and it has none yet.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("In the app, open Machines and create a join token."),
+                    Value::Str("On this machine, run the enroll command the app shows."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-NODE-183")),
+            ("title", Value::Str("The app's certificate authority can't be used.")),
+            ("why", Value::Str("The app keeps a private key to sign machine certificates. It could not read or save that key.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check that the app's data folder is on a disk with free space."),
+                    Value::Str("Make sure your account can write to the folder named in Details."),
+                    Value::Str("Restart the app."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-NODE-187")),
+            ("title", Value::Str("The app did not send this command to the machine.")),
+            ("why", Value::Str("The machine is draining or was removed, or this version can't send that kind of command yet.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check the machine's status in the app."),
+                    Value::Str("Pick another machine, or bring this one back before trying again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-NODE-188")),
+            ("title", Value::Str("This machine has too many messages waiting for the app.")),
+            ("why", Value::Str("The app has been out of reach for a long time. The agent keeps important messages until the app has them.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Reconnect this machine to the app; the waiting messages are sent then."),
+                    Value::Str("To keep more while offline, raise `gateway.spool_max_bytes` in the agent settings."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-NODE-189")),
+            ("title", Value::Str("The app and the agent don't understand each other.")),
+            ("why", Value::Str("They may run versions that don't match, or a message was damaged on the way.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Update the agent and the app to the same version."),
+                    Value::Str("Connect again."),
                 ])),
             ])),
         ]),

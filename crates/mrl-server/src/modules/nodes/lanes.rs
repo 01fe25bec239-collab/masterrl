@@ -1,0 +1,405 @@
+//! The four logical lanes of D-04-05 and where their messages go.
+//!
+//! An agent opens one gRPC stream per protobuf lane (CONTROL, TELEMETRY, BULK). Each message
+//! also belongs to one logical lane, which decides its loss rule:
+//!
+//! | Lane | Messages | On overflow | Acked |
+//! |---|---|---|---|
+//! | CONTROL | hello, heartbeat, inventory, command results, attempt/deployment status, reconcile, probe results, guard events, other worker messages | never dropped: the stream waits | after it is handled and recorded |
+//! | METRICS | worker metrics, samples, rollout and reward stats | dropped; the next delivered item counts them (`dropped_before`) | on receipt |
+//! | LOGS | worker log chunks | dropped; the next delivered item counts them (truncation marker) | on receipt |
+//! | TELEMETRY | node telemetry | latest wins, never queued | on receipt |
+//!
+//! Later parts consume lanes through a [`LaneSink`] registered on a [`LaneRouter`]. With no
+//! sink, CONTROL messages are journaled to `node_events` (`control_unrouted`, warning metric)
+//! and METRICS/LOGS are acked and discarded (counter). TELEMETRY always updates
+//! `node_telemetry_latest` here, and also reaches a sink that takes it.
+
+use mrl_proto::agent::v1::{agent_message::Body, AgentMessage};
+use mrl_proto::worker::v1::worker_message::Body as WorkerBody;
+use prometheus::{IntCounterVec, Opts};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock, RwLock};
+use tokio::sync::mpsc;
+use uuid::Uuid;
+
+/// A logical lane (D-04-05).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LaneKind {
+    /// Never dropped.
+    Control,
+    /// Bounded, decimated on overflow.
+    Metrics,
+    /// Bounded, truncated with a marker on overflow.
+    Logs,
+    /// Latest wins, no spool.
+    Telemetry,
+}
+
+impl LaneKind {
+    /// Metric label, like `metrics`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Control => "control",
+            Self::Metrics => "metrics",
+            Self::Logs => "logs",
+            Self::Telemetry => "telemetry",
+        }
+    }
+
+    /// The logical lane of an agent message.
+    pub fn of(msg: &AgentMessage) -> LaneKind {
+        match &msg.body {
+            Some(Body::Telemetry(_)) => Self::Telemetry,
+            Some(Body::Worker(w)) => match w.message.as_ref().and_then(|m| m.body.as_ref()) {
+                Some(WorkerBody::Log(_)) => Self::Logs,
+                Some(
+                    WorkerBody::Metrics(_)
+                    | WorkerBody::Samples(_)
+                    | WorkerBody::RolloutBatch(_)
+                    | WorkerBody::RewardBatchStats(_),
+                ) => Self::Metrics,
+                _ => Self::Control,
+            },
+            _ => Self::Control,
+        }
+    }
+}
+
+/// One agent message handed to a sink.
+#[derive(Debug, Clone)]
+pub struct LaneItem {
+    /// The node (uuid of its `node_…` id).
+    pub node_id: Uuid,
+    /// The node's session epoch when the message arrived.
+    pub session_epoch: i64,
+    /// The logical lane.
+    pub lane: LaneKind,
+    /// `AgentMessage.seq` (per protobuf lane). Delivery is at-least-once: dedupe on
+    /// `(node_id, lane, seq)`.
+    pub seq: u64,
+    /// METRICS/LOGS: how many items of this lane were dropped just before this one.
+    pub dropped_before: u64,
+    /// The message.
+    pub message: AgentMessage,
+}
+
+/// Why a sink could not take an item.
+#[derive(Debug, thiserror::Error)]
+#[error("{sink}: {detail}")]
+pub struct SinkError {
+    /// The sink's name.
+    pub sink: &'static str,
+    /// What went wrong.
+    pub detail: String,
+}
+
+/// Where a later part takes the messages of some lanes.
+///
+/// CONTROL items are delivered before the agent gets its ack; a sink error ends the session, so
+/// the agent replays the message from its spool after reconnecting (at-least-once). METRICS and
+/// LOGS items come from a bounded queue; TELEMETRY items are the latest reading.
+#[async_trait::async_trait]
+pub trait LaneSink: Send + Sync {
+    /// Short name for logs and metrics.
+    fn name(&self) -> &'static str;
+    /// The lanes this sink takes (the first registered sink for a lane wins).
+    fn lanes(&self) -> &'static [LaneKind];
+    /// Handles one item. Must be idempotent per `(node_id, lane, seq)`.
+    async fn deliver(&self, item: LaneItem) -> Result<(), SinkError>;
+}
+
+/// The registered sinks.
+#[derive(Default)]
+pub struct LaneRouter {
+    sinks: RwLock<Vec<Arc<dyn LaneSink>>>,
+}
+
+impl LaneRouter {
+    /// An empty router (tests, or a module built with its own router).
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// The process-wide router `NodesModule::from_config` uses. Later parts register their sink
+    /// here when their module is built: `LaneRouter::global().register(Arc::new(MySink))`.
+    pub fn global() -> Arc<Self> {
+        // ponytail: one router per process; production runs one server per process.
+        static GLOBAL: OnceLock<Arc<LaneRouter>> = OnceLock::new();
+        GLOBAL.get_or_init(LaneRouter::new).clone()
+    }
+
+    /// Adds a sink.
+    pub fn register(&self, sink: Arc<dyn LaneSink>) {
+        if let Ok(mut s) = self.sinks.write() {
+            s.push(sink);
+        }
+    }
+
+    /// The sink for `lane`, if any.
+    pub fn sink_for(&self, lane: LaneKind) -> Option<Arc<dyn LaneSink>> {
+        self.sinks
+            .read()
+            .ok()?
+            .iter()
+            .find(|s| s.lanes().contains(&lane))
+            .cloned()
+    }
+}
+
+/// Lane counters in the process-wide Prometheus registry (all no-ops if they can't be built).
+pub struct LaneMetrics(Option<[IntCounterVec; 3]>);
+
+impl LaneMetrics {
+    /// The process-wide instance.
+    pub fn get() -> &'static LaneMetrics {
+        static M: OnceLock<LaneMetrics> = OnceLock::new();
+        M.get_or_init(|| {
+            let make = |name: &str, help: &str, label: &str| {
+                let c = IntCounterVec::new(Opts::new(name, help), &[label]).ok()?;
+                let _ = prometheus::default_registry().register(Box::new(c.clone()));
+                Some(c)
+            };
+            let all = (|| {
+                Some([
+                    make(
+                        "mrl_gateway_lane_dropped_total",
+                        "Agent lane items dropped because the lane buffer was full.",
+                        "lane",
+                    )?,
+                    make(
+                        "mrl_gateway_lane_discarded_total",
+                        "Agent lane items acked and discarded because no sink takes the lane yet.",
+                        "lane",
+                    )?,
+                    make(
+                        "mrl_gateway_control_unrouted_total",
+                        "CONTROL messages journaled to node_events because no sink takes them yet.",
+                        "body",
+                    )?,
+                ])
+            })();
+            LaneMetrics(all)
+        })
+    }
+
+    fn inc(&self, which: usize, label: &str) {
+        if let Some(m) = &self.0 {
+            m[which].with_label_values(&[label]).inc();
+        }
+    }
+
+    fn value(&self, which: usize, label: &str) -> u64 {
+        self.0
+            .as_ref()
+            .map_or(0, |m| m[which].with_label_values(&[label]).get())
+    }
+
+    /// `mrl_gateway_lane_dropped_total{lane}` += 1.
+    pub fn dropped(&self, lane: LaneKind) {
+        self.inc(0, lane.as_str());
+    }
+
+    /// `mrl_gateway_lane_discarded_total{lane}` += 1.
+    pub fn discarded(&self, lane: LaneKind) {
+        self.inc(1, lane.as_str());
+    }
+
+    /// `mrl_gateway_control_unrouted_total{body}` += 1.
+    pub fn unrouted(&self, body: &str) {
+        self.inc(2, body);
+    }
+
+    /// Current `discarded` count for `lane`.
+    pub fn discarded_count(&self, lane: LaneKind) -> u64 {
+        self.value(1, lane.as_str())
+    }
+
+    /// Current `unrouted` count for `body`.
+    pub fn unrouted_count(&self, body: &str) -> u64 {
+        self.value(2, body)
+    }
+}
+
+/// A bounded METRICS or LOGS queue for one stream, drained into the sink by its own task.
+pub(crate) struct LossyLane {
+    lane: LaneKind,
+    tx: Option<mpsc::Sender<LaneItem>>,
+    dropped: Arc<AtomicU64>,
+}
+
+impl LossyLane {
+    /// A queue of `capacity` items feeding `router`'s sink for `lane` (none: discard).
+    pub fn start(router: &LaneRouter, lane: LaneKind, capacity: usize) -> Self {
+        let dropped = Arc::new(AtomicU64::new(0));
+        let tx = router.sink_for(lane).map(|sink| {
+            let (tx, mut rx) = mpsc::channel::<LaneItem>(capacity.max(1));
+            let pending = dropped.clone();
+            tokio::spawn(async move {
+                while let Some(mut item) = rx.recv().await {
+                    item.dropped_before = pending.swap(0, Ordering::Relaxed);
+                    if let Err(e) = sink.deliver(item).await {
+                        tracing::warn!(lane = lane.as_str(), error = %e, "lane sink failed; item dropped");
+                    }
+                }
+            });
+            tx
+        });
+        Self { lane, tx, dropped }
+    }
+
+    /// Queues `item`, or drops and counts it when the queue is full. Never waits.
+    pub fn offer(&self, item: LaneItem) {
+        let m = LaneMetrics::get();
+        let Some(tx) = &self.tx else {
+            m.discarded(self.lane);
+            return;
+        };
+        if tx.try_send(item).is_err() {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            m.dropped(self.lane);
+        }
+    }
+
+    /// Items dropped and not yet reported to the sink.
+    #[cfg(test)]
+    pub fn pending_drops(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
+}
+
+/// The body name of a message, for metrics and the journal.
+pub(crate) fn body_name(msg: &AgentMessage) -> &'static str {
+    match &msg.body {
+        None => "none",
+        Some(Body::Hello(_)) => "hello",
+        Some(Body::Heartbeat(_)) => "heartbeat",
+        Some(Body::Reconcile(_)) => "reconcile",
+        Some(Body::CommandResult(_)) => "command_result",
+        Some(Body::AttemptStatus(_)) => "attempt_status",
+        Some(Body::Worker(_)) => "worker",
+        Some(Body::Inventory(_)) => "inventory",
+        Some(Body::Telemetry(_)) => "telemetry",
+        Some(Body::Guard(_)) => "guard",
+        Some(Body::ProbeResult(_)) => "probe_result",
+        Some(Body::DeploymentStatus(_)) => "deployment_status",
+        Some(Body::Enroll(_)) => "enroll",
+        Some(Body::RenewCertificate(_)) => "renew_certificate",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mrl_proto::agent::v1::{NodeTelemetry, WorkerRelay};
+    use mrl_proto::worker::v1::{LogChunk, MetricsBatch, WorkerMessage};
+    use std::sync::Mutex;
+    use tokio::sync::Notify;
+
+    fn worker(body: WorkerBody) -> AgentMessage {
+        AgentMessage {
+            body: Some(Body::Worker(WorkerRelay {
+                message: Some(WorkerMessage {
+                    body: Some(body),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn messages_map_to_lanes() {
+        assert_eq!(LaneKind::of(&AgentMessage::default()), LaneKind::Control);
+        let t = AgentMessage {
+            body: Some(Body::Telemetry(NodeTelemetry::default())),
+            ..Default::default()
+        };
+        assert_eq!(LaneKind::of(&t), LaneKind::Telemetry);
+        assert_eq!(
+            LaneKind::of(&worker(WorkerBody::Log(LogChunk::default()))),
+            LaneKind::Logs
+        );
+        assert_eq!(
+            LaneKind::of(&worker(WorkerBody::Metrics(MetricsBatch::default()))),
+            LaneKind::Metrics
+        );
+        assert_eq!(
+            LaneKind::of(&worker(WorkerBody::Heartbeat(Default::default()))),
+            LaneKind::Control
+        );
+    }
+
+    /// A sink that blocks until released and records what it got.
+    struct Gate {
+        open: Notify,
+        got: Mutex<Vec<(u64, u64)>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LaneSink for Gate {
+        fn name(&self) -> &'static str {
+            "gate"
+        }
+        fn lanes(&self) -> &'static [LaneKind] {
+            &[LaneKind::Metrics]
+        }
+        async fn deliver(&self, item: LaneItem) -> Result<(), SinkError> {
+            self.open.notified().await;
+            self.got
+                .lock()
+                .unwrap()
+                .push((item.seq, item.dropped_before));
+            Ok(())
+        }
+    }
+
+    fn item(seq: u64) -> LaneItem {
+        LaneItem {
+            node_id: Uuid::nil(),
+            session_epoch: 1,
+            lane: LaneKind::Metrics,
+            seq,
+            dropped_before: 0,
+            message: AgentMessage::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn overflow_drops_counts_and_reports_on_the_next_item() {
+        let router = LaneRouter::new();
+        let gate = Arc::new(Gate {
+            open: Notify::new(),
+            got: Mutex::new(Vec::new()),
+        });
+        router.register(gate.clone());
+        let lane = LossyLane::start(&router, LaneKind::Metrics, 2);
+        // The sink task holds #1, the queue holds #2 and #3, so #4..#6 overflow.
+        lane.offer(item(1));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for s in 2..=6 {
+            lane.offer(item(s));
+        }
+        assert_eq!(lane.pending_drops(), 3);
+        for _ in 0..3 {
+            gate.open.notify_one();
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+        let got = gate.got.lock().unwrap().clone();
+        // #2 was taken after the drops happened, so it carries the marker.
+        assert_eq!(got, vec![(1, 0), (2, 3), (3, 0)]);
+    }
+
+    #[tokio::test]
+    async fn without_a_sink_items_are_discarded_and_counted() {
+        let router = LaneRouter::new();
+        let lane = LossyLane::start(&router, LaneKind::Logs, 4);
+        let before = LaneMetrics::get().discarded_count(LaneKind::Logs);
+        lane.offer(item(1));
+        lane.offer(item(2));
+        let after = LaneMetrics::get().discarded_count(LaneKind::Logs);
+        assert_eq!(after - before, 2);
+        assert!(router.sink_for(LaneKind::Control).is_none());
+    }
+}

@@ -1,0 +1,639 @@
+//! One gateway stream (one lane of one node), the same whichever side dialed.
+//!
+//! 1. The first agent message is `AgentHello` — or `EnrollRequest` on a connection without a
+//!    machine certificate, which may carry nothing else.
+//! 2. The certificate must be on file, not revoked or expired, belong to `AgentHello.node_id`
+//!    (and to the node the core dialed), and the node must not be DECOMMISSIONED.
+//! 3. CONTROL: `session_epoch += 1`; `CoreHello.resume_from_seq = control_rx_seq + 1`. Each
+//!    message with a new `seq` is handled and `control_rx_seq` raised in one transaction (dedupe on
+//!    node, lane, seq), then acked (`CoreMessage{seq: 0, ack_seq}`). Commands go out in `seq`
+//!    order; `AgentMessage.ack_seq` marks them RECEIVED; `CommandResult` finishes them.
+//! 4. TELEMETRY / BULK: lossy lanes (`lanes`), acked on receipt.
+//! 5. Every stream re-checks its certificate every `revocation_check_seconds` and closes at
+//!    once when this replica revokes the node.
+
+use super::{PeerInfo, PROTOCOL_VERSION};
+use crate::modules::nodes::lanes::{body_name, LaneItem, LaneKind, LaneMetrics, LossyLane};
+use crate::modules::nodes::store::{self, Accept, CertIdentity};
+use crate::modules::nodes::{codes, commands, Gateway, NodesError};
+use crate::transports::TransportKind;
+use mrl_domain::ids::NodeId;
+use mrl_proto::agent::v1::{
+    agent_message, core_message, AgentHello, AgentMessage, CoreHello, CoreMessage, EnrollRequest,
+    EnrollResult, Lane, LeaseGrant, RenewCertificateRequest, RenewCertificateResult,
+};
+use mrl_proto::common::v1::{Failure, FailureClass};
+use std::pin::Pin;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
+use time::OffsetDateTime;
+use tokio::sync::{mpsc, watch};
+use tokio_stream::{Stream, StreamExt};
+use tokio_util::sync::CancellationToken;
+use tonic::Status;
+use uuid::Uuid;
+
+/// Messages from the agent.
+pub type Inbound = Pin<Box<dyn Stream<Item = Result<AgentMessage, Status>> + Send>>;
+/// Messages to the agent (an `Err` closes the stream with that status).
+pub type Outbound = mpsc::Sender<Result<CoreMessage, Status>>;
+
+/// How long the agent has to send its first message.
+pub const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
+/// How often a CONTROL stream looks for commands without a wake-up.
+pub const COMMAND_POLL: Duration = Duration::from_secs(2);
+
+/// Runs one stream to its end. Errors are sent to the agent as the stream's status.
+pub async fn run(
+    gw: Arc<Gateway>,
+    peer: PeerInfo,
+    mut inbound: Inbound,
+    out: Outbound,
+    shutdown: CancellationToken,
+) {
+    if let Err(status) = drive(&gw, &peer, &mut inbound, &out, &shutdown).await {
+        tracing::info!(code = ?status.code(), message = status.message(), "gateway stream closed");
+        let _ = out.send(Err(status)).await;
+    }
+}
+
+fn now_ts() -> Option<prost_types::Timestamp> {
+    Some(ts(OffsetDateTime::now_utc()))
+}
+
+/// A protobuf timestamp.
+pub fn ts(t: OffsetDateTime) -> prost_types::Timestamp {
+    prost_types::Timestamp {
+        seconds: t.unix_timestamp(),
+        nanos: t.nanosecond() as i32,
+    }
+}
+
+fn denied(e: NodesError) -> Status {
+    Status::permission_denied(e.explain())
+}
+
+fn unavailable(e: NodesError) -> Status {
+    tracing::warn!(code = e.code(), error = %e, "gateway stream failed");
+    Status::unavailable(format!(
+        "{} the server could not record this message; reconnect and try again",
+        e.code()
+    ))
+}
+
+fn protocol(msg: &str) -> Status {
+    Status::invalid_argument(NodesError::Protocol(msg.to_owned()).explain())
+}
+
+async fn send(
+    out: &Outbound,
+    body: core_message::Body,
+    seq: u64,
+    ack_seq: u64,
+) -> Result<(), Status> {
+    out.send(Ok(CoreMessage {
+        seq,
+        ack_seq,
+        sent_at: now_ts(),
+        body: Some(body),
+    }))
+    .await
+    .map_err(|_| Status::cancelled("the agent closed the stream"))
+}
+
+async fn ack(out: &Outbound, ack_seq: u64) -> Result<(), Status> {
+    out.send(Ok(CoreMessage {
+        seq: 0,
+        ack_seq,
+        sent_at: now_ts(),
+        body: None,
+    }))
+    .await
+    .map_err(|_| Status::cancelled("the agent closed the stream"))
+}
+
+async fn drive(
+    gw: &Arc<Gateway>,
+    peer: &PeerInfo,
+    inbound: &mut Inbound,
+    out: &Outbound,
+    shutdown: &CancellationToken,
+) -> Result<(), Status> {
+    let first = tokio::time::timeout(HELLO_TIMEOUT, inbound.next())
+        .await
+        .map_err(|_| Status::deadline_exceeded("the agent sent no hello within 30 s"))?
+        .ok_or_else(|| Status::cancelled("the agent closed the stream before its hello"))??;
+    match (&peer.cert_sha256, first.body) {
+        (None, Some(agent_message::Body::Enroll(req))) => {
+            let result = enroll(gw, &req).await;
+            send(out, core_message::Body::EnrollResult(result), 0, 0).await?;
+            // Keep the stream open until the agent has the result and closes its side, so
+            // the answer is never cut off when the connection is torn down (core-dials).
+            let _ = tokio::time::timeout(Duration::from_secs(10), inbound.next()).await;
+            Ok(())
+        }
+        (None, _) => Err(Status::unauthenticated(
+            NodesError::Certificate(
+                "this connection has no machine certificate; enroll the machine first (`mrl-agent enroll`)".into(),
+            )
+            .explain(),
+        )),
+        (Some(_), Some(agent_message::Body::Enroll(_))) => Err(Status::failed_precondition(
+            NodesError::Protocol("this machine is already enrolled".into()).explain(),
+        )),
+        (Some(sha), Some(agent_message::Body::Hello(hello))) => {
+            let ident = check_identity(gw, peer, sha, &hello).await?;
+            let transport = peer.transport.or_else(|| TransportKind::from_proto(hello.transport));
+            match Lane::try_from(hello.lane) {
+                Ok(Lane::Control) => control(gw, sha, ident, &hello, transport, inbound, out, shutdown).await,
+                Ok(Lane::Telemetry | Lane::Bulk) => data(gw, sha, ident, &hello, inbound, out, shutdown).await,
+                _ => Err(protocol("AgentHello.lane must be CONTROL, TELEMETRY or BULK")),
+            }
+        }
+        _ => Err(protocol("the first message must be AgentHello")),
+    }
+}
+
+/// Plain-language failure for an `EnrollResult` / `RenewCertificateResult`.
+fn failure(e: &NodesError) -> Failure {
+    let (class, retry) = match e {
+        NodesError::Token(_) | NodesError::Certificate(_) => (FailureClass::UserConfig, false),
+        _ => (FailureClass::InfraTransient, true),
+    };
+    Failure {
+        class: class as i32,
+        sub_code: e.code().to_owned(),
+        message: e.to_string(),
+        retryable_hint: retry,
+        ..Failure::default()
+    }
+}
+
+async fn enroll(gw: &Arc<Gateway>, req: &EnrollRequest) -> EnrollResult {
+    let pki = match gw.pki() {
+        Ok(p) => p,
+        Err(e) => {
+            return EnrollResult {
+                failure: Some(failure(&e)),
+                ..EnrollResult::default()
+            }
+        }
+    };
+    match store::enroll(&gw.db, pki.clone(), &gw.config, req).await {
+        Ok(done) => {
+            tracing::info!(node = %NodeId::from_uuid(done.node), hostname = %req.hostname, "machine enrolled");
+            EnrollResult {
+                ok: true,
+                node_id: NodeId::from_uuid(done.node).to_string(),
+                certificate_chain_der: vec![done.cert.der.to_vec(), pki.ca.cert().to_vec()],
+                ca_bundle_der: pki.ca.cert().to_vec(),
+                // ponytail: no agent-update signing key yet; the agent updater part adds it.
+                update_signing_public_key: Vec::new(),
+                not_after: Some(ts(done.cert.not_after)),
+                failure: None,
+            }
+        }
+        Err(e) => {
+            tracing::info!(code = e.code(), error = %e, "enrollment refused");
+            EnrollResult {
+                failure: Some(failure(&e)),
+                ..EnrollResult::default()
+            }
+        }
+    }
+}
+
+/// Why `sha` may not be used now, if it may not.
+fn refusal(ident: &CertIdentity) -> Option<&'static str> {
+    if ident.revoked {
+        Some("this certificate was revoked; the machine must enroll again")
+    } else if ident.expired {
+        Some("this certificate has expired; the machine must enroll again")
+    } else if ident.status == "DECOMMISSIONED" {
+        Some("this machine was removed from the app")
+    } else {
+        None
+    }
+}
+
+async fn check_identity(
+    gw: &Gateway,
+    peer: &PeerInfo,
+    sha: &str,
+    hello: &AgentHello,
+) -> Result<CertIdentity, Status> {
+    let ident = store::cert_identity(&gw.db, sha)
+        .await
+        .map_err(unavailable)?
+        .ok_or_else(|| {
+            denied(NodesError::Certificate(
+                "this certificate was not issued to a machine of this app".into(),
+            ))
+        })?;
+    if let Some(why) = refusal(&ident) {
+        return Err(denied(NodesError::Certificate(why.into())));
+    }
+    let claimed = NodeId::from_str(&hello.node_id).ok().map(|n| n.as_uuid());
+    if claimed != Some(ident.node) || peer.dialed_node.is_some_and(|n| n != ident.node) {
+        return Err(denied(NodesError::Certificate(
+            "AgentHello.node_id does not match the machine certificate".into(),
+        )));
+    }
+    if !hello.certificate_sha256.is_empty() && !hello.certificate_sha256.eq_ignore_ascii_case(sha) {
+        return Err(denied(NodesError::Certificate(
+            "AgentHello.certificate_sha256 is not the certificate of this connection".into(),
+        )));
+    }
+    if !hello
+        .protocol_versions
+        .iter()
+        .any(|v| v == PROTOCOL_VERSION)
+    {
+        return Err(Status::failed_precondition(
+            NodesError::Protocol(format!(
+                "the agent speaks {:?} but this server speaks {PROTOCOL_VERSION}; update the agent",
+                hello.protocol_versions
+            ))
+            .explain(),
+        ));
+    }
+    Ok(ident)
+}
+
+/// Re-reads the certificate; `Err` when it may no longer be used.
+async fn still_valid(gw: &Gateway, sha: &str) -> Result<(), Status> {
+    match store::cert_identity(&gw.db, sha).await {
+        Ok(Some(ident)) => match refusal(&ident) {
+            Some(why) => Err(denied(NodesError::Certificate(why.into()))),
+            None => Ok(()),
+        },
+        Ok(None) => Err(denied(NodesError::Certificate(
+            "this certificate is no longer on file".into(),
+        ))),
+        // A database hiccup is not a revocation; check again on the next tick.
+        Err(_) => Ok(()),
+    }
+}
+
+fn hello(gw: &Gateway, lane: Lane, resume_from_seq: u64) -> core_message::Body {
+    core_message::Body::Hello(CoreHello {
+        core_id: gw.core_id.clone(),
+        protocol_version: PROTOCOL_VERSION.to_owned(),
+        heartbeat_interval_s: gw.config.heartbeat_interval_seconds,
+        max_message_bytes: super::MAX_MESSAGE_BYTES as u32,
+        resume_from_seq,
+        lane: lane as i32,
+    })
+}
+
+/// Lossy lanes and the telemetry writer of one stream.
+struct Lossy {
+    metrics: LossyLane,
+    logs: LossyLane,
+    telemetry: watch::Sender<Option<AgentMessage>>,
+}
+
+impl Lossy {
+    fn start(gw: &Arc<Gateway>, node: Uuid) -> Self {
+        let (tx, mut rx) = watch::channel::<Option<AgentMessage>>(None);
+        let gw2 = gw.clone();
+        tokio::spawn(async move {
+            while rx.changed().await.is_ok() {
+                let msg = rx.borrow_and_update().clone();
+                let Some(msg) = msg else { continue };
+                if let Some(agent_message::Body::Telemetry(t)) = &msg.body {
+                    if let Err(e) = store::telemetry(&gw2.db, node, t).await {
+                        tracing::debug!(code = e.code(), error = %e, "telemetry not saved");
+                    }
+                }
+                if let Some(sink) = gw2.lanes.sink_for(LaneKind::Telemetry) {
+                    let item = LaneItem {
+                        node_id: node,
+                        session_epoch: 0,
+                        lane: LaneKind::Telemetry,
+                        seq: msg.seq,
+                        dropped_before: 0,
+                        message: msg,
+                    };
+                    if let Err(e) = sink.deliver(item).await {
+                        tracing::debug!(error = %e, "telemetry sink failed");
+                    }
+                }
+            }
+        });
+        Self {
+            metrics: LossyLane::start(&gw.lanes, LaneKind::Metrics, gw.config.lane_buffer),
+            logs: LossyLane::start(&gw.lanes, LaneKind::Logs, gw.config.lane_buffer),
+            telemetry: tx,
+        }
+    }
+
+    /// Hands a non-CONTROL message to its lane; never waits.
+    fn offer(&self, lane: LaneKind, item: LaneItem) {
+        match lane {
+            LaneKind::Telemetry => {
+                // Latest wins: an unsaved older reading is simply replaced.
+                self.telemetry.send_replace(Some(item.message));
+            }
+            LaneKind::Metrics => self.metrics.offer(item),
+            LaneKind::Logs => self.logs.offer(item),
+            LaneKind::Control => {}
+        }
+    }
+}
+
+/// Records CONTROL `seq` and its database effects in one transaction.
+async fn record(
+    gw: &Gateway,
+    node: Uuid,
+    epoch: i64,
+    msg: &AgentMessage,
+    unrouted: bool,
+) -> Result<Accept, NodesError> {
+    let msg = msg.clone();
+    let to_db = |e: NodesError| match e {
+        NodesError::Db(d) => d,
+        o => crate::db::DbError::Query(sqlx::Error::Protocol(o.to_string())),
+    };
+    Ok(gw
+        .db
+        .transaction(move |tx| {
+            let msg = msg.clone();
+            Box::pin(async move {
+                let accepted = store::accept(tx, node, epoch, msg.seq)
+                    .await
+                    .map_err(to_db)?;
+                if accepted != Accept::New {
+                    return Ok(accepted);
+                }
+                match &msg.body {
+                    Some(agent_message::Body::Heartbeat(hb)) => {
+                        store::heartbeat(tx, node, hb.running.len())
+                            .await
+                            .map_err(to_db)?
+                    }
+                    Some(agent_message::Body::Inventory(inv)) => {
+                        store::inventory(tx, node, inv).await.map_err(to_db)?
+                    }
+                    Some(agent_message::Body::CommandResult(r)) => {
+                        store::command_result(tx, node, r).await.map_err(to_db)?
+                    }
+                    _ if unrouted => store::unrouted(tx, node, msg.seq, &msg)
+                        .await
+                        .map_err(to_db)?,
+                    _ => {}
+                }
+                Ok(Accept::New)
+            })
+        })
+        .await?)
+}
+
+/// True for messages the gateway handles itself (never routed to a sink).
+fn own(body: &Option<agent_message::Body>) -> bool {
+    use agent_message::Body as B;
+    matches!(
+        body,
+        None | Some(
+            B::Hello(_)
+                | B::Heartbeat(_)
+                | B::Inventory(_)
+                | B::CommandResult(_)
+                | B::Enroll(_)
+                | B::RenewCertificate(_)
+        )
+    )
+}
+
+/// Delivers a CONTROL message to its sink; `Ok(true)` when there is no sink (journal it).
+async fn route_control(
+    gw: &Gateway,
+    node: Uuid,
+    epoch: i64,
+    msg: &AgentMessage,
+) -> Result<bool, Status> {
+    let Some(sink) = gw.lanes.sink_for(LaneKind::Control) else {
+        tracing::warn!(node = %NodeId::from_uuid(node), body = body_name(msg), "no sink for this CONTROL message; journaled to node_events");
+        LaneMetrics::get().unrouted(body_name(msg));
+        return Ok(true);
+    };
+    sink.deliver(LaneItem {
+        node_id: node,
+        session_epoch: epoch,
+        lane: LaneKind::Control,
+        seq: msg.seq,
+        dropped_before: 0,
+        message: msg.clone(),
+    })
+    .await
+    .map_err(|e| {
+        tracing::warn!(error = %e, "CONTROL sink failed; the agent will resend");
+        Status::unavailable(format!("{} {e}; reconnect and resend", codes::PROTOCOL))
+    })?;
+    Ok(false)
+}
+
+async fn renew(
+    gw: &Gateway,
+    ident: &CertIdentity,
+    req: &RenewCertificateRequest,
+) -> RenewCertificateResult {
+    let pki = match gw.pki() {
+        Ok(p) => p,
+        Err(e) => {
+            return RenewCertificateResult {
+                failure: Some(failure(&e)),
+                ..Default::default()
+            }
+        }
+    };
+    match store::renew(
+        &gw.db,
+        &pki.ca,
+        &gw.config,
+        ident.node,
+        ident.lifecycle,
+        &req.csr_der,
+    )
+    .await
+    {
+        Ok(cert) => {
+            tracing::info!(node = %NodeId::from_uuid(ident.node), "certificate rotated");
+            RenewCertificateResult {
+                ok: true,
+                certificate_chain_der: vec![cert.der.to_vec(), pki.ca.cert().to_vec()],
+                not_after: Some(ts(cert.not_after)),
+                failure: None,
+            }
+        }
+        Err(e) => RenewCertificateResult {
+            failure: Some(failure(&e)),
+            ..Default::default()
+        },
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn control(
+    gw: &Arc<Gateway>,
+    sha: &str,
+    ident: CertIdentity,
+    h: &AgentHello,
+    transport: Option<TransportKind>,
+    inbound: &mut Inbound,
+    out: &Outbound,
+    shutdown: &CancellationToken,
+) -> Result<(), Status> {
+    let node = ident.node;
+    let (epoch, rx) = store::open_control(
+        &gw.db,
+        node,
+        &gw.core_id,
+        h,
+        transport.map(TransportKind::as_str),
+    )
+    .await
+    .map_err(unavailable)?;
+    let (superseded, revoked, wake) = gw.sessions.open_control(node, epoch);
+    let mut rx_seq = rx.max(0) as u64;
+    tracing::info!(node = %NodeId::from_uuid(node), epoch, "machine connected");
+    let result = async {
+        send(out, hello(gw, Lane::Control, rx_seq + 1), 0, rx_seq).await?;
+        let resume = h.resume_from_seq.max(1);
+        store::commands_received(&gw.db, node, resume - 1).await.map_err(unavailable)?;
+        let mut sent_upto = resume - 1;
+        let mut acked = 0u64;
+        let lossy = Lossy::start(gw, node);
+        let mut poll = tokio::time::interval(COMMAND_POLL);
+        let mut recheck = tokio::time::interval(Duration::from_secs(gw.config.revocation_check_seconds));
+        recheck.tick().await;
+        loop {
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => return Ok(()),
+                () = revoked.cancelled() => {
+                    return Err(denied(NodesError::Certificate("this machine's certificates were revoked".into())));
+                }
+                () = superseded.cancelled() => {
+                    return Err(Status::aborted(NodesError::Protocol("a newer connection from this machine took over".into()).explain()));
+                }
+                _ = recheck.tick() => still_valid(gw, sha).await?,
+                () = wake.notified() => sent_upto = send_commands(gw, node, sent_upto, rx_seq, out).await?,
+                _ = poll.tick() => sent_upto = send_commands(gw, node, sent_upto, rx_seq, out).await?,
+                m = inbound.next() => {
+                    let Some(Ok(m)) = m else { return Ok(()) };
+                    if m.ack_seq > acked {
+                        store::commands_received(&gw.db, node, m.ack_seq).await.map_err(unavailable)?;
+                        acked = m.ack_seq;
+                    }
+                    if m.seq == 0 {
+                        continue; // ack only
+                    }
+                    if m.seq <= rx_seq {
+                        ack(out, rx_seq).await?; // a replay
+                        continue;
+                    }
+                    let lane = LaneKind::of(&m);
+                    let mut unrouted = false;
+                    if lane != LaneKind::Control {
+                        lossy.offer(lane, LaneItem { node_id: node, session_epoch: epoch, lane, seq: m.seq, dropped_before: 0, message: m.clone() });
+                    } else if !own(&m.body) {
+                        unrouted = route_control(gw, node, epoch, &m).await?;
+                    }
+                    if let Some(agent_message::Body::RenewCertificate(req)) = &m.body {
+                        let result = renew(gw, &ident, req).await;
+                        send(out, core_message::Body::RenewCertificateResult(result), 0, rx_seq).await?;
+                    }
+                    match record(gw, node, epoch, &m, unrouted).await.map_err(unavailable)? {
+                        Accept::Stale => {
+                            return Err(Status::aborted(NodesError::Protocol("a newer connection from this machine took over".into()).explain()));
+                        }
+                        Accept::New | Accept::Duplicate => rx_seq = m.seq,
+                    }
+                    if let Some(agent_message::Body::Heartbeat(hb)) = &m.body {
+                        let leases = store::leases(&gw.db, node, &hb.running).await.map_err(unavailable)?;
+                        send(out, core_message::Body::Lease(LeaseGrant { heartbeat_seq: m.seq, leases }), 0, rx_seq).await?;
+                    }
+                    ack(out, rx_seq).await?;
+                }
+            }
+        }
+    }
+    .await;
+    gw.sessions.close_control(node, epoch);
+    if let Err(e) = store::close_control(&gw.db, node, epoch).await {
+        tracing::debug!(code = e.code(), error = %e, "could not record the disconnect");
+    }
+    tracing::info!(node = %NodeId::from_uuid(node), epoch, "machine disconnected");
+    result
+}
+
+/// Sends commands with `seq > after`; returns the last sent seq.
+async fn send_commands(
+    gw: &Gateway,
+    node: Uuid,
+    after: u64,
+    rx_seq: u64,
+    out: &Outbound,
+) -> Result<u64, Status> {
+    let mut last = after;
+    for (id, seq, payload) in store::pending_commands(&gw.db, node, after)
+        .await
+        .map_err(unavailable)?
+    {
+        let cmd = commands::decode(&payload).map_err(unavailable)?;
+        send(out, core_message::Body::Command(cmd), seq, rx_seq).await?;
+        store::mark_sent(&gw.db, id).await.map_err(unavailable)?;
+        last = seq;
+    }
+    Ok(last)
+}
+
+async fn data(
+    gw: &Arc<Gateway>,
+    sha: &str,
+    ident: CertIdentity,
+    h: &AgentHello,
+    inbound: &mut Inbound,
+    out: &Outbound,
+    shutdown: &CancellationToken,
+) -> Result<(), Status> {
+    let node = ident.node;
+    let lane = Lane::try_from(h.lane).unwrap_or(Lane::Telemetry);
+    let revoked = gw.sessions.revoked_token(node);
+    send(out, hello(gw, lane, 0), 0, 0).await?;
+    let lossy = Lossy::start(gw, node);
+    let mut recheck =
+        tokio::time::interval(Duration::from_secs(gw.config.revocation_check_seconds));
+    recheck.tick().await;
+    loop {
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => return Ok(()),
+            () = revoked.cancelled() => {
+                return Err(denied(NodesError::Certificate("this machine's certificates were revoked".into())));
+            }
+            _ = recheck.tick() => still_valid(gw, sha).await?,
+            m = inbound.next() => {
+                let Some(Ok(m)) = m else { return Ok(()) };
+                let kind = LaneKind::of(&m);
+                let seq = m.seq;
+                if kind == LaneKind::Control {
+                    // CONTROL-class messages on a data lane (like guard events) are delivered
+                    // without seq dedupe; sinks dedupe on (node, lane, seq) anyway.
+                    if !own(&m.body) && route_control(gw, node, 0, &m).await? {
+                        let mut tx = gw.db.begin().await.map_err(|e| unavailable(e.into()))?;
+                        store::unrouted(&mut tx, node, seq, &m).await.map_err(unavailable)?;
+                        tx.commit().await.map_err(|e| unavailable(e.into()))?;
+                    }
+                } else {
+                    lossy.offer(kind, LaneItem { node_id: node, session_epoch: 0, lane: kind, seq, dropped_before: 0, message: m });
+                }
+                if seq > 0 {
+                    ack(out, seq).await?;
+                }
+            }
+        }
+    }
+}

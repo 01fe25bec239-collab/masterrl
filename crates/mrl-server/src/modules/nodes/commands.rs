@@ -1,0 +1,327 @@
+//! Durable commands to agents.
+//!
+//! [`CommandSender::send`] writes an `agent_commands` row (per-node `seq`, deadline) and
+//! `pg_notify('mrl_agent_commands', <node uuid>)` in one transaction; it works on any replica.
+//! The replica holding the node's CONTROL stream wakes up and sends it (every stream also polls
+//! every 2 s). States: `PENDING → SENT → RECEIVED` (the agent journaled it, via `ack_seq`)
+//! `→ COMPLETED | FAILED` (its `CommandResult`). `PENDING`/`SENT` past the deadline become
+//! `EXPIRED`; a newer command with `supersede` turns older `PENDING` ones of the same kind and
+//! attempt into `SUPERSEDED`.
+//!
+//! Each owning part builds its own sender with the kinds it owns, so the server never sends a
+//! kind before the part that handles it exists:
+//! ```no_run
+//! # use mrl_server::modules::nodes::commands::{CommandKind, CommandSender, NewCommand};
+//! # use mrl_proto::agent::v1::{command::Kind, CancelAttempt};
+//! # async fn demo(gateway: std::sync::Arc<mrl_server::modules::nodes::Gateway>,
+//! #     node: mrl_domain::ids::NodeId, attempt: mrl_domain::ids::AttemptId)
+//! #     -> Result<(), mrl_server::modules::nodes::NodesError> {
+//! static KINDS: &[CommandKind] = &[CommandKind::LaunchAttempt, CommandKind::CancelAttempt];
+//! let sender = CommandSender::new(&gateway, KINDS);
+//! let cancel = Kind::CancelAttempt(CancelAttempt::default());
+//! let sent = sender.send(node, NewCommand::new(cancel).attempt(attempt, 3)).await?;
+//! let status = sender.status(sent.id).await?;
+//! # let _ = status; Ok(()) }
+//! ```
+
+use super::{Gateway, NodesError};
+use crate::db::Db;
+use mrl_domain::ids::{AttemptId, NodeId};
+use mrl_proto::agent::v1::{command::Kind, Command};
+use prost::Message;
+use sqlx::Row;
+use std::sync::Arc;
+use std::time::Duration;
+use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+/// `pg_notify` channel for new commands.
+pub const WAKE_CHANNEL: &str = "mrl_agent_commands";
+
+/// The command kinds (`agent_commands.kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(missing_docs)]
+pub enum CommandKind {
+    LaunchAttempt,
+    StartAttempt,
+    CancelAttempt,
+    PauseAttempt,
+    CheckpointAttempt,
+    StageArtifacts,
+    UploadArtifacts,
+    Cleanup,
+    Drain,
+    UpdateCredentials,
+    LaunchDeployment,
+    StopDeployment,
+    Probe,
+}
+
+impl CommandKind {
+    /// The kind of a command body.
+    pub fn of(kind: &Kind) -> Self {
+        match kind {
+            Kind::LaunchAttempt(_) => Self::LaunchAttempt,
+            Kind::StartAttempt(_) => Self::StartAttempt,
+            Kind::CancelAttempt(_) => Self::CancelAttempt,
+            Kind::PauseAttempt(_) => Self::PauseAttempt,
+            Kind::CheckpointAttempt(_) => Self::CheckpointAttempt,
+            Kind::StageArtifacts(_) => Self::StageArtifacts,
+            Kind::UploadArtifacts(_) => Self::UploadArtifacts,
+            Kind::Cleanup(_) => Self::Cleanup,
+            Kind::Drain(_) => Self::Drain,
+            Kind::UpdateCredentials(_) => Self::UpdateCredentials,
+            Kind::LaunchDeployment(_) => Self::LaunchDeployment,
+            Kind::StopDeployment(_) => Self::StopDeployment,
+            Kind::Probe(_) => Self::Probe,
+        }
+    }
+
+    /// Stored name, like `LaunchAttempt`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::LaunchAttempt => "LaunchAttempt",
+            Self::StartAttempt => "StartAttempt",
+            Self::CancelAttempt => "CancelAttempt",
+            Self::PauseAttempt => "PauseAttempt",
+            Self::CheckpointAttempt => "CheckpointAttempt",
+            Self::StageArtifacts => "StageArtifacts",
+            Self::UploadArtifacts => "UploadArtifacts",
+            Self::Cleanup => "Cleanup",
+            Self::Drain => "Drain",
+            Self::UpdateCredentials => "UpdateCredentials",
+            Self::LaunchDeployment => "LaunchDeployment",
+            Self::StopDeployment => "StopDeployment",
+            Self::Probe => "Probe",
+        }
+    }
+
+    fn starts_work(self) -> bool {
+        matches!(
+            self,
+            Self::LaunchAttempt | Self::StartAttempt | Self::LaunchDeployment
+        )
+    }
+}
+
+/// A command to write.
+#[derive(Debug, Clone)]
+pub struct NewCommand {
+    kind: Kind,
+    attempt: Option<(AttemptId, u64)>,
+    deadline: Option<Duration>,
+    supersede: bool,
+}
+
+impl NewCommand {
+    /// A command with the sender's default deadline.
+    pub fn new(kind: Kind) -> Self {
+        Self {
+            kind,
+            attempt: None,
+            deadline: None,
+            supersede: false,
+        }
+    }
+
+    /// The attempt (and its fencing epoch) the command is about.
+    pub fn attempt(mut self, attempt: AttemptId, epoch: u64) -> Self {
+        self.attempt = Some((attempt, epoch));
+        self
+    }
+
+    /// Fails (EXPIRED) unless sent within `d`.
+    pub fn deadline(mut self, d: Duration) -> Self {
+        self.deadline = Some(d);
+        self
+    }
+
+    /// Older unsent commands of the same kind and attempt become SUPERSEDED.
+    pub fn superseding(mut self) -> Self {
+        self.supersede = true;
+        self
+    }
+}
+
+/// A written command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CommandRef {
+    /// `agent_commands.id`; the agent echoes it as `command_id`.
+    pub id: Uuid,
+    /// Per-node sequence number.
+    pub seq: u64,
+}
+
+/// A command's state and result.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CommandStatus {
+    /// `PENDING`, `SENT`, `RECEIVED`, `COMPLETED`, `FAILED`, `EXPIRED` or `SUPERSEDED`.
+    pub state: String,
+    /// `{accepted, failure}` once the agent answered.
+    pub result: Option<serde_json::Value>,
+}
+
+/// Writes commands of the kinds its owner handles.
+#[derive(Clone)]
+pub struct CommandSender {
+    db: Db,
+    kinds: &'static [CommandKind],
+    default_deadline: Duration,
+}
+
+impl CommandSender {
+    /// A sender for `kinds` (the kinds the calling part owns).
+    pub fn new(gw: &Arc<Gateway>, kinds: &'static [CommandKind]) -> Self {
+        Self {
+            db: gw.db.clone(),
+            kinds,
+            default_deadline: Duration::from_secs(gw.config.command_deadline_seconds),
+        }
+    }
+
+    /// Writes the command for `node` (durable; delivered by whichever replica holds the stream).
+    pub async fn send(&self, node: NodeId, cmd: NewCommand) -> Result<CommandRef, NodesError> {
+        let kind = CommandKind::of(&cmd.kind);
+        if !self.kinds.contains(&kind) {
+            return Err(NodesError::CommandRefused(format!(
+                "this sender does not handle {} commands",
+                kind.as_str()
+            )));
+        }
+        let node = node.as_uuid();
+        let deadline = time::Duration::try_from(cmd.deadline.unwrap_or(self.default_deadline))
+            .unwrap_or(time::Duration::DAY);
+        let (attempt, epoch) = match cmd.attempt {
+            Some((a, e)) => (
+                Some(a.as_uuid()),
+                Some(i64::try_from(e).unwrap_or(i64::MAX)),
+            ),
+            None => (None, None),
+        };
+        let id = Uuid::now_v7();
+        let payload = Command {
+            command_id: id.to_string(),
+            kind: Some(cmd.kind.clone()),
+        }
+        .encode_to_vec();
+        let supersede = cmd.supersede;
+        let out = self
+            .db
+            .transaction(move |tx| {
+                let payload = payload.clone();
+                Box::pin(async move {
+                    let status: Option<String> =
+                        sqlx::query_scalar("SELECT status FROM compute_nodes WHERE id = $1 FOR UPDATE")
+                            .bind(node)
+                            .fetch_optional(&mut **tx)
+                            .await?;
+                    let refused = match status.as_deref() {
+                        None => Some("no machine has this id".to_owned()),
+                        Some("DECOMMISSIONED") => Some("the machine was removed".to_owned()),
+                        Some("DRAINING") if kind.starts_work() => {
+                            Some("the machine is draining and takes no new work".to_owned())
+                        }
+                        _ => None,
+                    };
+                    if let Some(r) = refused {
+                        return Ok(Err(r));
+                    }
+                    if supersede {
+                        sqlx::query(
+                            "UPDATE agent_commands SET state = 'SUPERSEDED', updated_at = now()
+                             WHERE node_id = $1 AND kind = $2 AND attempt_id IS NOT DISTINCT FROM $3
+                               AND state = 'PENDING'",
+                        )
+                        .bind(node)
+                        .bind(kind.as_str())
+                        .bind(attempt)
+                        .execute(&mut **tx)
+                        .await?;
+                    }
+                    let seq: i64 = sqlx::query_scalar(
+                        "UPDATE compute_nodes SET command_seq = command_seq + 1 WHERE id = $1 RETURNING command_seq",
+                    )
+                    .bind(node)
+                    .fetch_one(&mut **tx)
+                    .await?;
+                    sqlx::query(
+                        "INSERT INTO agent_commands (id, node_id, seq, kind, payload, attempt_id, epoch, state, deadline_at)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', now() + $8)",
+                    )
+                    .bind(id)
+                    .bind(node)
+                    .bind(seq)
+                    .bind(kind.as_str())
+                    .bind(&payload)
+                    .bind(attempt)
+                    .bind(epoch)
+                    .bind(deadline)
+                    .execute(&mut **tx)
+                    .await?;
+                    sqlx::query("SELECT pg_notify($1, $2)")
+                        .bind(WAKE_CHANNEL)
+                        .bind(node.to_string())
+                        .execute(&mut **tx)
+                        .await?;
+                    Ok(Ok(seq.max(0) as u64))
+                })
+            })
+            .await?;
+        match out {
+            Ok(seq) => Ok(CommandRef { id, seq }),
+            Err(r) => Err(NodesError::CommandRefused(r)),
+        }
+    }
+
+    /// The command's state and result.
+    pub async fn status(&self, id: Uuid) -> Result<Option<CommandStatus>, NodesError> {
+        let row = sqlx::query("SELECT state, result FROM agent_commands WHERE id = $1")
+            .bind(id)
+            .fetch_optional(self.db.pool())
+            .await?;
+        row.map(|r| {
+            Ok(CommandStatus {
+                state: r.try_get("state")?,
+                result: r.try_get("result")?,
+            })
+        })
+        .transpose()
+        .map_err(|e: sqlx::Error| e.into())
+    }
+}
+
+/// Wakes local CONTROL streams when any replica writes a command (LISTEN on [`WAKE_CHANNEL`]).
+pub(crate) async fn listen_for_wakes(gw: Arc<Gateway>, cancel: CancellationToken) {
+    while !cancel.is_cancelled() {
+        let listener = async {
+            let mut l = sqlx::postgres::PgListener::connect_with(gw.db.pool()).await?;
+            l.listen(WAKE_CHANNEL).await?;
+            loop {
+                let n = l.recv().await?;
+                if let Ok(node) = Uuid::parse_str(n.payload()) {
+                    gw.sessions.wake(node);
+                }
+            }
+            #[allow(unreachable_code)]
+            Ok::<(), sqlx::Error>(())
+        };
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            r = listener => {
+                if let Err(e) = r {
+                    tracing::debug!(error = %e, "command wake listener stopped; streams poll meanwhile");
+                }
+            }
+        }
+        tokio::select! {
+            () = cancel.cancelled() => return,
+            () = tokio::time::sleep(Duration::from_secs(1)) => {}
+        }
+    }
+}
+
+/// Reads a row's protobuf payload back into a command.
+pub(crate) fn decode(payload: &[u8]) -> Result<Command, NodesError> {
+    Command::decode(payload)
+        .map_err(|e| NodesError::Protocol(format!("stored command is damaged: {e}")))
+}

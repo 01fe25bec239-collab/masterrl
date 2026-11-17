@@ -33,6 +33,8 @@ tempfile = "=3.27.0"
 # <mrl:deps P17> P17 dependencies go right below this line.
 
 # <mrl:deps P18> P18 dependencies go right below this line.
+mrl-domain = { path = "../mrl-domain" }
+mrl-proto = { path = "../mrl-proto" }
 
 # <mrl:deps P19> P19 dependencies go right below this line.
 

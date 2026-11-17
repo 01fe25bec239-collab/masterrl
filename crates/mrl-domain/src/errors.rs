@@ -521,7 +521,46 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
     // <mrl:errors P17> rows for P17 go right below this line.
 
     // <mrl:errors P18> rows for P18 go right below this line.
-
+    (
+        code(ErrorFamily::Node, 180),
+        "The join token can't be used.",
+    ),
+    (
+        code(ErrorFamily::Node, 181),
+        "The app did not accept this machine's certificate.",
+    ),
+    (
+        code(ErrorFamily::Node, 182),
+        "This machine has not joined the app yet.",
+    ),
+    (
+        code(ErrorFamily::Node, 183),
+        "The app's certificate authority can't be used.",
+    ),
+    (
+        code(ErrorFamily::Link, 184),
+        "The app and this machine can't reach each other.",
+    ),
+    (
+        code(ErrorFamily::Link, 185),
+        "Confirm this machine's key before the first connection.",
+    ),
+    (
+        code(ErrorFamily::Link, 186),
+        "This machine's sign-in key changed.",
+    ),
+    (
+        code(ErrorFamily::Node, 187),
+        "The app did not send this command to the machine.",
+    ),
+    (
+        code(ErrorFamily::Node, 188),
+        "This machine has too many messages waiting for the app.",
+    ),
+    (
+        code(ErrorFamily::Node, 189),
+        "The app and the agent don't understand each other.",
+    ),
     // <mrl:errors P19> rows for P19 go right below this line.
 
     // <mrl:errors P20> rows for P20 go right below this line.

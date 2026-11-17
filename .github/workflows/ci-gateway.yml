@@ -1,0 +1,56 @@
+name: ci-gateway
+
+# The SSH transport against a real sshd in a container: first-use host key refused with its
+# fingerprint, confirmation recorded, key sign-in, direct-tcpip forward, and a changed host key
+# refused. Runs with MRL_TEST_SSH_REQUIRED, so a missing server fails the job instead of skipping.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-gateway-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  ssh:
+    name: gateway (ssh transport)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+
+      - name: start sshd in a container
+        run: |
+          set -euo pipefail
+          ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/id"
+          docker run -d --name mrl-sshd -p 127.0.0.1:2222:22 -e PUBKEY="$(cat "$RUNNER_TEMP/id.pub")" ubuntu:24.04 \
+            bash -c 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server \
+              && mkdir -p /root/.ssh /run/sshd && echo "$PUBKEY" > /root/.ssh/authorized_keys \
+              && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && exec /usr/sbin/sshd -D -e'
+          for _ in $(seq 1 90); do
+            if ssh-keyscan -p 2222 127.0.0.1 2>/dev/null | grep -q ssh-ed25519; then exit 0; fi
+            sleep 2
+          done
+          docker logs mrl-sshd
+          exit 1
+
+      - name: ssh transport test
+        env:
+          SSH_AUTH_SOCK: ""
+          MRL_TEST_SSH_ADDR: 127.0.0.1:2222
+          MRL_TEST_SSH_USER: root
+          MRL_TEST_SSH_FORWARD_PORT: "22"
+          MRL_TEST_SSH_REQUIRED: "1"
+        run: |
+          MRL_TEST_SSH_KEY="$RUNNER_TEMP/id" cargo test -p mrl-server --locked --lib -- --ignored --exact \
+            transports::ssh::tests::ssh_container_first_use_confirm_forward_and_changed_key

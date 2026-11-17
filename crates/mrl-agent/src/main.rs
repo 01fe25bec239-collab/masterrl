@@ -79,7 +79,26 @@ enum Command {
         action: ServiceAction,
     },
     // <mrl:cli-commands P18> P18 subcommands go right below this line.
-
+    /// Join this machine to the app with a one-time token (dial the app, or wait for it).
+    Enroll {
+        /// The app's gateway `host:port` (or tunnel hostname); the agent dials it.
+        #[arg(long, conflicts_with = "listen", required_unless_present = "listen")]
+        server: Option<String>,
+        /// Wait for the app to connect on this address instead (SSH, LAN, tunnel).
+        #[arg(long)]
+        listen: Option<std::net::SocketAddr>,
+        /// The `mrlj_…` join token from the app.
+        #[arg(long)]
+        token: String,
+        /// How to reach the app: direct, tailscale, cloudflare-tunnel (or ssh with --listen).
+        #[arg(long, value_enum, default_value = "direct")]
+        transport: mrl_agent::transports::TransportKind,
+        /// Replace an existing identity.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Check, step by step, that this machine can reach the app.
+    ConnectionTest,
     // <mrl:cli-commands P20> P20 subcommands go right below this line.
 }
 
@@ -195,6 +214,80 @@ async fn dispatch(config: Option<PathBuf>, command: Command) -> Result<ExitCode,
             run_local(cfg, &profile, limits, gpus, dir, cmd).await
         }
         // <mrl:cli-dispatch P18> P18 match arms go right below this line.
+        Command::Enroll {
+            server,
+            listen,
+            token,
+            transport,
+            force,
+        } => {
+            let (cfg, _) = AgentConfig::load(config.as_deref())?;
+            let ctx = AgentContext::from_config(cfg)?;
+            let kind = transport;
+            let enrolled = match (server, listen) {
+                (Some(s), _) => mrl_agent::enroll::enroll_dial(&ctx, &s, &token, kind, force).await,
+                (None, Some(l)) => {
+                    let stop = CancellationToken::new();
+                    let s2 = stop.clone();
+                    tokio::spawn(async move {
+                        wait_for_signal().await;
+                        s2.cancel();
+                    });
+                    mrl_agent::enroll::enroll_listen(&ctx, l, &token, kind, force, stop).await
+                }
+                (None, None) => Err(mrl_agent::session::LinkError::Token(
+                    "give --server or --listen".into(),
+                )),
+            };
+            match enrolled {
+                Ok(id) => {
+                    println!(
+                        "This machine joined the app as {}. Start the agent with `{NAME} run`.",
+                        id.link.node_id
+                    );
+                    Ok(ExitCode::SUCCESS)
+                }
+                Err(e) => {
+                    eprintln!("{NAME}: {}", e.explain());
+                    Ok(ExitCode::FAILURE)
+                }
+            }
+        }
+        Command::ConnectionTest => {
+            let (cfg, _) = AgentConfig::load(config.as_deref())?;
+            let state = mrl_agent::state::StateDir::open(&cfg.state_dir)?;
+            let id = match mrl_agent::enroll::Identity::load(state.root()) {
+                Ok(Some(id)) => id,
+                Ok(None) => {
+                    eprintln!("{NAME}: {} this machine has not joined the app yet; run `{NAME} enroll` first", mrl_agent::session::codes::NOT_ENROLLED);
+                    return Ok(ExitCode::FAILURE);
+                }
+                Err(e) => {
+                    eprintln!("{NAME}: {}", e.explain());
+                    return Ok(ExitCode::FAILURE);
+                }
+            };
+            let report = match mrl_agent::session::transport_for(&cfg.gateway, &id) {
+                Ok(t) => t.connection_test().await,
+                Err(e) => {
+                    eprintln!("{NAME}: {}", e.explain());
+                    return Ok(ExitCode::FAILURE);
+                }
+            };
+            for s in &report.steps {
+                println!(
+                    "{} {}: {}",
+                    if s.ok { "ok  " } else { "FAIL" },
+                    s.name,
+                    s.detail
+                );
+            }
+            Ok(if report.ok {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::FAILURE
+            })
+        }
 
         // <mrl:cli-dispatch P20> P20 match arms go right below this line.
         Command::Service { action } => {
