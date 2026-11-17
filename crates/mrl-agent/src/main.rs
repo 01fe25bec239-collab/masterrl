@@ -81,6 +81,13 @@ enum Command {
     // <mrl:cli-commands P18> P18 subcommands go right below this line.
 
     // <mrl:cli-commands P20> P20 subcommands go right below this line.
+    /// Check this machine: what it can train, and what to install to unlock more.
+    Doctor(mrl_agent::doctor::DoctorArgs),
+    /// Debug: run one training attempt here without a server.
+    Attempt {
+        #[command(subcommand)]
+        action: mrl_agent::attempts::local::AttemptCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -197,6 +204,10 @@ async fn dispatch(config: Option<PathBuf>, command: Command) -> Result<ExitCode,
         // <mrl:cli-dispatch P18> P18 match arms go right below this line.
 
         // <mrl:cli-dispatch P20> P20 match arms go right below this line.
+        Command::Doctor(args) => Ok(mrl_agent::doctor::cli(config.as_deref(), args).await),
+        Command::Attempt { action } => {
+            Ok(mrl_agent::attempts::local::cli(config.as_deref(), action).await)
+        }
         Command::Service { action } => {
             let (cfg, file) = AgentConfig::load(config.as_deref())?;
             let state = mrl_agent::state::StateDir::open(&cfg.state_dir)?;

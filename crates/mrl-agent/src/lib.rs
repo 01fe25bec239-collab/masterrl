@@ -22,6 +22,12 @@ pub mod transfer;
 // <mrl:lib P18> P18 `pub mod` lines go right below this line.
 
 // <mrl:lib P20> P20 `pub mod` lines go right below this line.
+pub mod attempts;
+pub mod doctor;
+pub mod envs;
+pub mod janitor;
+pub mod lanes;
+pub mod worker_server;
 
 use std::path::PathBuf;
 use std::sync::Arc;

@@ -1217,6 +1217,20 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'what_to_do': {'steps': ['Update the app on this machine, then start the run again.',
                                       "If that doesn't help, install a version of the engine made "
                                       'for your app version.']}},
+            {'code': 'MRL-ENV-201',
+             'title': "The training environment's lock file doesn't match its fingerprint.",
+             'why': 'The file that lists the exact package versions changed after the engine was '
+                    "installed. The agent won't install a changed list.",
+             'what_to_do': {'steps': ['Install the engine again from the app, so its files match.',
+                                      'If you changed the lock file on purpose, register it as a '
+                                      'new engine version.']}},
+            {'code': 'MRL-ENV-202',
+             'title': 'The training environment could not be installed.',
+             'why': "Installing the engine's packages or pulling its container image failed. The "
+                    'network may be down, or the disk may be full.',
+             'what_to_do': {'steps': ['Check that this machine is online and has free disk space.',
+                                      'Read the last installer lines in Details, then start the '
+                                      'run again.']}},
             {'code': 'MRL-IDEM-001',
              'title': 'This request is already running.',
              'why': 'A request with the same request key started earlier and has not finished.',
@@ -1450,6 +1464,19 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                                       'Run `mrl-agent service install` again.',
                                       'If it still fails, start the agent by hand with `mrl-agent '
                                       'run`.']}},
+            {'code': 'MRL-NODE-203',
+             'title': 'The agent could not open the connection to the training worker.',
+             'why': 'The agent talks to the training worker through a local socket file. It could '
+                    'not create that file.',
+             'what_to_do': {'steps': ["Make sure your account can write to the agent's state "
+                                      'folder.',
+                                      'Free up disk space, then start the run again.']}},
+            {'code': 'MRL-NODE-206',
+             'title': 'This machine is not taking new training runs right now.',
+             'why': 'Someone asked the machine to finish its current work and take nothing new, '
+                    'for example before an update.',
+             'what_to_do': {'steps': ['Wait until the machine is back in service, or pick another '
+                                      'machine.']}},
             {'code': 'MRL-PERM-001',
              'title': "Your role doesn't allow this action.",
              'why': 'Each project role can do a set list of things. This action needs a different '
@@ -1557,6 +1584,13 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                                       'If you started the service by hand, use a listen address '
                                       'like `unix:/tmp/reward.sock`.',
                                       'For local testing only, add `--allow-network`.']}},
+            {'code': 'MRL-STATE-204',
+             'title': "This training attempt can't do that right now.",
+             'why': "The attempt isn't running on this machine, already exists, or is in a step "
+                    "that doesn't allow the action. Details says which.",
+             'what_to_do': {'steps': ["Wait for the attempt's current step to finish, then try "
+                                      'again.',
+                                      'If the run moved to another machine, act on it there.']}},
             {'code': 'MRL-STORE-001',
              'title': 'The app refused a storage path.',
              'why': "The path points outside your workspace's storage area, or it has a part the "
@@ -1747,6 +1781,22 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                                       'the task needs.',
                                       'If a script started the job, fix the input named in '
                                       'Details.']}},
+            {'code': 'MRL-VAL-200',
+             'title': "The training attempt has settings the agent can't use.",
+             'why': 'A name, path or runtime in the attempt is missing or has the wrong form. '
+                    'Details names the setting.',
+             'what_to_do': {'steps': ['Start the run again from the app, so it sends complete '
+                                      'settings.',
+                                      'If you wrote the attempt file yourself, fix the setting '
+                                      'named in Details.']}},
+            {'code': 'MRL-VAL-205',
+             'title': 'A file path in the training attempt points outside its folder.',
+             'why': "Every input and output must stay inside the attempt's own folder. A path with "
+                    '`..` or a full path breaks that rule.',
+             'what_to_do': {'steps': ['Use a path inside the attempt folder, like '
+                                      '`data/train.jsonl`.',
+                                      'If the app sent the path, report it as a problem with the '
+                                      'app.']}},
             {'code': 'NODE_LOST',
              'title': 'The app lost contact with a machine in this run.',
              'why': 'The machine may have shut down, gone to sleep or dropped off the network.',

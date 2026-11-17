@@ -1704,6 +1704,7 @@ dependencies = [
  "axum",
  "clap",
  "futures",
+ "getrandom 0.3.4",
  "git-version",
  "mrl-domain",
  "mrl-proto",
@@ -1721,8 +1722,10 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tokio",
+ "tokio-stream",
  "tokio-util",
  "toml",
+ "tonic",
 ]
 
 [[package]]
@@ -1826,6 +1829,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "mrl-agent",
+ "mrl-proto",
  "mrl-server",
  "rcgen",
  "serde_json",
@@ -1835,6 +1839,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "tokio-stream",
  "tokio-util",
  "tonic",
  "tower",
