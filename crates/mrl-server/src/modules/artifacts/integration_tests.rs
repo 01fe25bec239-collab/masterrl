@@ -99,7 +99,7 @@ impl Env {
             Kind::S3 => (s3_config().await?, None),
         };
         let db = TestDb::new().await;
-        let module = ArtifactsModule::with_backend(db.db().clone(), config.clone());
+        let module = ArtifactsModule::with_backend(db.db().clone(), config.clone(), Mode::Team);
         let (store, resolver) = (module.store(), module.secrets());
         let audit = Arc::new(RecordingAuditSink::default());
         let secrets = Arc::new(InMemorySecretStore::default());
@@ -434,8 +434,20 @@ async fn interrupted_upload_resumes_and_verifies_the_hash_s3() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL (just dev)"]
-async fn ticket_scope_is_enforced() {
-    let e = Env::start(Kind::Fs).await.unwrap();
+async fn ticket_scope_is_enforced_fs() {
+    ticket_scope(Kind::Fs).await;
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL and SeaweedFS (just dev)"]
+async fn ticket_scope_is_enforced_s3() {
+    ticket_scope(Kind::S3).await;
+}
+
+async fn ticket_scope(kind: Kind) {
+    let Some(e) = Env::start(kind).await else {
+        return;
+    };
     let r = e
         .call(
             Method::POST,
@@ -524,6 +536,74 @@ async fn ticket_scope_is_enforced() {
     // The real ticket works.
     let r = e.put_bytes(&url, None, b"0123456789".to_vec(), &[]).await;
     assert_eq!(r.status, 200, "{}", r.text());
+    // A ticket PUT above the API's 2 MiB limit streams through (multipart above 16 MiB).
+    let big = data(17 << 20);
+    let big_claims = TicketClaims {
+        key: format!(
+            "orgs/org-a/runs/r-{}/big.bin",
+            uuid::Uuid::new_v4().simple()
+        ),
+        max_size: 20 << 20,
+        ..claims.clone()
+    };
+    let big_ticket = sign_ticket(&key, &big_claims).unwrap();
+    let sha = sha256_hex(&big);
+    let r = e
+        .put_bytes(
+            &format!("/api/v1/transfer/{big_ticket}"),
+            None,
+            big.clone(),
+            &[("x-mrl-content-sha256", &sha)],
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.json()["size"], big.len());
+    assert_eq!(
+        e.backend
+            .org("org-a")
+            .unwrap()
+            .sha256(&big_claims.key)
+            .await
+            .unwrap(),
+        sha
+    );
+    // Over the ticket's own limit, and a wrong hash, are still refused.
+    let small = sign_ticket(
+        &key,
+        &TicketClaims {
+            max_size: 3 << 20,
+            ..big_claims.clone()
+        },
+    )
+    .unwrap();
+    let r = e
+        .put_bytes(&format!("/api/v1/transfer/{small}"), None, big.clone(), &[])
+        .await;
+    assert_eq!(
+        (r.status, code(&r).as_str()),
+        (413, "MRL-STORE-009"),
+        "{}",
+        r.text()
+    );
+    let r = e
+        .put_bytes(
+            &format!("/api/v1/transfer/{big_ticket}"),
+            None,
+            data(3 << 20),
+            &[("x-mrl-content-sha256", &sha)],
+        )
+        .await;
+    assert_eq!(code(&r), "MRL-STORE-010");
+    // Every other route keeps the 2 MiB limit.
+    let r = e
+        .put_bytes(
+            &format!("/api/v1/uploads/{id}/parts/0"),
+            Some(A),
+            data((2 << 20) + 1),
+            &[],
+        )
+        .await;
+    assert_eq!(r.status, 413, "{}", r.text());
     // PUT tickets are not audited; nothing was downloaded.
     assert!(e
         .audit
@@ -615,6 +695,49 @@ async fn artifacts_register_and_download(kind: Kind) {
         "a failed registration frees the name: {}",
         r.text()
     );
+    // Staging areas are refused: their files are deleted or rewritten later.
+    let r = e
+        .call(
+            Method::POST,
+            "/api/v1/uploads",
+            A,
+            Some(json!({"filename": "p", "size": 12, "sha256": sha256_hex(b"{\"score\": 1}")})),
+        )
+        .await;
+    let up = r.json()["id"].as_str().unwrap().to_owned();
+    e.put_bytes(
+        &format!("/api/v1/uploads/{up}/parts/0"),
+        Some(A),
+        b"{\"score\": 1}".to_vec(),
+        &[],
+    )
+    .await;
+    let part = json!({"schema_version": "artifact-manifest/v1", "kind": "eval", "created_at": "2026-11-16T00:00:00Z",
+        "files": [{"path": "000000", "size": 12, "sha256": sha256_hex(b"{\"score\": 1}"), "role": "report"}]});
+    let staged = put_files(
+        &e,
+        "runs/r/checkpoints/c/_staging/attempt-1/",
+        &[("w.bin", b"w")],
+    )
+    .await;
+    for (prefix, m) in [
+        (format!("uploads/{up}/parts/"), part),
+        (
+            "runs/r/checkpoints/c/_staging/attempt-1/".to_owned(),
+            staged,
+        ),
+    ] {
+        let r = e
+            .call(
+                Method::POST,
+                "/api/v1/artifacts",
+                A,
+                Some(json!({"name": "staged", "prefix": prefix, "manifest": m})),
+            )
+            .await;
+        assert_eq!(r.status, 422, "{prefix}: {}", r.text());
+        assert!(r.text().contains("staging"), "{}", r.text());
+    }
     let r = e
         .call(Method::GET, "/api/v1/artifacts?kind=eval&limit=1", A, None)
         .await;
@@ -858,7 +981,30 @@ async fn other_orgs_see_nothing() {
     let r = e
         .call(Method::GET, &format!("/api/v1/lineage/{art}"), B, None)
         .await;
-    assert_eq!(r.json()["edges"], json!([]), "org-a's edges stay in org-a");
+    assert_eq!(
+        r.status,
+        404,
+        "another org's artifact is not a lineage root: {}",
+        r.text()
+    );
+    let r = e
+        .call(Method::GET, &format!("/api/v1/lineage/{ckpt}"), B, None)
+        .await;
+    assert_eq!(
+        r.status, 404,
+        "a node only org-a's edges know is not found in org-b"
+    );
+    // org-b can't link its artifacts to org-a's.
+    let manifest_b = json!({"schema_version": "artifact-manifest/v1", "kind": "eval", "created_at": "2026-11-16T00:00:00Z", "files": []});
+    let r = e
+        .call(
+            Method::POST,
+            "/api/v1/artifacts",
+            B,
+            Some(json!({"name": "b", "manifest": manifest_b, "links": [{"relation": "derived_from", "to": art}]})),
+        )
+        .await;
+    assert_eq!(r.status, 422, "{}", r.text());
     // org-b's own storage is separate from org-a's.
     assert!(e
         .backend
@@ -915,6 +1061,21 @@ async fn canary_secret_never_leaks() {
         )
         .await;
     assert_eq!((r.status, r.body.len()), (204, 0));
+    // Right after the write, while the row exists: the value is in no P19 row and in no
+    // stored idempotent response.
+    let rows: i64 = sqlx::query_scalar(
+        "SELECT (SELECT count(*) FROM secrets_metadata s WHERE s::text LIKE '%' || $1 || '%')
+              + (SELECT count(*) FROM idempotency_keys k WHERE k::text LIKE '%' || $1 || '%')
+              + (SELECT count(*) FROM secrets_metadata WHERE rotated_at IS NULL)",
+    )
+    .bind(&canary)
+    .fetch_one(e.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        rows, 0,
+        "the value is never in PostgreSQL, and the row says it was saved"
+    );
     // Bad bodies must not echo the value either.
     for bad in [
         format!("{{\"value\": \"{canary}\", \"extra\": 1}}"),
@@ -1008,8 +1169,11 @@ async fn canary_secret_never_leaks() {
         )
         .await;
     assert_eq!(code(&r), "MRL-PERM-190");
-    // `env` secrets read the server's environment when resolved.
+    // A team server's environment holds its own credentials (like AWS_SECRET_ACCESS_KEY):
+    // tenants can't point a secret at it, and an `env` row is never resolved there.
     let var = format!("MRL_P19_TEST_{}", uuid::Uuid::new_v4().simple()).to_uppercase();
+    let server_canary = format!("server-{canary}");
+    std::env::set_var(&var, &server_canary);
     let r = e
         .call(
             Method::POST,
@@ -1020,15 +1184,46 @@ async fn canary_secret_never_leaks() {
             ),
         )
         .await;
-    let env_id: mrl_domain::ids::SecretId = r.json()["id"].as_str().unwrap().parse().unwrap();
     assert_eq!(
-        e.resolver
-            .resolve(None, "org-a", env_id, "run")
-            .await
-            .unwrap_err()
-            .code(),
-        "MRL-RES-190"
+        (r.status, code(&r).as_str()),
+        (403, "MRL-PERM-001"),
+        "{}",
+        r.text()
     );
+    bodies.push(r.text());
+    let env_uuid = uuid::Uuid::new_v4();
+    let run2 = mrl_domain::ids::RunId::new();
+    e.db.seed(&format!(
+        "INSERT INTO secrets_metadata (id, org_id, name, backend, ref, kind, allowed_uses, created_by)
+         VALUES ('{env_uuid}', 'org-a', 'env1', 'env', '{var}', 'generic', '{{run}}', 'usr-a');
+         INSERT INTO run_secret_grants (run_id, secret_id, mount) VALUES ('{}', '{env_uuid}', 'env');",
+        run2.as_uuid()
+    ))
+    .await;
+    let env_id = mrl_domain::ids::SecretId::from_uuid(env_uuid);
+    let err = e
+        .resolver
+        .resolve(None, "org-a", env_id, "run")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "MRL-PERM-001");
+    let err = e
+        .resolver
+        .resolve_for_run(None, "org-a", run2)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "MRL-PERM-001");
+    assert!(!format!("{err:?}").contains(&canary));
+    // A solo (CLI) server reads it.
+    let solo = SecretResolver::new(e.db.db().clone(), Mode::Solo);
+    let got = solo.resolve(None, "org-a", env_id, "run").await.unwrap();
+    assert_eq!(got.expose(), server_canary);
+    std::env::remove_var(&var);
+    let err = solo
+        .resolve(None, "org-a", env_id, "run")
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "MRL-RES-190");
     // Everything a person or a scraper can read: responses, metrics, the audit log, logs.
     let internal = e.srv.running().internal_addr().unwrap();
     let metrics =
@@ -1053,14 +1248,6 @@ async fn canary_secret_never_leaks() {
     for text in bodies.iter().chain([&logs]) {
         assert!(!text.contains(&canary), "the canary leaked: {text}");
     }
-    let rows: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM secrets_metadata s WHERE s::text LIKE '%' || $1 || '%'",
-    )
-    .bind(&canary)
-    .fetch_one(e.db.pool())
-    .await
-    .unwrap();
-    assert_eq!(rows, 0, "the value is never in PostgreSQL");
 }
 
 #[tokio::test]

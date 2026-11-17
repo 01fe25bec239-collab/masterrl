@@ -1,20 +1,21 @@
 //! `PUT|GET /api/v1/transfer/{ticket}`: the server-proxied transfer endpoint. The ticket is
 //! the only credential (no sign-in); it allows one method on one key up to its size limit.
 //!
-//! - PUT: the body is checked against the size limit and, when the client sends
-//!   `x-mrl-content-sha256`, against that hash, then written to the ticket's key.
+//! - PUT: the body streams into a temporary file, counted against the ticket's size limit
+//!   (the API's 2 MiB limit does not apply here) and, when the client sends
+//!   `x-mrl-content-sha256`, checked against that hash; then it is stored at the ticket's key
+//!   (one put up to 16 MiB, multipart above).
 //! - GET: the object must fit the ticket's size limit. `Range: bytes=N-` and `bytes=N-M`
 //!   resume a download (206); the body streams in 8 MiB pieces.
 
 use super::{ArtifactStore, Error};
 use crate::app::AppState;
-use crate::http::BODY_LIMIT;
-use axum::body::{Body, Bytes};
+use axum::body::Body;
 use axum::extract::{Path, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use mrl_storage::{sha256_hex, StorageError, TicketMethod};
+use mrl_storage::{StorageError, TicketMethod};
 use std::sync::Arc;
 
 /// Header with the sha256 of a PUT body (lowercase hex), as the agent sends it.
@@ -46,20 +47,56 @@ pub(super) async fn upload(
     if let Some(n) = declared {
         claims.check_size(n).map_err(|e| too_large(e.to_string()))?;
     }
-    // ponytail: buffered; the API's 2 MiB body limit (P07) caps PUTs today. Stream to a
-    // temp file and `upload_file` once large bodies may pass that limit.
-    let limit = usize::try_from(claims.max_size)
-        .unwrap_or(usize::MAX)
-        .min(BODY_LIMIT);
-    let bytes: Bytes = axum::body::to_bytes(body, limit).await.map_err(|_| {
-        too_large(format!(
-            "The body is more than the {limit} bytes this ticket and the server allow."
-        ))
-    })?;
-    claims
-        .check_size(bytes.len() as u64)
-        .map_err(|e| too_large(e.to_string()))?;
-    let sha = sha256_hex(&bytes);
+    // Streamed into a temporary file while counting and hashing, so the ticket's size limit
+    // holds even without a content-length and nothing large sits in memory.
+    let tmp = std::env::temp_dir().join(format!("mrl-transfer-{}", uuid::Uuid::new_v4().simple()));
+    let result = receive(&s, &store, &claims, &headers, body, &tmp).await;
+    for p in [tmp.clone(), crate::modules::uploads::ledger_of(&tmp)] {
+        let _ = tokio::fs::remove_file(p).await;
+    }
+    let (size, sha) = result?;
+    Ok(Json(
+        serde_json::json!({ "key": claims.key, "size": size, "sha256": sha }),
+    ))
+}
+
+async fn receive(
+    s: &AppState,
+    store: &ArtifactStore,
+    claims: &mrl_storage::TicketClaims,
+    headers: &HeaderMap,
+    body: Body,
+    tmp: &std::path::Path,
+) -> Result<(u64, String), Error> {
+    use futures_util::StreamExt;
+    use sha2::{Digest, Sha256};
+    use tokio::io::AsyncWriteExt;
+    let io = |e: std::io::Error| {
+        Error::from(StorageError::Io {
+            path: tmp.to_owned(),
+            source: e,
+        })
+    };
+    let mut file = tokio::fs::File::create(tmp).await.map_err(io)?;
+    let (mut size, mut hash) = (0u64, Sha256::new());
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| {
+            crate::error::ApiError::new(
+                crate::error::ErrorCode::BadBody,
+                format!("The upload stopped before it finished: {e}"),
+            )
+        })?;
+        size += chunk.len() as u64;
+        claims
+            .check_size(size)
+            .map_err(|e| too_large(e.to_string()))?;
+        hash.update(&chunk);
+        file.write_all(&chunk).await.map_err(io)?;
+    }
+    file.flush().await.map_err(io)?;
+    drop(file);
+    let sha: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
     if let Some(want) = headers.get(SHA256_HEADER) {
         let want = want.to_str().unwrap_or_default();
         if want != sha {
@@ -71,15 +108,9 @@ pub(super) async fn upload(
             .into());
         }
     }
-    let size = bytes.len();
-    store
-        .org_store(&s, claims.org_id())
-        .await?
-        .put(&claims.key, bytes)
-        .await?;
-    Ok(Json(
-        serde_json::json!({ "key": claims.key, "size": size, "sha256": sha }),
-    ))
+    let st = store.org_store(s, claims.org_id()).await?;
+    crate::modules::uploads::store_file(&st, tmp, &claims.key, size).await?;
+    Ok((size, sha))
 }
 
 /// Downloads one object with a GET ticket. Supports `Range`.

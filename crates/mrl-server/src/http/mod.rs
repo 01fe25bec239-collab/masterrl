@@ -1,7 +1,8 @@
 //! HTTP framework: router composition from modules and the middleware every request passes.
 //!
 //! Order, outermost first: request ids and trace → metrics → compression → problem
-//! renderer → (solo: launch-secret check on every path) → body limit (2 MiB) → panic
+//! renderer → (solo: launch-secret check on every path) → body limit (2 MiB; ticket PUTs are
+//! exempt and capped by their ticket) → panic
 //! catcher → route. Module routes under `/api/v1` add, outermost first: authentication
 //! (team; solo already checked) → rate limit → idempotency → problem renderer.
 
@@ -32,6 +33,9 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Largest request body accepted (2 MiB). Larger content goes through uploads.
 pub const BODY_LIMIT: usize = 2 * 1024 * 1024;
+/// `PUT` bodies under this path skip [`BODY_LIMIT`]: the transfer ticket carries its own size
+/// limit, and the endpoint enforces it (P19).
+pub const UNLIMITED_PUT_PREFIX: &str = "/api/v1/transfer/";
 /// Request id header (echoed on every response).
 pub const REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 /// W3C trace context header.
@@ -113,7 +117,7 @@ fn finish(router: Router<AppState>, state: AppState, gate: bool) -> Router {
             ApiError::new(ErrorCode::Internal, "The server hit an internal problem.")
                 .into_response()
         }))
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(BODY_LIMIT));
+        .layer(from_fn(limit_body));
     let router = if gate {
         router.layer(from_fn_with_state(state.clone(), authenticate))
     } else {
@@ -257,6 +261,23 @@ fn meta_of(req: &Request) -> RequestMeta {
             trace_id: String::new(),
             request_id: String::new(),
         })
+}
+
+/// [`BODY_LIMIT`] on every request except ticket uploads (`PUT` under [`UNLIMITED_PUT_PREFIX`]).
+async fn limit_body(req: Request, next: Next) -> Response {
+    use tower::ServiceExt;
+    if req.method() == axum::http::Method::PUT && req.uri().path().starts_with(UNLIMITED_PUT_PREFIX)
+    {
+        return next.run(req).await;
+    }
+    let inner = tower::util::MapRequest::new(next, |r: axum::http::Request<_>| r.map(Body::new));
+    match tower_http::limit::RequestBodyLimit::new(inner, BODY_LIMIT)
+        .oneshot(req)
+        .await
+    {
+        Ok(res) => res.map(Body::new),
+        Err(never) => match never {},
+    }
 }
 
 /// Renders `ApiError`s and bare error responses (axum rejections, body limit) as

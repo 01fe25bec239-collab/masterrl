@@ -58,6 +58,7 @@ const SWEEP_EVERY: Duration = Duration::from_secs(3600);
 /// The module: routes, the cleanup job and the shared [`ArtifactStore`].
 pub struct ArtifactsModule {
     store: Arc<ArtifactStore>,
+    mode: crate::config::Mode,
 }
 
 impl ArtifactsModule {
@@ -65,13 +66,15 @@ impl ArtifactsModule {
     pub fn new(db: Db, config: &Config) -> Self {
         Self {
             store: Arc::new(ArtifactStore::new(db, backend_config(config))),
+            mode: config.server.mode,
         }
     }
 
-    /// The module with an explicit backend (tests and embedders).
-    pub fn with_backend(db: Db, backend: BackendConfig) -> Self {
+    /// The module with an explicit backend, for a server in `mode` (tests and embedders).
+    pub fn with_backend(db: Db, backend: BackendConfig, mode: crate::config::Mode) -> Self {
         Self {
             store: Arc::new(ArtifactStore::new(db, Ok(backend))),
+            mode,
         }
     }
 
@@ -82,7 +85,7 @@ impl ArtifactsModule {
 
     /// The secret resolver, for other modules (P20 delivers granted secrets with it).
     pub fn secrets(&self) -> crate::modules::secrets::SecretResolver {
-        crate::modules::secrets::SecretResolver::new(self.store.db.clone())
+        crate::modules::secrets::SecretResolver::new(self.store.db.clone(), self.mode)
     }
 }
 
@@ -332,6 +335,17 @@ impl ArtifactStore {
             .enumerate()
             .map(|(i, l)| l.parse(i))
             .collect::<Result<Vec<_>, _>>()?;
+        for (i, (from, _, to)) in links.iter().enumerate() {
+            let other = from.or(*to).filter(|n| matches!(n.kind, "art" | "up"));
+            if let Some(n) = other {
+                if !crate::modules::lineage::belongs(&self.db, &org, n).await? {
+                    return Err(field(
+                        &format!("/links/{i}"),
+                        "No item with this id exists here.",
+                    ));
+                }
+            }
+        }
         let id = state.seams.ids.new_uuid();
         let store = self.org_store(state, &org).await?;
         let prefix = match &new.prefix {
@@ -352,6 +366,17 @@ impl ArtifactStore {
                 ArtifactId::from_uuid(id)
             ),
         };
+        // Staging areas are cleaned up or overwritten (upload parts, checkpoint attempts), so a
+        // committed artifact may never point into one.
+        for f in &manifest.files {
+            let key = store.keys().join(&prefix, &f.path)?;
+            if is_staging(&key[store.keys().prefix().len()..]) {
+                return Err(field(
+                    "/prefix",
+                    "Artifact files can't live in a staging folder (`uploads/` or `_staging/`); finish the upload first and use its stored file.",
+                ));
+            }
+        }
         let size: u64 = manifest.files.iter().map(|f| f.size).sum();
         let inserted = sqlx::query(
             "INSERT INTO artifacts (id, org_id, project_id, name, kind, prefix, manifest, size_bytes, state, created_by)
@@ -455,6 +480,11 @@ impl ArtifactStore {
         .await?;
         Ok(row.map(Artifact::from))
     }
+}
+
+/// True for keys (relative to the org) in an area that is cleaned up or rewritten.
+fn is_staging(relative: &str) -> bool {
+    relative.starts_with("uploads/") || relative.split('/').any(|p| p == "_staging")
 }
 
 /// The ticket signing key: from the `SecretStore` (created the first time), else per process.
@@ -851,3 +881,17 @@ async fn action(
     tags((name = "artifacts", description = "Generic artifacts and the transfer endpoint."))
 )]
 struct Doc;
+
+#[cfg(test)]
+mod tests {
+    use super::is_staging;
+
+    #[test]
+    fn staging_areas_are_refused() {
+        assert!(is_staging("uploads/up_1/parts/000000"));
+        assert!(is_staging("runs/r/checkpoints/c/_staging/attempt-1/w.bin"));
+        assert!(!is_staging("evals/e1/results.json"));
+        assert!(!is_staging("exports/uploads/x"));
+        assert!(!is_staging("blobs/sha256/aa/bb/x"));
+    }
+}

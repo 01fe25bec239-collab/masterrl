@@ -1,0 +1,44 @@
+name: ci-artifacts
+
+# P19 uploads, artifacts, lineage and secrets against PostgreSQL and SeaweedFS (same setup as `just dev`).
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-artifacts-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  artifacts:
+    name: artifacts (postgres + s3)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      DATABASE_URL: postgres://mrl:mrl-dev-only@127.0.0.1:55432/masterrl
+      MRL_TEST_S3_ENDPOINT: http://127.0.0.1:8333
+      # Fail instead of skipping when SeaweedFS is not reachable.
+      MRL_TEST_S3_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+
+      # A job `services:` entry cannot pass SeaweedFS its `-s3` flags, so start both from the dev compose file.
+      - name: start PostgreSQL and SeaweedFS
+        run: docker compose -f deploy/local/compose.yaml up -d --wait postgres seaweedfs
+
+      - name: P19 integration tests (local folder + S3)
+        run: cargo test -p mrl-testkit --locked p19_artifacts -- --ignored
+
+      - name: service logs
+        if: failure()
+        run: docker compose -f deploy/local/compose.yaml logs postgres seaweedfs

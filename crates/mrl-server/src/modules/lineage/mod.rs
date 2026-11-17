@@ -16,7 +16,7 @@
 //! `{"id": "hidden-N", "kind": null, "redacted": true}` and is not followed further.
 
 use crate::app::AppState;
-use crate::db::{DbError, Tx};
+use crate::db::{Db, DbError, Tx};
 use crate::error::{ApiError, ErrorCode};
 use crate::modules::artifacts::{field, org_of, ArtifactStore, Error};
 use crate::seams::{Decision, RequestContext, Resource};
@@ -154,6 +154,32 @@ impl LineageWriter {
     }
 }
 
+/// Kinds whose rows P19 owns, so their org can be checked directly.
+fn has_table(kind: &str) -> bool {
+    matches!(kind, "art" | "up")
+}
+
+/// True when `node` is in `org`: artifacts and uploads by their own row; other kinds (whose
+/// tables belong to other parts) when an edge of `org` touches them.
+pub async fn belongs(db: &Db, org: &str, node: NodeRef) -> Result<bool, DbError> {
+    let sql = match node.kind {
+        "art" => {
+            "SELECT EXISTS (SELECT 1 FROM artifacts WHERE org_id = $1 AND id = $3 AND $2 = 'art')"
+        }
+        "up" => "SELECT EXISTS (SELECT 1 FROM uploads WHERE org_id = $1 AND id = $3 AND $2 = 'up')",
+        _ => {
+            "SELECT EXISTS (SELECT 1 FROM lineage_edges WHERE org_id = $1
+               AND ((from_kind = $2 AND from_id = $3) OR (to_kind = $2 AND to_id = $3)))"
+        }
+    };
+    Ok(sqlx::query_scalar(sql)
+        .bind(org)
+        .bind(node.kind)
+        .bind(node.id)
+        .fetch_one(db.pool())
+        .await?)
+}
+
 /// The read action for a node kind.
 pub fn read_action(kind: &str) -> &'static str {
     match kind {
@@ -255,6 +281,9 @@ pub(crate) async fn query(
     let org = org_of(&ctx)?;
     s.authorize(&ctx, "lineage.read", &node_resource(&org, None))
         .await?;
+    if !belongs(store.db(), &org, root).await? {
+        return Err(ApiError::new(ErrorCode::NotFound, "No item with this id exists.").into());
+    }
     s.authorize(
         &ctx,
         read_action(root.kind),
@@ -349,7 +378,8 @@ async fn walk(
                     .authorizer
                     .authorize(ctx, read_action(n.kind), &node_resource(org, Some(n)))
                     .await?
-                    == Decision::Allow;
+                    == Decision::Allow
+                    && (!has_table(n.kind) || belongs(store.db(), org, n).await?);
                 let node = if visible {
                     next.push(n);
                     Node {

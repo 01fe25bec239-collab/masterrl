@@ -3,7 +3,9 @@
 //! logged, put in metrics or synced.
 //!
 //! - `POST /secrets {name, kind, allowed_uses, env_var?}`: a reference. With `env_var`, the
-//!   value is read from that environment variable of the server when resolved (CLI use).
+//!   value is read from that environment variable of the server when resolved. Solo only:
+//!   on a team server the environment holds the server's own credentials, so tenants may
+//!   never point at it.
 //! - `PUT /secrets/{sec}/value {value}`: write-only; the answer is `204` with no body.
 //! - `POST /secrets/{sec}/grants {run_id, mount}`: lets a run receive the secret (needs the
 //!   `run` use).
@@ -11,6 +13,7 @@
 //!   P20 delivers granted secrets to agents with [`SecretResolver::resolve_for_run`].
 
 use crate::app::AppState;
+use crate::config::Mode;
 use crate::db::Db;
 use crate::error::{ApiError, ErrorCode, FieldError};
 use crate::modules::artifacts::{
@@ -147,12 +150,14 @@ impl From<Row> for SecretMeta {
 #[derive(Clone)]
 pub struct SecretResolver {
     db: Db,
+    mode: Mode,
 }
 
 impl SecretResolver {
-    /// A resolver over this database.
-    pub fn new(db: Db) -> Self {
-        Self { db }
+    /// A resolver over this database for a server in `mode`. Only solo servers resolve
+    /// `env` secrets.
+    pub fn new(db: Db, mode: Mode) -> Self {
+        Self { db, mode }
     }
 
     async fn row(&self, org: &str, id: Uuid) -> Result<Row, Error> {
@@ -177,7 +182,7 @@ impl SecretResolver {
         use_: &str,
     ) -> Result<Secret, Error> {
         let row = self.row(org, secret.as_uuid()).await?;
-        value(store, &row, use_).await
+        value(store, &row, use_, self.mode).await
     }
 
     /// Every secret granted to `run` in `org`, with its value, for delivery to the run's agent.
@@ -204,7 +209,7 @@ impl SecretResolver {
         let mut out = Vec::with_capacity(rows.len());
         for (mount, row) in rows {
             out.push(GrantedSecret {
-                value: value(store, &row, RUN_USE).await?,
+                value: value(store, &row, RUN_USE, self.mode).await?,
                 id: SecretId::from_uuid(row.id),
                 name: row.name,
                 mount,
@@ -225,6 +230,7 @@ async fn value(
     store: Option<&Arc<dyn SecretStore>>,
     row: &Row,
     use_: &str,
+    mode: Mode,
 ) -> Result<Secret, Error> {
     if !row.allowed_uses.iter().any(|u| u == use_) {
         return Err(Error::coded(
@@ -241,6 +247,9 @@ async fn value(
         )
     };
     if row.backend == "env" {
+        if mode != Mode::Solo {
+            return Err(env_refused());
+        }
         return std::env::var(&row.reference)
             .map(Secret::new)
             .map_err(|_| empty());
@@ -249,6 +258,14 @@ async fn value(
         .get(&row.reference)
         .await?
         .ok_or_else(empty)
+}
+
+fn env_refused() -> Error {
+    ApiError::new(
+        ErrorCode::Forbidden,
+        "Secrets read from environment variables work only on a solo server.",
+    )
+    .into()
 }
 
 fn store_of(store: Option<&Arc<dyn SecretStore>>) -> Result<&Arc<dyn SecretStore>, Error> {
@@ -359,6 +376,9 @@ pub(crate) async fn create(
     s.authorize(&ctx, "secrets.manage", &resource(&ctx, "secret", None))
         .await?;
     let uses = check_new(&new)?;
+    if new.env_var.is_some() && s.config.server.mode != Mode::Solo {
+        return Err(env_refused());
+    }
     let org = org_of(&ctx)?;
     let id = s.seams.ids.new_uuid();
     let (backend, reference) = match &new.env_var {
@@ -440,7 +460,7 @@ pub(crate) async fn get(
     let id = parse_id(&sec)?;
     s.authorize(&ctx, "tenancy.read", &resource(&ctx, "secret", Some(sec)))
         .await?;
-    let r = SecretResolver::new(store.db().clone());
+    let r = SecretResolver::new(store.db().clone(), s.config.server.mode);
     Ok(Json(r.row(&org_of(&ctx)?, id).await?.into()))
 }
 
@@ -480,7 +500,7 @@ pub(crate) async fn set_value(
         return Err(field("/value", "The value needs 1 byte to 64 KiB."));
     }
     let org = org_of(&ctx)?;
-    let row = SecretResolver::new(store.db().clone())
+    let row = SecretResolver::new(store.db().clone(), s.config.server.mode)
         .row(&org, id)
         .await?;
     if row.backend == "env" {
@@ -517,7 +537,7 @@ pub(crate) async fn delete(
     )
     .await?;
     let org = org_of(&ctx)?;
-    let row = SecretResolver::new(store.db().clone())
+    let row = SecretResolver::new(store.db().clone(), s.config.server.mode)
         .row(&org, id)
         .await?;
     if row.backend == "secret_store" {
@@ -560,7 +580,7 @@ pub(crate) async fn grant(
         return Err(field("/mount", "Use env or file."));
     }
     let org = org_of(&ctx)?;
-    let row = SecretResolver::new(store.db().clone())
+    let row = SecretResolver::new(store.db().clone(), s.config.server.mode)
         .row(&org, id)
         .await?;
     if !row.allowed_uses.iter().any(|u| u == RUN_USE) {

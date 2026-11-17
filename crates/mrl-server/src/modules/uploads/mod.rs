@@ -561,7 +561,7 @@ async fn complete(
 }
 
 /// `upload_file` keeps its resume ledger next to the file.
-fn ledger_of(path: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn ledger_of(path: &std::path::Path) -> std::path::PathBuf {
     let mut name = path.file_name().unwrap_or_default().to_owned();
     name.push(".mrl-upload.json");
     path.with_file_name(name)
@@ -599,15 +599,30 @@ async fn join_and_store(st: &Store, row: &Row, tmp: &std::path::Path) -> Result<
         Err(e) => return Err(e.into()),
     };
     if !exists {
-        let opts = TransferOptions::default();
-        if row.size() <= opts.part_size {
-            let data = tokio::fs::read(tmp).await.map_err(io)?;
-            st.put(&blob, Bytes::from(data)).await?;
-        } else {
-            st.upload_file(tmp, &blob, opts).await?;
-        }
+        store_file(st, tmp, &blob, row.size()).await?;
     }
     Ok(blob)
+}
+
+/// Stores the local file `tmp` of `size` bytes at `key`: one put up to 16 MiB, else a
+/// parallel multipart transfer. The caller deletes `tmp` and its [`ledger_of`] file.
+pub(crate) async fn store_file(
+    st: &Store,
+    tmp: &std::path::Path,
+    key: &str,
+    size: u64,
+) -> Result<(), Error> {
+    let opts = TransferOptions::default();
+    if size <= opts.part_size {
+        let data = tokio::fs::read(tmp).await.map_err(|e| StorageError::Io {
+            path: tmp.to_owned(),
+            source: e,
+        })?;
+        st.put(key, Bytes::from(data)).await?;
+    } else {
+        st.upload_file(tmp, key, opts).await?;
+    }
+    Ok(())
 }
 
 /// What one cleanup pass did.
