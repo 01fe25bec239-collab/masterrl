@@ -1,0 +1,3 @@
+# Known false positives (A1-reviewed). One fingerprint per line: <commit>:<file>:<rule>:<line>
+# P16 sync/crypto.rs line 1 is a doc comment naming the cipher; the generic-api-key rule misread it. No secret.
+10766ef6bbd5183bbc2092b98a2a0acac85c6ffc:crates/mrl-server/src/modules/sync/crypto.rs:generic-api-key:1
