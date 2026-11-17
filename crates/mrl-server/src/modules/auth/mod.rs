@@ -8,6 +8,7 @@
 //!   `GET|POST /auth/tokens`, `DELETE /auth/tokens/{id}`
 
 pub mod credentials;
+pub mod problem;
 pub mod signin;
 pub mod supabase;
 
@@ -26,6 +27,7 @@ use axum::response::IntoResponse;
 use axum::routing::{delete, get, post};
 use axum::{Extension, Json, Router};
 use mrl_domain::ids::{OrgId, ProjectId, TokenId, UserId};
+use problem::{Coded, Fail};
 use serde::{Deserialize, Serialize};
 use signin::{Flows, SignIn, SignInState};
 use std::str::FromStr;
@@ -214,6 +216,9 @@ impl ServerModule for AuthModule {
             .route("/auth/tokens", get(list_tokens).post(create_token))
             .route("/auth/tokens/{id}", delete(revoke_token))
             .layer(Extension(self.shared.clone()))
+            .layer(axum::middleware::from_fn(
+                crate::modules::auth::problem::render,
+            ))
     }
 
     fn public_routes(&self) -> Router<AppState> {
@@ -221,6 +226,9 @@ impl ServerModule for AuthModule {
             .route("/auth/login", post(login))
             .route("/auth/callback", post(callback))
             .layer(Extension(self.shared.clone()))
+            .layer(axum::middleware::from_fn(
+                crate::modules::auth::problem::render,
+            ))
     }
 
     fn openapi(&self) -> utoipa::openapi::OpenApi {
@@ -327,15 +335,17 @@ pub struct SignedIn {
     pub token: Option<NewToken>,
 }
 
-fn sign_in_failed(detail: impl std::fmt::Display) -> ApiError {
-    ApiError::new(
-        ErrorCode::Unauthenticated,
-        format!("{}: {detail}", signin::NOT_FINISHED),
+fn sign_in_failed(detail: impl std::fmt::Display) -> Fail {
+    Coded::new(
+        signin::NOT_FINISHED,
+        StatusCode::UNAUTHORIZED,
+        format!("{detail}."),
     )
+    .into()
 }
 
-fn not_set_up() -> ApiError {
-    ApiError::from(signin::SignInError::NotConfigured)
+fn not_set_up() -> Fail {
+    Fail::from(signin::SignInError::NotConfigured)
 }
 
 fn field(path: &str, message: impl Into<String>) -> ApiError {
@@ -352,16 +362,17 @@ fn field(path: &str, message: impl Into<String>) -> ApiError {
 async fn login(
     Extension(shared): Extension<Arc<Shared>>,
     Json(req): Json<LoginRequest>,
-) -> Result<Json<LoginStarted>, ApiError> {
+) -> Result<Json<LoginStarted>, Fail> {
     let supabase = shared.supabase.as_ref().ok_or_else(not_set_up)?;
     if !matches!(req.provider.as_str(), "google" | "github") {
-        return Err(field("/provider", "provider must be google or github"));
+        return Err(field("/provider", "provider must be google or github").into());
     }
     if !signin::redirect_allowed(&req.redirect_uri) {
         return Err(field(
             "/redirect_uri",
             "redirect_uri must be masterrl://auth/callback or an http://127.0.0.1:<port>/… address",
-        ));
+        )
+        .into());
     }
     let (flow_id, challenge) = shared.flows.start()?;
     let redirect_to = signin::with_flow(&req.redirect_uri, &flow_id);
@@ -378,7 +389,7 @@ async fn callback(
     Extension(shared): Extension<Arc<Shared>>,
     Extension(meta): Extension<RequestMeta>,
     Json(req): Json<CallbackRequest>,
-) -> Result<Json<SignedIn>, ApiError> {
+) -> Result<Json<SignedIn>, Fail> {
     let (supabase, verifier) = match (&shared.supabase, &shared.verifier) {
         (Some(s), Some(v)) => (s, v),
         _ => return Err(not_set_up()),
@@ -391,9 +402,12 @@ async fn callback(
         .exchange_code(&req.code, &flow.verifier)
         .await
         .map_err(|e| match e {
-            supabase::SupabaseError::Offline(_) => {
-                ApiError::new(ErrorCode::Unavailable, format!("{e}."))
-            }
+            supabase::SupabaseError::Offline(_) => Coded::new(
+                supabase::OFFLINE,
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("{e}."),
+            )
+            .into(),
             other => sign_in_failed(other),
         })?;
     let claims = verifier
@@ -416,15 +430,13 @@ async fn callback(
             if linked.is_some_and(|l| l != profile.supabase_user_id)
                 && sign_in.state().await? == SignInState::Active
             {
-                return Err(ApiError::new(
-                    ErrorCode::Forbidden,
-                    format!(
-                        "{}: this app is signed in to another account; sign out first",
-                        signin::OTHER_ACCOUNT
-                    ),
-                ));
+                return Err(Coded::new(
+                    signin::OTHER_ACCOUNT,
+                    StatusCode::CONFLICT,
+                    "This app is signed in to another account; sign out first.",
+                )
+                .into());
             }
-            sign_in.keep(&tokens).await?;
             owner
         }
         Mode::Team => tenancy::upsert_supabase_user(db, &profile)
@@ -480,6 +492,10 @@ async fn callback(
         .await
         .map_err(db_error)?;
     commit(tx).await?;
+    // The keychain is not transactional: keep the Supabase session once the link is saved.
+    if shared.mode == Mode::Solo {
+        shared.sign_in(&state).keep(&tokens).await?;
+    }
     Ok(Json(SignedIn {
         user: UserInfo {
             id: user.to_string(),
@@ -534,7 +550,7 @@ async fn me(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
     ctx: RequestContext,
-) -> Result<Json<Me>, ApiError> {
+) -> Result<Json<Me>, Fail> {
     state
         .authorize(&ctx, "auth.session", &Resource::kind("account"))
         .await?;
@@ -605,9 +621,10 @@ fn kind_name(k: PrincipalKind) -> &'static str {
     }
 }
 
+/// Writes an `auth.session` audit row in `tx`, with the change it records.
 async fn record(
     state: &AppState,
-    db: &Db,
+    tx: &mut crate::db::Tx,
     ctx: &RequestContext,
     target: &str,
     details: serde_json::Value,
@@ -621,11 +638,7 @@ async fn record(
         AuditOutcome::Success,
         &ctx.trace_id,
     );
-    let mut tx = db.begin().await.map_err(db_error)?;
-    audit::write(&mut tx, &event, &details)
-        .await
-        .map_err(db_error)?;
-    commit(tx).await
+    audit::write(tx, &event, &details).await.map_err(db_error)
 }
 
 #[utoipa::path(post, path = "/auth/logout", tag = "auth", responses((status = 204, description = "Signed out.")))]
@@ -634,36 +647,52 @@ async fn logout(
     Extension(shared): Extension<Arc<Shared>>,
     ctx: RequestContext,
     headers: HeaderMap,
-) -> Result<StatusCode, ApiError> {
+) -> Result<StatusCode, Fail> {
     state
         .authorize(&ctx, "auth.session", &Resource::kind("account"))
         .await?;
     let db = &shared.db;
+    // The access token the caller sent is revoked even when another credential (like the
+    // solo launch secret, which the CLI also sends) signed the request in.
+    let mut revoke = Vec::new();
     if ctx.principal.kind == PrincipalKind::Service {
-        if let Ok(id) = TokenId::from_str(&ctx.principal.id) {
-            sqlx::query(
-                "UPDATE api_tokens SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
-            )
-            .bind(id.as_uuid())
-            .execute(db.pool())
-            .await
-            .map_err(|e| db_error(e.into()))?;
+        revoke.extend(TokenId::from_str(&ctx.principal.id).ok());
+    }
+    if let Some(sent) =
+        credentials::bearer(&headers).filter(|t| t.starts_with(credentials::PAT_PREFIX))
+    {
+        let pepper = shared.pepper(&state).await?;
+        if let Some(p) = credentials::verify_token(db, &pepper, sent).await? {
+            revoke.extend(TokenId::from_str(&p.id).ok());
         }
     }
+    let mut tx = db.begin().await.map_err(db_error)?;
+    for id in &revoke {
+        sqlx::query(
+            "UPDATE api_tokens SET revoked_at = now() WHERE id = $1 AND revoked_at IS NULL",
+        )
+        .bind(id.as_uuid())
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_error(e.into()))?;
+    }
+    credentials::end_session(&mut tx, &headers)
+        .await
+        .map_err(db_error)?;
+    let revoked: Vec<String> = revoke.iter().map(ToString::to_string).collect();
+    record(
+        &state,
+        &mut tx,
+        &ctx,
+        &ctx.principal.id,
+        serde_json::json!({ "step": "signed_out", "tokens_revoked": revoked }),
+    )
+    .await?;
+    commit(tx).await?;
+    // The keychain is not transactional: forget the Supabase session once the rest is done.
     if shared.mode == Mode::Solo {
         shared.sign_in(&state).sign_out().await?;
     }
-    credentials::end_session(db, &headers)
-        .await
-        .map_err(db_error)?;
-    record(
-        &state,
-        db,
-        &ctx,
-        &ctx.principal.id,
-        serde_json::json!({ "step": "signed_out" }),
-    )
-    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -692,27 +721,30 @@ async fn start_session(
     Extension(shared): Extension<Arc<Shared>>,
     ctx: RequestContext,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<impl IntoResponse, Fail> {
     if ctx.principal.kind == PrincipalKind::Service {
         return Err(ApiError::new(
             ErrorCode::Forbidden,
             "Access tokens cannot start browser sessions.",
-        ));
+        )
+        .into());
     }
     let user = authorize_self_shared(&state, &shared, &ctx, "auth.session").await?;
     let ua = headers
         .get(header::USER_AGENT)
         .and_then(|v| v.to_str().ok());
-    let s = credentials::create_session(&shared.db, user, ua).await?;
-    let max_age = i64::from(credentials::SESSION_MAX_DAYS) * 86_400;
+    let mut tx = shared.db.begin().await.map_err(db_error)?;
+    let s = credentials::create_session(&mut tx, user, ua).await?;
     record(
         &state,
-        &shared.db,
+        &mut tx,
         &ctx,
         &user.to_string(),
         serde_json::json!({ "step": "session_started" }),
     )
     .await?;
+    commit(tx).await?;
+    let max_age = i64::from(credentials::SESSION_MAX_DAYS) * 86_400;
     Ok((
         StatusCode::CREATED,
         [(
@@ -732,13 +764,23 @@ async fn end_session(
     Extension(shared): Extension<Arc<Shared>>,
     ctx: RequestContext,
     headers: HeaderMap,
-) -> Result<impl IntoResponse, ApiError> {
+) -> Result<impl IntoResponse, Fail> {
     state
         .authorize(&ctx, "auth.session", &Resource::kind("account"))
         .await?;
-    credentials::end_session(&shared.db, &headers)
+    let mut tx = shared.db.begin().await.map_err(db_error)?;
+    credentials::end_session(&mut tx, &headers)
         .await
         .map_err(db_error)?;
+    record(
+        &state,
+        &mut tx,
+        &ctx,
+        &ctx.principal.id,
+        serde_json::json!({ "step": "session_ended" }),
+    )
+    .await?;
+    commit(tx).await?;
     Ok((
         StatusCode::NO_CONTENT,
         [(header::SET_COOKIE, cookie("", 0, shared.secure_cookie))],
@@ -800,7 +842,7 @@ async fn list_tokens(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
     ctx: RequestContext,
-) -> Result<Json<Page<TokenInfo>>, ApiError> {
+) -> Result<Json<Page<TokenInfo>>, Fail> {
     let user = authorize_self_shared(&state, &shared, &ctx, "auth.manage_tokens").await?;
     let rows: Vec<TokenRow> = sqlx::query_as(
         "SELECT id, name, token_prefix, scopes, expires_at, last_used_at FROM api_tokens \
@@ -851,18 +893,18 @@ async fn create_token(
     Extension(shared): Extension<Arc<Shared>>,
     ctx: RequestContext,
     Json(req): Json<CreateToken>,
-) -> Result<(StatusCode, Json<NewToken>), ApiError> {
+) -> Result<(StatusCode, Json<NewToken>), Fail> {
     let user = authorize_self_shared(&state, &shared, &ctx, "auth.manage_tokens").await?;
     let name = req.name.trim();
     if name.is_empty() || name.chars().count() > 100 {
-        return Err(field("/name", "name must have 1–100 characters"));
+        return Err(field("/name", "name must have 1–100 characters").into());
     }
     credentials::check_scopes(&req.scopes).map_err(|m| field("/scopes", m))?;
     let days = req.days.unwrap_or(shared.config.token_days);
     if !(1..=credentials::MAX_TOKEN_DAYS).contains(&days) {
-        return Err(field("/days", "days must be 1–365"));
+        return Err(field("/days", "days must be 1–365").into());
     }
-    let project = req
+    let mut project = req
         .project_id
         .as_deref()
         .map(|p| ProjectId::from_str(p).map_err(|e| field("/project_id", e.to_string())))
@@ -877,17 +919,59 @@ async fn create_token(
             return Err(ApiError::new(
                 ErrorCode::Unauthenticated,
                 "This access token no longer works.",
-            ));
+            )
+            .into());
         };
         if !credentials::scopes_cover(&grant.scopes, &req.scopes) {
             return Err(ApiError::new(
                 ErrorCode::Forbidden,
                 "A token can only make tokens with the same or fewer scopes.",
-            ));
+            )
+            .into());
+        }
+        // A one-project token only makes tokens for that same project.
+        match (grant.project, project) {
+            (Some(bound), Some(asked)) if bound != asked => {
+                return Err(ApiError::new(
+                    ErrorCode::Forbidden,
+                    "This token is limited to one project, so the tokens it makes are too.",
+                )
+                .into())
+            }
+            (Some(bound), _) => project = Some(bound),
+            (None, _) => {}
         }
         org = grant.org;
     } else if org.is_none() && shared.mode == Mode::Team {
         org = tenancy::primary_org(db, user).await.map_err(db_error)?;
+    }
+    if let Some(p) = project {
+        // The token's org is the project's; the caller must be able to act there.
+        let owner: Option<Uuid> =
+            sqlx::query_scalar("SELECT org_id FROM projects WHERE id = $1 AND deleted_at IS NULL")
+                .bind(p.as_uuid())
+                .fetch_optional(db.pool())
+                .await
+                .map_err(|e| db_error(e.into()))?;
+        let Some(project_org) = owner.map(OrgId::from_uuid) else {
+            return Err(
+                ApiError::new(ErrorCode::NotFound, "No project with this id exists.").into(),
+            );
+        };
+        if org.is_some_and(|o| o != project_org) && ctx.principal.kind == PrincipalKind::Service {
+            return Err(
+                ApiError::new(ErrorCode::NotFound, "No project with this id exists.").into(),
+            );
+        }
+        org = Some(project_org);
+        let on_project = Resource {
+            org: Some(project_org.to_string()),
+            project: Some(p.to_string()),
+            ..Resource::kind("project")
+        };
+        state
+            .authorize(&ctx, "auth.manage_tokens", &on_project)
+            .await?;
     }
     let pepper = shared.pepper(&state).await?;
     let token_req = credentials::TokenRequest {
@@ -933,7 +1017,7 @@ async fn revoke_token(
     Extension(shared): Extension<Arc<Shared>>,
     ctx: RequestContext,
     Path(id): Path<String>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<StatusCode, Fail> {
     let user = authorize_self_shared(&state, &shared, &ctx, "auth.manage_tokens").await?;
     let missing = || ApiError::new(ErrorCode::NotFound, "No token with this id exists.");
     let token = TokenId::from_str(&id).map_err(|_| missing())?;
@@ -947,7 +1031,7 @@ async fn revoke_token(
         .map_err(|e| db_error(e.into()))?
         .rows_affected();
     if n != 1 {
-        return Err(missing());
+        return Err(missing().into());
     }
     let event = audit::event(
         at,

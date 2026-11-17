@@ -77,25 +77,31 @@ pub struct TokenGrant {
     pub org: Option<OrgId>,
     /// Its scopes.
     pub scopes: Vec<String>,
+    /// The one project it is limited to, if any.
+    pub project: Option<ProjectId>,
 }
+
+/// user, org, scopes, project.
+type GrantRow = (Uuid, Option<Uuid>, Vec<String>, Option<Uuid>);
 
 /// The grant behind a token principal id (`tok_…`), if that token is still live.
 pub async fn token_grant(db: &Db, principal_id: &str) -> Result<Option<TokenGrant>, DbError> {
     let Ok(id) = TokenId::from_str(principal_id) else {
         return Ok(None);
     };
-    let row: Option<(Uuid, Option<Uuid>, Vec<String>)> = sqlx::query_as(
-        "SELECT user_id, org_id, scopes FROM api_tokens \
+    let row: Option<GrantRow> = sqlx::query_as(
+        "SELECT user_id, org_id, scopes, project_id FROM api_tokens \
          WHERE id = $1 AND revoked_at IS NULL AND expires_at > now()",
     )
     .bind(id.as_uuid())
     .fetch_optional(db.pool())
     .await?;
-    Ok(row.map(|(user, org, scopes)| TokenGrant {
+    Ok(row.map(|(user, org, scopes, project)| TokenGrant {
         id,
         user: UserId::from_uuid(user),
         org: org.map(OrgId::from_uuid),
         scopes,
+        project: project.map(ProjectId::from_uuid),
     }))
 }
 
@@ -262,9 +268,9 @@ pub struct NewSession {
     pub expires_at: OffsetDateTime,
 }
 
-/// Starts a session for `user`.
+/// Starts a session for `user` in `tx`.
 pub async fn create_session(
-    db: &Db,
+    tx: &mut Tx,
     user: UserId,
     user_agent: Option<&str>,
 ) -> Result<NewSession, SeamError> {
@@ -280,7 +286,7 @@ pub async fn create_session(
     .bind(SESSION_IDLE_HOURS)
     .bind(SESSION_MAX_DAYS)
     .bind(user_agent.map(|u| u.chars().take(200).collect::<String>()))
-    .fetch_one(db.pool())
+    .fetch_one(&mut **tx)
     .await
     .map_err(DbError::from)?;
     Ok(NewSession {
@@ -288,6 +294,16 @@ pub async fn create_session(
         csrf: Secret::new(csrf),
         expires_at,
     })
+}
+
+/// The `Authorization: Bearer` token in `headers`.
+pub fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
 }
 
 /// The session cookie value in `headers`.
@@ -343,12 +359,12 @@ pub async fn verify_session(db: &Db, headers: &HeaderMap) -> Result<Option<UserI
     Ok(Some(UserId::from_uuid(user)))
 }
 
-/// Ends the session named by the cookie in `headers`, if any.
-pub async fn end_session(db: &Db, headers: &HeaderMap) -> Result<(), DbError> {
+/// Ends the session named by the cookie in `headers`, if any, in `tx`.
+pub async fn end_session(tx: &mut Tx, headers: &HeaderMap) -> Result<(), DbError> {
     if let Some(cookie) = session_cookie(headers) {
         sqlx::query("DELETE FROM sessions WHERE id_hash = $1")
             .bind(sha256(cookie))
-            .execute(db.pool())
+            .execute(&mut **tx)
             .await?;
     }
     Ok(())
@@ -404,13 +420,7 @@ impl Authenticator for CoreAuthenticator {
                 return Ok(Some(p));
             }
         }
-        let bearer = headers
-            .get(header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .map(str::trim)
-            .filter(|t| !t.is_empty());
-        if let Some(token) = bearer {
+        if let Some(token) = bearer(headers) {
             return if token.starts_with(PAT_PREFIX) {
                 verify_token(&self.db, &self.pepper, token).await
             } else {

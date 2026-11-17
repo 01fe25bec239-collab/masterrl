@@ -9,13 +9,14 @@
 use super::{acting_user, bind_role, Scope};
 use crate::app::AppState;
 use crate::db::Db;
-use crate::error::{ApiError, ErrorCode, FieldError, Problem, ERROR_TYPE_BASE, PROBLEM_JSON};
+use crate::error::{ApiError, ErrorCode, FieldError};
 use crate::http::pagination::{Page, PageQuery, PageRequest};
 use crate::modules::audit;
+use crate::modules::auth::problem::{Coded, Fail};
 use crate::modules::auth::{commit, db_error};
 use crate::seams::{AuditOutcome, RequestContext, Resource};
-use axum::extract::{OriginalUri, Path, Query, State};
-use axum::http::{header, StatusCode};
+use axum::extract::{Path, Query, State};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
@@ -42,6 +43,9 @@ pub(super) fn router(db: Db) -> Router<AppState> {
             get(list_projects).post(create_project),
         )
         .layer(Extension(db))
+        .layer(axum::middleware::from_fn(
+            crate::modules::auth::problem::render,
+        ))
 }
 
 pub(super) fn doc() -> utoipa::openapi::OpenApi {
@@ -150,32 +154,14 @@ fn check(item: &NewItem) -> Result<(), ApiError> {
     }
 }
 
-/// 409 with MRL-CONFLICT-160. P07's `ApiError` has no 409 conflict code, so the problem
-/// document is built here, title from the code registry.
-fn slug_taken(slug: &str, level: &str, uri: &OriginalUri, ctx: &RequestContext) -> Response {
-    let title = mrl_domain::errors::ErrorCode::from_str(SLUG_TAKEN)
-        .ok()
-        .and_then(|c| c.title())
-        .unwrap_or("This short name is already used here.");
-    let problem = Problem {
-        r#type: format!("{ERROR_TYPE_BASE}{SLUG_TAKEN}"),
-        title: title.to_owned(),
-        status: 409,
-        detail: format!(
-            "{SLUG_TAKEN}: {level} already has something named {slug:?}; pick another slug."
-        ),
-        instance: uri.path().to_owned(),
-        code: SLUG_TAKEN.to_owned(),
-        errors: Vec::new(),
-        trace_id: ctx.trace_id.clone(),
-    };
-    let body = serde_json::to_vec(&problem).unwrap_or_default();
-    (
+/// 409 with MRL-CONFLICT-160.
+fn slug_taken(slug: &str, level: &str) -> Fail {
+    Coded::new(
+        SLUG_TAKEN,
         StatusCode::CONFLICT,
-        [(header::CONTENT_TYPE, PROBLEM_JSON)],
-        body,
+        format!("{level} already has something named {slug:?}; pick another slug."),
     )
-        .into_response()
+    .into()
 }
 
 fn missing(what: &str) -> ApiError {
@@ -244,7 +230,7 @@ async fn list_orgs(
     Extension(db): Extension<Db>,
     ctx: RequestContext,
     Query(q): Query<PageQuery>,
-) -> Result<Json<Page<Org>>, ApiError> {
+) -> Result<Json<Page<Org>>, Fail> {
     state
         .authorize(&ctx, "auth.session", &Resource::kind("org"))
         .await?;
@@ -278,9 +264,8 @@ async fn create_org(
     State(state): State<AppState>,
     Extension(db): Extension<Db>,
     ctx: RequestContext,
-    uri: OriginalUri,
     Json(item): Json<NewItem>,
-) -> Result<Response, ApiError> {
+) -> Result<Response, Fail> {
     let resource = Resource {
         org: ctx.org.clone(),
         ..Resource::kind("org")
@@ -308,7 +293,7 @@ async fn create_org(
     .await
     .map_err(|e| db_error(e.into()))?;
     let Some(created_at) = created else {
-        return Ok(slug_taken(&item.slug, "This server", &uri, &ctx));
+        return Err(slug_taken(&item.slug, "This server"));
     };
     // The creator owns the new org.
     bind_role(&mut tx, id, user, Role::Owner, Scope::Org)
@@ -366,7 +351,7 @@ async fn list_workspaces(
     ctx: RequestContext,
     Path(org): Path<String>,
     Query(q): Query<PageQuery>,
-) -> Result<Json<Page<Workspace>>, ApiError> {
+) -> Result<Json<Page<Workspace>>, Fail> {
     let page = q.resolve()?;
     let org = find_org(&db, &org).await?;
     let resource = Resource {
@@ -402,10 +387,9 @@ async fn create_workspace(
     State(state): State<AppState>,
     Extension(db): Extension<Db>,
     ctx: RequestContext,
-    uri: OriginalUri,
     Path(org): Path<String>,
     Json(item): Json<NewItem>,
-) -> Result<Response, ApiError> {
+) -> Result<Response, Fail> {
     let org = find_org(&db, &org).await?;
     let resource = Resource {
         id: Some(org.to_string()),
@@ -429,7 +413,7 @@ async fn create_workspace(
     .await
     .map_err(|e| db_error(e.into()))?;
     let Some(created_at) = created else {
-        return Ok(slug_taken(&item.slug, "This org", &uri, &ctx));
+        return Err(slug_taken(&item.slug, "This org"));
     };
     audited(
         &state,
@@ -493,7 +477,7 @@ async fn list_projects(
     ctx: RequestContext,
     Path(ws): Path<String>,
     Query(q): Query<PageQuery>,
-) -> Result<Json<Page<Project>>, ApiError> {
+) -> Result<Json<Page<Project>>, Fail> {
     let page = q.resolve()?;
     let (ws, org) = find_workspace(&db, &ws).await?;
     state
@@ -526,10 +510,9 @@ async fn create_project(
     State(state): State<AppState>,
     Extension(db): Extension<Db>,
     ctx: RequestContext,
-    uri: OriginalUri,
     Path(ws): Path<String>,
     Json(item): Json<NewItem>,
-) -> Result<Response, ApiError> {
+) -> Result<Response, Fail> {
     let (ws, org) = find_workspace(&db, &ws).await?;
     state
         .authorize(&ctx, "tenancy.manage_projects", &ws_resource(ws, org))
@@ -549,7 +532,7 @@ async fn create_project(
     .await
     .map_err(|e| db_error(e.into()))?;
     let Some(created_at) = created else {
-        return Ok(slug_taken(&item.slug, "This workspace", &uri, &ctx));
+        return Err(slug_taken(&item.slug, "This workspace"));
     };
     audited(
         &state,

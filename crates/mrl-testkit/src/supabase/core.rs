@@ -30,6 +30,8 @@ pub enum Auth {
     Launch,
     /// `Authorization: Bearer …` (an access token or a Supabase JWT).
     Bearer(String),
+    /// The launch secret and a bearer token together, as the CLI sends them in solo mode.
+    LaunchAndBearer(String),
     /// The renderer session cookie, with the CSRF header or `Sec-Fetch-Site: same-origin`.
     Cookie {
         /// Cookie value.
@@ -125,6 +127,11 @@ impl CoreServer {
             Auth::None => {}
             Auth::Launch => headers.push((LAUNCH_SECRET_HEADER, TEST_SECRET)),
             Auth::Bearer(t) => {
+                bearer = format!("Bearer {t}");
+                headers.push(("authorization", &bearer));
+            }
+            Auth::LaunchAndBearer(t) => {
+                headers.push((LAUNCH_SECRET_HEADER, TEST_SECRET));
                 bearer = format!("Bearer {t}");
                 headers.push(("authorization", &bearer));
             }

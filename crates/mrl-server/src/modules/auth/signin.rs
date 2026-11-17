@@ -2,7 +2,6 @@
 //! OS keychain. Local work never needs it; it is needed for setup sync and joining a team.
 
 use super::supabase::{Supabase, SupabaseError, SupabaseUser, TokenSet};
-use crate::error::{ApiError, ErrorCode};
 use crate::modules::sync::crypto;
 use crate::seams::{SeamError, Secret, SecretStore};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -73,16 +72,6 @@ pub enum SignInError {
     /// The keychain failed.
     #[error("{0}")]
     Store(String),
-}
-
-impl From<SignInError> for ApiError {
-    fn from(e: SignInError) -> Self {
-        let code = match &e {
-            SignInError::SignedOut | SignInError::Expired => ErrorCode::Unauthenticated,
-            _ => ErrorCode::Unavailable,
-        };
-        ApiError::new(code, format!("{e}."))
-    }
 }
 
 /// A live access token and who it belongs to.

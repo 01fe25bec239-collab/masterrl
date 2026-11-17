@@ -329,6 +329,8 @@ impl JwtVerifier {
         let mut v = Validation::new(header.alg);
         v.set_issuer(&[self.supabase.issuer()]);
         v.set_audience(&[AUDIENCE]);
+        // `set_issuer`/`set_audience` check these claims only when present; require them.
+        v.set_required_spec_claims(&["exp", "iss", "aud", "sub"]);
         v.leeway = 30;
         Ok(jsonwebtoken::decode::<Claims>(token, &key, &v)
             .ok()

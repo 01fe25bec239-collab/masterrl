@@ -189,6 +189,21 @@ impl MockSupabase {
         json!(*lock(&self.mock.rows))
     }
 
+    /// A JWT with exactly these claims, signed with the project key (for claim checks).
+    pub fn sign(&self, claims: &Value) -> String {
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(KID.to_owned());
+        match jsonwebtoken::encode(&header, claims, &self.mock.signing) {
+            Ok(t) => t,
+            Err(e) => panic!("mock supabase sign: {e}"),
+        }
+    }
+
+    /// The `iss` of this project's tokens.
+    pub fn issuer(&self) -> String {
+        self.mock.issuer.clone()
+    }
+
     /// A signed access token for `user`, valid for `ttl` seconds.
     pub fn access_token(&self, user: &MockUser, ttl: i64) -> String {
         self.mock.access_token(user, ttl)

@@ -15,6 +15,7 @@ use crate::config::Mode;
 use crate::db::Db;
 use crate::error::{ApiError, ErrorCode, FieldError};
 use crate::modules::audit;
+use crate::modules::auth::problem::{Coded, Fail};
 use crate::modules::auth::signin::{Access, SignIn, SignInState};
 use crate::modules::auth::supabase::{self, Supabase, SupabaseError};
 use crate::modules::auth::{commit, db_error, AuthConfig};
@@ -22,6 +23,7 @@ use crate::modules::tenancy;
 use crate::seams::{AuditOutcome, RequestContext, Resource, Secret, SecretStore};
 use crate::ServerModule;
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::routing::{get, post};
 use axum::{Extension, Json, Router};
 use base64::engine::general_purpose::STANDARD;
@@ -38,7 +40,7 @@ use utoipa::{OpenApi, ToSchema};
 pub const PROFILE_SCHEMA: &str = "setup-profile/v1";
 /// The envelope format of one encrypted copy.
 pub const ENVELOPE_FORMAT: &str = "mrl-sync/v1";
-/// `SecretStore` name of the sync key.
+/// `SecretStore` name prefix of sync keys (`sync.key.<id>`; bare `sync.key` before 16005).
 pub const KEY_SECRET: &str = "sync.key";
 /// Supabase table (see the P16 handoff for its schema).
 pub const TABLE: &str = "setup_profiles";
@@ -162,7 +164,8 @@ pub fn find_secret(v: &Value, path: &str) -> Option<String> {
             let p = format!("{path}/{k}");
             let lower = k.to_ascii_lowercase();
             let named = SECRET_WORDS.iter().any(|w| lower.contains(w)) && !lower.ends_with("_ref");
-            if named && v.is_string() {
+            // Any non-empty value under a secret-like name is refused, whatever its type.
+            if named && !v.is_null() {
                 Some(p)
             } else {
                 find_secret(v, &p)
@@ -286,22 +289,34 @@ async fn put_copies(sb: &Supabase, access: &Access, copies: &[Copy]) -> Result<(
     .map(drop)
 }
 
-fn remote_error(e: SupabaseError) -> ApiError {
+fn remote_error(e: SupabaseError) -> Fail {
     match e {
-        SupabaseError::Offline(_) => ApiError::new(ErrorCode::Unavailable, format!("{e}.")),
+        SupabaseError::Offline(_) => Coded::new(
+            crate::modules::auth::supabase::OFFLINE,
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("{e}."),
+        )
+        .into(),
         SupabaseError::Refused {
             status: 401 | 403, ..
-        } => ApiError::new(
-            ErrorCode::Unauthenticated,
-            format!(
-                "{}: the sign-in service refused this session, so sign in again.",
-                crate::modules::auth::signin::EXPIRED
-            ),
-        ),
+        } => Coded::new(
+            crate::modules::auth::signin::EXPIRED,
+            StatusCode::UNAUTHORIZED,
+            "The sign-in service refused this session; sign in again.",
+        )
+        .into(),
         other => ApiError::new(
             ErrorCode::Unavailable,
             format!("The saved setup could not be reached: {other}."),
-        ),
+        )
+        .into(),
+    }
+}
+
+fn fail_text(f: Fail) -> String {
+    match f {
+        Fail::Api(e) => e.detail,
+        Fail::Coded(c) => format!("{}: {}", c.code, c.detail),
     }
 }
 
@@ -340,6 +355,9 @@ impl ServerModule for SyncModule {
             .route("/sync/restore", post(restore))
             .route("/sync/status", get(status))
             .layer(Extension(self.shared.clone()))
+            .layer(axum::middleware::from_fn(
+                crate::modules::auth::problem::render,
+            ))
     }
 
     fn openapi(&self) -> utoipa::openapi::OpenApi {
@@ -388,11 +406,11 @@ fn sign_in(state: &AppState, shared: &Shared) -> SignIn {
     SignIn::new(shared.supabase.clone(), state.seams.secrets.clone())
 }
 
-fn online(shared: &Shared) -> Result<&Supabase, ApiError> {
+fn online(shared: &Shared) -> Result<&Supabase, Fail> {
     shared
         .supabase
         .as_ref()
-        .ok_or_else(|| ApiError::from(crate::modules::auth::signin::SignInError::NotConfigured))
+        .ok_or_else(|| Fail::from(crate::modules::auth::signin::SignInError::NotConfigured))
 }
 
 async fn load_profile(db: &Db, user: UserId) -> Result<SetupProfile, ApiError> {
@@ -418,7 +436,7 @@ async fn get_profile(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
     ctx: RequestContext,
-) -> Result<Json<SetupProfile>, ApiError> {
+) -> Result<Json<SetupProfile>, Fail> {
     let c = caller(&state, &shared, &ctx).await?;
     Ok(Json(load_profile(&shared.db, c.user).await?))
 }
@@ -430,7 +448,7 @@ async fn put_profile(
     Extension(shared): Extension<Arc<Shared>>,
     ctx: RequestContext,
     Json(profile): Json<SetupProfile>,
-) -> Result<Json<SetupProfile>, ApiError> {
+) -> Result<Json<SetupProfile>, Fail> {
     let c = caller(&state, &shared, &ctx).await?;
     check(&profile)?;
     let value = serde_json::to_value(&profile)
@@ -476,7 +494,7 @@ async fn setup(
     Extension(shared): Extension<Arc<Shared>>,
     ctx: RequestContext,
     Json(req): Json<SetupRequest>,
-) -> Result<Json<SetupDone>, ApiError> {
+) -> Result<Json<SetupDone>, Fail> {
     let c = caller(&state, &shared, &ctx).await?;
     if req.passphrase.chars().count() < MIN_PASSPHRASE {
         return Err(ApiError::validation(vec![FieldError::new(
@@ -484,14 +502,14 @@ async fn setup(
             ErrorCode::FieldValue,
             "the passphrase needs at least 12 characters",
             "Use a few unrelated words. Write it down somewhere safe.",
-        )]));
+        )])
+        .into());
     }
     let kdf =
         KdfParams::generate().map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
     let key = derive(kdf.clone(), req.passphrase).await?;
-    c.secrets
-        .set(KEY_SECRET, Secret::new(crypto::to_hex(&key)))
-        .await?;
+    let previous = active_key(&shared.db, c.user).await?.map(|(r, _)| r);
+    let staged = stage_key(c.secrets.as_ref(), &key).await?;
     let kdf_json = serde_json::to_value(&kdf)
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
     let event = audit::event(
@@ -503,24 +521,25 @@ async fn setup(
         AuditOutcome::Success,
         &ctx.trace_id,
     );
-    let mut tx = shared.db.begin().await.map_err(db_error)?;
-    sqlx::query(
-        "INSERT INTO sync_state (user_id, kdf) VALUES ($1, $2) \
-         ON CONFLICT (user_id) DO UPDATE SET kdf = EXCLUDED.kdf, set_up_at = now()",
-    )
-    .bind(c.user.as_uuid())
-    .bind(&kdf_json)
-    .execute(&mut *tx)
-    .await
-    .map_err(|e| db_error(e.into()))?;
-    audit::write(
-        &mut tx,
-        &event,
-        &serde_json::json!({ "step": "sync_set_up" }),
-    )
-    .await
-    .map_err(db_error)?;
-    commit(tx).await?;
+    let committed = async {
+        let mut tx = shared.db.begin().await.map_err(db_error)?;
+        sqlx::query(
+            "INSERT INTO sync_state (user_id, kdf, key_ref) VALUES ($1, $2, $3) \
+             ON CONFLICT (user_id) DO UPDATE SET kdf = EXCLUDED.kdf, key_ref = EXCLUDED.key_ref, set_up_at = now()",
+        )
+        .bind(c.user.as_uuid())
+        .bind(&kdf_json)
+        .bind(&staged)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| db_error(e.into()))?;
+        audit::write(&mut tx, &event, &serde_json::json!({ "step": "sync_set_up" }))
+            .await
+            .map_err(db_error)?;
+        commit(tx).await
+    }
+    .await;
+    settle_key(c.secrets.as_ref(), committed, &staged, previous).await?;
     Ok(Json(SetupDone {
         recovery_key: crypto::recovery_key(&key),
     }))
@@ -537,11 +556,61 @@ pub struct Pushed {
     pub copies: usize,
 }
 
-fn not_set_up() -> ApiError {
-    ApiError::new(
-        ErrorCode::Validation,
-        format!("{NOT_SET_UP}: setup sync is not turned on yet; run `mrl sync setup` first."),
+fn not_set_up() -> Fail {
+    Coded::new(
+        NOT_SET_UP,
+        StatusCode::CONFLICT,
+        "Setup sync is not turned on yet; run `mrl sync setup` first.",
     )
+    .into()
+}
+
+/// The keychain name of the active sync key and its KDF settings, if sync is set up.
+async fn active_key(db: &Db, user: UserId) -> Result<Option<(String, Value)>, ApiError> {
+    let row: Option<(Option<String>, Value)> =
+        sqlx::query_as("SELECT key_ref, kdf FROM sync_state WHERE user_id = $1")
+            .bind(user.as_uuid())
+            .fetch_optional(db.pool())
+            .await
+            .map_err(|e| db_error(e.into()))?;
+    Ok(row.map(|(r, kdf)| (r.unwrap_or_else(|| KEY_SECRET.to_owned()), kdf)))
+}
+
+/// Saves `key` under a fresh keychain name. It is not used until a `sync_state` row names it.
+async fn stage_key(
+    secrets: &dyn SecretStore,
+    key: &[u8; crypto::KEY_LEN],
+) -> Result<String, ApiError> {
+    let name = format!("{KEY_SECRET}.{}", uuid::Uuid::now_v7().simple());
+    secrets.set(&name, Secret::new(crypto::to_hex(key))).await?;
+    Ok(name)
+}
+
+/// After the transaction that names `staged`: on success the previous key goes, on failure
+/// the staged one does, so the active key always matches the stored KDF settings.
+async fn settle_key(
+    secrets: &dyn SecretStore,
+    committed: Result<(), ApiError>,
+    staged: &str,
+    previous: Option<String>,
+) -> Result<(), ApiError> {
+    let drop_quietly = |name: String| async move {
+        if let Err(e) = secrets.delete(&name).await {
+            tracing::warn!(error = %e, "could not delete an unused sync key from the keychain");
+        }
+    };
+    match committed {
+        Ok(()) => {
+            if let Some(old) = previous.filter(|o| o != staged) {
+                drop_quietly(old).await;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            drop_quietly(staged.to_owned()).await;
+            Err(e)
+        }
+    }
 }
 
 fn now_rfc3339(at: OffsetDateTime) -> String {
@@ -555,20 +624,18 @@ async fn push(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
     ctx: RequestContext,
-) -> Result<Json<Pushed>, ApiError> {
+) -> Result<Json<Pushed>, Fail> {
     let c = caller(&state, &shared, &ctx).await?;
     let sb = online(&shared)?;
-    let kdf: Option<Value> = sqlx::query_scalar("SELECT kdf FROM sync_state WHERE user_id = $1")
-        .bind(c.user.as_uuid())
-        .fetch_optional(shared.db.pool())
-        .await
-        .map_err(|e| db_error(e.into()))?;
+    let Some((key_ref, kdf)) = active_key(&shared.db, c.user).await? else {
+        return Err(not_set_up());
+    };
     let key = c
         .secrets
-        .get(KEY_SECRET)
+        .get(&key_ref)
         .await?
         .and_then(|k| crypto::key_from_hex(k.expose()));
-    let (Some(kdf), Some(key)) = (kdf, key) else {
+    let Some(key) = key else {
         return Err(not_set_up());
     };
     let kdf: KdfParams = serde_json::from_value(kdf)
@@ -658,15 +725,14 @@ pub struct Restored {
     pub profile: SetupProfile,
 }
 
-fn wrong_key() -> ApiError {
-    ApiError::validation(vec![FieldError::new(
+fn wrong_key() -> Fail {
+    Coded::field(
+        WRONG_PASSPHRASE,
         "/passphrase",
-        ErrorCode::FieldValue,
-        format!(
-            "{WRONG_PASSPHRASE}: this passphrase or recovery key does not open the saved setup"
-        ),
+        "This passphrase or recovery key does not open the saved setup.",
         "Check for typing mistakes, or use the recovery key you saved at setup.",
-    )])
+    )
+    .into()
 }
 
 #[utoipa::path(post, path = "/sync/restore", tag = "sync", request_body = RestoreRequest,
@@ -676,7 +742,7 @@ async fn restore(
     Extension(shared): Extension<Arc<Shared>>,
     ctx: RequestContext,
     Json(req): Json<RestoreRequest>,
-) -> Result<Json<Restored>, ApiError> {
+) -> Result<Json<Restored>, Fail> {
     let c = caller(&state, &shared, &ctx).await?;
     let sb = online(&shared)?;
     let access = sign_in(&state, &shared).access().await?;
@@ -686,10 +752,11 @@ async fn restore(
         None => copies.into_iter().next(),
     }
     .ok_or_else(|| {
-        ApiError::new(
-            ErrorCode::NotFound,
+        Coded::new(
+            NOTHING_SAVED,
+            StatusCode::NOT_FOUND,
             format!(
-                "{NOTHING_SAVED}: there is no saved setup{} for this account.",
+                "There is no saved setup{} for this account.",
                 req.version
                     .map(|v| format!(" with version {v}"))
                     .unwrap_or_default()
@@ -700,7 +767,8 @@ async fn restore(
         return Err(ApiError::new(
             ErrorCode::FieldValue,
             "This saved setup was made by a newer version of the app.",
-        ));
+        )
+        .into());
     }
     let key = match (&req.recovery_key, req.passphrase) {
         (Some(r), _) => crypto::key_from_hex(r).ok_or_else(wrong_key)?,
@@ -711,7 +779,8 @@ async fn restore(
                 ErrorCode::FieldMissing,
                 "give the sync passphrase or the recovery key",
                 "Send passphrase or recovery_key.",
-            )]))
+            )])
+            .into())
         }
     };
     let sealed = STANDARD
@@ -725,9 +794,8 @@ async fn restore(
         )
     })?;
     check(&profile)?;
-    c.secrets
-        .set(KEY_SECRET, Secret::new(crypto::to_hex(&key)))
-        .await?;
+    let previous = active_key(&shared.db, c.user).await?.map(|(r, _)| r);
+    let staged = stage_key(c.secrets.as_ref(), &key).await?;
     let (profile_json, kdf_json) = (
         serde_json::to_value(&profile)
             .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?,
@@ -746,45 +814,50 @@ async fn restore(
         &ctx.trace_id,
     );
     let version = copy.version;
-    let mut tx = shared.db.begin().await.map_err(db_error)?;
-    let q = |e: sqlx::Error| db_error(e.into());
-    // After a wiped data folder the local owner is new: link it again.
-    if solo {
+    let committed = async {
+        let mut tx = shared.db.begin().await.map_err(db_error)?;
+        let q = |e: sqlx::Error| db_error(e.into());
+        // After a wiped data folder the local owner is new: link it again.
+        if solo {
+            sqlx::query(
+                "UPDATE users SET supabase_user_id = $2 WHERE id = $1 AND supabase_user_id IS NULL",
+            )
+            .bind(c.user.as_uuid())
+            .bind(link.supabase_user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(q)?;
+        }
         sqlx::query(
-            "UPDATE users SET supabase_user_id = $2 WHERE id = $1 AND supabase_user_id IS NULL",
+            "INSERT INTO setup_profiles (user_id, profile) VALUES ($1, $2) \
+             ON CONFLICT (user_id) DO UPDATE SET profile = EXCLUDED.profile, updated_at = now()",
         )
         .bind(c.user.as_uuid())
-        .bind(link.supabase_user_id)
+        .bind(&profile_json)
         .execute(&mut *tx)
         .await
         .map_err(q)?;
+        sqlx::query(
+            "INSERT INTO sync_state (user_id, kdf, key_ref, last_restore_at) VALUES ($1, $2, $3, now()) \
+             ON CONFLICT (user_id) DO UPDATE SET kdf = EXCLUDED.kdf, key_ref = EXCLUDED.key_ref, last_restore_at = now()",
+        )
+        .bind(c.user.as_uuid())
+        .bind(&kdf_json)
+        .bind(&staged)
+        .execute(&mut *tx)
+        .await
+        .map_err(q)?;
+        audit::write(
+            &mut tx,
+            &event,
+            &serde_json::json!({ "step": "sync_restored", "version": version }),
+        )
+        .await
+        .map_err(db_error)?;
+        commit(tx).await
     }
-    sqlx::query(
-        "INSERT INTO setup_profiles (user_id, profile) VALUES ($1, $2) \
-         ON CONFLICT (user_id) DO UPDATE SET profile = EXCLUDED.profile, updated_at = now()",
-    )
-    .bind(c.user.as_uuid())
-    .bind(&profile_json)
-    .execute(&mut *tx)
-    .await
-    .map_err(q)?;
-    sqlx::query(
-        "INSERT INTO sync_state (user_id, kdf, last_restore_at) VALUES ($1, $2, now()) \
-         ON CONFLICT (user_id) DO UPDATE SET kdf = EXCLUDED.kdf, last_restore_at = now()",
-    )
-    .bind(c.user.as_uuid())
-    .bind(&kdf_json)
-    .execute(&mut *tx)
-    .await
-    .map_err(q)?;
-    audit::write(
-        &mut tx,
-        &event,
-        &serde_json::json!({ "step": "sync_restored", "version": version }),
-    )
-    .await
-    .map_err(db_error)?;
-    commit(tx).await?;
+    .await;
+    settle_key(c.secrets.as_ref(), committed, &staged, previous).await?;
     Ok(Json(Restored {
         version: copy.version,
         at: copy.at,
@@ -829,7 +902,7 @@ async fn status(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
     ctx: RequestContext,
-) -> Result<Json<SyncStatus>, ApiError> {
+) -> Result<Json<SyncStatus>, Fail> {
     let c = caller(&state, &shared, &ctx).await?;
     let row: Option<(Option<OffsetDateTime>, Option<i64>, Option<OffsetDateTime>)> =
         sqlx::query_as("SELECT last_push_at, last_pushed_version, last_restore_at FROM sync_state WHERE user_id = $1")
@@ -837,7 +910,10 @@ async fn status(
             .fetch_optional(shared.db.pool())
             .await
             .map_err(|e| db_error(e.into()))?;
-    let set_up = row.is_some() && c.secrets.get(KEY_SECRET).await?.is_some();
+    let set_up = match active_key(&shared.db, c.user).await? {
+        Some((key_ref, _)) => c.secrets.get(&key_ref).await?.is_some(),
+        None => false,
+    };
     let si = sign_in(&state, &shared);
     let sign_in_state = si.state().await?;
     let (copies, copies_unavailable) = match (&shared.supabase, sign_in_state) {
@@ -854,9 +930,9 @@ async fn status(
                     ),
                     None,
                 ),
-                Err(e) => (None, Some(remote_error(e).detail)),
+                Err(e) => (None, Some(fail_text(remote_error(e)))),
             },
-            Err(e) => (None, Some(ApiError::from(e).detail)),
+            Err(e) => (None, Some(fail_text(Fail::from(e)))),
         },
         _ => (None, Some("Sign in to see your saved copies.".to_owned())),
     };

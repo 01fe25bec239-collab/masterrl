@@ -318,25 +318,38 @@ impl Rbac {
         action: Action,
         resource: &Resource,
     ) -> Result<Decision, DbError> {
-        let (user, scopes, token_org) = match ctx.principal.kind {
+        let project = resource
+            .project
+            .as_deref()
+            .or(ctx.project.as_deref())
+            .and_then(|p| ProjectId::from_str(p).ok());
+        let (user, token_org) = match ctx.principal.kind {
             PrincipalKind::LocalOwner => return Ok(verdict(&[Role::Owner], action)),
             PrincipalKind::User => match UserId::from_str(&ctx.principal.id) {
-                Ok(u) => (u, None, None),
+                Ok(u) => (u, None),
                 Err(_) => return Ok(Decision::Deny),
             },
             PrincipalKind::Service => {
-                match credentials::token_grant(&self.db, &ctx.principal.id).await? {
-                    Some(g) => (g.user, Some(g.scopes), g.org),
-                    None => return Ok(Decision::Deny),
+                let Some(g) = credentials::token_grant(&self.db, &ctx.principal.id).await? else {
+                    return Ok(Decision::Deny);
+                };
+                // Token limits apply before any role, the solo owner's included.
+                if !credentials::scopes_allow(&g.scopes, action) {
+                    return Ok(Decision::Deny);
                 }
+                let personal = matches!(action, Action::AuthSession | Action::AuthManageTokens);
+                if let (Some(bound), false) = (g.project, personal) {
+                    match project {
+                        Some(p) if p == bound => {}
+                        // Another project looks missing, like another org.
+                        Some(_) => return Ok(Decision::Hide),
+                        // Org-wide actions are outside a one-project token.
+                        None => return Ok(Decision::Deny),
+                    }
+                }
+                (g.user, g.org)
             }
         };
-        if scopes
-            .as_ref()
-            .is_some_and(|s| !credentials::scopes_allow(s, action))
-        {
-            return Ok(Decision::Deny);
-        }
         if !is_active(&self.db, user).await? {
             return Ok(Decision::Deny);
         }
@@ -360,11 +373,6 @@ impl Rbac {
         if token_org.is_some_and(|t| t != org) {
             return Ok(Decision::Hide);
         }
-        let project = resource
-            .project
-            .as_deref()
-            .or(ctx.project.as_deref())
-            .and_then(|p| ProjectId::from_str(p).ok());
         // A `workspace` resource (by id) also counts roles bound to that workspace.
         let workspace = (resource.kind == "workspace")
             .then(|| {
