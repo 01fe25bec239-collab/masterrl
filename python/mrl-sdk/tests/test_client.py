@@ -21,7 +21,6 @@ class Fake(BaseHTTPRequestHandler):
         body = self.rfile.read(length) if length else b""
         Fake.seen.append(
             {
-                "port": self.server.server_address[1],
                 "method": self.command,
                 "path": self.path,
                 "headers": {k.lower(): v for k, v in self.headers.items()},
@@ -133,7 +132,7 @@ def test_redirects_stay_on_the_server(server: str) -> None:
         with pytest.raises(MrlError) as err:
             mrl.get_job("job_1")
         assert err.value.code == "MRL-ENV-170"
-        assert [r["port"] for r in Fake.seen] == [int(server.rsplit(":", 1)[1])]
+        assert [r["headers"]["host"] for r in Fake.seen] == [server.removeprefix("http://")]
         # The same origin: followed, credentials kept.
         Fake.seen.clear()
         Fake.answers.append((307, {}, "/api/v1/jobs/job_2"))
