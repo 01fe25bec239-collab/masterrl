@@ -54,11 +54,10 @@ pub struct FakeWorker {
 
 async fn channel(target: &str) -> Result<tonic::transport::Channel, Status> {
     let unavailable = |e: tonic::transport::Error| Status::unavailable(e.to_string());
-    let endpoint = tonic::transport::Endpoint::from_static("http://localhost");
     #[cfg(unix)]
     if !target.contains(':') {
         let path = PathBuf::from(target);
-        return endpoint
+        return tonic::transport::Endpoint::from_static("http://localhost")
             .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
                 let path = path.clone();
                 async move {
@@ -284,6 +283,15 @@ impl RunnerFixture {
         spec: serde_json::Value,
         edit: impl FnOnce(&mut mrl_agent::attempts::record::AttemptRecord),
     ) -> Self {
+        Self::readopt_with(spec, 256, edit).await
+    }
+
+    /// [`Self::readopt`] with an event channel of `capacity` (to test a slow reader).
+    pub async fn readopt_with(
+        spec: serde_json::Value,
+        capacity: usize,
+        edit: impl FnOnce(&mut mrl_agent::attempts::record::AttemptRecord),
+    ) -> Self {
         use mrl_agent::attempts::record::{AttemptRecord, ProcIdentity, WorkerProc};
         use mrl_agent::attempts::runner::{socket_path, Runner, Shared};
         let agent = super::FakeAgent::start(0).unwrap_or_else(|e| panic!("{}", e.explain()));
@@ -321,6 +329,7 @@ impl RunnerFixture {
             exit: None,
             staged_paths: Default::default(),
             lease_deadline_unix_ms: None,
+            stop_deadline_unix_ms: None,
             exit_report: None,
             requests: Vec::new(),
             uploads: Default::default(),
@@ -331,7 +340,7 @@ impl RunnerFixture {
         record
             .save(&job)
             .unwrap_or_else(|e| panic!("{}", e.explain()));
-        let (tx, events) = mrl_agent::attempts::attempt_events(256);
+        let (tx, events) = mrl_agent::attempts::attempt_events(capacity);
         let envs =
             mrl_agent::envs::Envs::open(agent.ctx.state.root(), Arc::clone(&agent.ctx.cache))
                 .unwrap_or_else(|e| panic!("{}", e.explain()));
@@ -936,5 +945,125 @@ mod runner_tests {
                 .await
                 .unwrap();
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_closed_event_channel_leaves_messages_unacked() {
+        let mut fx = RunnerFixture::readopt(spec("att_cl", serde_json::json!({})), |_| {}).await;
+        let (_, closed) = mrl_agent::attempts::attempt_events(1);
+        drop(std::mem::replace(&mut fx.events, closed));
+        let (mut w, _) = fx.worker("trainer").await;
+        w.send(Body::Progress(mrl_proto::worker::v1::Progress {
+            step: 1,
+            ..Default::default()
+        }))
+        .await;
+        // Not relayed, so not acked: the stream ends and the worker keeps the message.
+        let mut acked = false;
+        while let Ok(Some(m)) = w.recv().await {
+            acked |= m.ack_seq >= 1;
+        }
+        assert!(!acked);
+        let (_, ack) = fx.worker("trainer").await;
+        assert_eq!(ack.resume_from_seq, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_full_event_channel_does_not_outlive_the_lease() {
+        let fx = RunnerFixture::readopt_with(
+            spec("att_full", serde_json::json!({"lease_s": 30})),
+            1,
+            |r| r.lease_deadline_unix_ms = Some(now_ms() + 2000),
+        )
+        .await;
+        let (mut w, _) = fx.worker("trainer").await;
+        for step in 1..=5 {
+            w.send(Body::Progress(mrl_proto::worker::v1::Progress {
+                step,
+                ..Default::default()
+            }))
+            .await;
+        }
+        // Nobody reads the events; the lease still fences the attempt on time.
+        let mut fx = fx;
+        let d = tokio::time::timeout(Duration::from_secs(30), &mut fx.task)
+            .await
+            .expect("the runner was not stuck")
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.phase, AttemptPhase::SelfFenced as i32);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn new_tickets_retry_a_rejected_upload() {
+        let (base, got) = sink().await;
+        let path = "checkpoints/ckpt_1/w.bin";
+        let sha = sha_hex(b"weights");
+        let mut fx = RunnerFixture::readopt(spec("att_rt", serde_json::json!({})), |r| {
+            r.checkpoints
+                .insert("ckpt_1".into(), staged(path, &sha, 7, None));
+        })
+        .await;
+        let file = fx.staging().join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"weights").unwrap();
+        let (mut w, _) = fx.worker("trainer").await;
+        let mut expired = target(&base, path, &sha, 7);
+        expired.expires_unix = time::OffsetDateTime::now_utc().unix_timestamp() - 60;
+        fx.control
+            .send(Control::Upload {
+                command_id: "up-old".into(),
+                checkpoint_id: "ckpt_1".into(),
+                targets: vec![expired],
+            })
+            .await
+            .unwrap();
+        let first = fx
+            .event(|e| match e {
+                AttemptEvent::CommandDone(r) => Some(r),
+                _ => None,
+            })
+            .await;
+        assert_eq!(first.command_id, "up-old");
+        assert!(first.failure.is_some(), "the expired ticket fails");
+        fx.control
+            .send(Control::Upload {
+                command_id: "up-new".into(),
+                checkpoint_id: "ckpt_1".into(),
+                targets: vec![target(&base, path, &sha, 7)],
+            })
+            .await
+            .unwrap();
+        let second = fx
+            .event(|e| match e {
+                AttemptEvent::CommandDone(r) => Some(r),
+                _ => None,
+            })
+            .await;
+        assert_eq!(second.command_id, "up-new");
+        assert!(second.failure.is_none(), "{second:?}");
+        assert_eq!(got.lock().unwrap().as_slice(), [b"weights".to_vec()]);
+        let acks = read_until(&mut w, |b| {
+            matches!(b, AgentBody::CheckpointCommitAck(a) if a.state == CommitState::Committed as i32)
+        })
+        .await
+        .unwrap();
+        assert!(!acks.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancel_deadline_survives_a_restart() {
+        // The cancel's grace ran out while the agent was away; the worker ignored it.
+        let mut fx = RunnerFixture::readopt(spec("att_cd", serde_json::json!({})), |r| {
+            r.cancel_requested = true;
+            r.stop_deadline_unix_ms = Some(now_ms() - 1000);
+        })
+        .await;
+        let d = tokio::time::timeout(Duration::from_secs(30), &mut fx.task)
+            .await
+            .expect("stopped at the saved deadline")
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.exit_kind, ExitKind::Cancelled as i32);
     }
 }

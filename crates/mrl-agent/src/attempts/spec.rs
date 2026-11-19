@@ -427,8 +427,19 @@ impl AttemptSpec {
             }
         }
         let mut names = std::collections::BTreeSet::new();
+        let mut paths: Vec<PathBuf> = Vec::new();
         for input in &self.inputs {
-            safe_relative(&input.local_path)?;
+            let p = safe_relative(&input.local_path)?;
+            // Two inputs may not share a file, and one may not sit inside another.
+            if let Some(other) = paths.iter().find(|o| o.starts_with(&p) || p.starts_with(o)) {
+                return bad(format!(
+                    "input {} uses {} which collides with {}",
+                    input.name,
+                    p.display(),
+                    other.display()
+                ));
+            }
+            paths.push(p);
             if !is_sha256(&input.sha256) {
                 return bad(format!("input {} has no valid sha256", input.name));
             }
@@ -633,6 +644,26 @@ mod tests {
             ..tag
         };
         assert!(matches!(pinned.kind(), Ok(RuntimeKind::Container { .. })));
+        let sha = "b".repeat(64);
+        let input = |name: &str, path: &str| InputSpec {
+            name: name.into(),
+            local_path: path.into(),
+            sha256: sha.clone(),
+            size: 1,
+            url: None,
+            expires_at: None,
+            file: Some("/f".into()),
+        };
+        let mut two = AttemptSpec::from_launch(&launch(), &[], Path::new("/s")).unwrap();
+        two.inputs = vec![input("model", "m/w.bin"), input("dataset.train", "m/w.bin")];
+        assert!(two.validate().is_err(), "same file");
+        two.inputs = vec![input("model", "m"), input("dataset.train", "m/w.bin")];
+        assert!(two.validate().is_err(), "one inside the other");
+        two.inputs = vec![
+            input("model", "m/w.bin"),
+            input("dataset.train", "d/t.jsonl"),
+        ];
+        assert!(two.validate().is_ok());
         for bad in ["", "/etc/passwd", "../x", "a/../../b", "a\\b"] {
             assert!(safe_relative(bad).is_err(), "{bad}");
         }

@@ -57,6 +57,9 @@ pub struct AttemptRecord {
     /// `AgentMessage` bytes; sent again when a worker reconnects (workers ignore repeats).
     #[serde(default)]
     pub requests: Vec<Vec<u8>>,
+    /// After a cancel or pause: when the agent stops the workers itself (Unix ms, wall clock).
+    #[serde(default)]
+    pub stop_deadline_unix_ms: Option<i64>,
     /// Upload tickets per checkpoint id, from `UploadArtifacts`.
     #[serde(default)]
     pub uploads: BTreeMap<String, UploadPlan>,
@@ -245,13 +248,7 @@ impl AttemptRecord {
         let path = job_dir.join(RECORD_FILE);
         let json =
             serde_json::to_vec_pretty(self).map_err(|e| AttemptError::Spec(e.to_string()))?;
-        crate::state::atomic_write(&path, &json).map_err(|e| AgentError::state(&path, e))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .map_err(|e| AgentError::state(&path, e))?;
-        }
+        write_private(&path, &json).map_err(|e| AgentError::state(&path, e))?;
         Ok(())
     }
 
@@ -271,8 +268,77 @@ impl AttemptRecord {
     }
 }
 
+/// Like [`crate::state::atomic_write`], but the file is owner-only (0600 on Unix) from the
+/// moment it exists: the temporary file is created with that mode before any byte is written,
+/// and the rename keeps it.
+pub fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .ok_or_else(|| std::io::Error::other("the path has no file name"))?
+        .to_string_lossy();
+    let tmp = dir.join(format!(
+        ".{name}.tmp-{}-{}",
+        std::process::id(),
+        SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let result = (|| {
+        let mut open = std::fs::OpenOptions::new();
+        open.write(true).create_new(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut open, 0o600);
+        let mut f = open.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)?;
+        #[cfg(unix)]
+        std::fs::File::open(dir)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
+}
+
+/// Creates a folder only the owner can open (0700 on Unix).
+pub fn private_dir(dir: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn private_files_are_never_readable_by_others() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("attempt.json");
+        super::write_private(&p, b"{}").unwrap();
+        super::write_private(&p, b"{\"a\":1}").unwrap();
+        let mode = std::fs::metadata(&p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::read(&p).unwrap(), b"{\"a\":1}");
+        assert_eq!(
+            std::fs::read_dir(dir.path()).unwrap().count(),
+            1,
+            "no temporary file left"
+        );
+    }
+
     use super::*;
 
     #[test]

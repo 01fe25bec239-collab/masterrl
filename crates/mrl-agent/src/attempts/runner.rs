@@ -91,6 +91,61 @@ pub enum Control {
     Detach(oneshot::Sender<()>),
 }
 
+/// Why a launch stopped before its workers ran.
+enum Early {
+    Failed(AttemptError),
+    Cancelled,
+    Fenced,
+    Detached,
+}
+
+/// What happened to an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    Sent,
+    Closed,
+    LeaseOver,
+}
+
+/// The monotonic instant for a wall-clock time (Unix ms); now if it has passed.
+fn instant_at(deadline_ms: i64) -> Instant {
+    let left = u64::try_from(deadline_ms - now_ms()).unwrap_or(0);
+    Instant::now() + Duration::from_millis(left)
+}
+
+/// Downloads the inputs and materializes every runtime the roles use.
+async fn prepare(
+    sh: Arc<Shared>,
+    spec: super::AttemptSpec,
+    job_dir: PathBuf,
+) -> Result<(BTreeMap<String, String>, HashMap<String, Materialized>), AttemptError> {
+    let id = spec.attempt.attempt_id.clone();
+    let staged = files::stage_inputs(&sh.ctx, &spec, &inputs_dir(&job_dir), &id).await?;
+    let log = job_dir.join("logs").join("environment.log");
+    let progress = sh.progress.clone();
+    let say = move |p: crate::envs::EnvProgress| {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log)
+        {
+            let _ = writeln!(f, "[{}] {}: {}", p.runtime_ref, p.stage, p.detail);
+        }
+        if let Some(cb) = &progress {
+            cb(p);
+        }
+    };
+    let mut envs = HashMap::new();
+    for rt in &spec.runtimes {
+        if spec.roles.iter().any(|r| r.runtime_ref == rt.runtime_ref) {
+            let m = sh.envs.materialize(rt, &id, &say).await?;
+            envs.insert(rt.runtime_ref.clone(), m);
+        }
+    }
+    Ok((staged, envs))
+}
+
 enum StopMsg {
     Stop(Duration),
     Kill,
@@ -176,8 +231,16 @@ pub const WORKER_SOCKET_LINK: &str = "w.sock";
 const MAX_SOCKET_PATH: usize = 100;
 
 /// Environment variable every worker (and everything it starts) carries, so the janitor can
-/// find the attempt's processes even after they changed folder and session.
-pub const ATTEMPT_ENV: &str = "MRL_ATTEMPT_ID";
+/// find this launch's processes even after they changed folder and session. Its value is
+/// [`attempt_token`]: unique per launch (derived from the nonce), so two agents never match
+/// each other's processes, even for the same attempt id.
+pub const TOKEN_ENV: &str = "MRL_ATTEMPT_TOKEN";
+
+/// The launch token for a nonce (not the nonce itself, which stays secret).
+pub fn attempt_token(nonce: &str) -> String {
+    let h = mrl_storage::sha256_hex(format!("mrl-attempt-token\0{nonce}").as_bytes());
+    h[..32].to_owned()
+}
 
 /// Keeps an isolating sandbox's launcher (bubblewrap, which uses `--die-with-parent`) alive
 /// when the agent dies, so the worker can be re-adopted. Forwards SIGTERM and exits with the
@@ -187,7 +250,8 @@ const KEEPER: &str = r#""$@" & c=$!
 trap 'kill -TERM "$c" 2>/dev/null' TERM
 while :; do wait "$c"; s=$?; kill -0 "$c" 2>/dev/null || exit "$s"; done"#;
 
-fn now_ms() -> i64 {
+/// Now, Unix milliseconds.
+pub fn now_ms() -> i64 {
     (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
 }
 
@@ -268,15 +332,36 @@ impl Runner {
     }
 
     /// Runs a new attempt to its end. `None` means it was detached (agent shutdown).
-    pub async fn run(mut self, control: mpsc::Receiver<Control>) -> Option<ExitDecision> {
+    pub async fn run(mut self, mut control: mpsc::Receiver<Control>) -> Option<ExitDecision> {
         self.gpu_uuids = self.lookup_gpus();
-        if let Err(e) = self.launch().await {
-            for w in self.workers.values() {
-                let _ = w.stop.send(StopMsg::Kill).await;
-            }
-            return Some(self.fail_early(e).await);
+        // The lease was fixed when the launch was accepted; staging counts against it.
+        if let Some(at) = self.rec.lease_deadline_unix_ms {
+            self.arm_lease(at);
         }
-        self.main_loop(control).await
+        match self.launch(&mut control).await {
+            Ok(()) => self.main_loop(control).await,
+            Err(early) => {
+                for w in self.workers.values() {
+                    let _ = w.stop.send(StopMsg::Kill).await;
+                }
+                match early {
+                    Early::Failed(e) => Some(self.fail_early(e).await),
+                    Early::Detached => {
+                        self.save();
+                        None
+                    }
+                    Early::Cancelled | Early::Fenced => {
+                        let ev = ExitEvidence {
+                            self_fenced: self.self_fenced,
+                            cancel_requested: self.rec.cancel_requested,
+                            agent_stopped: true,
+                            ..ExitEvidence::default()
+                        };
+                        Some(self.finish_with(decide(&ev)).await)
+                    }
+                }
+            }
+        }
     }
 
     /// Re-attaches to live workers after an agent restart.
@@ -304,13 +389,40 @@ impl Runner {
         if let Some(at) = self.rec.lease_deadline_unix_ms {
             self.arm_lease(at);
         }
+        // A cancel or pause deadline set before the restart still holds.
+        if let Some(at) = self.rec.stop_deadline_unix_ms {
+            self.stop_at = Some(instant_at(at));
+        }
         self.main_loop(control).await
     }
 
     /// Arms the lease timer for a wall-clock deadline (Unix ms).
     fn arm_lease(&mut self, deadline_ms: i64) {
-        let left = u64::try_from(deadline_ms - now_ms()).unwrap_or(0);
-        self.lease = Some(Instant::now() + Duration::from_millis(left));
+        self.lease = Some(instant_at(deadline_ms));
+    }
+
+    /// True once the lease deadline has passed.
+    fn lease_over(&self) -> bool {
+        self.lease.is_some_and(|at| Instant::now() >= at)
+    }
+
+    /// Sends an event. Waits while the channel is full, but never past the lease deadline, so
+    /// a slow reader can't keep the attempt running without a lease.
+    async fn emit(&self, ev: AttemptEvent) -> Delivery {
+        let far = Instant::now() + Duration::from_secs(365 * 24 * 3600);
+        tokio::select! {
+            biased;
+            r = self.sh.events.send(ev) => if r.is_ok() { Delivery::Sent } else { Delivery::Closed },
+            () = tokio::time::sleep_until(self.lease.unwrap_or(far)) => Delivery::LeaseOver,
+        }
+    }
+
+    /// Sets the absolute stop deadline after a cancel or pause request, saved for restarts.
+    fn set_stop_deadline(&mut self, after: Duration) {
+        let at = now_ms() + i64::try_from(after.as_millis()).unwrap_or(i64::MAX);
+        self.rec.stop_deadline_unix_ms = Some(at);
+        self.stop_at = Some(instant_at(at));
+        self.save();
     }
 
     /// Records and arms a new lease deadline.
@@ -351,7 +463,13 @@ impl Runner {
             failure: decision.and_then(|d| d.failure.clone()),
             time: Some(now_ts()),
         };
-        let _ = self.sh.events.send(AttemptEvent::Status(status)).await;
+        let ev = AttemptEvent::Status(status);
+        if decision.is_some() {
+            // The final status: bounded, the saved outcome is reported again on reconnect.
+            let _ = tokio::time::timeout(Duration::from_secs(10), self.emit(ev)).await;
+        } else {
+            let _ = self.emit(ev).await;
+        }
     }
 
     async fn set_phase(&mut self, phase: AttemptPhase) {
@@ -371,57 +489,77 @@ impl Runner {
         }
     }
 
-    async fn launch(&mut self) -> Result<(), AttemptError> {
+    /// Stages inputs and environments (cancellable, bounded by the lease), then starts the
+    /// server and the workers.
+    async fn launch(&mut self, control: &mut mpsc::Receiver<Control>) -> Result<(), Early> {
         self.set_phase(AttemptPhase::Staging).await;
-        let id = self.id().to_owned();
-        self.rec.staged_paths = files::stage_inputs(
-            &self.sh.ctx,
-            &self.rec.spec,
-            &inputs_dir(&self.job_dir),
-            &id,
-        )
-        .await?;
-        let log = self.job_dir.join("logs").join("environment.log");
-        let progress = self.sh.progress.clone();
-        let say = move |p: crate::envs::EnvProgress| {
-            use std::io::Write;
-            if let Ok(mut f) = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log)
-            {
-                let _ = writeln!(f, "[{}] {}: {}", p.runtime_ref, p.stage, p.detail);
-            }
-            if let Some(cb) = &progress {
-                cb(p);
+        std::fs::create_dir_all(self.job_dir.join("logs"))
+            .map_err(|e| Early::Failed(AgentError::state(self.job_dir.join("logs"), e).into()))?;
+        let work = prepare(
+            Arc::clone(&self.sh),
+            self.rec.spec.clone(),
+            self.job_dir.clone(),
+        );
+        tokio::pin!(work);
+        let far = || Instant::now() + Duration::from_secs(365 * 24 * 3600);
+        let (staged, envs) = loop {
+            let lease_at = self.lease.unwrap_or_else(far);
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(lease_at), if self.lease.is_some() => {
+                    self.self_fenced = true;
+                    return Err(Early::Fenced);
+                }
+                c = control.recv() => match c {
+                    Some(Control::Cancel { .. }) | None => {
+                        self.rec.cancel_requested = true;
+                        return Err(Early::Cancelled);
+                    }
+                    Some(Control::Detach(done)) => {
+                        let _ = done.send(());
+                        return Err(Early::Detached);
+                    }
+                    Some(Control::Start(reply)) => {
+                        let _ = reply.send(Err(AttemptError::state(self.id(), "is still staging its inputs")));
+                    }
+                    Some(Control::Lease { duration_s, kill_budget_s }) => {
+                        let margin = i64::from(duration_s.saturating_sub(kill_budget_s)) * 1000;
+                        self.set_lease(now_ms() + margin);
+                    }
+                    Some(Control::Pause { request_id, deadline_s, reason }) => {
+                        // Sent to the workers when they connect; they pause at once.
+                        self.remember(&AgentBody::Pause(PauseRequest { request_id, deadline_s, reason }));
+                    }
+                    Some(Control::Upload { command_id, checkpoint_id, targets }) => {
+                        self.store_plan(checkpoint_id, command_id, targets);
+                    }
+                    Some(Control::Hw(events)) => {
+                        self.hw_events.extend(events.into_iter().filter(|e| self.gpu_uuids.contains(&e.uuid)));
+                    }
+                    Some(Control::Checkpoint { .. }) => {}
+                },
+                r = &mut work => break r.map_err(Early::Failed)?,
             }
         };
-        std::fs::create_dir_all(self.job_dir.join("logs"))
-            .map_err(|e| AgentError::state(self.job_dir.join("logs"), e))?;
-        let mut envs: HashMap<String, Materialized> = HashMap::new();
-        for rt in self.rec.spec.runtimes.clone() {
-            if self
-                .rec
-                .spec
-                .roles
-                .iter()
-                .any(|r| r.runtime_ref == rt.runtime_ref)
-            {
-                let m = self.sh.envs.materialize(&rt, &id, &say).await?;
-                envs.insert(rt.runtime_ref.clone(), m);
-            }
+        if self.lease_over() {
+            self.self_fenced = true;
+            return Err(Early::Fenced);
         }
+        self.rec.staged_paths = staged;
+        self.save();
         self.set_phase(AttemptPhase::Preparing).await;
-        self.start_server().await?;
+        self.start_server().await.map_err(Early::Failed)?;
         let spec = self.rec.spec.clone();
         for (role_id, role, primary) in spec.workers() {
             let mat = envs.get(&role.runtime_ref).ok_or_else(|| {
-                AttemptError::Spec(format!("runtime {} was not prepared", role.runtime_ref))
+                Early::Failed(AttemptError::Spec(format!(
+                    "runtime {} was not prepared",
+                    role.runtime_ref
+                )))
             })?;
-            self.start_worker(&role_id, role, primary, mat).await?;
-        }
-        if spec.lease_s > 0 {
-            self.set_lease(now_ms() + i64::from(spec.lease_s) * 1000);
+            self.start_worker(&role_id, role, primary, mat)
+                .await
+                .map_err(Early::Failed)?;
         }
         Ok(())
     }
@@ -496,7 +634,7 @@ impl Runner {
             role.runtime_ref.clone(),
         );
         env.insert("MRL_ROLE_ID".to_owned(), role_id.to_owned());
-        env.insert(ATTEMPT_ENV.to_owned(), self.id().to_owned());
+        env.insert(TOKEN_ENV.to_owned(), attempt_token(&self.rec.nonce));
         for (k, v) in &self.secrets {
             env.insert(k.clone(), v.expose().to_owned());
         }
@@ -608,6 +746,15 @@ impl Runner {
             let lease_at = self.lease.unwrap_or_else(far);
             let stop_at = self.stop_at.unwrap_or_else(far);
             tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(lease_at), if self.lease.is_some() && !self.self_fenced => {
+                    self.self_fenced = true;
+                    self.stop_all().await;
+                }
+                () = tokio::time::sleep_until(stop_at), if self.stop_at.is_some() => {
+                    self.stop_at = None;
+                    self.stop_all().await;
+                }
                 Some(inb) = self.inbound_rx.recv() => self.on_inbound(inb).await,
                 Some(exit) = self.exits_rx.recv() => {
                     if self.on_exit(exit).await {
@@ -625,14 +772,6 @@ impl Runner {
                     None => self.stop_all().await,
                 },
                 Some(u) = self.uploads_rx.recv() => self.on_upload(u).await,
-                () = tokio::time::sleep_until(lease_at), if self.lease.is_some() && !self.self_fenced => {
-                    self.self_fenced = true;
-                    self.stop_all().await;
-                }
-                () = tokio::time::sleep_until(stop_at), if self.stop_at.is_some() => {
-                    self.stop_at = None;
-                    self.stop_all().await;
-                }
                 _ = stall_tick.tick() => {
                     if !self.stalled
                         && self.rec.phase == AttemptPhase::Running as i32
@@ -723,19 +862,16 @@ impl Runner {
         })
     }
 
-    async fn relay(&self, role_id: &str, msg: WorkerMessage) {
-        if let Some(lane) = crate::lanes::lane_for(&msg) {
-            let relay = WorkerRelay {
-                attempt: Some(self.rec.spec.attempt.to_proto()),
-                role_id: role_id.to_owned(),
-                message: Some(msg),
-            };
-            let _ = self
-                .sh
-                .events
-                .send(AttemptEvent::Relay { lane, relay })
-                .await;
-        }
+    async fn relay(&self, role_id: &str, msg: WorkerMessage) -> Delivery {
+        let Some(lane) = crate::lanes::lane_for(&msg) else {
+            return Delivery::Sent;
+        };
+        let relay = WorkerRelay {
+            attempt: Some(self.rec.spec.attempt.to_proto()),
+            role_id: role_id.to_owned(),
+            message: Some(msg),
+        };
+        self.emit(AttemptEvent::Relay { lane, relay }).await
     }
 
     fn role_spec(&self, role_id: &str) -> Option<RoleSpec> {
@@ -780,8 +916,11 @@ impl Runner {
             }
             Inbound::Message { role_id, msg, done } => {
                 // Not saved: `done` is dropped, so the message is not acked and comes again.
-                if self.on_message(&role_id, &msg).await {
-                    self.relay(&role_id, msg).await;
+                // Acked only when relayed too: a closed or stuck event channel leaves the
+                // message with the worker, which replays it.
+                if self.on_message(&role_id, &msg).await
+                    && self.relay(&role_id, msg).await == Delivery::Sent
+                {
                     let _ = done.send(());
                 }
             }
@@ -789,7 +928,7 @@ impl Runner {
                 if let Some(WorkerBody::Heartbeat(hb)) = &msg.body {
                     self.rec.last_step = self.rec.last_step.max(hb.last_step);
                 }
-                self.relay(&role_id, msg).await;
+                let _ = self.relay(&role_id, msg).await;
             }
             Inbound::Disconnected { .. } => {}
             Inbound::Refused {
@@ -849,6 +988,30 @@ impl Runner {
                 self.save();
             }
         }
+    }
+
+    /// Saves the tickets for a checkpoint, so a restarted agent still has them and the command
+    /// to answer.
+    fn store_plan(
+        &mut self,
+        checkpoint_id: String,
+        command_id: String,
+        targets: Vec<UploadTarget>,
+    ) {
+        let plan = self
+            .rec
+            .uploads
+            .entry(checkpoint_id)
+            .or_insert_with(|| UploadPlan {
+                command_id: command_id.clone(),
+                targets: Vec::new(),
+            });
+        plan.command_id = command_id;
+        for t in targets {
+            plan.targets.retain(|x| x.local_path != t.local_path);
+            plan.targets.push(t);
+        }
+        self.save();
     }
 
     /// Keeps a control request so a reconnecting worker gets it again.
@@ -1074,7 +1237,7 @@ impl Runner {
                         ..Default::default()
                     }),
             };
-            let _ = self.sh.events.send(AttemptEvent::CommandDone(result)).await;
+            let _ = self.emit(AttemptEvent::CommandDone(result)).await;
         }
     }
 
@@ -1121,8 +1284,7 @@ impl Runner {
                 });
                 self.remember(&body);
                 self.send_all(body).await;
-                self.stop_at =
-                    Some(Instant::now() + Duration::from_secs(grace_s.into()) + DEADLINE_MARGIN);
+                self.set_stop_deadline(Duration::from_secs(grace_s.into()) + DEADLINE_MARGIN);
                 self.set_phase(AttemptPhase::Stopping).await;
             }
             Control::Pause {
@@ -1139,8 +1301,7 @@ impl Runner {
                 if let Some(role) = self.primary_role() {
                     self.send(&role, body).await;
                 }
-                self.stop_at =
-                    Some(Instant::now() + Duration::from_secs(deadline_s.into()) + DEADLINE_MARGIN);
+                self.set_stop_deadline(Duration::from_secs(deadline_s.into()) + DEADLINE_MARGIN);
             }
             Control::Checkpoint {
                 request_id,
@@ -1197,19 +1358,12 @@ impl Runner {
                             .await;
                     });
                 } else {
-                    // Saved, so a restarted agent still has the tickets and the command to answer.
-                    let plan = self
-                        .rec
-                        .uploads
-                        .entry(checkpoint_id.clone())
-                        .or_insert_with(|| UploadPlan {
-                            command_id: command_id.clone(),
-                            targets: Vec::new(),
-                        });
-                    plan.command_id = command_id;
-                    for t in targets {
-                        plan.targets.retain(|x| x.local_path != t.local_path);
-                        plan.targets.push(t);
+                    self.store_plan(checkpoint_id.clone(), command_id, targets);
+                    // New tickets retry a rejected upload (a corrupt checkpoint stays corrupt).
+                    if let Some(ck) = self.rec.checkpoints.get_mut(&checkpoint_id) {
+                        if ck.state == Some(CommitState::Rejected as i32) {
+                            ck.state = None;
+                        }
                     }
                     self.save();
                     self.try_commit(&checkpoint_id).await;
@@ -1492,9 +1646,12 @@ fn spawn_exec(
     tx
 }
 
-/// Signals a process by identity (its process group too: workers lead their own).
+/// Signals a process by identity (its process group too: workers lead their own). A process
+/// is signalled only while it is still the same process (pid and start time), so a reused pid
+/// or process group is never hit.
 pub fn signal_identity(identity: &ProcIdentity, force: bool) {
     match identity {
+        ProcIdentity::Pid { .. } if !identity.alive() => {}
         ProcIdentity::Pid { pid, .. } => {
             #[cfg(unix)]
             {
@@ -1566,7 +1723,10 @@ fn spawn_watch(
                         while Instant::now() < until && alive(&identity).await {
                             tokio::time::sleep(Duration::from_millis(200)).await;
                         }
-                        signal_identity(&identity, true);
+                        // Escalate only if the original process is still there.
+                        if alive(&identity).await {
+                            signal_identity(&identity, true);
+                        }
                         break;
                     }
                     Some(StopMsg::Kill) => signal_identity(&identity, true),
@@ -1652,6 +1812,31 @@ mod tests {
         let q = socket_path(&deep, "att_1");
         assert!(q.as_os_str().len() <= MAX_SOCKET_PATH);
         assert!(q.starts_with("/tmp"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn signals_reach_only_the_same_process() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let ProcIdentity::Pid { pid, start_time } = ProcIdentity::of_pid(child.id()).unwrap()
+        else {
+            panic!("pid identity")
+        };
+        // Same pid, other start time: a reused pid is left alone.
+        signal_identity(
+            &ProcIdentity::Pid {
+                pid,
+                start_time: start_time + 1,
+            },
+            true,
+        );
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(child.try_wait().unwrap().is_none(), "still running");
+        signal_identity(&ProcIdentity::Pid { pid, start_time }, true);
+        assert!(child.wait().unwrap().code().is_none(), "killed");
     }
 
     #[cfg(unix)]

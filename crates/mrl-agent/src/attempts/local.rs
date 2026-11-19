@@ -135,12 +135,12 @@ async fn run_cli(config: Option<&Path>, cmd: AttemptCommand) -> Result<ExitCode,
     let mine = readopted
         .iter()
         .find(|s| s.attempt.as_ref().is_some_and(|a| a.attempt_id == id));
-    match (mine, AttemptRecord::load(&job_dir)?) {
-        (Some(s), _) if s.failure.is_none() => eprintln!("mrl-agent: re-adopted attempt {id}"),
-        (_, Some(rec)) if rec.exit.is_some() => {
+    match (AttemptRecord::load(&job_dir)?, mine) {
+        (Some(rec), _) if rec.exit.is_some() => {
             eprintln!("mrl-agent: attempt {id} already ran here");
             return print_outcome(rec.exit.as_ref(), json);
         }
+        (Some(_), Some(_)) => eprintln!("mrl-agent: re-adopted attempt {id}"),
         _ => attempts.launch(spec)?,
     }
 

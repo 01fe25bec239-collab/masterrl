@@ -4,7 +4,7 @@
 //!   or containers) still alive, kills leftover processes whose working folder is inside the
 //!   attempt folder, removes the attempt's pins from the node cache and the environments, and
 //!   checks that its GPUs gave their memory back.
-//! - [`purge`] wipes an ended attempt's scratch (work, staging, inputs and its socket); the
+//! - [`purge`] wipes an ended attempt's scratch (work, staging, inputs, upload snapshots and its socket); the
 //!   saved record and logs stay for diagnosis.
 //! - [`sweep`] runs every few minutes ([`JanitorService`]): it repeats `release` for ended
 //!   attempts whose processes are somehow still alive, purges ended attempts older than
@@ -82,7 +82,8 @@ pub async fn release(
         report.killed += kill_cgroup(cg);
     }
     let job_dir = ctx.state.job_dir(&id);
-    report.killed += kill_leftovers(&job_dir, &id);
+    let token = crate::attempts::runner::attempt_token(&rec.nonce);
+    report.killed += kill_leftovers(&job_dir, &token);
     match envs.unpin_all(&id) {
         Ok(n) => report.unpinned = n,
         Err(e) => report.errors.push(e.explain()),
@@ -91,13 +92,14 @@ pub async fn release(
     report
 }
 
-/// Processes of the attempt `attempt_id` that are still alive (not this agent): those whose
-/// environment carries `MRL_ATTEMPT_ID=<attempt_id>` (inherited by every child, even one that
-/// changed folder and session; readable on Linux) or whose working folder is inside `job_dir`.
-pub fn leftovers(job_dir: &Path, attempt_id: &str) -> Vec<u32> {
+/// Processes of one launch that are still alive (not this agent): those whose environment
+/// carries `MRL_ATTEMPT_TOKEN=<token>` (inherited by every child, even one that changed folder
+/// and session; readable on Linux) or whose working folder is inside `job_dir`. The token is
+/// unique per launch, so another agent's processes never match.
+pub fn leftovers(job_dir: &Path, token: &str) -> Vec<u32> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
     let dir = std::fs::canonicalize(job_dir).ok();
-    let mark = format!("{}={attempt_id}", crate::attempts::runner::ATTEMPT_ENV);
+    let mark = format!("{}={token}", crate::attempts::runner::TOKEN_ENV);
     let Ok(mut sys) = System::new() else {
         return Vec::new();
     };
@@ -126,8 +128,8 @@ pub fn leftovers(job_dir: &Path, attempt_id: &str) -> Vec<u32> {
         .collect()
 }
 
-fn kill_leftovers(job_dir: &Path, attempt_id: &str) -> usize {
-    let found = leftovers(job_dir, attempt_id);
+fn kill_leftovers(job_dir: &Path, token: &str) -> usize {
+    let found = leftovers(job_dir, token);
     for pid in &found {
         if let Some(identity) = ProcIdentity::of_pid(*pid) {
             signal_identity(&identity, true);
@@ -213,11 +215,11 @@ async fn gpu_residue(ctx: &AgentContext, uuids: &HashSet<String>) -> Vec<String>
     warnings
 }
 
-/// Wipes an ended attempt's scratch: work, staging, inputs and its socket. True if anything was
-/// removed.
+/// Wipes an ended attempt's scratch: work, staging, inputs, upload snapshots and its socket.
+/// True if anything was removed.
 pub fn purge(state_root: &Path, job_dir: &Path) -> Result<bool> {
     let mut removed = false;
-    for sub in ["work", "staging", "inputs"] {
+    for sub in ["work", "staging", "inputs", "uploads"] {
         let d = job_dir.join(sub);
         if d.exists() {
             make_writable(&d);
@@ -232,6 +234,8 @@ pub fn purge(state_root: &Path, job_dir: &Path) -> Result<bool> {
 }
 
 /// Inputs are read-only; give the owner write access back so they can be deleted.
+// Windows only clears the read-only flag (no Unix mode bits are involved).
+#[cfg_attr(not(unix), allow(clippy::permissions_set_readonly_false))]
 fn make_writable(dir: &Path) {
     #[cfg(unix)]
     {
@@ -249,7 +253,24 @@ fn make_writable(dir: &Path) {
         }
     }
     #[cfg(not(unix))]
-    let _ = dir;
+    {
+        // Windows: inputs carry the read-only flag, which blocks deleting them.
+        let mut stack = vec![dir.to_path_buf()];
+        while let Some(d) = stack.pop() {
+            if let Ok(rd) = std::fs::read_dir(&d) {
+                for e in rd.flatten() {
+                    let p = e.path();
+                    if e.file_type().is_ok_and(|t| t.is_dir()) {
+                        stack.push(p);
+                    } else if let Ok(m) = std::fs::metadata(&p) {
+                        let mut perms = m.permissions();
+                        perms.set_readonly(false);
+                        let _ = std::fs::set_permissions(&p, perms);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// What [`sweep`] did.

@@ -466,7 +466,7 @@ fn environments(f: &Facts) -> (Outcome, String, Option<&'static str>) {
 }
 
 /// A task this machine can or can't run.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct TaskLine {
     /// Task id, like `sft-lora`.
     pub task: String,
@@ -474,6 +474,47 @@ pub struct TaskLine {
     pub name: String,
     /// The catalog note.
     pub note: Option<String>,
+    /// "It can't": what stops it here (a failed check or a missing system component).
+    pub blocked_by: Option<String>,
+    /// "This machine can": download still needed first (app-managed packages), GB (low, high).
+    pub download_first_gb: Option<(f64, f64)>,
+}
+
+/// Components the user installs on the system; the app installs the rest on demand.
+const SYSTEM_COMPONENTS: [&str; 4] = ["nvidia-driver", "cuda", "wsl2", "python-env"];
+
+/// Why `task`'s components can't work here, from the check results (`None`: nothing blocks).
+fn blocker(f: &Facts, checks: &[CheckResult], components: &[PlanComponent]) -> Option<String> {
+    let failed = |name: &str| {
+        checks
+            .iter()
+            .find(|c| c.check == name && c.outcome == Outcome::Fail)
+            .map(|c| c.summary.clone())
+    };
+    // These block every task.
+    for name in ["os", "cpu_ram_disk", "python_uv"] {
+        if let Some(why) = failed(name) {
+            return Some(why);
+        }
+    }
+    let needs = |id: &str| components.iter().any(|c| c.id == id);
+    if needs("nvidia-driver") || needs("cuda") {
+        if let Some(why) = failed("nvidia_driver") {
+            return Some(why);
+        }
+    }
+    if needs("wsl2") {
+        if let Some(why) = failed("wsl2") {
+            return Some(why);
+        }
+    }
+    if needs("mlx") && !f.inventory.apple.as_ref().is_some_and(|a| a.mlx_available) {
+        return Some("MLX can't run on this Mac".into());
+    }
+    components
+        .iter()
+        .find(|c| SYSTEM_COMPONENTS.contains(&c.id.as_str()) && !c.installed)
+        .map(|c| format!("{} is not installed", c.name))
 }
 
 /// One component of an environment plan.
@@ -672,7 +713,7 @@ pub fn plan(task: &str, f: &Facts) -> Option<EnvPlan> {
 
 /// Runs every check and builds the capability summary.
 pub fn run(f: &Facts) -> DoctorReport {
-    let checks = checks()
+    let checks: Vec<CheckResult> = checks()
         .iter()
         .map(|c| {
             let (outcome, summary, code) = (c.run)(f);
@@ -701,23 +742,38 @@ pub fn run(f: &Facts) -> DoctorReport {
         let Some(task) = row.str("task") else {
             continue;
         };
-        let line = TaskLine {
+        let mut line = TaskLine {
             task: task.to_owned(),
             name: catalog::recipe(task)
                 .and_then(|r| r.str("name"))
                 .unwrap_or(task)
                 .to_owned(),
             note: row.str("note").map(str::to_owned),
+            blocked_by: None,
+            download_first_gb: None,
         };
-        if row.get("supported").and_then(|s| s.as_bool()) == Some(true) {
-            caps.can.push(line);
-            for c in plan(task, f).map(|p| p.components).unwrap_or_default() {
-                if !c.installed && caps.to_install.iter().all(|x| x.id != c.id) {
-                    caps.to_install.push(c);
-                }
-            }
-        } else {
+        if row.get("supported").and_then(|s| s.as_bool()) != Some(true) {
             caps.cannot.push(line);
+            continue;
+        }
+        let task_plan = plan(task, f);
+        let components = task_plan
+            .as_ref()
+            .map(|p| p.components.clone())
+            .unwrap_or_default();
+        for c in components.iter().filter(|c| !c.installed) {
+            if caps.to_install.iter().all(|x| x.id != c.id) {
+                caps.to_install.push(c.clone());
+            }
+        }
+        // Supported here only counts when the checks and the system components agree.
+        line.blocked_by = blocker(f, &checks, &components);
+        if line.blocked_by.is_some() {
+            caps.cannot.push(line);
+        } else {
+            let gb = task_plan.map_or((0.0, 0.0), |p| p.to_download_gb);
+            line.download_first_gb = (gb.1 > 0.0).then_some(gb);
+            caps.can.push(line);
         }
     }
     DoctorReport {
@@ -806,18 +862,22 @@ impl DoctorReport {
         }
         s += "\n\nThis machine can:\n";
         for t in &caps.can {
-            s += &format!(
-                "  - {}{}\n",
-                t.name,
-                t.note.as_ref().map_or(String::new(), |n| format!(" ({n})"))
-            );
+            s += &format!("  - {}", t.name);
+            if let Some(n) = &t.note {
+                s += &format!(" ({n})");
+            }
+            if let Some((lo, hi)) = t.download_first_gb {
+                s += &format!(", after a download of about {lo:.1}–{hi:.1} GB");
+            }
+            s.push('\n');
         }
         s += "It can't:\n";
         for t in &caps.cannot {
+            let why = t.blocked_by.as_ref().or(t.note.as_ref());
             s += &format!(
                 "  - {}{}\n",
                 t.name,
-                t.note.as_ref().map_or(String::new(), |n| format!(": {n}"))
+                why.map_or(String::new(), |n| format!(": {n}"))
             );
         }
         if !caps.to_install.is_empty() {
@@ -1020,6 +1080,16 @@ mod tests {
             Some("nvidia-24gb")
         );
         assert!(r.capabilities.can.iter().any(|t| t.task == "grpo"));
+        let grpo = r
+            .capabilities
+            .can
+            .iter()
+            .find(|t| t.task == "grpo")
+            .unwrap();
+        assert!(
+            grpo.download_first_gb.is_some(),
+            "app packages still to download"
+        );
         assert!(r.capabilities.cannot.iter().any(|t| t.task == "mlx-sft"));
         // Driver and CUDA are present; PyTorch is not installed in any app environment.
         assert!(r.capabilities.to_install.iter().any(|c| c.id == "pytorch"));
@@ -1061,6 +1131,10 @@ mod tests {
             outcome(&r, "cpu_ram_disk"),
             (Outcome::Fail, Some("MRL-ENV-004"))
         );
+        assert!(
+            r.capabilities.can.is_empty(),
+            "failed prerequisites block every task"
+        );
         let proto = r.to_proto("r", &[], &f.inventory, Path::new("/s"));
         let issue = &proto.checks[3].issues[0];
         assert_eq!(issue.code, "MRL-ENV-006");
@@ -1068,6 +1142,21 @@ mod tests {
             !issue.hint.is_empty(),
             "hint comes from the guidance catalog"
         );
+        // Only the driver fails: NVIDIA tasks are blocked, with the reason.
+        f.tools.uv = Some("uv 0.11.28".into());
+        f.state_disk_free = Some(500 * GIB);
+        let r = run(&f);
+        let grpo = r
+            .capabilities
+            .cannot
+            .iter()
+            .find(|t| t.task == "grpo")
+            .unwrap();
+        assert!(
+            grpo.blocked_by.as_deref().unwrap().contains("driver"),
+            "{grpo:?}"
+        );
+        assert!(r.capabilities.can.iter().all(|t| t.task != "sft-lora"));
     }
 
     #[test]

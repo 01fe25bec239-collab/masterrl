@@ -479,7 +479,13 @@ async fn janitor_leaves_no_processes_or_scratch() {
     assert_eq!(d.exit_kind, ExitKind::Cancelled as i32, "{d:?}");
     let job = ctx.state.job_dir("att_jan");
     assert!(
-        mrl_agent::janitor::leftovers(&job, "att_jan").is_empty(),
+        mrl_agent::janitor::leftovers(
+            &job,
+            &mrl_agent::attempts::runner::attempt_token(
+                &AttemptRecord::load(&job).unwrap().unwrap().nonce
+            )
+        )
+        .is_empty(),
         "no process left in the attempt folder"
     );
     assert!(!primary_identity(&ctx, "att_jan").alive());
@@ -606,25 +612,25 @@ async fn tampered_lock_hash_is_dependency_env() {
     assert_eq!(attempts.launch(again).unwrap_err().code(), "MRL-STATE-204");
 }
 
-/// An orphan that changed folder and session after the agent crashed is still found (by the
-/// attempt marker in its environment) and stopped. Linux: other processes' environments are
-/// readable there.
+/// Starts a job for `id` whose child leaves its folder and session, then "crashes" the agent
+/// (nothing kills the job) and lets the main process die. Returns the record and the orphan.
 #[cfg(target_os = "linux")]
-#[tokio::test(flavor = "multi_thread")]
-async fn janitor_stops_an_orphan_that_left_folder_and_session() {
-    use mrl_agent::attempts::runner::ATTEMPT_ENV;
-    let dir = tempfile::tempdir().unwrap();
-    let ctx = ctx(dir.path(), None);
-    let envs = mrl_agent::envs::Envs::open(ctx.state.root(), Arc::clone(&ctx.cache)).unwrap();
-    let job = ctx.state.job_dir("att_orph");
-    let pid_file = dir.path().join("orphan.pid");
+async fn orphaned_job(
+    ctx: &AgentContext,
+    dir: &Path,
+    id: &str,
+    nonce: &str,
+) -> (AttemptRecord, ProcIdentity) {
+    use mrl_agent::attempts::runner::{attempt_token, TOKEN_ENV};
+    let job = ctx.state.job_dir(id);
+    let pid_file = dir.join(format!("{id}-{nonce}.pid"));
     let script = format!(
         "setsid sh -c 'cd /tmp && echo $$ > {} && exec sleep 300' & exec sleep 300",
         pid_file.display()
     );
     let mut exec_spec =
-        mrl_agent::exec::ExecSpec::new("att_orph-trainer", "/bin/sh", &["-c", &script], &job);
-    exec_spec.env.insert(ATTEMPT_ENV.into(), "att_orph".into());
+        mrl_agent::exec::ExecSpec::new(&format!("{id}-trainer"), "/bin/sh", &["-c", &script], &job);
+    exec_spec.env.insert(TOKEN_ENV.into(), attempt_token(nonce));
     let exec = ctx.executor.spawn(exec_spec).await.unwrap();
     let main = ProcIdentity::of_pid(exec.pid().unwrap()).unwrap();
     let orphan = loop {
@@ -636,20 +642,20 @@ async fn janitor_stops_an_orphan_that_left_folder_and_session() {
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    // The agent crashes: nothing kills the job; then its main process dies on its own.
     std::mem::forget(exec);
     nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(pid_of(&main)),
         nix::sys::signal::Signal::SIGKILL,
     )
     .unwrap();
-    let orphan_id = ProcIdentity::of_pid(orphan).unwrap();
-    assert!(orphan_id.alive());
-
-    let mut rec = AttemptRecord {
-        spec: spec("att_orph", serde_json::json!({}), serde_json::json!({})),
-        nonce: "n".into(),
-        socket: dir.path().join("x.sock"),
+    let orphan = ProcIdentity::of_pid(orphan).unwrap();
+    assert!(orphan.alive());
+    let mut spec = spec(id, serde_json::json!({}), serde_json::json!({}));
+    spec.attempt.attempt_id = id.into();
+    let rec = AttemptRecord {
+        spec,
+        nonce: nonce.into(),
+        socket: dir.join("x.sock"),
         phase: AttemptPhase::Running as i32,
         workers: vec![mrl_agent::attempts::record::WorkerProc {
             role_id: "trainer".into(),
@@ -665,25 +671,105 @@ async fn janitor_stops_an_orphan_that_left_folder_and_session() {
         exit: None,
         staged_paths: Default::default(),
         lease_deadline_unix_ms: None,
+        stop_deadline_unix_ms: None,
         exit_report: None,
         requests: Vec::new(),
         uploads: Default::default(),
     };
-    rec.spec.attempt.attempt_id = "att_orph".into();
-    let report = mrl_agent::janitor::release(&ctx, &envs, &rec, &Default::default()).await;
-    assert!(report.killed >= 1, "{report:?}");
+    (rec, orphan)
+}
+
+#[cfg(target_os = "linux")]
+async fn gone(p: &ProcIdentity) -> bool {
     for _ in 0..50 {
-        if !orphan_id.alive() {
-            break;
+        if !p.alive() {
+            return true;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(!orphan_id.alive(), "the orphan was stopped");
+    false
+}
+
+/// An orphan that changed folder and session after the agent crashed is still found (by the
+/// launch token in its environment) and stopped; another agent's job with the same attempt id
+/// is left alone. Linux: other processes' environments are readable there.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn janitor_stops_its_orphans_and_never_another_agents() {
+    let (dir_a, dir_b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (ctx_a, ctx_b) = (ctx(dir_a.path(), None), ctx(dir_b.path(), None));
+    let (rec_a, orphan_a) = orphaned_job(&ctx_a, dir_a.path(), "att_same", "nonce-a").await;
+    let (rec_b, orphan_b) = orphaned_job(&ctx_b, dir_b.path(), "att_same", "nonce-b").await;
+    let envs_a = mrl_agent::envs::Envs::open(ctx_a.state.root(), Arc::clone(&ctx_a.cache)).unwrap();
+    let report = mrl_agent::janitor::release(&ctx_a, &envs_a, &rec_a, &Default::default()).await;
+    assert!(report.killed >= 1, "{report:?}");
+    assert!(gone(&orphan_a).await, "its own orphan was stopped");
+    assert!(
+        orphan_b.alive(),
+        "the other agent's worker (same attempt id) was not touched"
+    );
+    let envs_b = mrl_agent::envs::Envs::open(ctx_b.state.root(), Arc::clone(&ctx_b.cache)).unwrap();
+    mrl_agent::janitor::release(&ctx_b, &envs_b, &rec_b, &Default::default()).await;
+    assert!(gone(&orphan_b).await);
+}
+
+/// Credentials sent with UpdateCredentials before the launch reach the worker's environment
+/// (checked by hash, never printed).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs uv; runs in ci-attempts"]
+async fn credentials_reach_the_running_worker() {
+    if !ready("credentials_reach_the_running_worker") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), None);
+    let (attempts, seen) = manager(&ctx);
+    attempts.set_credential(
+        "att_cred",
+        "hf_hub",
+        mrl_agent::attempts::spec::Secret::new("tok-xyz"),
+    );
+    attempts
+        .launch(spec(
+            "att_cred",
+            serde_json::json!({"steps": 40, "step_seconds": 0.5}),
+            serde_json::json!({"upload_dir": dir.path().join("out")}),
+        ))
+        .unwrap();
+    seen.until_step(1).await;
+    let pid = pid_of(&primary_identity(&ctx, "att_cred"));
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+    let value = environ
+        .split(|b| *b == 0)
+        .find_map(|kv| kv.strip_prefix(b"MRL_CREDENTIAL_HF_HUB=".as_slice()))
+        .expect("the credential is in the worker environment");
+    assert_eq!(
+        mrl_storage::sha256_hex(value),
+        mrl_storage::sha256_hex(b"tok-xyz")
+    );
+    let cancel = Command {
+        command_id: "c".into(),
+        kind: Some(Kind::CancelAttempt(mrl_proto::agent::v1::CancelAttempt {
+            attempt: Some(mrl_proto::common::v1::AttemptRef {
+                job_id: "job_t".into(),
+                attempt_id: "att_cred".into(),
+                fencing_epoch: 1,
+            }),
+            request_id: "r".into(),
+            grace_s: 5,
+            reason: "done".into(),
+        })),
+    };
+    attempts.handle(&cancel).await.unwrap();
+    tokio::time::timeout(WAIT, attempts.wait("att_cred"))
+        .await
+        .unwrap();
 }
 
 /// A real agent crash: `mrl-agent attempt run` is SIGKILLed mid-run, its worker keeps running,
 /// and running the command again re-adopts it to a COMPLETED end with every checkpoint.
-async fn crash_and_readopt(test: &str, sandbox: &str) {
+async fn crash_and_readopt(test: &str, sandbox: &str, id: &str) {
     let dir = tempfile::tempdir().unwrap();
     let state = dir.path().join("state");
     let config = dir.path().join("agent.toml");
@@ -697,11 +783,11 @@ async fn crash_and_readopt(test: &str, sandbox: &str) {
     .unwrap();
     let out = dir.path().join("out");
     let mut s = spec(
-        "att_crash",
+        id,
         serde_json::json!({"steps": 12, "checkpoint_every": 2, "step_seconds": 0.5}),
         serde_json::json!({"upload_dir": out}),
     );
-    s.attempt.attempt_id = "att_crash".into();
+    s.attempt.attempt_id = id.into();
     let spec_file = dir.path().join("spec.json");
     std::fs::write(&spec_file, serde_json::to_vec(&s).unwrap()).unwrap();
     let agent = |log: &str| {
@@ -720,7 +806,7 @@ async fn crash_and_readopt(test: &str, sandbox: &str) {
             .spawn()
             .unwrap()
     };
-    let job = state.join("jobs").join("att_crash");
+    let job = state.join("jobs").join(id);
     let mut first = agent("first.log");
     let deadline = std::time::Instant::now() + WAIT;
     loop {
@@ -752,7 +838,7 @@ async fn crash_and_readopt(test: &str, sandbox: &str) {
         .unwrap();
     let log = std::fs::read_to_string(dir.path().join("second.log")).unwrap();
     assert!(status.success(), "{test}: {log}");
-    assert!(log.contains("re-adopted attempt att_crash"), "{log}");
+    assert!(log.contains(&format!("re-adopted attempt {id}")), "{log}");
     assert!(log.contains("Attempt ended: EXIT_KIND_COMPLETED"), "{log}");
     let ckpts = std::fs::read_dir(out.join("checkpoints")).unwrap().count();
     assert_eq!(ckpts, 6, "{test}: every checkpoint was committed");
@@ -762,7 +848,7 @@ async fn crash_and_readopt(test: &str, sandbox: &str) {
 #[ignore = "needs uv; runs in ci-attempts"]
 async fn real_agent_crash_is_readopted() {
     if ready("real_agent_crash_is_readopted") {
-        crash_and_readopt("no sandbox", "none").await;
+        crash_and_readopt("no sandbox", "none", "att_crash_plain").await;
     }
 }
 
@@ -791,5 +877,5 @@ async fn real_agent_crash_is_readopted_under_bubblewrap() {
         );
         return;
     }
-    crash_and_readopt("bubblewrap", "bubblewrap").await;
+    crash_and_readopt("bubblewrap", "bubblewrap", "att_crash_bwrap").await;
 }

@@ -101,7 +101,23 @@ pub struct Envs {
     root: PathBuf,
     cache: Arc<NodeCache>,
     locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    free_space: Arc<FreeSpaceFn>,
 }
+
+/// Free bytes on the disk holding a path (replaceable in tests).
+pub type FreeSpaceFn = dyn Fn(&Path) -> Option<u64> + Send + Sync;
+
+/// Folders never copied into an install snapshot (build output, caches, VCS data).
+const SNAPSHOT_SKIP: [&str; 8] = [
+    ".git",
+    "target",
+    "node_modules",
+    ".venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+];
 
 impl Envs {
     /// Opens `<state>/envs`.
@@ -112,7 +128,46 @@ impl Envs {
             root,
             cache,
             locks: std::sync::Mutex::default(),
+            free_space: Arc::new(disk_free),
         })
+    }
+
+    /// Uses `f` to read free disk space (tests).
+    pub fn with_free_space(mut self, f: Arc<FreeSpaceFn>) -> Self {
+        self.free_space = f;
+        self
+    }
+
+    /// Before an install: evicts unused cache entries and unpinned environments (least
+    /// recently used first) until the disk keeps `min_free_bytes` free and environments plus
+    /// cache fit the cache budget. Fails with MRL-ENV-004 if pinned ones alone don't allow it.
+    fn make_room(&self, installing: &Path) -> Result<(), AttemptError> {
+        self.cache.reserve(0)?;
+        let budget = self.cache.budget();
+        let mut envs: Vec<InstalledEnv> = self
+            .installed()
+            .into_iter()
+            .filter(|e| e.dir != installing)
+            .collect();
+        loop {
+            let free = (self.free_space)(&self.root).unwrap_or(u64::MAX);
+            let used =
+                self.cache.usage().used_bytes + envs.iter().map(|e| dir_size(&e.dir)).sum::<u64>();
+            if free >= budget.min_free_bytes && used <= budget.max_bytes {
+                return Ok(());
+            }
+            let Some(i) = envs.iter().position(|e| e.pinned_by.is_empty()) else {
+                return Err(AgentError::CacheFull {
+                    needed: 0,
+                    pinned: used,
+                    budget: budget.max_bytes,
+                    min_free: budget.min_free_bytes,
+                }
+                .into());
+            };
+            let env = envs.remove(i);
+            remove_env(&env)?;
+        }
     }
 
     /// The folder for a runtime.
@@ -150,7 +205,9 @@ impl Envs {
             RuntimeKind::Process { lock_sha256 } => {
                 self.process(rt, &lock_sha256, &dir, holder, &say).await?
             }
-            RuntimeKind::Container { image } => container(rt, &image, &dir, &say).await?,
+            RuntimeKind::Container { image } => {
+                container(rt, &image, &dir, &say, || self.make_room(&dir)).await?
+            }
         };
         let pin = dir.join(PINS).join(holder);
         std::fs::create_dir_all(dir.join(PINS))
@@ -181,13 +238,15 @@ impl Envs {
         })?;
         let lock_path = project.join("uv.lock");
         say("checking", format!("checking {}", lock_path.display()));
-        let (_, actual) =
-            mrl_storage::sha256_file(&lock_path)
-                .await
-                .map_err(|e| AttemptError::EnvInstall {
-                    runtime_ref: rt.runtime_ref.clone(),
-                    reason: format!("the lock file could not be read ({e})"),
-                })?;
+        let install_err = |reason: String| AttemptError::EnvInstall {
+            runtime_ref: rt.runtime_ref.clone(),
+            reason,
+        };
+        // Read once: these exact bytes are checked, cached and installed from.
+        let lock = tokio::fs::read(&lock_path)
+            .await
+            .map_err(|e| install_err(format!("the lock file could not be read ({e})")))?;
+        let actual = mrl_storage::sha256_hex(&lock);
         if actual != lock_sha256 {
             return Err(AttemptError::LockMismatch {
                 runtime_ref: rt.runtime_ref.clone(),
@@ -197,13 +256,12 @@ impl Envs {
         }
         // The verified lock is kept in the node cache, pinned while the attempt runs.
         if self.cache.get(lock_sha256)?.is_none() {
-            self.cache
-                .reserve(std::fs::metadata(&lock_path).map_or(0, |m| m.len()))?;
+            self.cache.reserve(lock.len() as u64)?;
             let tmp = self
                 .cache
                 .incoming_dir()
                 .join(format!("{lock_sha256}.lock"));
-            tokio::fs::copy(&lock_path, &tmp)
+            tokio::fs::write(&tmp, &lock)
                 .await
                 .map_err(|e| AgentError::state(&tmp, e))?;
             self.cache.insert_file(&tmp, lock_sha256).await?;
@@ -216,23 +274,37 @@ impl Envs {
             let uv = which("uv").ok_or_else(|| {
                 AttemptError::UvMissing("no `uv` program was found on PATH".into())
             })?;
+            let plan = LockPlan::parse(&lock, project).map_err(install_err)?;
+            self.make_room(dir)?;
+            // Install from an agent-owned copy holding the verified lock, never the live
+            // project folder.
+            let snap = self.root.join(format!(".src-{}", rt.dir_name()));
+            let snap_project =
+                snapshot_project(project, &plan.local_dirs, &lock, &snap, &self.root)
+                    .map_err(|e| install_err(format!("the project could not be copied ({e})")))?;
+            plan.check_build_pins(&snap_project, project)
+                .map_err(install_err)?;
             let mut cmd = tokio::process::Command::new(uv);
             cmd.args(["sync", "--frozen", "--no-dev", "--no-editable", "--project"])
-                .arg(project)
+                .arg(&snap_project)
                 .env("UV_PROJECT_ENVIRONMENT", dir)
                 .env_remove("VIRTUAL_ENV");
             if let Some(p) = &rt.package {
                 cmd.args(["--package", p]);
             }
-            run_streaming(cmd, &rt.runtime_ref, "installing", say).await?;
+            // Packages from an index must come as prebuilt wheels: nothing is built from a
+            // source archive with unlocked build tools.
+            for name in &plan.remote {
+                cmd.args(["--no-build-package", name]);
+            }
+            let synced = run_streaming(cmd, &rt.runtime_ref, "installing", say).await;
+            let _ = std::fs::remove_dir_all(&snap);
+            synced?;
             if !program.is_file() {
-                return Err(AttemptError::EnvInstall {
-                    runtime_ref: rt.runtime_ref.clone(),
-                    reason: format!(
-                        "the environment has no worker program at {} (is mrl-runtime a dependency?)",
-                        program.display()
-                    ),
-                });
+                return Err(install_err(format!(
+                    "the environment has no worker program at {} (is mrl-runtime a dependency?)",
+                    program.display()
+                )));
             }
         }
         let mut read_paths = vec![dir.to_path_buf()];
@@ -293,26 +365,195 @@ impl Envs {
     pub fn evict_unused(&self, min_free_bytes: u64) -> Result<Vec<String>, AttemptError> {
         let mut removed = Vec::new();
         for env in self.installed() {
-            if disk_free(&self.root).is_none_or(|f| f >= min_free_bytes) {
+            if (self.free_space)(&self.root).is_none_or(|f| f >= min_free_bytes) {
                 break;
             }
             if !env.pinned_by.is_empty() {
                 continue;
             }
-            if let Some(image) = env.runtime_ref.strip_prefix("oci:") {
-                if let Some(docker) = which("docker") {
-                    let _ = std::process::Command::new(docker)
-                        .args(["image", "rm", image])
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
-                }
-            }
-            std::fs::remove_dir_all(&env.dir).map_err(|e| AgentError::state(&env.dir, e))?;
+            remove_env(&env)?;
             removed.push(env.runtime_ref);
         }
         Ok(removed)
     }
+}
+
+/// Deletes an environment (and its image, in container mode).
+fn remove_env(env: &InstalledEnv) -> Result<(), AttemptError> {
+    if let Some(image) = env.runtime_ref.strip_prefix("oci:") {
+        if let Some(docker) = which("docker") {
+            let _ = std::process::Command::new(docker)
+                .args(["image", "rm", image])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
+    }
+    std::fs::remove_dir_all(&env.dir).map_err(|e| AgentError::state(&env.dir, e))?;
+    Ok(())
+}
+
+/// Bytes used by the files under `dir` (links not followed).
+fn dir_size(dir: &Path) -> u64 {
+    let mut total = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in rd.flatten() {
+            match e.file_type() {
+                Ok(t) if t.is_dir() => stack.push(e.path()),
+                Ok(t) if t.is_file() => total += e.metadata().map_or(0, |m| m.len()),
+                _ => {}
+            }
+        }
+    }
+    total
+}
+
+/// What a `uv.lock` asks for.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct LockPlan {
+    /// Packages from an index or a URL (must be prebuilt wheels).
+    remote: Vec<String>,
+    /// Local packages (workspace members, path sources), as folders.
+    local_dirs: Vec<PathBuf>,
+}
+
+impl LockPlan {
+    /// Reads the packages of a lock file whose project is `project`.
+    fn parse(lock: &[u8], project: &Path) -> Result<Self, String> {
+        let text = std::str::from_utf8(lock).map_err(|_| "the lock file is not text".to_owned())?;
+        let doc: toml::Table =
+            toml::from_str(text).map_err(|e| format!("the lock file can't be read ({e})"))?;
+        let mut plan = Self::default();
+        let packages = doc
+            .get("package")
+            .and_then(|p| p.as_array())
+            .cloned()
+            .unwrap_or_default();
+        for p in packages {
+            let name = p
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or_default()
+                .to_owned();
+            let Some(source) = p.get("source").and_then(|s| s.as_table()) else {
+                continue;
+            };
+            if source.contains_key("git") {
+                return Err(format!(
+                    "{name} comes from a git repository; locked environments need released packages"
+                ));
+            }
+            let local = ["editable", "virtual", "directory", "path"]
+                .iter()
+                .find_map(|k| source.get(*k).and_then(|v| v.as_str()));
+            match local {
+                Some(rel) => {
+                    let p = project.join(rel);
+                    plan.local_dirs.push(if p.is_file() {
+                        p.parent().map_or(p.clone(), Path::to_path_buf)
+                    } else {
+                        p
+                    });
+                }
+                None => plan.remote.push(name),
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Local packages are built here, so their build tools must be pinned exactly (`==`).
+    fn check_build_pins(&self, snap_project: &Path, project: &Path) -> Result<(), String> {
+        for dir in &self.local_dirs {
+            let rel = dir.strip_prefix(project).unwrap_or(dir);
+            let pyproject = snap_project.join(rel).join("pyproject.toml");
+            let Ok(text) = std::fs::read_to_string(&pyproject) else {
+                continue;
+            };
+            let doc: toml::Table = toml::from_str(&text)
+                .map_err(|e| format!("{} can't be read ({e})", pyproject.display()))?;
+            let requires = doc
+                .get("build-system")
+                .and_then(|b| b.get("requires"))
+                .and_then(|r| r.as_array())
+                .cloned()
+                .unwrap_or_default();
+            for r in requires.iter().filter_map(|r| r.as_str()) {
+                if !r.contains("==") {
+                    return Err(format!(
+                        "the build requirement {r:?} in {} is not pinned with ==",
+                        pyproject.display()
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Copies the project and its local packages into `snap` (same relative layout, build output
+/// and caches skipped, nothing under `exclude`), writes the verified `lock` as its `uv.lock`,
+/// and returns the copied project folder.
+fn snapshot_project(
+    project: &Path,
+    local_dirs: &[PathBuf],
+    lock: &[u8],
+    snap: &Path,
+    exclude: &Path,
+) -> std::io::Result<PathBuf> {
+    let project = std::fs::canonicalize(project)?;
+    let exclude = std::fs::canonicalize(exclude).unwrap_or_else(|_| exclude.to_path_buf());
+    let mut dirs = vec![project.clone()];
+    for d in local_dirs {
+        if let Ok(c) = std::fs::canonicalize(d) {
+            dirs.push(c);
+        }
+    }
+    let mut root = project.clone();
+    for d in &dirs {
+        while !d.starts_with(&root) {
+            if !root.pop() {
+                break;
+            }
+        }
+    }
+    let _ = std::fs::remove_dir_all(snap);
+    dirs.sort();
+    let mut copied: Vec<PathBuf> = Vec::new();
+    for d in dirs {
+        if copied.iter().any(|c| d.starts_with(c)) {
+            continue;
+        }
+        let rel = d.strip_prefix(&root).unwrap_or(Path::new(""));
+        copy_tree(&d, &snap.join(rel), &exclude)?;
+        copied.push(d);
+    }
+    let snap_project = snap.join(project.strip_prefix(&root).unwrap_or(Path::new("")));
+    crate::state::atomic_write(&snap_project.join("uv.lock"), lock)?;
+    Ok(snap_project)
+}
+
+fn copy_tree(from: &Path, to: &Path, exclude: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(to)?;
+    for e in std::fs::read_dir(from)? {
+        let e = e?;
+        let src = e.path();
+        let name = e.file_name();
+        let t = e.file_type()?;
+        if t.is_dir() {
+            // The state folder may live inside the project: never copy it into itself.
+            if SNAPSHOT_SKIP.iter().any(|s| name == *s) || src.starts_with(exclude) {
+                continue;
+            }
+            copy_tree(&src, &to.join(&name), exclude)?;
+        } else if t.is_file() {
+            std::fs::copy(&src, to.join(&name))?;
+        }
+    }
+    Ok(())
 }
 
 async fn container(
@@ -320,6 +561,7 @@ async fn container(
     image: &str,
     dir: &Path,
     say: &(dyn Fn(&'static str, String) + Send + Sync),
+    make_room: impl FnOnce() -> Result<(), AttemptError>,
 ) -> Result<Materialized, AttemptError> {
     let docker = which("docker").ok_or_else(|| {
         AttemptError::DockerMissing("no `docker` program was found on PATH".into())
@@ -342,6 +584,7 @@ async fn container(
     };
     let hit = has_digest(&docker);
     if !hit {
+        make_room()?;
         let mut cmd = tokio::process::Command::new(&docker);
         cmd.args(["pull", image]);
         run_streaming(cmd, &rt.runtime_ref, "installing", say).await?;
@@ -533,6 +776,118 @@ mod tests {
             std::slice::from_ref(&rt.runtime_ref)
         );
         assert!(!d.exists());
+    }
+
+    #[test]
+    fn lock_plan_and_snapshot_use_the_verified_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = dir.path().join("repo");
+        let project = repo.join("adapters").join("a");
+        let runtime = repo.join("runtime");
+        for d in [
+            project.clone(),
+            runtime.join("src"),
+            project.join(".venv"),
+            project.join("target"),
+        ] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[build-system]\nrequires = [\"uv_build==0.11.28\"]\n",
+        )
+        .unwrap();
+        std::fs::write(
+            runtime.join("pyproject.toml"),
+            "[build-system]\nrequires = [\"uv_build>=0.11\"]\n",
+        )
+        .unwrap();
+        std::fs::write(runtime.join("src").join("m.py"), "x = 1\n").unwrap();
+        std::fs::write(project.join("uv.lock"), "changed after the check").unwrap();
+        let lock = br#"version = 1
+[[package]]
+name = "a"
+source = { editable = "." }
+[[package]]
+name = "runtime"
+source = { editable = "../../runtime" }
+[[package]]
+name = "torch"
+source = { registry = "https://pypi.org/simple" }
+"#;
+        let plan = LockPlan::parse(lock, &project).unwrap();
+        assert_eq!(plan.remote, ["torch"]);
+        assert_eq!(plan.local_dirs.len(), 2);
+        let snap = dir.path().join("snap");
+        let sp = snapshot_project(
+            &project,
+            &plan.local_dirs,
+            lock,
+            &snap,
+            &dir.path().join("state"),
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(sp.join("uv.lock")).unwrap(),
+            lock,
+            "the verified bytes"
+        );
+        assert!(
+            snap.join("runtime").join("src").join("m.py").is_file(),
+            "layout kept"
+        );
+        assert!(!sp.join(".venv").exists() && !sp.join("target").exists());
+        // The runtime's build tool is a range, not a pin.
+        let e = plan.check_build_pins(&sp, &project).unwrap_err();
+        assert!(e.contains("uv_build>=0.11"), "{e}");
+        let git = b"[[package]]\nname = \"g\"\nsource = { git = \"https://x\" }\n";
+        assert!(LockPlan::parse(git, &project).is_err());
+    }
+
+    #[tokio::test]
+    async fn a_low_disk_evicts_unused_environments_then_refuses() {
+        if which("uv").is_none() {
+            return; // the uv check comes before the space check
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cache = NodeCache::open(
+            dir.path().join("cache"),
+            CacheBudget {
+                max_bytes: 1 << 30,
+                min_free_bytes: 1 << 20,
+            },
+        )
+        .unwrap();
+        let e = Envs::open(dir.path(), Arc::new(cache))
+            .unwrap()
+            .with_free_space(Arc::new(|_| Some(0)));
+        let mk = |n: &str, pinned: bool| {
+            let rt = RuntimeSpec {
+                runtime_ref: format!("uv:sha256:{}", n.repeat(64)),
+                project: None,
+                package: None,
+            };
+            let d = e.dir_for(&rt);
+            std::fs::create_dir_all(d.join(PINS)).unwrap();
+            write_marker(&d, &rt).unwrap();
+            if pinned {
+                std::fs::write(d.join(PINS).join("att_live"), b"").unwrap();
+            }
+            d
+        };
+        let (old, kept) = (mk("2", false), mk("3", true));
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("uv.lock"), b"version = 1\n").unwrap();
+        let rt = RuntimeSpec {
+            runtime_ref: format!("uv:sha256:{}", mrl_storage::sha256_hex(b"version = 1\n")),
+            project: Some(project),
+            package: None,
+        };
+        let err = e.materialize(&rt, "att_new", &|_| {}).await.unwrap_err();
+        assert_eq!(err.code(), "MRL-ENV-004", "{}", err.explain());
+        assert!(!old.exists(), "the unpinned environment was evicted first");
+        assert!(kept.exists(), "a pinned one never is");
     }
 
     #[test]

@@ -122,7 +122,7 @@ impl Attempts {
         progress: Option<Arc<ProgressFn>>,
     ) -> Result<Arc<Self>, AttemptError> {
         let envs = Arc::new(Envs::open(ctx.state.root(), Arc::clone(&ctx.cache))?);
-        Ok(Arc::new(Self {
+        let me = Self {
             shared: Arc::new(Shared {
                 ctx,
                 envs,
@@ -135,7 +135,16 @@ impl Attempts {
             credentials: Mutex::default(),
             epochs: Mutex::default(),
             draining: AtomicBool::new(false),
-        }))
+        };
+        // Every job's highest epoch is known before the first launch is accepted.
+        if let Ok(rd) = std::fs::read_dir(me.shared.ctx.state.root().join("jobs")) {
+            for dir in rd.flatten() {
+                if let Ok(Some(rec)) = AttemptRecord::load(&dir.path()) {
+                    me.note_epoch(&rec);
+                }
+            }
+        }
+        Ok(Arc::new(me))
     }
 
     /// The environments folder.
@@ -169,6 +178,7 @@ impl Attempts {
             return Err(AttemptError::state(&id, "already exists on this machine"));
         }
         let secrets = self.secrets_for(&spec)?;
+        let rec_lease_s = spec.lease_s;
         let rec = AttemptRecord {
             socket: runner::socket_path(self.shared.ctx.state.root(), &id),
             nonce: runner::new_nonce()?,
@@ -182,12 +192,15 @@ impl Attempts {
             cancel_requested: false,
             exit: None,
             staged_paths: BTreeMap::new(),
-            lease_deadline_unix_ms: None,
+            // Fixed now: staging and environment installs count against the lease.
+            lease_deadline_unix_ms: (rec_lease_s > 0)
+                .then(|| runner::now_ms() + i64::from(rec_lease_s) * 1000),
+            stop_deadline_unix_ms: None,
             exit_report: None,
             requests: Vec::new(),
             uploads: BTreeMap::new(),
         };
-        std::fs::create_dir_all(&job_dir).map_err(|e| crate::AgentError::state(&job_dir, e))?;
+        record::private_dir(&job_dir).map_err(|e| crate::AgentError::state(&job_dir, e))?;
         rec.save(&job_dir)?;
         let runner = Runner::new(Arc::clone(&self.shared), rec.clone(), secrets);
         self.spawn(&rec, false, runner);
@@ -218,9 +231,17 @@ impl Attempts {
         });
     }
 
-    fn secrets_for(&self, spec: &AttemptSpec) -> Result<Vec<(String, Secret)>, AttemptError> {
+    /// The worker's secret environment: the spec's grants, plus every credential the core sent
+    /// for this attempt with `UpdateCredentials` (as `MRL_CREDENTIAL_<NAME>`).
+    pub fn secrets_for(&self, spec: &AttemptSpec) -> Result<Vec<(String, Secret)>, AttemptError> {
         let creds = lock(&self.credentials);
         let given = creds.get(&spec.attempt.attempt_id);
+        let granted: Vec<String> = spec.secrets.iter().map(|g| g.name.clone()).collect();
+        let sent = given
+            .into_iter()
+            .flatten()
+            .filter(|(name, _)| !granted.contains(name))
+            .map(|(name, v)| Ok((spec::credential_env(name), v.clone())));
         spec.secrets
             .iter()
             .map(|g| {
@@ -234,6 +255,7 @@ impl Attempts {
                     })?;
                 Ok((env, value))
             })
+            .chain(sent)
             .collect()
     }
 
@@ -318,8 +340,17 @@ impl Attempts {
         }
     }
 
-    /// After an agent restart: re-attaches to attempts whose workers still run and reports the
-    /// others lost. Returns the status of each (for the reconcile report).
+    /// Remembers the highest fencing epoch seen for the record's job.
+    fn note_epoch(&self, rec: &AttemptRecord) {
+        lock(&self.epochs)
+            .entry(rec.spec.attempt.job_id.clone())
+            .and_modify(|e| *e = (*e).max(rec.spec.attempt.fencing_epoch))
+            .or_insert(rec.spec.attempt.fencing_epoch);
+    }
+
+    /// After an agent restart: re-attaches to attempts whose workers still run, reports the
+    /// others lost, and reports attempts that ended earlier with their saved outcome. Returns
+    /// the status of each (for the reconcile report).
     pub async fn readopt(self: &Arc<Self>) -> Vec<AttemptStatus> {
         let jobs = self.shared.ctx.state.root().join("jobs");
         let Ok(rd) = std::fs::read_dir(&jobs) else {
@@ -331,13 +362,15 @@ impl Attempts {
                 continue;
             };
             let id = rec.spec.attempt.attempt_id.clone();
-            if rec.exit.is_some() || lock(&self.live).contains_key(&id) {
+            self.note_epoch(&rec);
+            if lock(&self.live).contains_key(&id) {
                 continue;
             }
-            lock(&self.epochs)
-                .entry(rec.spec.attempt.job_id.clone())
-                .and_modify(|e| *e = (*e).max(rec.spec.attempt.fencing_epoch))
-                .or_insert(rec.spec.attempt.fencing_epoch);
+            if let Some(d) = rec.exit.clone() {
+                // Ended before the restart: reported again, in case its status never got out.
+                out.push(status_of(&rec, Some(&d)));
+                continue;
+            }
             let primary_alive = rec
                 .workers
                 .iter()
