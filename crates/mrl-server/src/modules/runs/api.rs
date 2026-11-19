@@ -539,6 +539,27 @@ pub async fn submit(
     let resolved_sha256 =
         Sha256::digest(serde_json::to_vec(&resolved).unwrap_or_default()).to_vec();
 
+    // The parent's project never changes, so it is authorized before the write transaction
+    // (the authorizer may need a pool connection). A parent the submitter can't read
+    // answers exactly like a missing one.
+    if let Some(parent) = sub.parent_run_id {
+        let parent_project: Option<Uuid> =
+            sqlx::query_scalar("SELECT project_id FROM runs WHERE id = $1 AND org_id = $2")
+                .bind(parent.as_uuid())
+                .bind(org)
+                .fetch_optional(db.pool())
+                .await?;
+        let readable = match parent_project {
+            Some(p) => {
+                let res = resource("run", Some(parent.to_string()), org, p);
+                scope::allowed(&state, &ctx, "runs.read", &res).await?
+            }
+            None => false,
+        };
+        if !readable {
+            return Err(JobsError::not_found("parent run"));
+        }
+    }
     let mut tx = db.begin().await?;
     let experiment = match sub.experiment_id {
         Some(e) => sqlx::query_scalar::<_, Uuid>(
@@ -553,23 +574,13 @@ pub async fn submit(
         None => get_or_create(&mut tx, org, project, DEFAULT_EXPERIMENT, &who).await?,
     };
     if let Some(parent) = sub.parent_run_id {
-        // A parent the submitter can't read answers exactly like a missing one.
-        let parent_project: Option<Uuid> =
-            sqlx::query_scalar("SELECT project_id FROM runs WHERE id = $1 AND org_id = $2")
+        let found: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM runs WHERE id = $1 AND org_id = $2")
                 .bind(parent.as_uuid())
                 .bind(org)
                 .fetch_optional(&mut *tx)
                 .await?;
-        let readable = match parent_project {
-            Some(p) => {
-                let res = scope::resource("run", Some(parent.to_string()), org, p);
-                scope::allowed(&state, &ctx, "runs.read", &res).await?
-            }
-            None => false,
-        };
-        if !readable {
-            return Err(JobsError::not_found("parent run"));
-        }
+        found.ok_or_else(|| JobsError::not_found("parent run"))?;
     }
     let run_id = Uuid::now_v7();
     let inserted = sqlx::query(
@@ -671,6 +682,7 @@ pub async fn submit(
     scope::audit(
         &state,
         &ctx,
+        project,
         "runs.submit",
         RunId::from_uuid(run_id).to_string(),
     )

@@ -196,18 +196,19 @@ pub async fn cancel(
     ctx: &RequestContext,
     id: &str,
 ) -> Result<JobRow, JobsError> {
-    let org = scope::tenant(ctx)?;
-    let id: JobId = scope::parse_id(id, "job")?;
+    // Authorize on the job's fixed identity (org, project, creator) before the write
+    // transaction, so the authorizer never waits for a pool connection a lock holds.
+    let seen = read_job(state, db, ctx, id).await?;
+    let job = JobId::from_uuid(seen.id).to_string();
+    let res = resource("job", Some(job.clone()), seen.org_id, seen.project_id);
+    scope::authorize_cancel(state, ctx, &res, &seen.created_by).await?;
     let mut tx = db.begin().await?;
-    let row = JobTransitions::lock(&mut tx, org, id.as_uuid())
+    let row = JobTransitions::lock(&mut tx, seen.org_id, seen.id)
         .await?
         .ok_or_else(|| JobsError::not_found("job"))?;
-    let res = resource("job", Some(id.to_string()), row.org_id, row.project_id);
-    scope::authorize(state, ctx, "runs.read", &res).await?;
-    scope::authorize_cancel(state, ctx, &res, &row.created_by).await?;
     let row = JobTransitions::request_cancel(&mut tx, &row, &ctx.principal.id).await?;
     tx.commit().await?;
-    scope::audit(state, ctx, "runs.cancel", id.to_string()).await;
+    scope::audit(state, ctx, row.project_id, "runs.cancel", job).await;
     Ok(row)
 }
 
@@ -237,15 +238,16 @@ pub async fn patch(
         )])
         .into());
     }
-    let org = scope::tenant(&ctx)?;
-    let id: JobId = scope::parse_id(&job, "job")?;
+    // Authorize before the write transaction (see `cancel`).
+    let seen = read_job(&state, &db, &ctx, &job).await?;
+    let job = JobId::from_uuid(seen.id).to_string();
+    let res = resource("job", Some(job.clone()), seen.org_id, seen.project_id);
+    scope::authorize(&state, &ctx, "runs.cancel_any", &res).await?;
+    let org = seen.org_id;
     let mut tx = db.begin().await?;
-    let row = JobTransitions::lock(&mut tx, org, id.as_uuid())
+    let row = JobTransitions::lock(&mut tx, org, seen.id)
         .await?
         .ok_or_else(|| JobsError::not_found("job"))?;
-    let res = resource("job", Some(id.to_string()), row.org_id, row.project_id);
-    scope::authorize(&state, &ctx, "runs.read", &res).await?;
-    scope::authorize(&state, &ctx, "runs.cancel_any", &res).await?;
     etag::check_if_match(&headers, &etag::from_version(row.version), false)?;
     if JobMachine::is_terminal(row.job_state()?) {
         return Err(JobsError::illegal(format!(
@@ -266,6 +268,6 @@ pub async fn patch(
     .await?
     .ok_or_else(|| JobsError::changed("job"))?;
     tx.commit().await?;
-    scope::audit(&state, &ctx, "jobs.set_priority", id.to_string()).await;
+    scope::audit(&state, &ctx, next.project_id, "jobs.set_priority", job).await;
     Ok(with_etag(next.version, next.view()))
 }

@@ -79,14 +79,20 @@ pub async fn authorize_cancel(
     authorize(state, ctx, "runs.cancel_any", res).await
 }
 
-/// Records a successful action. The change is already committed, so a failing sink is
-/// logged instead of failing the request.
-pub async fn audit(state: &AppState, ctx: &RequestContext, action: &str, target: String) {
+/// Records a successful action on something in `project`. The change is already
+/// committed, so a failing sink is logged instead of failing the request.
+pub async fn audit(
+    state: &AppState,
+    ctx: &RequestContext,
+    project: Uuid,
+    action: &str,
+    target: String,
+) {
     let event = AuditEvent {
         at: state.seams.clock.now(),
         actor: ctx.principal.id.clone(),
         org: ctx.org.clone(),
-        project: ctx.project.clone(),
+        project: Some(ProjectId::from_uuid(project).to_string()),
         action: action.to_owned(),
         target,
         outcome: AuditOutcome::Success,

@@ -188,6 +188,28 @@ fn http_client() -> reqwest::Result<reqwest::blocking::Client> {
         .build()
 }
 
+/// Every item of the cursor-paged list `list` (`{items, next_cursor}`), following
+/// `next_cursor` to the end. A server that repeats a cursor is an error, not a loop.
+pub fn all_items(
+    mut get: impl FnMut(&str) -> Result<Value, String>,
+    list: &str,
+) -> Result<Vec<Value>, String> {
+    let mut items = Vec::new();
+    let mut path = list.to_owned();
+    let mut cursors = std::collections::HashSet::new();
+    loop {
+        let page = get(&path)?;
+        items.extend(page["items"].as_array().cloned().unwrap_or_default());
+        match page["next_cursor"].as_str() {
+            None => return Ok(items),
+            Some(c) if !cursors.insert(c.to_owned()) => {
+                return Err(format!("{list} sent the same page cursor twice; stopped"));
+            }
+            Some(c) => path = format!("{list}?cursor={}", crate::commands::encode(c)),
+        }
+    }
+}
+
 /// A problem document (or any error answer) as plain text.
 pub fn problem(status: u16, json: &Value) -> String {
     let Some(code) = json["code"].as_str() else {

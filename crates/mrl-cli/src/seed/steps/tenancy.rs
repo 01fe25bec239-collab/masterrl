@@ -4,10 +4,8 @@
 //! `/workspaces/{ws}/projects`), paging through every `next_cursor` before creating.
 
 use super::super::{SeedState, SeedStep};
-use crate::api::{Api, Failure};
-use crate::commands::encode;
+use crate::api::{all_items, Api, Failure};
 use serde_json::{json, Value};
-use std::collections::HashSet;
 
 /// Slug and name of the seeded org.
 pub const ORG: &str = "dev";
@@ -16,37 +14,17 @@ pub const WORKSPACE: &str = "default";
 /// Slug and name of the seeded project.
 pub const PROJECT: &str = "demo";
 
-/// The item with `slug` in a `{items: [...]}` page, if any.
-fn find(page: &Value, slug: &str) -> Option<String> {
-    page["items"]
-        .as_array()?
-        .iter()
-        .find(|i| i["slug"] == slug)
-        .and_then(|i| i["id"].as_str())
-        .map(str::to_owned)
-}
-
-/// Looks for `slug` on every page of `list`, following `next_cursor` to the end.
+/// The id of the item with `slug` on any page of `list`.
 pub fn find_on_any_page(
-    mut get: impl FnMut(&str) -> Result<Value, String>,
+    get: impl FnMut(&str) -> Result<Value, String>,
     list: &str,
     slug: &str,
 ) -> Result<Option<String>, String> {
-    let mut path = list.to_owned();
-    let mut cursors = HashSet::new();
-    loop {
-        let page = get(&path)?;
-        if let Some(id) = find(&page, slug) {
-            return Ok(Some(id));
-        }
-        match page["next_cursor"].as_str() {
-            None => return Ok(None),
-            Some(c) if !cursors.insert(c.to_owned()) => {
-                return Err(format!("{list} sent the same page cursor twice; stopped"));
-            }
-            Some(c) => path = format!("{list}?cursor={}", encode(c)),
-        }
-    }
+    Ok(all_items(get, list)?
+        .iter()
+        .find(|i| i["slug"] == slug)
+        .and_then(|i| i["id"].as_str())
+        .map(str::to_owned))
 }
 
 /// Returns `(id, created)` for `slug` under `list`: lists every page first and creates
@@ -169,9 +147,14 @@ mod tests {
     #[test]
     fn find_matches_by_slug() {
         let page = json!({"items": [{"id": "org_1", "slug": "dev"}, {"id": "org_2", "slug": "x"}]});
-        assert_eq!(find(&page, "dev").as_deref(), Some("org_1"));
-        assert_eq!(find(&page, "nope"), None);
-        assert_eq!(find(&json!({}), "dev"), None);
+        let one = |_: &str| Ok(page.clone());
+        assert_eq!(
+            find_on_any_page(one, "/orgs", "dev").unwrap().as_deref(),
+            Some("org_1")
+        );
+        assert_eq!(find_on_any_page(one, "/orgs", "nope").unwrap(), None);
+        let empty = |_: &str| Ok(json!({}));
+        assert_eq!(find_on_any_page(empty, "/orgs", "dev").unwrap(), None);
         assert!(line("org", "dev", "org_1", true).starts_with("created"));
     }
 

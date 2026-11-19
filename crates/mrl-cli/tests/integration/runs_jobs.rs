@@ -45,15 +45,9 @@ async fn env(accepting: bool) -> Env {
         Chains::registered(db.db())
     };
     let org = OrgId::new();
-    let rules = Arc::<Mutex<AuthRules>>::default();
-    let srv = runs_server_with_rules(
-        &db,
-        chains,
-        &users(org, OrgId::new()),
-        vec![],
-        rules.clone(),
-    )
-    .await;
+    let harness = Harness::default();
+    let rules = harness.rules.clone();
+    let srv = runs_server_with(db.db(), chains, &users(org, OrgId::new()), vec![], &harness).await;
     Env {
         db,
         srv,
@@ -1309,4 +1303,102 @@ async fn hidden_parents_and_jobs_stay_hidden() {
     assert_eq!(res.status, 503, "{}", res.text());
     let res = e2.submit("res", "c5", &body).await;
     assert_eq!(res.status, 503, "{}", res.text());
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn one_connection_is_enough_and_audits_name_the_project() {
+    let db = TestDb::new().await;
+    let org = OrgId::new();
+    let project = ProjectId::new();
+    // One pool connection, shared by the runs module and an authorizer that reads the
+    // database (like P16's): authorizing while a write transaction holds it would time out.
+    let small = db.replica_with(&mrl_server::config::DatabaseConfig {
+        max_connections: 1,
+        acquire_timeout_seconds: 3,
+        ..mrl_testkit::pg::test_config()
+    });
+    let harness = Harness::default();
+    harness.rules.lock().unwrap().pool = Some(small.clone());
+    let srv = runs_server_with(
+        &small,
+        accepting_chains(),
+        &users(org, OrgId::new()),
+        vec![],
+        &harness,
+    )
+    .await;
+    let runs = format!("/api/v1/projects/{project}/runs");
+    let post = |token: &'static str, path: String, key: Option<&'static str>, body: Value| {
+        let srv = &srv;
+        async move {
+            let body = (!body.is_null()).then_some(body);
+            call(srv, Method::POST, &path, token, key, body.as_ref()).await
+        }
+    };
+    let parent = post("res", runs.clone(), Some("a"), submission("parent")).await;
+    assert_eq!(parent.status, 201, "{}", parent.text());
+    let parent = parent.json();
+    let mut child = submission("child");
+    child["parent_run_id"] = parent["id"].clone();
+    let child = post("res", runs.clone(), Some("b"), child).await;
+    assert_eq!(child.status, 201, "{}", child.text());
+    let child = child.json();
+    let third = post("res", runs.clone(), Some("c"), submission("third"))
+        .await
+        .json();
+
+    let job = parent["job_id"].as_str().unwrap();
+    let res = post(
+        "res",
+        format!("/api/v1/jobs/{job}:cancel"),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.text());
+    let run = child["id"].as_str().unwrap();
+    let res = post(
+        "res",
+        format!("/api/v1/runs/{run}:cancel"),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.text());
+    let job = third["job_id"].as_str().unwrap();
+    let res = call(
+        &srv,
+        Method::PATCH,
+        &format!("/api/v1/jobs/{job}"),
+        "maint",
+        None,
+        Some(&json!({"priority": 5})),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.text());
+    let exps = format!("/api/v1/projects/{project}/experiments");
+    let res = post("res", exps, None, json!({"name": "sweep"})).await;
+    assert_eq!(res.status, 201, "{}", res.text());
+
+    let events = harness.audit.events();
+    let got: Vec<(&str, Option<&str>)> = events
+        .iter()
+        .map(|e| (e.action.as_str(), e.project.as_deref()))
+        .collect();
+    let p = project.to_string();
+    let p = Some(p.as_str());
+    assert_eq!(
+        got,
+        [
+            ("runs.submit", p),
+            ("runs.submit", p),
+            ("runs.submit", p),
+            ("runs.cancel", p),
+            ("runs.cancel", p),
+            ("jobs.set_priority", p),
+            ("experiments.create", p),
+        ]
+    );
+    srv.shutdown().await.unwrap();
 }

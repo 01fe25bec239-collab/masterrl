@@ -16,7 +16,7 @@ use mrl_server::modules::jobs::{
 };
 use mrl_server::modules::runs::RunsModule;
 use mrl_server::seams::{Authorizer, Decision, Principal, RequestContext, Resource, SeamError};
-use mrl_server::{AppState, ServerModule};
+use mrl_server::{AppState, Db, ServerModule};
 use mrl_testkit::pg::TestDb;
 use mrl_testkit::seams as ts;
 use mrl_testkit::server::{TestResponse, TestServer};
@@ -46,12 +46,14 @@ pub fn test_user(token: &str, id: &str, org: OrgId, role: Role) -> TestUser {
 }
 
 /// Changes a test can make to [`RoleAuthorizer`] while the server runs.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub struct AuthRules {
     /// `(principal id, project id)` pairs the authorizer hides (404).
     pub hidden: HashSet<(String, String)>,
     /// The authorizer's backend is down: every call fails.
     pub down: bool,
+    /// Like P16's authorizer, read the database on this pool for every decision.
+    pub pool: Option<Db>,
 }
 
 /// Authorizes like RBAC: other orgs are hidden (404); inside the org the role table
@@ -81,7 +83,7 @@ impl Authorizer for RoleAuthorizer {
         action: &str,
         resource: &Resource,
     ) -> Result<Decision, SeamError> {
-        {
+        let pool = {
             let rules = self.rules.lock().unwrap();
             if rules.down {
                 return Err(SeamError::new("authorizer", "the test backend is down"));
@@ -94,6 +96,13 @@ impl Authorizer for RoleAuthorizer {
                     return Ok(Decision::Hide);
                 }
             }
+            rules.pool.clone()
+        };
+        if let Some(db) = pool {
+            sqlx::query("SELECT 1")
+                .execute(db.pool())
+                .await
+                .map_err(|e| SeamError::new("authorizer", e.to_string()))?;
         }
         if resource.org.is_some() && resource.org != ctx.principal.org {
             return Ok(Decision::Hide);
@@ -134,25 +143,37 @@ pub async fn runs_server(
     users: &[TestUser],
     extra: Vec<Box<dyn ServerModule>>,
 ) -> TestServer {
-    runs_server_with_rules(db, chains, users, extra, Arc::default()).await
+    runs_server_with(db.db(), chains, users, extra, &Harness::default()).await
 }
 
-/// [`runs_server`] whose authorizer follows `rules`.
-pub async fn runs_server_with_rules(
-    db: &TestDb,
+/// What a test can watch or change on a [`runs_server_with`] server.
+#[derive(Clone, Default)]
+pub struct Harness {
+    /// The authorizer's rules.
+    pub rules: Arc<Mutex<AuthRules>>,
+    /// Every audit event the server records.
+    pub audit: Arc<ts::RecordingAuditSink>,
+}
+
+/// [`runs_server`] with the runs module on `db` (any pool) and this `harness`.
+pub async fn runs_server_with(
+    db: &Db,
     chains: Chains,
     users: &[TestUser],
     extra: Vec<Box<dyn ServerModule>>,
-    rules: Arc<Mutex<AuthRules>>,
+    harness: &Harness,
 ) -> TestServer {
     let tokens: Vec<(&str, Principal)> = users
         .iter()
         .map(|u| (u.token.as_str(), u.principal.clone()))
         .collect();
-    let seams = ts::team(&tokens).authorizer(RoleAuthorizer::new(users, rules));
+    let authz = RoleAuthorizer::new(users, harness.rules.clone());
+    let seams = ts::team(&tokens)
+        .authorizer(authz)
+        .audit_arc(harness.audit.clone());
     let seams = ts::build(seams, Mode::Team);
     let mut modules: Vec<Box<dyn ServerModule>> =
-        vec![Box::new(RunsModule::with_chains(db.db().clone(), chains))];
+        vec![Box::new(RunsModule::with_chains(db.clone(), chains))];
     modules.extend(extra);
     match TestServer::start(team_config(), seams, modules).await {
         Ok(s) => s,
@@ -267,7 +288,7 @@ impl ServerModule for TenancyDouble {
             Json(json!({ "user": { "id": ctx.principal.id }, "principal_kind": "user" }))
         };
         let t = || self.clone();
-        let (t1, t2, t3, t4, t5, t6, t7) = (t(), t(), t(), t(), t(), t(), t());
+        let (t1, t2, t3, t4, t5, t6) = (t(), t(), t(), t(), t(), t());
         Router::new()
             .route("/auth/me", get(me))
             .route(
@@ -305,16 +326,6 @@ impl ServerModule for TenancyDouble {
                 .post(move |Path(ws): Path<String>, Json(b): Json<Value>| async move {
                     let item = json!({"id": ProjectId::new().to_string(), "workspace_id": ws, "slug": b["slug"], "name": b["name"]});
                     create(&mut t6.lock().projects, item, "workspace_id")
-                }),
-            )
-            .route(
-                "/projects/{prj}",
-                get(move |Path(prj): Path<String>| async move {
-                    let t = t7.lock();
-                    match t.projects.iter().find(|p| p["id"] == prj.as_str()) {
-                        Some(p) => Ok(Json(p.clone())),
-                        None => Err(StatusCode::NOT_FOUND),
-                    }
                 }),
             )
     }

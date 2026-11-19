@@ -242,7 +242,7 @@ pub async fn create(
     .map_err(JobsError::from)
     .map_err(name_taken)?;
     let id = ExperimentId::from_uuid(row.id).to_string();
-    scope::audit(&state, &ctx, "experiments.create", id.clone()).await;
+    scope::audit(&state, &ctx, project, "experiments.create", id.clone()).await;
     let location = format!("/api/v1/experiments/{id}");
     Ok((
         StatusCode::CREATED,
@@ -371,6 +371,6 @@ pub async fn patch(
     .map_err(JobsError::from)
     .map_err(name_taken)?
     .ok_or_else(|| JobsError::changed("experiment"))?;
-    scope::audit(&state, &ctx, "experiments.update", exp).await;
+    scope::audit(&state, &ctx, next.project_id, "experiments.update", exp).await;
     Ok(with_etag(next.version, next.view()))
 }
