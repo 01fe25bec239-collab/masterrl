@@ -156,9 +156,13 @@ impl Attempts {
 
     /// Starts an attempt. Returns once it is accepted; it runs in the background.
     pub fn launch(self: &Arc<Self>, spec: AttemptSpec) -> Result<(), AttemptError> {
-        // One launch at a time: the "already exists" check and the saved record that claims
-        // the id happen together.
         let _one_launch = lock(&self.launching);
+        self.launch_locked(spec)
+    }
+
+    /// [`Self::launch`] with `launching` held: one launch (or stage) at a time, so the
+    /// "already exists" check and the saved record that claims the id happen together.
+    fn launch_locked(self: &Arc<Self>, spec: AttemptSpec) -> Result<(), AttemptError> {
         spec.validate()?;
         let id = spec.attempt.attempt_id.clone();
         if self.draining.load(Ordering::SeqCst) {
@@ -378,6 +382,27 @@ impl Attempts {
                 out.push(status_of(&rec, Some(&d)));
                 continue;
             }
+            // A container is adopted only when it carries this launch's token, and from then on
+            // by its id; one that is gone or took over the name is dropped from the record, so
+            // nothing here ever stops it.
+            let token = runner::attempt_token(&rec.nonce);
+            let mut checked = Vec::with_capacity(rec.workers.len());
+            for mut w in std::mem::take(&mut rec.workers) {
+                if matches!(w.identity, record::ProcIdentity::Container { .. }) {
+                    let (i, t) = (w.identity.clone(), token.clone());
+                    match tokio::task::spawn_blocking(move || i.verified(&t))
+                        .await
+                        .ok()
+                        .flatten()
+                    {
+                        Some(v) => w.identity = v,
+                        None => continue,
+                    }
+                }
+                checked.push(w);
+            }
+            rec.workers = checked;
+            let _ = rec.save(&dir);
             let primary_alive = rec
                 .workers
                 .iter()
@@ -460,9 +485,11 @@ impl Attempts {
                     .map(|a| a.attempt_id.clone())
                     .unwrap_or_default();
                 // Staged inputs stay until the launch is accepted, so a retry still has them.
+                // Staging waits on the same lock, so every accepted stage is in the spec.
+                let _one_launch = lock(&self.launching);
                 let staged = lock(&self.staged).get(&id).cloned().unwrap_or_default();
                 let launched = AttemptSpec::from_launch(l, &staged, self.shared.ctx.state.root())
-                    .and_then(|spec| self.launch(spec));
+                    .and_then(|spec| self.launch_locked(spec));
                 if launched.is_ok() {
                     lock(&self.staged).remove(&id);
                 }
@@ -474,7 +501,15 @@ impl Attempts {
                     .as_ref()
                     .map(|a| a.attempt_id.clone())
                     .unwrap_or_default();
-                if lock(&self.live).contains_key(&id) {
+                // Under the launch lock: a stage either lands before a launch copies the list,
+                // or sees the launch's record and is refused.
+                let _one_launch = lock(&self.launching);
+                let launched = lock(&self.live).contains_key(&id)
+                    || AttemptRecord::load(&self.shared.ctx.state.job_dir(&id))
+                        .ok()
+                        .flatten()
+                        .is_some();
+                if launched {
                     Err(AttemptError::state(
                         &id,
                         "is already launched; stage its inputs before the launch",

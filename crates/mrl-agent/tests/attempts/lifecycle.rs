@@ -776,7 +776,8 @@ async fn crash_and_readopt(test: &str, sandbox: &str, id: &str) {
     std::fs::write(
         &config,
         format!(
-            "state_dir = {:?}\n[sandbox]\nbackend = {sandbox:?}\n",
+            // No disk floor: this test is about re-adoption, not the space check.
+            "state_dir = {:?}\n[cache]\nmin_free_bytes = 0\n[sandbox]\nbackend = {sandbox:?}\n",
             state.display().to_string()
         ),
     )
@@ -1000,7 +1001,10 @@ async fn an_old_record_never_removes_a_newer_container() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = ctx(dir.path(), None);
     let envs = mrl_agent::envs::Envs::open(ctx.state.root(), Arc::clone(&ctx.cache)).unwrap();
-    let identity = ProcIdentity::Container { name: name.clone() };
+    let identity = ProcIdentity::Container {
+        name: name.clone(),
+        id: None,
+    };
     let old = old_record(dir.path(), "att_c1", "old-launch", identity.clone(), None);
     let report = mrl_agent::janitor::release(&ctx, &envs, &old, &Default::default()).await;
     assert!(
@@ -1016,6 +1020,87 @@ async fn an_old_record_never_removes_a_newer_container() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(!identity.alive(), "its own launch removes it");
+}
+
+/// After an agent restart, an expired lease on an old record never stops the newer launch's
+/// container that took over the name; the old attempt is reported lost. The container's own
+/// launch, re-adopted with the same expired lease, is bound to its id and stopped.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; runs in ci-attempts"]
+async fn a_restart_never_adopts_a_newer_container() {
+    use mrl_agent::attempts::runner::{attempt_token, now_ms, TOKEN_ENV};
+    if !docker_ready("a_restart_never_adopts_a_newer_container") {
+        return;
+    }
+    let docker = mrl_agent::envs::which("docker").unwrap();
+    let name = format!("mrl-test-r{}", std::process::id());
+    let run = std::process::Command::new(&docker)
+        .args(["run", "-d", "--rm", "--name", &name, "-e"])
+        .arg(format!("{TOKEN_ENV}={}", attempt_token("new-launch")))
+        .args(["busybox:1.36", "sleep", "300"])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(run.success());
+    let identity = ProcIdentity::Container {
+        name: name.clone(),
+        id: None,
+    };
+    let save = |ctx: &AgentContext, id: &str, nonce: &str| {
+        let root = ctx.state.root();
+        let mut rec = old_record(root, id, nonce, identity.clone(), None);
+        rec.phase = AttemptPhase::Running as i32;
+        rec.socket = mrl_agent::attempts::runner::socket_path(root, id);
+        rec.lease_deadline_unix_ms = Some(now_ms() - 1000);
+        let job = ctx.state.job_dir(id);
+        std::fs::create_dir_all(&job).unwrap();
+        rec.save(&job).unwrap();
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), None);
+    save(&ctx, "att_r1", "old-launch");
+    let (attempts, _seen) = manager(&ctx);
+    let statuses = attempts.readopt().await;
+    let old = statuses
+        .iter()
+        .find(|s| s.attempt.as_ref().is_some_and(|a| a.attempt_id == "att_r1"))
+        .unwrap();
+    let failure = old.failure.as_ref().unwrap();
+    assert_eq!(failure.sub_code, "WORKER_LOST", "{old:?}");
+    // Had it been adopted, its expired lease would have fenced it and stopped the container
+    // before this returns.
+    let _ = tokio::time::timeout(WAIT, attempts.wait("att_r1")).await;
+    assert!(identity.alive(), "the newer launch's container survived");
+
+    // The container's own launch: adopted by id, fenced by its expired lease, stopped.
+    let dir2 = tempfile::tempdir().unwrap();
+    let ctx2 = self::ctx(dir2.path(), None);
+    save(&ctx2, "att_r2", "new-launch");
+    let (attempts2, _seen2) = manager(&ctx2);
+    attempts2.readopt().await;
+    let rec = AttemptRecord::load(&ctx2.state.job_dir("att_r2"))
+        .unwrap()
+        .unwrap();
+    assert!(
+        matches!(
+            &rec.workers[0].identity,
+            ProcIdentity::Container { id: Some(_), .. }
+        ),
+        "bound to the container id: {:?}",
+        rec.workers
+    );
+    let d = tokio::time::timeout(WAIT, attempts2.wait("att_r2"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d.phase, AttemptPhase::SelfFenced as i32, "{d:?}");
+    for _ in 0..100 {
+        if !identity.alive() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!identity.alive(), "its own launch stopped it");
 }
 
 /// The lease runs out while the event reader is stuck: the launch ends fenced and no worker

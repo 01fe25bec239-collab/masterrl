@@ -380,6 +380,76 @@ async fn a_rejected_launch_keeps_its_inputs_and_an_id_launches_once() {
         .unwrap();
 }
 
+/// A stage racing a launch of the same attempt either lands in the launched spec or is refused;
+/// it is never accepted and then lost.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stage_racing_its_launch_is_kept_or_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, attempts, _rx) = manager(dir.path());
+    let url = stuck_link().await;
+    let rt = format!("uv:sha256:{}", "e".repeat(64));
+    let project = ctx.state.root().join("runtimes").join(rt.replace(':', "-"));
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("uv.lock"), b"version = 1\n").unwrap();
+    let stage = |id: &str, name: &str| Command {
+        command_id: format!("stage-{name}"),
+        kind: Some(Kind::StageArtifacts(mrl_proto::agent::v1::StageArtifacts {
+            attempt: attempt_ref("job_s", id),
+            items: vec![mrl_proto::agent::v1::StageItem {
+                name: name.into(),
+                url: url.clone(),
+                sha256: "d".repeat(64),
+                size: 4,
+                local_path: format!("{name}/w.bin"),
+                expires_at: Some(prost_types::Timestamp {
+                    seconds: time::OffsetDateTime::now_utc().unix_timestamp() + 600,
+                    nanos: 0,
+                }),
+            }],
+        })),
+    };
+    let launch = |id: &str| Command {
+        command_id: "launch".into(),
+        kind: Some(Kind::LaunchAttempt(mrl_proto::agent::v1::LaunchAttempt {
+            attempt: attempt_ref("job_s", id),
+            engine_name: "fake".into(),
+            job_spec_json: "{}".into(),
+            roles: vec![mrl_proto::agent::v1::RoleLaunch {
+                role_id: "trainer".into(),
+                kind: "trainer".into(),
+                primary: true,
+                count: 1,
+                gpu_indices: Vec::new(),
+                runtime_ref: rt.clone(),
+            }],
+            ..Default::default()
+        })),
+    };
+    for n in 0..10 {
+        let id = format!("att_s{n}");
+        assert!(attempts.handle(&stage(&id, "a")).await.unwrap().accepted);
+        let (a, b) = (Arc::clone(&attempts), Arc::clone(&attempts));
+        let (l, s) = (launch(&id), stage(&id, "b"));
+        let launched = tokio::spawn(async move { a.handle(&l).await.unwrap().accepted });
+        let staged = tokio::spawn(async move { b.handle(&s).await.unwrap().accepted });
+        assert!(launched.await.unwrap());
+        let staged = staged.await.unwrap();
+        let rec = mrl_agent::attempts::record::AttemptRecord::load(&ctx.state.job_dir(&id))
+            .unwrap()
+            .unwrap();
+        let names: Vec<&str> = rec.spec.inputs.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(
+            names.contains(&"b"),
+            staged,
+            "accepted stages reach the spec: {names:?}"
+        );
+        attempts.handle(&cancel_cmd("job_s", &id)).await.unwrap();
+        tokio::time::timeout(WAIT, attempts.wait(&id))
+            .await
+            .unwrap();
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn commands_must_name_the_right_job_and_drain_cancels_the_running() {
     let dir = tempfile::tempdir().unwrap();

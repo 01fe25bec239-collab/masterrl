@@ -60,32 +60,40 @@ pub async fn release(
     };
     let token = crate::attempts::runner::attempt_token(&rec.nonce);
     for w in &rec.workers {
-        // A container is touched only when it carries this launch's token: an old record
-        // never removes a newer launch's container that reused the name.
-        if let ProcIdentity::Container { name } = &w.identity {
-            let (n, t) = (name.clone(), token.clone());
-            let owned = tokio::task::spawn_blocking(move || owns_container(&n, &t))
+        // A container is touched only when it carries this launch's token, and then by its
+        // id: an old record never stops or removes a newer launch's container that reused the
+        // name.
+        let identity = if matches!(w.identity, ProcIdentity::Container { .. }) {
+            let (i, t) = (w.identity.clone(), token.clone());
+            match tokio::task::spawn_blocking(move || i.verified(&t))
                 .await
-                .unwrap_or(false);
-            if !owned {
-                report
-                    .errors
-                    .push(format!("container {name} is not this launch's; left alone"));
-                continue;
+                .ok()
+                .flatten()
+            {
+                Some(v) => v,
+                None => {
+                    report.errors.push(format!(
+                        "container for {} is not this launch's; left alone",
+                        w.role_id
+                    ));
+                    continue;
+                }
             }
-        }
-        let identity = w.identity.clone();
-        let alive = tokio::task::spawn_blocking(move || identity.alive())
+        } else {
+            w.identity.clone()
+        };
+        let probe = identity.clone();
+        let alive = tokio::task::spawn_blocking(move || probe.alive())
             .await
             .unwrap_or(false);
         if alive {
-            signal_identity(&w.identity, true);
+            signal_identity(&identity, true);
             report.killed += 1;
         }
-        if let ProcIdentity::Container { name } = &w.identity {
+        if let ProcIdentity::Container { id: Some(id), .. } = &identity {
             if let Some(docker) = crate::envs::which("docker") {
                 let _ = tokio::process::Command::new(docker)
-                    .args(["rm", "-f", name])
+                    .args(["rm", "-f", id])
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
                     .status()
@@ -175,28 +183,6 @@ pub fn job_cgroup_of(pid: u32) -> Option<PathBuf> {
         let _ = pid;
         None
     }
-}
-
-/// True when container `name` exists and its environment carries this launch's token.
-pub fn owns_container(name: &str, token: &str) -> bool {
-    let mark = format!("{}={token}", crate::attempts::runner::TOKEN_ENV);
-    crate::envs::which("docker").is_some_and(|docker| {
-        std::process::Command::new(docker)
-            .args([
-                "inspect",
-                "--format",
-                "{{range .Config.Env}}{{println .}}{{end}}",
-                name,
-            ])
-            .stderr(std::process::Stdio::null())
-            .output()
-            .is_ok_and(|o| {
-                o.status.success()
-                    && String::from_utf8_lossy(&o.stdout)
-                        .lines()
-                        .any(|l| l == mark)
-            })
-    })
 }
 
 /// True when process `pid`'s environment carries this launch's token (Linux).

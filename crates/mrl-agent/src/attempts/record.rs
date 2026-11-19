@@ -150,10 +150,14 @@ pub enum ProcIdentity {
         /// Start time, seconds since the Unix epoch.
         start_time: u64,
     },
-    /// A container, by name.
+    /// A container: its name, and its id once the agent has checked that it carries this
+    /// launch's token. A name can be reused by a later launch; an id never is.
     Container {
         /// Container name.
         name: String,
+        /// Container id, set once verified; every later check and signal uses it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
     },
 }
 
@@ -167,9 +171,51 @@ impl ProcIdentity {
     pub fn alive(&self) -> bool {
         match self {
             Self::Pid { pid, start_time } => process_start(*pid) == Some(*start_time),
-            Self::Container { name } => container_running(name),
+            Self::Container { name, id } => container_running(id.as_deref().unwrap_or(name)),
         }
     }
+
+    /// The same identity, checked to belong to the launch with `token`: a container must carry
+    /// `MRL_ATTEMPT_TOKEN=<token>`, and comes back bound to its id. `None` for a container that
+    /// is gone or belongs to another launch. Process identities are already tied to their start
+    /// time and come back unchanged.
+    pub fn verified(&self, token: &str) -> Option<Self> {
+        match self {
+            Self::Pid { .. } => Some(self.clone()),
+            Self::Container { name, id } => {
+                let found = owned_container(id.as_deref().unwrap_or(name), token)?;
+                // A bound id never changes; a different one is someone else's container.
+                id.as_ref()
+                    .is_none_or(|i| *i == found)
+                    .then(|| Self::Container {
+                        name: name.clone(),
+                        id: Some(found),
+                    })
+            }
+        }
+    }
+}
+
+/// The id of container `reference` (a name or id) when its environment carries
+/// `MRL_ATTEMPT_TOKEN=<token>`; `None` when it is gone or belongs to another launch.
+pub fn owned_container(reference: &str, token: &str) -> Option<String> {
+    let mark = format!("{}={token}", super::runner::TOKEN_ENV);
+    let docker = crate::envs::which("docker")?;
+    let out = std::process::Command::new(docker)
+        .args([
+            "inspect",
+            "--format",
+            "{{.Id}}{{range .Config.Env}}{{println}}{{.}}{{end}}",
+            reference,
+        ])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut lines = text.lines();
+    let id = lines.next()?.trim().to_owned();
+    (!id.is_empty() && lines.any(|l| l == mark)).then_some(id)
 }
 
 /// Start time of `pid` (seconds since the epoch), if the process exists and is not a zombie.

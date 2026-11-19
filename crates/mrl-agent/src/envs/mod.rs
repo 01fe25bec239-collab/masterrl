@@ -139,38 +139,36 @@ impl Envs {
         self
     }
 
-    /// Before an install of about `incoming` bytes: one space decision for the node cache,
-    /// the environments and the new install, all against the same free-space reading.
-    /// Unpinned environments go first (least recently used), then unpinned cache entries,
-    /// until the disk keeps `min_free_bytes` free after the install and everything fits the
-    /// cache budget. Fails with MRL-ENV-004 when only pinned data is left.
+    /// Before writing about `incoming` bytes (a lock file and/or an install): one space
+    /// decision for the node cache, the environments (images included) and the new data, all
+    /// against the same free-space reading. Unpinned environments go first (least recently
+    /// used), then unpinned cache entries, until the disk keeps `min_free_bytes` free after the
+    /// write and everything fits the cache budget. Fails with MRL-ENV-004 when only pinned data
+    /// is left.
     fn make_room(&self, installing: &Path, incoming: u64) -> Result<(), AttemptError> {
         let budget = self.cache.budget();
-        let mut envs: Vec<InstalledEnv> = self
-            .installed()
-            .into_iter()
-            .filter(|e| e.dir != installing)
-            .collect();
+        let mut envs = sized(
+            self.installed()
+                .into_iter()
+                .filter(|e| e.dir != installing)
+                .collect(),
+        );
         loop {
             let free = (self.free_space)(&self.root).unwrap_or(u64::MAX);
-            let used =
-                self.cache.usage().used_bytes + envs.iter().map(|e| dir_size(&e.dir)).sum::<u64>();
-            let short_disk = (budget.min_free_bytes + incoming).saturating_sub(free);
-            let short_budget = (used + incoming).saturating_sub(budget.max_bytes);
-            if short_disk == 0 && short_budget == 0 {
+            let cache_used = self.cache.usage().used_bytes;
+            let used = cache_used + envs.iter().map(|(_, b)| b).sum::<u64>();
+            let short = (budget.min_free_bytes + incoming)
+                .saturating_sub(free)
+                .max((used + incoming).saturating_sub(budget.max_bytes));
+            if short == 0 {
                 return Ok(());
             }
-            if let Some(i) = envs.iter().position(|e| e.pinned_by.is_empty()) {
-                let env = envs.remove(i);
-                remove_env(&env)?;
+            if let Some(i) = envs.iter().position(|(e, _)| e.pinned_by.is_empty()) {
+                remove_env(&envs.remove(i).0)?;
                 continue;
             }
             // No environment left to remove: free cache entries instead.
-            let evicted = self
-                .cache
-                .reserve(short_disk.max(short_budget))
-                .unwrap_or_default();
-            if evicted.is_empty() {
+            if self.shrink_cache(cache_used.saturating_sub(short)) == 0 {
                 return Err(AgentError::CacheFull {
                     needed: incoming,
                     pinned: used,
@@ -182,25 +180,54 @@ impl Envs {
         }
     }
 
-    /// Shrinks environments plus cache to `limit` bytes (a `Cleanup` command), removing
-    /// unpinned environments first, then unpinned cache entries. Pinned data stays.
+    /// Shrinks environments (images included) plus cache to `limit` bytes (a `Cleanup`
+    /// command), removing unpinned environments first, then unpinned cache entries. Only
+    /// deletes: a low disk never makes it fail. Pinned data stays.
     pub fn prune_to(&self, limit: u64) -> Result<(), AttemptError> {
-        let mut envs = self.installed();
+        let mut envs = sized(self.installed());
         loop {
-            let env_bytes: u64 = envs.iter().map(|e| dir_size(&e.dir)).sum();
+            let env_bytes: u64 = envs.iter().map(|(_, b)| b).sum();
             if self.cache.usage().used_bytes + env_bytes <= limit {
                 return Ok(());
             }
-            if let Some(i) = envs.iter().position(|e| e.pinned_by.is_empty()) {
-                let env = envs.remove(i);
-                remove_env(&env)?;
+            if let Some(i) = envs.iter().position(|(e, _)| e.pinned_by.is_empty()) {
+                remove_env(&envs.remove(i).0)?;
                 continue;
             }
-            // Cache must end at or below `limit - env_bytes`: reserve the rest of its budget.
-            let cache_target = limit.saturating_sub(env_bytes);
-            self.cache
-                .reserve(self.cache.budget().max_bytes.saturating_sub(cache_target))?;
+            self.shrink_cache(limit.saturating_sub(env_bytes));
             return Ok(());
+        }
+    }
+
+    /// Evicts unpinned cache entries, least recently used first, toward `target` bytes in the
+    /// cache. Returns how many were evicted.
+    fn shrink_cache(&self, target: u64) -> usize {
+        // ponytail: the node cache only offers `reserve(n)` ("make n more bytes fit"), which
+        // also applies the disk floor and evicts nothing when it can't meet both. The largest
+        // n it accepts frees the most toward the target; bisection finds it in at most 64
+        // tries. Ceiling: when all unpinned entries together can't restore the disk floor,
+        // every n fails and nothing is evicted. A byte-target eviction on `NodeCache`
+        // (state/cache.rs, not this part's file) would replace this.
+        let want = self.cache.budget().max_bytes.saturating_sub(target);
+        let mut evicted = 0;
+        let (mut lo, mut hi) = (0u64, want);
+        let mut n = want;
+        loop {
+            match self.cache.reserve(n) {
+                Ok(e) => {
+                    evicted += e.len();
+                    lo = n.saturating_add(1);
+                    if n == u64::MAX {
+                        return evicted;
+                    }
+                }
+                Err(_) if n == 0 => return evicted,
+                Err(_) => hi = n - 1,
+            }
+            if lo > hi {
+                return evicted;
+            }
+            n = lo + (hi - lo) / 2;
         }
     }
 
@@ -288,9 +315,26 @@ impl Envs {
                 actual,
             });
         }
+        let program = worker_program(dir);
+        let hit = marker_matches(dir, rt) && program.is_file();
+        let install = if hit {
+            None
+        } else {
+            let uv = which("uv").ok_or_else(|| {
+                AttemptError::UvMissing("no `uv` program was found on PATH".into())
+            })?;
+            Some((uv, LockPlan::parse(&lock, project).map_err(install_err)?))
+        };
+        // One space decision for everything written next (the lock, when the cache lacks it,
+        // and the install), before any of it is written.
+        let lock_cached = self.cache.get(lock_sha256)?.is_some();
+        if install.is_some() || !lock_cached {
+            let incoming = if lock_cached { 0 } else { lock.len() as u64 }
+                + install.as_ref().map_or(0, |(_, plan)| plan.install_bytes);
+            self.make_room(dir, incoming)?;
+        }
         // The verified lock is kept in the node cache, pinned while the attempt runs.
-        if self.cache.get(lock_sha256)?.is_none() {
-            self.cache.reserve(lock.len() as u64)?;
+        if !lock_cached {
             let tmp = self
                 .cache
                 .incoming_dir()
@@ -302,14 +346,7 @@ impl Envs {
         }
         self.cache.pin(lock_sha256, holder)?;
 
-        let program = worker_program(dir);
-        let hit = marker_matches(dir, rt) && program.is_file();
-        if !hit {
-            let uv = which("uv").ok_or_else(|| {
-                AttemptError::UvMissing("no `uv` program was found on PATH".into())
-            })?;
-            let plan = LockPlan::parse(&lock, project).map_err(install_err)?;
-            self.make_room(dir, plan.install_bytes)?;
+        if let Some((uv, plan)) = install {
             // Install from an agent-owned copy holding the verified lock, never the live
             // project folder. The copy is removed however the install ends (error, cancel);
             // one left by a dead agent is reclaimed by `Envs::open`.
@@ -318,7 +355,8 @@ impl Envs {
                 rt.dir_name(),
                 snapshot_owner()
             )));
-            let copy = snapshot_project(project, &plan.local_dirs, &lock, &snap.0, &self.root)
+            let dirs: Vec<PathBuf> = plan.local.iter().map(|p| p.dir.clone()).collect();
+            let copy = snapshot_project(project, &dirs, &lock, &snap.0, &self.root)
                 .map_err(|e| install_err(format!("the project could not be copied ({e})")))?;
             plan.check_build_backends(&copy).map_err(install_err)?;
             let snap_project = copy.project.clone();
@@ -431,6 +469,32 @@ fn remove_env(env: &InstalledEnv) -> Result<(), AttemptError> {
     Ok(())
 }
 
+/// Environments with the disk bytes each holds.
+fn sized(envs: Vec<InstalledEnv>) -> Vec<(InstalledEnv, u64)> {
+    envs.into_iter()
+        .map(|e| {
+            let b = env_bytes(&e);
+            (e, b)
+        })
+        .collect()
+}
+
+/// Disk bytes an environment holds: its folder, plus its image in container mode.
+fn env_bytes(env: &InstalledEnv) -> u64 {
+    let image = env.runtime_ref.strip_prefix("oci:").and_then(|image| {
+        let out = std::process::Command::new(which("docker")?)
+            .args(["image", "inspect", "--format", "{{.Size}}", image])
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout)
+            .trim()
+            .parse::<u64>()
+            .ok()
+    });
+    dir_size(&env.dir) + image.unwrap_or(0)
+}
+
 /// Bytes used by the files under `dir` (links not followed).
 fn dir_size(dir: &Path) -> u64 {
     let mut total = 0;
@@ -450,13 +514,23 @@ fn dir_size(dir: &Path) -> u64 {
     total
 }
 
+/// A package from the source tree.
+#[derive(Debug, PartialEq, Eq)]
+struct LocalPackage {
+    /// Its folder.
+    dir: PathBuf,
+    /// A virtual project (`source = { virtual = ... }`): uv installs only its dependencies and
+    /// never builds it.
+    is_virtual: bool,
+}
+
 /// What a `uv.lock` asks for.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct LockPlan {
     /// Packages from an index or a URL (must be prebuilt wheels).
     remote: Vec<String>,
-    /// Local packages (workspace members, path sources), as folders.
-    local_dirs: Vec<PathBuf>,
+    /// Local packages (workspace members, path sources).
+    local: Vec<LocalPackage>,
     /// Estimated installed size: three times the largest wheel of each package.
     install_bytes: u64,
 }
@@ -489,14 +563,17 @@ impl LockPlan {
             }
             let local = ["editable", "virtual", "directory", "path"]
                 .iter()
-                .find_map(|k| source.get(*k).and_then(|v| v.as_str()));
+                .find_map(|k| source.get(*k).and_then(|v| v.as_str()).map(|v| (*k, v)));
             match local {
-                Some(rel) => {
+                Some((kind, rel)) => {
                     let p = project.join(rel);
-                    plan.local_dirs.push(if p.is_file() {
-                        p.parent().map_or(p.clone(), Path::to_path_buf)
-                    } else {
-                        p
+                    plan.local.push(LocalPackage {
+                        dir: if p.is_file() {
+                            p.parent().map_or(p.clone(), Path::to_path_buf)
+                        } else {
+                            p
+                        },
+                        is_virtual: kind == "virtual",
                     });
                 }
                 None => {
@@ -516,21 +593,25 @@ impl LockPlan {
         Ok(plan)
     }
 
-    /// Local packages are built here. Their only build backend allowed is `uv_build`, pinned
-    /// to one exact version (`uv_build==X.Y.Z`): it has no dependencies of its own and uv
-    /// builds it natively, so no unlocked build tools are resolved. Anything else (another
-    /// backend, extra build requirements, a range or wildcard) is refused.
+    /// Local packages are built here (all but virtual projects). Their only build backend
+    /// allowed is `uv_build`, pinned to one exact version (`uv_build==X.Y.Z`): it has no
+    /// dependencies of its own and uv builds it natively, so no unlocked build tools are
+    /// resolved. Anything else (no `pyproject.toml` or `[build-system]`, which means uv's
+    /// legacy setuptools build; another backend; extra build requirements; a range or
+    /// wildcard) is refused.
     fn check_build_backends(&self, copy: &Snapshot) -> Result<(), String> {
-        for dir in &self.local_dirs {
-            let pyproject = copy.copy_of(dir).join("pyproject.toml");
-            let Ok(text) = std::fs::read_to_string(&pyproject) else {
-                continue;
+        for pkg in self.local.iter().filter(|p| !p.is_virtual) {
+            let pyproject = copy.copy_of(&pkg.dir).join("pyproject.toml");
+            let legacy = || {
+                format!(
+                    "{} has no [build-system]; it must build with uv_build pinned to one exact version (uv_build==X.Y.Z)",
+                    pyproject.display()
+                )
             };
+            let text = std::fs::read_to_string(&pyproject).map_err(|_| legacy())?;
             let doc: toml::Table = toml::from_str(&text)
                 .map_err(|e| format!("{} can't be read ({e})", pyproject.display()))?;
-            let Some(build) = doc.get("build-system") else {
-                continue; // virtual project: nothing to build
-            };
+            let build = doc.get("build-system").ok_or_else(legacy)?;
             let backend = build.get("build-backend").and_then(|b| b.as_str());
             let requires: Vec<&str> = build
                 .get("requires")
@@ -973,16 +1054,10 @@ source = { registry = "https://pypi.org/simple" }
 "#;
         let plan = LockPlan::parse(lock, &project).unwrap();
         assert_eq!(plan.remote, ["torch"]);
-        assert_eq!(plan.local_dirs.len(), 2);
+        assert_eq!(plan.local.len(), 2);
+        let dirs: Vec<PathBuf> = plan.local.iter().map(|p| p.dir.clone()).collect();
         let snap = dir.path().join("snap");
-        let sp = snapshot_project(
-            &project,
-            &plan.local_dirs,
-            lock,
-            &snap,
-            &dir.path().join("state"),
-        )
-        .unwrap();
+        let sp = snapshot_project(&project, &dirs, lock, &snap, &dir.path().join("state")).unwrap();
         assert_eq!(
             std::fs::read(sp.project.join("uv.lock")).unwrap(),
             lock,
@@ -1009,9 +1084,28 @@ source = { registry = "https://pypi.org/simple" }
             plan.check_build_backends(&sp).is_err(),
             "extra build requirement"
         );
+        // ...a legacy package (no [build-system], or no pyproject.toml at all)...
+        set("[project]\nname = \"runtime\"\nversion = \"1\"\n");
+        let e = plan.check_build_backends(&sp).unwrap_err();
+        assert!(e.contains("no [build-system]"), "{e}");
+        std::fs::remove_file(&runtime_copy).unwrap();
+        assert!(plan.check_build_backends(&sp).is_err(), "no pyproject.toml");
         // ...and one exact uv_build passes.
         set("[build-system]\nrequires = [\"uv_build==0.11.28\"]\nbuild-backend = \"uv_build\"\n");
         assert!(plan.check_build_backends(&sp).is_ok());
+        // Only a virtual project may have no build system: uv never builds it.
+        let virt = br#"version = 1
+[[package]]
+name = "a"
+source = { virtual = "." }
+"#;
+        let vplan = LockPlan::parse(virt, &project).unwrap();
+        std::fs::write(
+            sp.project.join("pyproject.toml"),
+            "[project]\nname = \"a\"\nversion = \"1\"\n",
+        )
+        .unwrap();
+        assert!(vplan.check_build_backends(&sp).is_ok());
         let git = b"[[package]]\nname = \"g\"\nsource = { git = \"https://x\" }\n";
         assert!(LockPlan::parse(git, &project).is_err());
     }
@@ -1021,30 +1115,33 @@ source = { registry = "https://pypi.org/simple" }
         if which("uv").is_none() {
             return; // the uv check comes before the space check
         }
-        let dir = tempfile::tempdir().unwrap();
-        let cache = NodeCache::open(
-            dir.path().join("cache"),
-            CacheBudget {
-                max_bytes: 1 << 30,
-                min_free_bytes: 1 << 20,
-            },
-        )
-        .unwrap();
-        let envs_root = dir.path().join("envs");
-        let old_marker = Arc::new(std::sync::Mutex::new(None::<PathBuf>));
-        let watch = Arc::clone(&old_marker);
-        // One reading for everything: the disk is full while the unused environment exists.
-        let free: Arc<FreeSpaceFn> = Arc::new(move |_| {
-            let full = watch
+        // One disk for everything: the node cache and the environments both see it full
+        // while the unused environment exists.
+        static OLD: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+        fn disk(_: &Path) -> Option<u64> {
+            let full = OLD
                 .lock()
                 .unwrap()
                 .as_ref()
                 .is_some_and(|p: &PathBuf| p.exists());
             Some(if full { 0 } else { 100 << 30 })
-        });
-        let e = Envs::open(dir.path(), Arc::new(cache))
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            NodeCache::open_with_free_space(
+                dir.path().join("cache"),
+                CacheBudget {
+                    max_bytes: 1 << 30,
+                    min_free_bytes: 1 << 20,
+                },
+                disk,
+            )
+            .unwrap(),
+        );
+        let envs_root = dir.path().join("envs");
+        let e = Envs::open(dir.path(), Arc::clone(&cache))
             .unwrap()
-            .with_free_space(free);
+            .with_free_space(Arc::new(disk));
         let mk = |n: &str, pinned: bool| {
             let rt = RuntimeSpec {
                 runtime_ref: format!("uv:sha256:{}", n.repeat(64)),
@@ -1060,7 +1157,7 @@ source = { registry = "https://pypi.org/simple" }
             d
         };
         let (old, kept) = (mk("2", false), mk("3", true));
-        *old_marker.lock().unwrap() = Some(old.clone());
+        *OLD.lock().unwrap() = Some(old.clone());
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(project.join("uv.lock"), b"version = 1\n").unwrap();
@@ -1074,6 +1171,11 @@ source = { registry = "https://pypi.org/simple" }
         assert_ne!(err.code(), "MRL-ENV-004", "{}", err.explain());
         assert!(!old.exists(), "the unused environment made room");
         assert!(kept.exists(), "the pinned one survived");
+        let lock_sha = mrl_storage::sha256_hex(b"version = 1\n");
+        assert!(
+            cache.get(&lock_sha).unwrap().is_some(),
+            "the lock went into the cache after the room was made"
+        );
         // Install copies never outlive the install.
         let left = std::fs::read_dir(&envs_root)
             .unwrap()
@@ -1087,6 +1189,102 @@ source = { registry = "https://pypi.org/simple" }
         let err = e.materialize(&rt, "att_new", &|_| {}).await.unwrap_err();
         assert_eq!(err.code(), "MRL-ENV-004", "{}", err.explain());
         assert!(kept.exists());
+    }
+
+    #[tokio::test]
+    async fn a_cold_install_refuses_a_legacy_local_package() {
+        if which("uv").is_none() {
+            return; // the uv check comes first
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        let legacy = project.join("legacy");
+        std::fs::create_dir_all(&legacy).unwrap();
+        // setup.py only: uv would build it with its default setuptools backend.
+        std::fs::write(
+            legacy.join("setup.py"),
+            "from setuptools import setup\nsetup()\n",
+        )
+        .unwrap();
+        let lock =
+            b"version = 1\n[[package]]\nname = \"legacy\"\nsource = { editable = \"legacy\" }\n";
+        std::fs::write(project.join("uv.lock"), lock).unwrap();
+        let rt = RuntimeSpec {
+            runtime_ref: format!("uv:sha256:{}", mrl_storage::sha256_hex(lock)),
+            project: Some(project),
+            package: None,
+        };
+        let e = envs(dir.path())
+            .materialize(&rt, "att_l", &|_| {})
+            .await
+            .unwrap_err();
+        assert_eq!(e.code(), "MRL-ENV-202", "{}", e.explain());
+        assert!(e.explain().contains("no [build-system]"), "{}", e.explain());
+    }
+
+    #[tokio::test]
+    async fn pruning_a_low_disk_deletes_unpinned_data_and_keeps_pinned() {
+        // The disk is below its floor the whole time pruning runs (by less than the unpinned
+        // data, which is what `NodeCache::reserve` can act on).
+        static LOW: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        fn disk(_: &Path) -> Option<u64> {
+            Some(if LOW.load(std::sync::atomic::Ordering::SeqCst) {
+                0
+            } else {
+                100 << 30
+            })
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let cache = Arc::new(
+            NodeCache::open_with_free_space(
+                dir.path().join("cache"),
+                CacheBudget {
+                    max_bytes: 1 << 30,
+                    min_free_bytes: 4,
+                },
+                disk,
+            )
+            .unwrap(),
+        );
+        let mut shas = Vec::new();
+        for (i, body) in [b"old entry".as_slice(), b"pinned entry"]
+            .iter()
+            .enumerate()
+        {
+            let tmp = cache.incoming_dir().join(format!("e{i}"));
+            std::fs::write(&tmp, body).unwrap();
+            let sha = mrl_storage::sha256_hex(body);
+            cache.insert_file(&tmp, &sha).await.unwrap();
+            shas.push(sha);
+        }
+        cache.pin(&shas[1], "att_live").unwrap();
+        let e = Envs::open(dir.path(), Arc::clone(&cache))
+            .unwrap()
+            .with_free_space(Arc::new(disk));
+        let mk = |n: &str, pinned: bool| {
+            let rt = RuntimeSpec {
+                runtime_ref: format!("uv:sha256:{}", n.repeat(64)),
+                project: None,
+                package: None,
+            };
+            let d = e.dir_for(&rt);
+            std::fs::create_dir_all(d.join(PINS)).unwrap();
+            write_marker(&d, &rt).unwrap();
+            std::fs::write(d.join("payload"), vec![0u8; 4096]).unwrap();
+            if pinned {
+                std::fs::write(d.join(PINS).join("att_live"), b"").unwrap();
+            }
+            d
+        };
+        let (old, kept) = (mk("4", false), mk("5", true));
+        LOW.store(true, std::sync::atomic::Ordering::SeqCst);
+        e.prune_to(0).unwrap();
+        assert!(!old.exists() && kept.exists());
+        assert!(
+            cache.get(&shas[0]).unwrap().is_none(),
+            "unpinned entry evicted"
+        );
+        assert!(cache.get(&shas[1]).unwrap().is_some(), "pinned entry kept");
     }
 
     #[test]

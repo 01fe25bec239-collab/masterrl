@@ -214,7 +214,11 @@ pub struct Runner {
     lease: Option<Instant>,
     stop_at: Option<Instant>,
     last_seen: Instant,
+    /// Checkpoints uploading now, or uploaded with an outcome not saved yet.
     in_flight: HashSet<String>,
+    /// Finished uploads whose outcome could not be saved: saved again on the retry tick,
+    /// never uploaded twice.
+    unsaved: HashMap<String, UploadDone>,
 }
 
 /// Folders of an attempt.
@@ -324,6 +328,7 @@ impl Runner {
             stop_at: None,
             last_seen: Instant::now(),
             in_flight: HashSet::new(),
+            unsaved: HashMap::new(),
         }
     }
 
@@ -557,7 +562,7 @@ impl Runner {
                         }));
                     }
                     Some(Control::Upload { command_id, checkpoint_id, targets }) => {
-                        self.store_plan(checkpoint_id, command_id, targets);
+                        self.accept_plan(checkpoint_id, command_id, targets).await;
                     }
                     Some(Control::Hw(events)) => {
                         self.hw_events.extend(events.into_iter().filter(|e| self.gpu_uuids.contains(&e.uuid)));
@@ -746,7 +751,10 @@ impl Runner {
             .map_err(|e| AgentError::state(inputs_dir(&self.job_dir), e))?;
         let exec = self.sh.ctx.executor.spawn(spec).await?;
         let identity = match &container {
-            Some(name) => Some(ProcIdentity::Container { name: name.clone() }),
+            Some(name) => Some(ProcIdentity::Container {
+                name: name.clone(),
+                id: None,
+            }),
             None => exec.pid().and_then(ProcIdentity::of_pid),
         };
         if let Some(identity) = identity {
@@ -940,7 +948,7 @@ impl Runner {
                     self.stop_all().await;
                     return;
                 }
-                self.note_cgroup(&role_id);
+                self.note_cgroup(&role_id).await;
                 // Everything the worker may be waiting for is sent again; it ignores repeats.
                 self.send(&role_id, self.prepare_msg(&role)).await;
                 if self.rec.started.contains(&role_id) {
@@ -1010,20 +1018,63 @@ impl Runner {
     }
 
     /// Linux: remembers the worker's own cgroup once it is in it (at its first Hello).
-    fn note_cgroup(&mut self, role_id: &str) {
-        let Some(w) = self
-            .rec
-            .workers
-            .iter_mut()
-            .find(|w| w.role_id == role_id && w.cgroup.is_none())
-        else {
+    /// Once a worker has connected: notes its job cgroup (Linux), or binds its container to
+    /// the container id after checking the launch token, so later signals never reach a
+    /// container that took over the name.
+    async fn note_cgroup(&mut self, role_id: &str) {
+        let token = attempt_token(&self.rec.nonce);
+        let Some(w) = self.rec.workers.iter_mut().find(|w| w.role_id == role_id) else {
             return;
         };
-        if let ProcIdentity::Pid { pid, .. } = w.identity {
-            w.cgroup = crate::janitor::job_cgroup_of(pid);
-            if w.cgroup.is_some() {
-                self.save();
+        match &w.identity {
+            ProcIdentity::Pid { pid, .. } if w.cgroup.is_none() => {
+                w.cgroup = crate::janitor::job_cgroup_of(*pid);
+                if w.cgroup.is_some() {
+                    self.save();
+                }
             }
+            ProcIdentity::Container { id: None, .. } => {
+                let identity = w.identity.clone();
+                let bound = tokio::task::spawn_blocking(move || identity.verified(&token))
+                    .await
+                    .ok()
+                    .flatten();
+                if let Some(bound) = bound {
+                    if let Some(w) = self.rec.workers.iter_mut().find(|w| w.role_id == role_id) {
+                        w.identity = bound;
+                    }
+                    self.save();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Takes the tickets of an `UploadArtifacts` command for a checkpoint that is not uploading.
+    /// Every command gets exactly one result: an earlier command still waiting for this
+    /// checkpoint (no outcome yet) is answered now as replaced, and the new one owns the upload.
+    async fn accept_plan(
+        &mut self,
+        checkpoint_id: String,
+        command_id: String,
+        targets: Vec<UploadTarget>,
+    ) {
+        let undecided = self
+            .rec
+            .checkpoints
+            .get(&checkpoint_id)
+            .is_none_or(|c| c.state.is_none());
+        let replaced = self
+            .rec
+            .uploads
+            .get(&checkpoint_id)
+            .map(|p| p.command_id.clone())
+            .filter(|old| undecided && *old != command_id);
+        self.store_plan(checkpoint_id.clone(), command_id.clone(), targets);
+        if let Some(old) = replaced {
+            let why =
+                format!("replaced by upload command {command_id} for checkpoint {checkpoint_id}");
+            self.command_done(old, Some(why)).await;
         }
     }
 
@@ -1256,11 +1307,13 @@ impl Runner {
                 prev
             });
             if !self.save() {
-                // Not durable yet: nobody hears the outcome; the retry tick uploads again and
-                // reports it once it is saved.
+                // Not durable yet: nobody hears the outcome. The result is kept and the retry
+                // tick saves it again (no second upload), then reports it.
                 if let (Some(ck), Some(prev)) = (self.rec.checkpoints.get_mut(id), prev) {
                     ck.state = prev;
                 }
+                self.in_flight.insert(id.clone());
+                self.unsaved.insert(id.clone(), u);
                 return;
             }
             if let Some(role) = self.primary_role() {
@@ -1292,6 +1345,9 @@ impl Runner {
 
     /// Retries commits whose outcome could not be saved (and any that now have tickets).
     async fn retry_commits(&mut self) {
+        for (_, done) in std::mem::take(&mut self.unsaved) {
+            self.on_upload(done).await;
+        }
         let waiting: Vec<String> = self
             .rec
             .checkpoints
@@ -1429,8 +1485,9 @@ impl Runner {
                         .get(&checkpoint_id)
                         .map(|p| p.command_id.clone());
                     if self.in_flight.contains(&checkpoint_id) {
-                        // One upload per checkpoint at a time; a replay of the running command
-                        // gets its result when it ends.
+                        // One upload per checkpoint at a time (including one whose outcome is
+                        // still being saved); a replay of the running command gets its result
+                        // when it ends.
                         if active.as_deref() != Some(command_id.as_str()) {
                             let why = format!(
                                 "checkpoint {checkpoint_id} is already uploading (command {})",
@@ -1454,7 +1511,8 @@ impl Runner {
                             self.command_done(command_id, Some(why)).await;
                         }
                         _ => {
-                            self.store_plan(checkpoint_id.clone(), command_id, targets);
+                            self.accept_plan(checkpoint_id.clone(), command_id, targets)
+                                .await;
                             // New tickets retry a rejected upload.
                             if let Some(ck) = self.rec.checkpoints.get_mut(&checkpoint_id) {
                                 if ck.state == Some(CommitState::Rejected as i32) {
@@ -1778,8 +1836,8 @@ pub fn signal_identity(identity: &ProcIdentity, force: bool) {
                     .status();
             }
         }
-        ProcIdentity::Container { name } => {
-            let name = name.clone();
+        ProcIdentity::Container { name, id } => {
+            let name = id.clone().unwrap_or_else(|| name.clone());
             let _ = std::process::Command::new(
                 crate::envs::which("docker").unwrap_or_else(|| "docker".into()),
             )
@@ -1833,7 +1891,9 @@ fn spawn_watch(
             }
         }
         let (code, oom) = match &identity {
-            ProcIdentity::Container { name } => container_exit(name).await,
+            ProcIdentity::Container { name, id } => {
+                container_exit(id.as_deref().unwrap_or(name)).await
+            }
             ProcIdentity::Pid { .. } => (None, false),
         };
         let _ = exits

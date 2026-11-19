@@ -169,6 +169,17 @@ fn open_beneath(staging: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
 /// plain folder (then file), not a reparse point. The copy then reads from that file handle.
 #[cfg(windows)]
 fn open_beneath(staging: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
+    open_beneath_with(staging, rel, &mut || {})
+}
+
+/// [`open_beneath`], calling `between` once every folder is held and before the file opens
+/// (tests race a replacement there).
+#[cfg(windows)]
+fn open_beneath_with(
+    staging: &Path,
+    rel: &Path,
+    between: &mut dyn FnMut(),
+) -> std::io::Result<std::fs::File> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     const FILE_SHARE_READ: u32 = 0x1;
     const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
@@ -200,6 +211,7 @@ fn open_beneath(staging: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
         p.push(c);
         held.push(open(&p, true)?);
     }
+    between();
     p.push(last);
     let file = open(&p, false)?;
     drop(held);
@@ -365,8 +377,39 @@ mod tests {
                 .unwrap();
             assert!(made.success());
             assert!(snapshot(&staging, "junction/w.bin", 7, &sha).await.is_err());
-            // While a snapshot reads, the folders on the path can't be replaced.
             assert!(snapshot(&staging, "ckpt/w.bin", 7, &sha).await.is_ok());
         }
+    }
+
+    /// Windows: a replacement raced into the walk fails. While the folders are held, the
+    /// folder can't be renamed away (to swap in one holding other bytes); once the file is
+    /// open it can't be replaced; and the bytes read are the original ones.
+    #[cfg(windows)]
+    #[test]
+    fn held_folders_and_file_cannot_be_replaced() {
+        use std::io::Read;
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        let ckpt = staging.join("ckpt");
+        std::fs::create_dir_all(&ckpt).unwrap();
+        std::fs::write(ckpt.join("w.bin"), b"weights").unwrap();
+        let other = dir.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        std::fs::write(other.join("w.bin"), b"secret!").unwrap();
+        let mut raced = false;
+        let mut f = open_beneath_with(&staging, &Path::new("ckpt").join("w.bin"), &mut || {
+            let moved = std::fs::rename(&ckpt, dir.path().join("moved"));
+            assert!(moved.is_err(), "a held folder can't be renamed away");
+            raced = true;
+        })
+        .unwrap();
+        assert!(raced);
+        assert!(
+            std::fs::rename(other.join("w.bin"), ckpt.join("w.bin")).is_err(),
+            "the open file can't be replaced"
+        );
+        let mut got = Vec::new();
+        f.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"weights");
     }
 }

@@ -1167,7 +1167,7 @@ mod runner_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_commit_is_acknowledged_only_once_saved() {
-        let (base, _got) = sink().await;
+        let (base, got) = sink().await;
         let path = "checkpoints/ckpt_1/w.bin";
         let sha = sha_hex(b"weights");
         let mut fx = RunnerFixture::readopt(spec("att_du", serde_json::json!({})), |r| {
@@ -1177,7 +1177,11 @@ mod runner_tests {
                 "ckpt_1".into(),
                 UploadPlan {
                     command_id: "up-1".into(),
-                    targets: vec![target(&base, path, &sha, 7)],
+                    // Expires while the outcome can't be saved.
+                    targets: vec![UploadTarget {
+                        expires_unix: time::OffsetDateTime::now_utc().unix_timestamp() + 2,
+                        ..target(&base, path, &sha, 7)
+                    }],
                 },
             );
         })
@@ -1197,7 +1201,10 @@ mod runner_tests {
         )
         .await;
         assert!(early.is_err(), "no ack while the outcome can't be saved");
-        // Saving works again: the retry uploads, saves, and only then acknowledges.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        assert_eq!(got.lock().unwrap().len(), 1, "the PUT succeeded once");
+        // Saving works again (the ticket has expired): the kept result is saved and only then
+        // acknowledged, with no second upload.
         std::fs::remove_dir_all(&record).unwrap();
         fx.record.save(&job).unwrap();
         let acks = read_until(&mut w, |b| matches!(b, AgentBody::CheckpointCommitAck(_)))
@@ -1212,5 +1219,45 @@ mod runner_tests {
         let r = done(&mut fx).await;
         assert_eq!(r.command_id, "up-1");
         assert!(r.failure.is_none());
+        assert_eq!(got.lock().unwrap().len(), 1, "uploaded exactly once");
+    }
+
+    /// Two commands for one checkpoint before the worker asks to commit: the first is answered
+    /// as replaced, the second owns the upload and gets its result.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_waiting_upload_command_is_answered_when_replaced() {
+        let (base, got) = sink().await;
+        let path = "checkpoints/ckpt_1/w.bin";
+        let sha = sha_hex(b"weights");
+        let mut fx = RunnerFixture::readopt(spec("att_rp", serde_json::json!({})), |r| {
+            let mut ck = staged(path, &sha, 7, None);
+            ck.commit_requested = false;
+            r.checkpoints.insert("ckpt_1".into(), ck);
+        })
+        .await;
+        let file = fx.staging().join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"weights").unwrap();
+        let (mut w, _) = fx.worker("trainer").await;
+        for id in ["up-a", "up-b"] {
+            fx.control
+                .send(upload(id, target(&base, path, &sha, 7)))
+                .await
+                .unwrap();
+        }
+        let first = done(&mut fx).await;
+        assert_eq!(first.command_id, "up-a");
+        assert!(first.failure.is_some(), "A was replaced by B");
+        w.send(Body::CheckpointCommit(
+            mrl_proto::worker::v1::CheckpointCommitRequest {
+                checkpoint_id: "ckpt_1".into(),
+                manifest_sha256: SHA.into(),
+            },
+        ))
+        .await;
+        let second = done(&mut fx).await;
+        assert_eq!(second.command_id, "up-b");
+        assert!(second.failure.is_none(), "{second:?}");
+        assert_eq!(got.lock().unwrap().len(), 1);
     }
 }
