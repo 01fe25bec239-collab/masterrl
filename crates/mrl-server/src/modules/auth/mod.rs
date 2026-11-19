@@ -135,9 +135,9 @@ fn no_secret_store() -> ApiError {
     ApiError::new(ErrorCode::Unavailable, "This server has no secret store.")
 }
 
-/// Refuses an `Idempotency-Key` on an endpoint that returns a secret once (a token, a session
-/// cookie, a recovery key). P07's idempotency store keeps whole response bodies for replay,
-/// so these must never reach it: the refusal (a 400) is all that gets stored.
+/// Refuses an `Idempotency-Key` on an endpoint that takes or returns a secret (a passphrase, a
+/// recovery key, a token, a session cookie). These endpoints are mounted outside P07's
+/// idempotency layer (see [`Caller`]), so nothing about the request is stored.
 pub fn no_replay(headers: &HeaderMap) -> Result<(), ApiError> {
     if headers.contains_key(crate::http::idempotency::IDEMPOTENCY_KEY) {
         return Err(ApiError::new(
@@ -146,6 +146,64 @@ pub fn no_replay(headers: &HeaderMap) -> Result<(), ApiError> {
         ));
     }
     Ok(())
+}
+
+/// The signed-in caller on an endpoint that takes or returns a secret.
+///
+/// P07's idempotency layer fingerprints the body (a fast check of a passphrase) and keeps the
+/// response for replay before any handler runs, so these endpoints are mounted with the
+/// public routes, and this extractor does what the signed-in stack does: refuses an
+/// `Idempotency-Key`, signs the caller in (solo mode's launch-secret gate already has) and
+/// applies the rate limit.
+pub struct Caller(pub RequestContext);
+
+impl axum::extract::FromRequestParts<AppState> for Caller {
+    type Rejection = Fail;
+
+    async fn from_request_parts(
+        parts: &mut axum::http::request::Parts,
+        state: &AppState,
+    ) -> Result<Self, Fail> {
+        no_replay(&parts.headers)?;
+        let ctx = match parts.extensions.get::<RequestContext>() {
+            Some(ctx) => ctx.clone(),
+            None => {
+                let meta = parts
+                    .extensions
+                    .get::<RequestMeta>()
+                    .cloned()
+                    .unwrap_or(RequestMeta {
+                        trace_id: String::new(),
+                        request_id: String::new(),
+                    });
+                let principal = state
+                    .seams
+                    .authenticator
+                    .authenticate(&parts.headers)
+                    .await?
+                    .ok_or_else(|| {
+                        ApiError::new(
+                            ErrorCode::Unauthenticated,
+                            "The request has no valid sign-in details.",
+                        )
+                    })?;
+                RequestContext::new(principal, &meta)
+            }
+        };
+        let now = std::time::Instant::now();
+        if let Err(secs) = state
+            .limiter()
+            .check(&ctx.principal.id, ctx.org.as_deref(), now)
+        {
+            return Err(ApiError::new(
+                ErrorCode::RateLimited,
+                "Too many requests for this account or org.",
+            )
+            .retry_after(secs)
+            .into());
+        }
+        Ok(Caller(ctx))
+    }
 }
 
 /// A database error as an API error (503, details only in the log).
@@ -225,8 +283,6 @@ impl ServerModule for AuthModule {
         Router::new()
             .route("/auth/me", get(me))
             .route("/auth/logout", post(logout))
-            .route("/auth/session", post(start_session).delete(end_session))
-            .route("/auth/tokens", get(list_tokens).post(create_token))
             .route("/auth/tokens/{id}", delete(revoke_token))
             .layer(Extension(self.shared.clone()))
             .layer(axum::middleware::from_fn(
@@ -234,10 +290,14 @@ impl ServerModule for AuthModule {
             ))
     }
 
+    /// Also the routes that hand out a secret; their handlers sign the caller in through
+    /// [`Caller`], outside P07's idempotency layer.
     fn public_routes(&self) -> Router<AppState> {
         Router::new()
             .route("/auth/login", post(login))
             .route("/auth/callback", post(callback))
+            .route("/auth/session", post(start_session).delete(end_session))
+            .route("/auth/tokens", get(list_tokens).post(create_token))
             .layer(Extension(self.shared.clone()))
             .layer(axum::middleware::from_fn(
                 crate::modules::auth::problem::render,
@@ -735,10 +795,9 @@ fn cookie(value: &str, max_age: i64, secure: bool) -> String {
 async fn start_session(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
-    ctx: RequestContext,
+    Caller(ctx): Caller,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, Fail> {
-    no_replay(&headers)?;
     if ctx.principal.kind == PrincipalKind::Service {
         return Err(ApiError::new(
             ErrorCode::Forbidden,
@@ -779,7 +838,7 @@ async fn start_session(
 async fn end_session(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
-    ctx: RequestContext,
+    Caller(ctx): Caller,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, Fail> {
     state
@@ -858,7 +917,7 @@ pub struct TokenInfo {
 async fn list_tokens(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
-    ctx: RequestContext,
+    Caller(ctx): Caller,
 ) -> Result<Json<Page<TokenInfo>>, Fail> {
     let user = authorize_self_shared(&state, &shared, &ctx, "auth.manage_tokens").await?;
     let rows: Vec<TokenRow> = sqlx::query_as(
@@ -908,11 +967,9 @@ pub struct CreateToken {
 async fn create_token(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
-    ctx: RequestContext,
-    headers: HeaderMap,
+    Caller(ctx): Caller,
     Json(req): Json<CreateToken>,
 ) -> Result<(StatusCode, Json<NewToken>), Fail> {
-    no_replay(&headers)?;
     let user = authorize_self_shared(&state, &shared, &ctx, "auth.manage_tokens").await?;
     let name = req.name.trim();
     if name.is_empty() || name.chars().count() > 100 {
@@ -1041,7 +1098,16 @@ async fn revoke_token(
     ctx: RequestContext,
     Path(id): Path<String>,
 ) -> Result<StatusCode, Fail> {
-    let user = authorize_self_shared(&state, &shared, &ctx, "auth.manage_tokens").await?;
+    // A token may always revoke itself (like the CLI dropping a token it could not keep),
+    // whatever its owner's role or its scopes.
+    let user = if ctx.principal.kind == PrincipalKind::Service && ctx.principal.id == id {
+        tenancy::acting_user(&shared.db, &ctx.principal)
+            .await
+            .map_err(db_error)?
+            .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "No token with this id exists."))?
+    } else {
+        authorize_self_shared(&state, &shared, &ctx, "auth.manage_tokens").await?
+    };
     let missing = || ApiError::new(ErrorCode::NotFound, "No token with this id exists.");
     let token = TokenId::from_str(&id).map_err(|_| missing())?;
     let at = state.seams.clock.now();

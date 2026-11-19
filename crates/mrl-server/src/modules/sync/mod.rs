@@ -465,10 +465,20 @@ impl ServerModule for SyncModule {
     fn routes(&self) -> Router<AppState> {
         Router::new()
             .route("/sync/profile", get(get_profile).put(put_profile))
-            .route("/sync/setup", post(setup))
             .route("/sync/push", post(push))
-            .route("/sync/restore", post(restore))
             .route("/sync/status", get(status))
+            .layer(Extension(self.shared.clone()))
+            .layer(axum::middleware::from_fn(
+                crate::modules::auth::problem::render,
+            ))
+    }
+
+    /// Setup and restore take the passphrase or recovery key: their handlers sign the caller
+    /// in through `auth::Caller`, outside P07's idempotency layer.
+    fn public_routes(&self) -> Router<AppState> {
+        Router::new()
+            .route("/sync/setup", post(setup))
+            .route("/sync/restore", post(restore))
             .layer(Extension(self.shared.clone()))
             .layer(axum::middleware::from_fn(
                 crate::modules::auth::problem::render,
@@ -528,6 +538,21 @@ fn online(shared: &Shared) -> Result<&Supabase, Fail> {
         .ok_or_else(|| Fail::from(crate::modules::auth::signin::SignInError::NotConfigured))
 }
 
+/// A saved profile (the local copy or a decrypted backup). Revisions before the typed
+/// transport wrote `transport.options` on every machine; those free-form settings are no
+/// longer kept, so they are dropped here instead of failing the read. The API still refuses
+/// them.
+fn read_saved(mut v: Value) -> Result<SetupProfile, serde_json::Error> {
+    if let Some(machines) = v.get_mut("machines").and_then(Value::as_array_mut) {
+        for m in machines {
+            if let Some(t) = m.get_mut("transport").and_then(Value::as_object_mut) {
+                t.remove("options");
+            }
+        }
+    }
+    serde_json::from_value(v)
+}
+
 async fn load_profile(db: &Db, user: UserId) -> Result<SetupProfile, ApiError> {
     let raw: Option<Value> =
         sqlx::query_scalar("SELECT profile FROM setup_profiles WHERE user_id = $1")
@@ -537,7 +562,7 @@ async fn load_profile(db: &Db, user: UserId) -> Result<SetupProfile, ApiError> {
             .map_err(|e| db_error(e.into()))?;
     match raw {
         None => Ok(SetupProfile::default()),
-        Some(v) => serde_json::from_value(v).map_err(|e| {
+        Some(v) => read_saved(v).map_err(|e| {
             ApiError::new(
                 ErrorCode::Internal,
                 format!("the saved setup could not be read: {e}"),
@@ -607,11 +632,9 @@ async fn derive(kdf: KdfParams, passphrase: String) -> Result<[u8; crypto::KEY_L
 async fn setup(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
-    ctx: RequestContext,
-    headers: axum::http::HeaderMap,
+    crate::modules::auth::Caller(ctx): crate::modules::auth::Caller,
     Json(req): Json<SetupRequest>,
 ) -> Result<Json<SetupDone>, Fail> {
-    crate::modules::auth::no_replay(&headers)?;
     let c = caller(&state, &shared, &ctx).await?;
     if req.passphrase.chars().count() < MIN_PASSPHRASE {
         return Err(ApiError::validation(vec![FieldError::new(
@@ -840,7 +863,7 @@ fn wrong_key() -> Fail {
 async fn restore(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
-    ctx: RequestContext,
+    crate::modules::auth::Caller(ctx): crate::modules::auth::Caller,
     Json(req): Json<RestoreRequest>,
 ) -> Result<Json<Restored>, Fail> {
     let c = caller(&state, &shared, &ctx).await?;
@@ -887,12 +910,14 @@ async fn restore(
         .decode(&copy.blob.sealed)
         .map_err(|_| wrong_key())?;
     let plain = crypto::open(&key, &aad(access.user.id), &sealed).map_err(|_| wrong_key())?;
-    let profile: SetupProfile = serde_json::from_slice(&plain).map_err(|e| {
-        ApiError::new(
-            ErrorCode::FieldValue,
-            format!("The saved setup could not be read: {e}."),
-        )
-    })?;
+    let profile = serde_json::from_slice(&plain)
+        .and_then(read_saved)
+        .map_err(|e| {
+            ApiError::new(
+                ErrorCode::FieldValue,
+                format!("The saved setup could not be read: {e}."),
+            )
+        })?;
     check(&profile)?;
     let previous = active_key(&shared.db, c.user).await?.map(|(r, _)| r);
     let staged = stage_key(c.secrets.as_ref(), &key).await?;
@@ -1154,5 +1179,31 @@ mod tests {
         let unknown: Result<SetupProfile, _> =
             serde_json::from_value(serde_json::json!({"schema": PROFILE_SCHEMA, "ssh_key": "x"}));
         assert!(unknown.is_err(), "unknown fields are refused");
+    }
+
+    #[test]
+    fn backups_from_the_revision_with_transport_options_still_open() {
+        // What 10766ef's serializer wrote: `options` on every machine, empty or not.
+        let legacy = serde_json::json!({
+            "schema": PROFILE_SCHEMA,
+            "machines": [
+                {"name": "gpu-box", "address": "10.0.0.7", "transport": {"kind": "ssh", "user": "ada", "key_ref": "ssh.gpu-box", "options": {}}},
+                {"name": "laptop", "address": "laptop.tail1234.ts.net", "transport": {"kind": "tailscale", "options": {"exit_node": "lab"}}}
+            ],
+            "preferences": {}, "team_memberships": [], "ui": {}
+        });
+        let key = [7u8; crypto::KEY_LEN];
+        let user = uuid::Uuid::now_v7();
+        let sealed = crypto::seal(&key, &aad(user), &serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let plain = crypto::open(&key, &aad(user), &sealed).unwrap();
+        let profile = serde_json::from_slice(&plain).and_then(read_saved).unwrap();
+        check(&profile).unwrap();
+        assert_eq!(profile.machines.len(), 2);
+        assert_eq!(profile.machines[0].transport.user.as_deref(), Some("ada"));
+        let again = serde_json::to_value(&profile).unwrap();
+        assert!(!again.to_string().contains("options"), "{again}");
+        // The API itself still refuses free-form options.
+        let posted: Result<SetupProfile, _> = serde_json::from_value(legacy);
+        assert!(posted.is_err());
     }
 }

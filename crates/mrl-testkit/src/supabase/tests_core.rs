@@ -2059,7 +2059,7 @@ async fn secrets_are_never_kept_for_idempotent_replay() {
             .await
         }
     };
-    let routes: [(&str, Option<Value>); 3] = [
+    let routes: [(&str, Option<Value>); 4] = [
         (
             "/api/v1/auth/tokens",
             Some(json!({"name": "x", "scopes": ["*"]})),
@@ -2067,6 +2067,10 @@ async fn secrets_are_never_kept_for_idempotent_replay() {
         ("/api/v1/auth/session", None),
         (
             "/api/v1/sync/setup",
+            Some(json!({"passphrase": PASSPHRASE})),
+        ),
+        (
+            "/api/v1/sync/restore",
             Some(json!({"passphrase": PASSPHRASE})),
         ),
     ];
@@ -2087,18 +2091,8 @@ async fn secrets_are_never_kept_for_idempotent_replay() {
     assert_eq!(core.db.count("api_tokens").await, 0);
     assert_eq!(core.db.count("sessions").await, 0);
     assert_eq!(core.db.count("sync_state").await, 0);
-    let stored: Vec<String> = sqlx::query_scalar(
-        "SELECT encode(coalesce(response_body, ''::bytea), 'escape') FROM idempotency_keys",
-    )
-    .fetch_all(core.db.pool())
-    .await
-    .unwrap();
-    assert!(
-        stored.iter().all(|b| !b.contains("mrl_pat_")
-            && !b.contains("recovery_key")
-            && !b.contains("csrf_token")),
-        "{stored:?}"
-    );
+    // Not even the refusal or a fingerprint of the body (a fast passphrase check) is kept.
+    assert_eq!(core.db.count("idempotency_keys").await, 0);
     // Without the key the same requests work; other endpoints still replay.
     assert_eq!(
         core.call(
@@ -2345,4 +2339,137 @@ async fn a_rate_limited_refresh_is_temporary() {
 async fn push(core: &CoreServer) -> TestResponse {
     core.call(Method::POST, "/api/v1/sync/push", &Auth::Launch, None)
         .await
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn the_upgrade_clears_idempotency_entries_kept_by_earlier_revisions() {
+    let sb = MockSupabase::start().await;
+    let core = solo(&sb).await;
+    // What an earlier revision could have kept: a replayable new token and a fingerprint.
+    core.db
+        .seed(
+            "INSERT INTO idempotency_keys (scope, key, request_sha256, state, response_status, response_body, expires_at) VALUES \
+             ('usr_1', 'k1', '\\x00', 'DONE', 201, convert_to('{\"token\":\"mrl_pat_x\"}', 'UTF8'), now() + interval '1 day'), \
+             ('usr_1', 'k2', '\\x01', 'IN_PROGRESS', NULL, NULL, now() + interval '1 day');",
+        )
+        .await;
+    assert_eq!(core.db.count("idempotency_keys").await, 2);
+    sqlx::raw_sql(include_str!(
+        "../../../mrl-server/migrations/16007_clear_idempotency.sql"
+    ))
+    .execute(core.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(core.db.count("idempotency_keys").await, 0);
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn an_org_bound_token_of_a_platform_admin_cannot_create_orgs() {
+    let sb = MockSupabase::start().await;
+    let core = CoreServer::start(Mode::Team, &sb, TestDb::new().await, Arc::default()).await;
+    let lab = OrgId::new();
+    core.db
+        .seed(&format!(
+            "INSERT INTO organizations (id, slug, name, kind) VALUES ('{}', 'lab', 'Lab', 'team');",
+            lab.as_uuid()
+        ))
+        .await;
+    let (jwt, admin) = member(&core, &sb, "ada").await;
+    grant(&core, lab, admin, Role::Owner, Scope::Org).await;
+    sqlx::query("UPDATE users SET platform_admin = true WHERE id = $1")
+        .bind(admin.as_uuid())
+        .execute(core.db.pool())
+        .await
+        .unwrap();
+    let token = core
+        .call(
+            Method::POST,
+            "/api/v1/auth/tokens",
+            &Auth::Bearer(jwt.clone()),
+            Some(json!({"name": "lab only", "scopes": ["*"]})),
+        )
+        .await;
+    assert_eq!(token.status, 201, "{}", token.text());
+    let token = token.json()["token"].as_str().unwrap().to_owned();
+    let create = |auth: Auth, slug: &'static str| {
+        let core = &core;
+        async move {
+            core.call(
+                Method::POST,
+                "/api/v1/orgs",
+                &auth,
+                Some(json!({"slug": slug, "name": slug})),
+            )
+            .await
+        }
+    };
+    let refused = create(Auth::Bearer(token), "rival").await;
+    assert_eq!(refused.status, 403, "{}", refused.text());
+    assert_eq!(create(Auth::Bearer(jwt), "rival").await.status, 201);
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_viewer_login_token_can_revoke_itself() {
+    let sb = MockSupabase::start().await;
+    let core = CoreServer::start(Mode::Team, &sb, TestDb::new().await, Arc::default()).await;
+    let lab = OrgId::new();
+    core.db
+        .seed(&format!(
+            "INSERT INTO organizations (id, slug, name, kind) VALUES ('{}', 'lab', 'Lab', 'team');",
+            lab.as_uuid()
+        ))
+        .await;
+    assert_eq!(core.sign_in(&sb, &Auth::None, false).await.status, 200);
+    let viewer: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE supabase_user_id = $1")
+        .bind(sb.user().id)
+        .fetch_one(core.db.pool())
+        .await
+        .unwrap();
+    grant(
+        &core,
+        lab,
+        UserId::from_uuid(viewer),
+        Role::Viewer,
+        Scope::Org,
+    )
+    .await;
+    // What `mrl login` does: sign in with a token, then drop it if the keychain fails.
+    let issue = || async {
+        let done = core.sign_in(&sb, &Auth::None, true).await;
+        assert_eq!(done.status, 200, "{}", done.text());
+        let t = &done.json()["token"];
+        (
+            t["id"].as_str().unwrap().to_owned(),
+            t["token"].as_str().unwrap().to_owned(),
+        )
+    };
+    let (id, token) = issue().await;
+    let (other_id, _) = issue().await;
+    let revoke = |id: String, token: String| {
+        let core = &core;
+        async move {
+            core.call(
+                Method::DELETE,
+                &format!("/api/v1/auth/tokens/{id}"),
+                &Auth::Bearer(token),
+                None,
+            )
+            .await
+        }
+    };
+    // A viewer may not manage tokens in general, so not another token of theirs.
+    let other = revoke(other_id, token.clone()).await;
+    assert_eq!(other.status, 403, "{}", other.text());
+    let own = revoke(id, token.clone()).await;
+    assert_eq!(own.status, 204, "{}", own.text());
+    let after = core
+        .call(Method::GET, "/api/v1/auth/me", &Auth::Bearer(token), None)
+        .await;
+    assert_eq!(after.status, 401, "{}", after.text());
+    core.stop().await;
 }

@@ -382,6 +382,21 @@ impl Rbac {
                 (g.user, g.org)
             }
         };
+        // An org-bound token stays in its org before any role, platform grant or the solo
+        // owner's shortcut: platform actions are outside it, another org looks missing.
+        if let Some(bound) = token_org {
+            if resource.kind == PLATFORM {
+                return Ok(Decision::Deny);
+            }
+            let named = resource
+                .org
+                .as_deref()
+                .or(ctx.org.as_deref())
+                .and_then(|o| OrgId::from_str(o).ok());
+            if named.is_some_and(|o| o != bound) {
+                return Ok(Decision::Hide);
+            }
+        }
         if !is_active(&self.db, user).await? {
             return Ok(Decision::Deny);
         }
