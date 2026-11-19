@@ -560,7 +560,9 @@ pub(crate) mod tests {
 
     #[test]
     fn a_token_that_cannot_be_saved_is_revoked_and_never_shown() {
-        let token = "mrl_pat_SECRETsecretSECRETsecretSECRETsecret1234";
+        // Built at run time, so the source holds no token-shaped literal.
+        let fake = format!("mrl_pat_{}", "t".repeat(43));
+        let token = fake.as_str();
         for failing in ["token", "server"] {
             let revoked = std::cell::Cell::new(0);
             let revoke = || {
