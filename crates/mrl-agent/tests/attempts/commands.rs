@@ -266,3 +266,349 @@ async fn the_lease_and_a_cancel_both_stop_a_launch_that_is_still_staging() {
         "{d:?}"
     );
 }
+
+fn attempt_ref(job: &str, id: &str) -> Option<AttemptRef> {
+    Some(AttemptRef {
+        job_id: job.into(),
+        attempt_id: id.into(),
+        fencing_epoch: 1,
+    })
+}
+
+fn cancel_cmd(job: &str, id: &str) -> Command {
+    Command {
+        command_id: format!("cancel-{id}"),
+        kind: Some(Kind::CancelAttempt(mrl_proto::agent::v1::CancelAttempt {
+            attempt: attempt_ref(job, id),
+            request_id: "r".into(),
+            grace_s: 5,
+            reason: "test".into(),
+        })),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_launch_keeps_its_inputs_and_an_id_launches_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, attempts, _rx) = manager(dir.path());
+    let url = stuck_link().await;
+    let stage = Command {
+        command_id: "stage".into(),
+        kind: Some(Kind::StageArtifacts(mrl_proto::agent::v1::StageArtifacts {
+            attempt: attempt_ref("job_g", "att_g"),
+            items: vec![mrl_proto::agent::v1::StageItem {
+                name: "model".into(),
+                url: url.clone(),
+                sha256: "d".repeat(64),
+                size: 4,
+                local_path: "model/w.bin".into(),
+                expires_at: Some(prost_types::Timestamp {
+                    seconds: time::OffsetDateTime::now_utc().unix_timestamp() + 600,
+                    nanos: 0,
+                }),
+            }],
+        })),
+    };
+    assert!(attempts.handle(&stage).await.unwrap().accepted);
+    // The installed adapter project for the gateway path.
+    let rt = format!("uv:sha256:{}", "e".repeat(64));
+    let project = ctx.state.root().join("runtimes").join(rt.replace(':', "-"));
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("uv.lock"), b"version = 1\n").unwrap();
+    let launch = |json: &str| Command {
+        command_id: "launch".into(),
+        kind: Some(Kind::LaunchAttempt(mrl_proto::agent::v1::LaunchAttempt {
+            attempt: attempt_ref("job_g", "att_g"),
+            engine_name: "fake".into(),
+            job_spec_json: json.into(),
+            roles: vec![mrl_proto::agent::v1::RoleLaunch {
+                role_id: "trainer".into(),
+                kind: "trainer".into(),
+                primary: true,
+                count: 1,
+                gpu_indices: Vec::new(),
+                runtime_ref: rt.clone(),
+            }],
+            ..Default::default()
+        })),
+    };
+    assert!(!attempts.handle(&launch("not json")).await.unwrap().accepted);
+    assert!(
+        attempts.handle(&launch("{}")).await.unwrap().accepted,
+        "the retry is accepted"
+    );
+    let rec = mrl_agent::attempts::record::AttemptRecord::load(&ctx.state.job_dir("att_g"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rec.spec.inputs.len(),
+        1,
+        "the staged input survived the rejected launch"
+    );
+    attempts
+        .handle(&cancel_cmd("job_g", "att_g"))
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, attempts.wait("att_g"))
+        .await
+        .unwrap();
+
+    // Two launches of one id at the same moment: exactly one is accepted.
+    let spec = bad_lock_spec(dir.path(), "att_twice", "job_h", 1, slow_input(&url));
+    let (a, b) = (Arc::clone(&attempts), Arc::clone(&attempts));
+    let (s1, s2) = (spec.clone(), spec);
+    let (h1, h2) = (
+        tokio::runtime::Handle::current(),
+        tokio::runtime::Handle::current(),
+    );
+    let t1 = std::thread::spawn(move || {
+        let _rt = h1.enter();
+        a.launch(s1).is_ok()
+    });
+    let t2 = std::thread::spawn(move || {
+        let _rt = h2.enter();
+        b.launch(s2).is_ok()
+    });
+    let oks = [t1.join().unwrap(), t2.join().unwrap()];
+    assert_eq!(oks.iter().filter(|o| **o).count(), 1, "{oks:?}");
+    attempts
+        .handle(&cancel_cmd("job_h", "att_twice"))
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, attempts.wait("att_twice"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn commands_must_name_the_right_job_and_drain_cancels_the_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_ctx, attempts, _rx) = manager(dir.path());
+    let url = stuck_link().await;
+    attempts
+        .launch(bad_lock_spec(
+            dir.path(),
+            "att_j",
+            "job_right",
+            1,
+            slow_input(&url),
+        ))
+        .unwrap();
+    assert_eq!(attempts.running()[0].job_id, "job_right");
+    let wrong = attempts
+        .handle(&cancel_cmd("job_wrong", "att_j"))
+        .await
+        .unwrap();
+    assert!(!wrong.accepted, "another job's command is refused");
+    let drain = Command {
+        command_id: "drain".into(),
+        kind: Some(Kind::Drain(mrl_proto::agent::v1::Drain {
+            cancel_running: true,
+            reason: "update".into(),
+        })),
+    };
+    assert!(attempts.handle(&drain).await.unwrap().accepted);
+    let d = tokio::time::timeout(WAIT, attempts.wait("att_j"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        d.exit_kind,
+        mrl_proto::worker::v1::ExitKind::Cancelled as i32
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_pause_during_staging_keeps_its_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, attempts, _rx) = manager(dir.path());
+    let url = stuck_link().await;
+    attempts
+        .launch(bad_lock_spec(
+            dir.path(),
+            "att_p",
+            "job_p",
+            1,
+            slow_input(&url),
+        ))
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let pause = Command {
+        command_id: "pause".into(),
+        kind: Some(Kind::PauseAttempt(mrl_proto::agent::v1::PauseAttempt {
+            attempt: attempt_ref("job_p", "att_p"),
+            request_id: "p1".into(),
+            deadline_s: 1,
+            reason: 1,
+        })),
+    };
+    assert!(attempts.handle(&pause).await.unwrap().accepted);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let rec = mrl_agent::attempts::record::AttemptRecord::load(&ctx.state.job_dir("att_p"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.requests.len(), 1, "kept for the workers");
+    assert!(rec.stop_deadline_unix_ms.is_some(), "its deadline is saved");
+    let d = tokio::time::timeout(WAIT, attempts.wait("att_p"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        d.exit_kind,
+        mrl_proto::worker::v1::ExitKind::Paused as i32,
+        "{d:?}"
+    );
+    assert!(rec.workers.is_empty());
+}
+
+/// Serves `body` after a short delay, counting requests.
+async fn delayed_file(body: &'static [u8]) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let h = Arc::clone(&hits);
+    let app = axum::Router::new().route(
+        "/obj",
+        axum::routing::get(move || {
+            let h = Arc::clone(&h);
+            async move {
+                h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                body
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (format!("http://{addr}/obj"), hits)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn two_attempts_fill_one_input_once_and_keep_their_own_pins() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, _attempts, _rx) = manager(dir.path());
+    let (url, hits) = delayed_file(b"shared!").await;
+    let sha = mrl_storage::sha256_hex(b"shared!");
+    let expires = time::OffsetDateTime::now_utc() + time::Duration::minutes(10);
+    let input = serde_json::json!({"inputs": [{
+        "name": "model", "local_path": "model/w.bin", "sha256": sha, "size": 7, "url": url,
+        "expires_at": expires.format(&time::format_description::well_known::Rfc3339).unwrap()
+    }]});
+    let a = bad_lock_spec(dir.path(), "att_fa", "job_f", 1, input.clone());
+    let b = bad_lock_spec(dir.path(), "att_fb", "job_f", 1, input);
+    let (da, db) = (dir.path().join("a"), dir.path().join("b"));
+    let (ra, rb) = tokio::join!(
+        mrl_agent::attempts::files::stage_inputs(&ctx, &a, &da, "att_fa"),
+        mrl_agent::attempts::files::stage_inputs(&ctx, &b, &db, "att_fb"),
+    );
+    for (r, d) in [(ra, &da), (rb, &db)] {
+        r.unwrap();
+        assert_eq!(
+            std::fs::read(d.join("model").join("w.bin")).unwrap(),
+            b"shared!"
+        );
+    }
+    assert_eq!(
+        hits.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "downloaded once"
+    );
+    ctx.cache.unpin_all("att_fa").unwrap();
+    assert!(
+        ctx.cache.usage().pinned_bytes > 0,
+        "the other attempt's pin stays"
+    );
+    // A different input at a path already taken is refused, never silently reused.
+    let other = bad_lock_spec(
+        dir.path(),
+        "att_fc",
+        "job_f",
+        1,
+        serde_json::json!({"inputs": [{
+            "name": "model", "local_path": "model/w.bin",
+            "sha256": mrl_storage::sha256_hex(b"other"), "size": 5, "file": write_tmp(dir.path(), b"other")
+        }]}),
+    );
+    let e = mrl_agent::attempts::files::stage_inputs(&ctx, &other, &da, "att_fc")
+        .await
+        .unwrap_err();
+    assert_eq!(e.code(), "MRL-VAL-200");
+}
+
+fn write_tmp(dir: &std::path::Path, bytes: &[u8]) -> std::path::PathBuf {
+    let p = dir.join(format!("f-{}", mrl_storage::sha256_hex(bytes)));
+    std::fs::write(&p, bytes).unwrap();
+    p
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn node_cleanup_purges_ended_attempts_and_prunes_unpinned_data() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, attempts, _rx) = manager(dir.path());
+    let url = stuck_link().await;
+    attempts
+        .launch(bad_lock_spec(
+            dir.path(),
+            "att_live",
+            "job_l",
+            1,
+            slow_input(&url),
+        ))
+        .unwrap();
+    let data = write_tmp(dir.path(), b"{}\n");
+    let input = serde_json::json!({"inputs": [{
+        "name": "dataset.train", "local_path": "data/t.jsonl",
+        "sha256": mrl_storage::sha256_hex(b"{}\n"), "size": 3, "file": data
+    }]});
+    attempts
+        .launch(bad_lock_spec(dir.path(), "att_done", "job_d", 1, input))
+        .unwrap();
+    tokio::time::timeout(WAIT, attempts.wait("att_done"))
+        .await
+        .unwrap();
+    // Two environments: one pinned by the live attempt, one unused.
+    let envs = ctx.state.root().join("envs");
+    for (name, pin) in [("uv-sha256-pinned", true), ("uv-sha256-unused", false)] {
+        let d = envs.join(name);
+        std::fs::create_dir_all(d.join(".pins")).unwrap();
+        let marker =
+            serde_json::json!({"runtime_ref": format!("uv:sha256:{name}"), "last_used_unix": 1});
+        std::fs::write(d.join(".mrl-env.json"), marker.to_string()).unwrap();
+        std::fs::write(d.join("blob"), vec![0u8; 4096]).unwrap();
+        if pin {
+            std::fs::write(d.join(".pins").join("att_live"), b"").unwrap();
+        }
+    }
+    let cleanup = Command {
+        command_id: "clean".into(),
+        kind: Some(Kind::Cleanup(Cleanup {
+            attempt: None,
+            purge_scratch: true,
+            cache_limit_bytes: 1,
+        })),
+    };
+    let r = attempts.handle(&cleanup).await.unwrap();
+    assert!(r.accepted, "{r:?}");
+    assert!(
+        !ctx.state.job_dir("att_done").join("inputs").exists(),
+        "ended scratch purged"
+    );
+    assert!(
+        ctx.state.job_dir("att_live").exists(),
+        "the live attempt is untouched"
+    );
+    assert!(
+        !envs.join("uv-sha256-unused").exists(),
+        "unused environment pruned"
+    );
+    assert!(
+        envs.join("uv-sha256-pinned").exists(),
+        "pinned environment kept"
+    );
+    attempts
+        .handle(&cancel_cmd("job_l", "att_live"))
+        .await
+        .unwrap();
+    tokio::time::timeout(WAIT, attempts.wait("att_live"))
+        .await
+        .unwrap();
+}

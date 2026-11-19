@@ -51,6 +51,7 @@ jobs:
         env:
           MRL_TEST_ATTEMPTS_REQUIRED: "1"
           MRL_TEST_SANDBOX_REQUIRED: "1"
+          MRL_TEST_DOCKER_REQUIRED: "1"
         run: cargo test -p mrl-agent --locked --test attempts -- --include-ignored
 
       - name: worker protocol tests (Rust client)

@@ -95,7 +95,7 @@ pub fn attempt_events(capacity: usize) -> (AttemptEventSender, AttemptEvents) {
 }
 
 struct Live {
-    epoch: u64,
+    attempt: AttemptRef,
     control: mpsc::Sender<Control>,
 }
 
@@ -108,6 +108,7 @@ pub struct Attempts {
     credentials: Mutex<HashMap<String, BTreeMap<String, Secret>>>,
     epochs: Mutex<HashMap<String, u64>>,
     draining: AtomicBool,
+    launching: Mutex<()>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -135,6 +136,7 @@ impl Attempts {
             credentials: Mutex::default(),
             epochs: Mutex::default(),
             draining: AtomicBool::new(false),
+            launching: Mutex::new(()),
         };
         // Every job's highest epoch is known before the first launch is accepted.
         if let Ok(rd) = std::fs::read_dir(me.shared.ctx.state.root().join("jobs")) {
@@ -154,6 +156,9 @@ impl Attempts {
 
     /// Starts an attempt. Returns once it is accepted; it runs in the background.
     pub fn launch(self: &Arc<Self>, spec: AttemptSpec) -> Result<(), AttemptError> {
+        // One launch at a time: the "already exists" check and the saved record that claims
+        // the id happen together.
+        let _one_launch = lock(&self.launching);
         spec.validate()?;
         let id = spec.attempt.attempt_id.clone();
         if self.draining.load(Ordering::SeqCst) {
@@ -214,7 +219,7 @@ impl Attempts {
         lock(&self.live).insert(
             id.clone(),
             Live {
-                epoch: rec.spec.attempt.fencing_epoch,
+                attempt: rec.spec.attempt.to_proto(),
                 control,
             },
         );
@@ -268,13 +273,9 @@ impl Attempts {
 
     /// Attempts running now.
     pub fn running(&self) -> Vec<AttemptRef> {
-        let live = lock(&self.live);
-        live.iter()
-            .map(|(id, l)| AttemptRef {
-                job_id: String::new(),
-                attempt_id: id.clone(),
-                fencing_epoch: l.epoch,
-            })
+        lock(&self.live)
+            .values()
+            .map(|l| l.attempt.clone())
             .collect()
     }
 
@@ -285,7 +286,13 @@ impl Attempts {
             let l = live.get(&r.attempt_id).ok_or_else(|| {
                 AttemptError::state(&r.attempt_id, "is not running on this machine")
             })?;
-            if r.fencing_epoch < l.epoch {
+            if r.job_id != l.attempt.job_id {
+                return Err(AttemptError::state(
+                    &r.attempt_id,
+                    format!("belongs to job {}, not {}", l.attempt.job_id, r.job_id),
+                ));
+            }
+            if r.fencing_epoch < l.attempt.fencing_epoch {
                 return Err(AttemptError::state(
                     &r.attempt_id,
                     format!("the command's fencing epoch {} is stale", r.fencing_epoch),
@@ -452,9 +459,14 @@ impl Attempts {
                     .as_ref()
                     .map(|a| a.attempt_id.clone())
                     .unwrap_or_default();
-                let staged = lock(&self.staged).remove(&id).unwrap_or_default();
-                AttemptSpec::from_launch(l, &staged, self.shared.ctx.state.root())
-                    .and_then(|spec| self.launch(spec))
+                // Staged inputs stay until the launch is accepted, so a retry still has them.
+                let staged = lock(&self.staged).get(&id).cloned().unwrap_or_default();
+                let launched = AttemptSpec::from_launch(l, &staged, self.shared.ctx.state.root())
+                    .and_then(|spec| self.launch(spec));
+                if launched.is_ok() {
+                    lock(&self.staged).remove(&id);
+                }
+                launched
             }
             Kind::StageArtifacts(s) => {
                 let id = s
@@ -614,6 +626,29 @@ impl Attempts {
         if id.is_empty() {
             let live: HashSet<String> = lock(&self.live).keys().cloned().collect();
             crate::janitor::sweep(ctx, &self.shared.envs, &live).await?;
+            if c.purge_scratch {
+                // Asked for explicitly: every ended attempt's scratch now, not only old ones.
+                // Running attempts (and ones waiting to be re-adopted) are left alone.
+                let jobs = ctx.state.root().join("jobs");
+                for dir in std::fs::read_dir(&jobs)
+                    .map_err(|e| crate::AgentError::state(&jobs, e))?
+                    .flatten()
+                    .map(|e| e.path())
+                {
+                    let name = dir
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned();
+                    let ended = AttemptRecord::load(&dir)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|r| r.exit.is_some());
+                    if ended && !live.contains(&name) {
+                        crate::janitor::purge(ctx.state.root(), &dir)?;
+                    }
+                }
+            }
         } else {
             if lock(&self.live).contains_key(&id) {
                 return Err(AttemptError::state(
@@ -630,9 +665,8 @@ impl Attempts {
             }
         }
         if c.cache_limit_bytes > 0 {
-            let budget = ctx.cache.budget().max_bytes;
-            ctx.cache
-                .reserve(budget.saturating_sub(c.cache_limit_bytes))?;
+            // Node cache plus environments, down to the limit; pinned data stays.
+            self.shared.envs.prune_to(c.cache_limit_bytes)?;
         }
         Ok(())
     }

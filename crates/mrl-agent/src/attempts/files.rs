@@ -4,6 +4,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use mrl_storage::{StorageError, TransferTicket};
 
@@ -32,6 +33,13 @@ pub async fn stage_inputs(
     let mut staged = BTreeMap::new();
     for input in &spec.inputs {
         let dest = inputs_dir.join(safe_relative(&input.local_path)?);
+        // One fill per hash at a time (across attempts); the cache is checked again once this
+        // attempt owns the fill, and the object is pinned before the fill is released.
+        let fill = {
+            let mut fills = FILLS.lock().unwrap_or_else(|p| p.into_inner());
+            Arc::clone(fills.entry(input.sha256.clone()).or_default())
+        };
+        let _filling = fill.lock().await;
         let object = match ctx.cache.get(&input.sha256)? {
             Some(p) => p,
             None => {
@@ -54,10 +62,24 @@ pub async fn stage_inputs(
             }
         };
         ctx.cache.pin(&input.sha256, holder)?;
+        drop(_filling);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| AgentError::state(parent, e))?;
         }
-        if !dest.exists() {
+        if std::fs::symlink_metadata(&dest).is_ok() {
+            // Already there: only a retry of this same input may reuse it (for example a
+            // differently cased name on a case-insensitive disk is another input's file).
+            let same = mrl_storage::sha256_file(&dest)
+                .await
+                .is_ok_and(|(n, sha)| n == input.size && sha == input.sha256);
+            if !same {
+                return Err(AttemptError::Spec(format!(
+                    "input {} would overwrite another input at {}",
+                    input.name,
+                    dest.display()
+                )));
+            }
+        } else {
             link_or_copy(&object, &dest)?;
         }
         read_only(&dest)?;
@@ -66,21 +88,40 @@ pub async fn stage_inputs(
     Ok(staged)
 }
 
+/// Cache fills in progress, by sha256.
+static FILLS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// Copies `from` to a new file `to` (fails if `to` exists).
+fn copy_new(from: &Path, to: &Path) -> Result<(), AttemptError> {
+    let mut src = std::fs::File::open(from).map_err(|e| AgentError::state(from, e))?;
+    let mut dst = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(to)
+        .map_err(|e| AgentError::state(to, e))?;
+    std::io::copy(&mut src, &mut dst).map_err(|e| AgentError::state(to, e))?;
+    Ok(())
+}
+
 /// Unix: a hard link to the (read-only) cache object.
 #[cfg(unix)]
 fn link_or_copy(object: &Path, dest: &Path) -> Result<(), AttemptError> {
-    if std::fs::hard_link(object, dest).is_err() {
-        std::fs::copy(object, dest).map_err(|e| AgentError::state(dest, e))?;
+    match std::fs::hard_link(object, dest) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(AgentError::state(dest, e).into())
+        }
+        Err(_) => copy_new(object, dest),
     }
-    Ok(())
 }
 
 /// Windows: always a private copy, so a worker can never change the shared cache object
 /// through a writable link.
 #[cfg(not(unix))]
 fn link_or_copy(object: &Path, dest: &Path) -> Result<(), AttemptError> {
-    std::fs::copy(object, dest).map_err(|e| AgentError::state(dest, e))?;
-    Ok(())
+    copy_new(object, dest)
 }
 
 #[cfg(unix)]
@@ -122,16 +163,55 @@ fn open_beneath(staging: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
     Ok(std::fs::File::from(fd))
 }
 
-#[cfg(not(unix))]
+/// Windows: walks the path holding a handle on every folder, opened without following
+/// reparse points (junctions, links) and shared for reading only, so nothing on the path can be
+/// renamed, replaced or deleted until the file itself is open; every handle is checked to be a
+/// plain folder (then file), not a reparse point. The copy then reads from that file handle.
+#[cfg(windows)]
 fn open_beneath(staging: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
-    let mut p = staging.to_path_buf();
-    for c in rel.components() {
-        p.push(c);
-        if std::fs::symlink_metadata(&p)?.file_type().is_symlink() {
-            return Err(std::io::Error::other("the path contains a link"));
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    const FILE_SHARE_READ: u32 = 0x1;
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    let open = |p: &Path, dir: bool| -> std::io::Result<std::fs::File> {
+        let f = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(
+                FILE_FLAG_OPEN_REPARSE_POINT | if dir { FILE_FLAG_BACKUP_SEMANTICS } else { 0 },
+            )
+            .open(p)?;
+        let m = f.metadata()?;
+        if m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 || m.is_dir() != dir {
+            return Err(std::io::Error::other(
+                "the path contains a link or junction",
+            ));
         }
+        Ok(f)
+    };
+    let parts: Vec<_> = rel.components().collect();
+    let Some((last, dirs)) = parts.split_last() else {
+        return Err(std::io::Error::other("empty path"));
+    };
+    let mut p = staging.to_path_buf();
+    let mut held = vec![open(&p, true)?];
+    for c in dirs {
+        p.push(c);
+        held.push(open(&p, true)?);
     }
-    std::fs::File::open(p)
+    p.push(last);
+    let file = open(&p, false)?;
+    drop(held);
+    Ok(file)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_beneath(staging: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
+    let _ = (staging, rel);
+    Err(std::io::Error::other(
+        "uploads are not supported on this system",
+    ))
 }
 
 /// Copies a staged file into an agent-owned snapshot (`<attempt>/uploads/`, outside staging)
@@ -271,6 +351,22 @@ mod tests {
             std::fs::write(dir.path().join("out/w.bin"), b"weights").unwrap();
             std::os::unix::fs::symlink(dir.path().join("out"), staging.join("dirlink")).unwrap();
             assert!(snapshot(&staging, "dirlink/w.bin", 7, &sha).await.is_err());
+        }
+        #[cfg(windows)]
+        {
+            // A junction to a folder outside staging.
+            std::fs::create_dir_all(dir.path().join("out")).unwrap();
+            std::fs::write(dir.path().join("out").join("w.bin"), b"weights").unwrap();
+            let made = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(staging.join("junction"))
+                .arg(dir.path().join("out"))
+                .status()
+                .unwrap();
+            assert!(made.success());
+            assert!(snapshot(&staging, "junction/w.bin", 7, &sha).await.is_err());
+            // While a snapshot reads, the folders on the path can't be replaced.
+            assert!(snapshot(&staging, "ckpt/w.bin", 7, &sha).await.is_ok());
         }
     }
 }

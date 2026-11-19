@@ -124,6 +124,7 @@ impl Envs {
     pub fn open(state_root: &Path, cache: Arc<NodeCache>) -> Result<Self, AttemptError> {
         let root = state_root.join("envs");
         std::fs::create_dir_all(&root).map_err(|e| AgentError::state(&root, e))?;
+        reclaim_snapshots(&root);
         Ok(Self {
             root,
             cache,
@@ -138,11 +139,12 @@ impl Envs {
         self
     }
 
-    /// Before an install: evicts unused cache entries and unpinned environments (least
-    /// recently used first) until the disk keeps `min_free_bytes` free and environments plus
-    /// cache fit the cache budget. Fails with MRL-ENV-004 if pinned ones alone don't allow it.
-    fn make_room(&self, installing: &Path) -> Result<(), AttemptError> {
-        self.cache.reserve(0)?;
+    /// Before an install of about `incoming` bytes: one space decision for the node cache,
+    /// the environments and the new install, all against the same free-space reading.
+    /// Unpinned environments go first (least recently used), then unpinned cache entries,
+    /// until the disk keeps `min_free_bytes` free after the install and everything fits the
+    /// cache budget. Fails with MRL-ENV-004 when only pinned data is left.
+    fn make_room(&self, installing: &Path, incoming: u64) -> Result<(), AttemptError> {
         let budget = self.cache.budget();
         let mut envs: Vec<InstalledEnv> = self
             .installed()
@@ -153,20 +155,52 @@ impl Envs {
             let free = (self.free_space)(&self.root).unwrap_or(u64::MAX);
             let used =
                 self.cache.usage().used_bytes + envs.iter().map(|e| dir_size(&e.dir)).sum::<u64>();
-            if free >= budget.min_free_bytes && used <= budget.max_bytes {
+            let short_disk = (budget.min_free_bytes + incoming).saturating_sub(free);
+            let short_budget = (used + incoming).saturating_sub(budget.max_bytes);
+            if short_disk == 0 && short_budget == 0 {
                 return Ok(());
             }
-            let Some(i) = envs.iter().position(|e| e.pinned_by.is_empty()) else {
+            if let Some(i) = envs.iter().position(|e| e.pinned_by.is_empty()) {
+                let env = envs.remove(i);
+                remove_env(&env)?;
+                continue;
+            }
+            // No environment left to remove: free cache entries instead.
+            let evicted = self
+                .cache
+                .reserve(short_disk.max(short_budget))
+                .unwrap_or_default();
+            if evicted.is_empty() {
                 return Err(AgentError::CacheFull {
-                    needed: 0,
+                    needed: incoming,
                     pinned: used,
                     budget: budget.max_bytes,
                     min_free: budget.min_free_bytes,
                 }
                 .into());
-            };
-            let env = envs.remove(i);
-            remove_env(&env)?;
+            }
+        }
+    }
+
+    /// Shrinks environments plus cache to `limit` bytes (a `Cleanup` command), removing
+    /// unpinned environments first, then unpinned cache entries. Pinned data stays.
+    pub fn prune_to(&self, limit: u64) -> Result<(), AttemptError> {
+        let mut envs = self.installed();
+        loop {
+            let env_bytes: u64 = envs.iter().map(|e| dir_size(&e.dir)).sum();
+            if self.cache.usage().used_bytes + env_bytes <= limit {
+                return Ok(());
+            }
+            if let Some(i) = envs.iter().position(|e| e.pinned_by.is_empty()) {
+                let env = envs.remove(i);
+                remove_env(&env)?;
+                continue;
+            }
+            // Cache must end at or below `limit - env_bytes`: reserve the rest of its budget.
+            let cache_target = limit.saturating_sub(env_bytes);
+            self.cache
+                .reserve(self.cache.budget().max_bytes.saturating_sub(cache_target))?;
+            return Ok(());
         }
     }
 
@@ -206,7 +240,7 @@ impl Envs {
                 self.process(rt, &lock_sha256, &dir, holder, &say).await?
             }
             RuntimeKind::Container { image } => {
-                container(rt, &image, &dir, &say, || self.make_room(&dir)).await?
+                container(rt, &image, &dir, &say, |bytes| self.make_room(&dir, bytes)).await?
             }
         };
         let pin = dir.join(PINS).join(holder);
@@ -275,15 +309,19 @@ impl Envs {
                 AttemptError::UvMissing("no `uv` program was found on PATH".into())
             })?;
             let plan = LockPlan::parse(&lock, project).map_err(install_err)?;
-            self.make_room(dir)?;
+            self.make_room(dir, plan.install_bytes)?;
             // Install from an agent-owned copy holding the verified lock, never the live
-            // project folder.
-            let snap = self.root.join(format!(".src-{}", rt.dir_name()));
-            let snap_project =
-                snapshot_project(project, &plan.local_dirs, &lock, &snap, &self.root)
-                    .map_err(|e| install_err(format!("the project could not be copied ({e})")))?;
-            plan.check_build_pins(&snap_project, project)
-                .map_err(install_err)?;
+            // project folder. The copy is removed however the install ends (error, cancel);
+            // one left by a dead agent is reclaimed by `Envs::open`.
+            let snap = ScopedDir(self.root.join(format!(
+                ".src-{}-{}",
+                rt.dir_name(),
+                snapshot_owner()
+            )));
+            let copy = snapshot_project(project, &plan.local_dirs, &lock, &snap.0, &self.root)
+                .map_err(|e| install_err(format!("the project could not be copied ({e})")))?;
+            plan.check_build_backends(&copy).map_err(install_err)?;
+            let snap_project = copy.project.clone();
             let mut cmd = tokio::process::Command::new(uv);
             cmd.args(["sync", "--frozen", "--no-dev", "--no-editable", "--project"])
                 .arg(&snap_project)
@@ -298,7 +336,7 @@ impl Envs {
                 cmd.args(["--no-build-package", name]);
             }
             let synced = run_streaming(cmd, &rt.runtime_ref, "installing", say).await;
-            let _ = std::fs::remove_dir_all(&snap);
+            drop(snap);
             synced?;
             if !program.is_file() {
                 return Err(install_err(format!(
@@ -419,6 +457,8 @@ struct LockPlan {
     remote: Vec<String>,
     /// Local packages (workspace members, path sources), as folders.
     local_dirs: Vec<PathBuf>,
+    /// Estimated installed size: three times the largest wheel of each package.
+    install_bytes: u64,
 }
 
 impl LockPlan {
@@ -459,38 +499,121 @@ impl LockPlan {
                         p
                     });
                 }
-                None => plan.remote.push(name),
+                None => {
+                    let wheel = p
+                        .get("wheels")
+                        .and_then(|w| w.as_array())
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|w| w.get("size").and_then(|s| s.as_integer()))
+                        .max()
+                        .unwrap_or(0);
+                    plan.install_bytes += u64::try_from(wheel).unwrap_or(0) * 3;
+                    plan.remote.push(name);
+                }
             }
         }
         Ok(plan)
     }
 
-    /// Local packages are built here, so their build tools must be pinned exactly (`==`).
-    fn check_build_pins(&self, snap_project: &Path, project: &Path) -> Result<(), String> {
+    /// Local packages are built here. Their only build backend allowed is `uv_build`, pinned
+    /// to one exact version (`uv_build==X.Y.Z`): it has no dependencies of its own and uv
+    /// builds it natively, so no unlocked build tools are resolved. Anything else (another
+    /// backend, extra build requirements, a range or wildcard) is refused.
+    fn check_build_backends(&self, copy: &Snapshot) -> Result<(), String> {
         for dir in &self.local_dirs {
-            let rel = dir.strip_prefix(project).unwrap_or(dir);
-            let pyproject = snap_project.join(rel).join("pyproject.toml");
+            let pyproject = copy.copy_of(dir).join("pyproject.toml");
             let Ok(text) = std::fs::read_to_string(&pyproject) else {
                 continue;
             };
             let doc: toml::Table = toml::from_str(&text)
                 .map_err(|e| format!("{} can't be read ({e})", pyproject.display()))?;
-            let requires = doc
-                .get("build-system")
-                .and_then(|b| b.get("requires"))
+            let Some(build) = doc.get("build-system") else {
+                continue; // virtual project: nothing to build
+            };
+            let backend = build.get("build-backend").and_then(|b| b.as_str());
+            let requires: Vec<&str> = build
+                .get("requires")
                 .and_then(|r| r.as_array())
-                .cloned()
-                .unwrap_or_default();
-            for r in requires.iter().filter_map(|r| r.as_str()) {
-                if !r.contains("==") {
-                    return Err(format!(
-                        "the build requirement {r:?} in {} is not pinned with ==",
-                        pyproject.display()
-                    ));
-                }
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r.as_str())
+                .collect();
+            let exact = |r: &str| {
+                r.strip_prefix("uv_build==").is_some_and(|v| {
+                    !v.is_empty()
+                        && v.split('.')
+                            .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+                })
+            };
+            if backend != Some("uv_build") || requires.len() != 1 || !exact(requires[0]) {
+                return Err(format!(
+                    "{} must build with uv_build pinned to one exact version (uv_build==X.Y.Z), not {requires:?}",
+                    pyproject.display()
+                ));
             }
         }
         Ok(())
+    }
+}
+
+/// A folder removed when this value is dropped.
+struct ScopedDir(PathBuf);
+
+impl Drop for ScopedDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `<pid>-<start time>` of this agent, naming its install snapshots.
+fn snapshot_owner() -> String {
+    let pid = std::process::id();
+    let start = crate::attempts::record::process_start(pid).unwrap_or(0);
+    format!("{pid}-{start}")
+}
+
+/// Removes install snapshots (`.src-<name>-<pid>-<start>`) whose agent is no longer running.
+fn reclaim_snapshots(root: &Path) {
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if !name.starts_with(".src-") {
+            continue;
+        }
+        let mut parts = name.rsplitn(3, '-');
+        let start = parts.next().and_then(|s| s.parse::<u64>().ok());
+        let pid = parts.next().and_then(|p| p.parse::<u32>().ok());
+        let alive = match (pid, start) {
+            (Some(pid), Some(start_time)) => {
+                crate::attempts::record::ProcIdentity::Pid { pid, start_time }.alive()
+            }
+            _ => false,
+        };
+        if !alive {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
+}
+
+/// An install snapshot: where the source tree's folders were copied.
+struct Snapshot {
+    /// The copy of the project folder.
+    project: PathBuf,
+    /// Common ancestor of the project and its local packages (in the source tree).
+    src_root: PathBuf,
+    /// Where `src_root` was copied.
+    copy_root: PathBuf,
+}
+
+impl Snapshot {
+    /// The copy of a source folder.
+    fn copy_of(&self, dir: &Path) -> PathBuf {
+        let d = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+        self.copy_root
+            .join(d.strip_prefix(&self.src_root).unwrap_or(Path::new("")))
     }
 }
 
@@ -503,7 +626,7 @@ fn snapshot_project(
     lock: &[u8],
     snap: &Path,
     exclude: &Path,
-) -> std::io::Result<PathBuf> {
+) -> std::io::Result<Snapshot> {
     let project = std::fs::canonicalize(project)?;
     let exclude = std::fs::canonicalize(exclude).unwrap_or_else(|_| exclude.to_path_buf());
     let mut dirs = vec![project.clone()];
@@ -533,7 +656,11 @@ fn snapshot_project(
     }
     let snap_project = snap.join(project.strip_prefix(&root).unwrap_or(Path::new("")));
     crate::state::atomic_write(&snap_project.join("uv.lock"), lock)?;
-    Ok(snap_project)
+    Ok(Snapshot {
+        project: snap_project,
+        src_root: root,
+        copy_root: snap.to_path_buf(),
+    })
 }
 
 fn copy_tree(from: &Path, to: &Path, exclude: &Path) -> std::io::Result<()> {
@@ -561,7 +688,7 @@ async fn container(
     image: &str,
     dir: &Path,
     say: &(dyn Fn(&'static str, String) + Send + Sync),
-    make_room: impl FnOnce() -> Result<(), AttemptError>,
+    make_room: impl FnOnce(u64) -> Result<(), AttemptError>,
 ) -> Result<Materialized, AttemptError> {
     let docker = which("docker").ok_or_else(|| {
         AttemptError::DockerMissing("no `docker` program was found on PATH".into())
@@ -584,7 +711,7 @@ async fn container(
     };
     let hit = has_digest(&docker);
     if !hit {
-        make_room()?;
+        make_room(image_bytes(&docker, image))?;
         let mut cmd = tokio::process::Command::new(&docker);
         cmd.args(["pull", image]);
         run_streaming(cmd, &rt.runtime_ref, "installing", say).await?;
@@ -605,6 +732,35 @@ async fn container(
         cache_hit: hit,
         read_paths: Vec::new(),
     })
+}
+
+/// The image's compressed layer sizes (`docker manifest inspect -v`), times three for the
+/// unpacked image; 0 when the registry can't be asked.
+fn image_bytes(docker: &Path, image: &str) -> u64 {
+    let Ok(out) = std::process::Command::new(docker)
+        .args(["manifest", "inspect", "-v", image])
+        .stderr(Stdio::null())
+        .output()
+    else {
+        return 0;
+    };
+    fn sum(v: &serde_json::Value) -> u64 {
+        match v {
+            serde_json::Value::Object(m) => {
+                let here = m.get("layers").and_then(|l| l.as_array()).map_or(0, |l| {
+                    l.iter().filter_map(|x| x.get("size")?.as_u64()).sum()
+                });
+                here + m
+                    .iter()
+                    .filter(|(k, _)| *k != "layers")
+                    .map(|(_, v)| sum(v))
+                    .sum::<u64>()
+            }
+            serde_json::Value::Array(a) => a.iter().map(sum).sum(),
+            _ => 0,
+        }
+    }
+    serde_json::from_slice::<serde_json::Value>(&out.stdout).map_or(0, |v| sum(&v) * 3)
 }
 
 /// Runs `cmd`, passing each output line to `say`. Fails with the last lines on a non-zero exit.
@@ -794,12 +950,12 @@ mod tests {
         }
         std::fs::write(
             project.join("pyproject.toml"),
-            "[build-system]\nrequires = [\"uv_build==0.11.28\"]\n",
+            "[build-system]\nrequires = [\"uv_build==0.11.28\"]\nbuild-backend = \"uv_build\"\n",
         )
         .unwrap();
         std::fs::write(
             runtime.join("pyproject.toml"),
-            "[build-system]\nrequires = [\"uv_build>=0.11\"]\n",
+            "[build-system]\nrequires = [\"uv_build>=0.11\"]\nbuild-backend = \"uv_build\"\n",
         )
         .unwrap();
         std::fs::write(runtime.join("src").join("m.py"), "x = 1\n").unwrap();
@@ -828,7 +984,7 @@ source = { registry = "https://pypi.org/simple" }
         )
         .unwrap();
         assert_eq!(
-            std::fs::read(sp.join("uv.lock")).unwrap(),
+            std::fs::read(sp.project.join("uv.lock")).unwrap(),
             lock,
             "the verified bytes"
         );
@@ -836,16 +992,32 @@ source = { registry = "https://pypi.org/simple" }
             snap.join("runtime").join("src").join("m.py").is_file(),
             "layout kept"
         );
-        assert!(!sp.join(".venv").exists() && !sp.join("target").exists());
+        assert!(!sp.project.join(".venv").exists() && !sp.project.join("target").exists());
         // The runtime's build tool is a range, not a pin.
-        let e = plan.check_build_pins(&sp, &project).unwrap_err();
+        // The runtime outside the project is checked in its copy: a range is refused...
+        let e = plan.check_build_backends(&sp).unwrap_err();
         assert!(e.contains("uv_build>=0.11"), "{e}");
+        let runtime_copy = sp.copy_of(&runtime).join("pyproject.toml");
+        let set = |text: &str| std::fs::write(&runtime_copy, text).unwrap();
+        // ...as are a wildcard and a backend with build dependencies of its own...
+        set("[build-system]\nrequires = [\"uv_build==0.11.*\"]\nbuild-backend = \"uv_build\"\n");
+        assert!(plan.check_build_backends(&sp).is_err(), "wildcard");
+        set("[build-system]\nrequires = [\"hatchling==1.27.0\"]\nbuild-backend = \"hatchling.build\"\n");
+        assert!(plan.check_build_backends(&sp).is_err(), "other backend");
+        set("[build-system]\nrequires = [\"uv_build==0.11.28\", \"setuptools==80.0.0\"]\nbuild-backend = \"uv_build\"\n");
+        assert!(
+            plan.check_build_backends(&sp).is_err(),
+            "extra build requirement"
+        );
+        // ...and one exact uv_build passes.
+        set("[build-system]\nrequires = [\"uv_build==0.11.28\"]\nbuild-backend = \"uv_build\"\n");
+        assert!(plan.check_build_backends(&sp).is_ok());
         let git = b"[[package]]\nname = \"g\"\nsource = { git = \"https://x\" }\n";
         assert!(LockPlan::parse(git, &project).is_err());
     }
 
     #[tokio::test]
-    async fn a_low_disk_evicts_unused_environments_then_refuses() {
+    async fn one_space_decision_evicts_unused_environments_first() {
         if which("uv").is_none() {
             return; // the uv check comes before the space check
         }
@@ -858,9 +1030,21 @@ source = { registry = "https://pypi.org/simple" }
             },
         )
         .unwrap();
+        let envs_root = dir.path().join("envs");
+        let old_marker = Arc::new(std::sync::Mutex::new(None::<PathBuf>));
+        let watch = Arc::clone(&old_marker);
+        // One reading for everything: the disk is full while the unused environment exists.
+        let free: Arc<FreeSpaceFn> = Arc::new(move |_| {
+            let full = watch
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|p: &PathBuf| p.exists());
+            Some(if full { 0 } else { 100 << 30 })
+        });
         let e = Envs::open(dir.path(), Arc::new(cache))
             .unwrap()
-            .with_free_space(Arc::new(|_| Some(0)));
+            .with_free_space(free);
         let mk = |n: &str, pinned: bool| {
             let rt = RuntimeSpec {
                 runtime_ref: format!("uv:sha256:{}", n.repeat(64)),
@@ -876,6 +1060,7 @@ source = { registry = "https://pypi.org/simple" }
             d
         };
         let (old, kept) = (mk("2", false), mk("3", true));
+        *old_marker.lock().unwrap() = Some(old.clone());
         let project = dir.path().join("proj");
         std::fs::create_dir_all(&project).unwrap();
         std::fs::write(project.join("uv.lock"), b"version = 1\n").unwrap();
@@ -884,10 +1069,38 @@ source = { registry = "https://pypi.org/simple" }
             project: Some(project),
             package: None,
         };
+        // Space is found (the next step, uv on an empty project, is what fails here).
+        let err = e.materialize(&rt, "att_new", &|_| {}).await.unwrap_err();
+        assert_ne!(err.code(), "MRL-ENV-004", "{}", err.explain());
+        assert!(!old.exists(), "the unused environment made room");
+        assert!(kept.exists(), "the pinned one survived");
+        // Install copies never outlive the install.
+        let left = std::fs::read_dir(&envs_root)
+            .unwrap()
+            .flatten()
+            .filter(|d| d.file_name().to_string_lossy().starts_with(".src-"))
+            .count();
+        assert_eq!(left, 0);
+
+        // Only pinned data left and still no room: refused.
+        let e = e.with_free_space(Arc::new(|_| Some(0)));
         let err = e.materialize(&rt, "att_new", &|_| {}).await.unwrap_err();
         assert_eq!(err.code(), "MRL-ENV-004", "{}", err.explain());
-        assert!(!old.exists(), "the unpinned environment was evicted first");
-        assert!(kept.exists(), "a pinned one never is");
+        assert!(kept.exists());
+    }
+
+    #[test]
+    fn snapshots_of_dead_agents_are_reclaimed() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("envs");
+        let dead = root.join(".src-uv-x-4294967294-1");
+        let mine = root.join(format!(".src-uv-y-{}", snapshot_owner()));
+        for d in [&dead, &mine] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let _ = envs(dir.path());
+        assert!(!dead.exists(), "a dead agent's copy is removed");
+        assert!(mine.exists(), "a running installer's copy is kept");
     }
 
     #[test]

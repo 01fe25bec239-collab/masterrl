@@ -879,3 +879,171 @@ async fn real_agent_crash_is_readopted_under_bubblewrap() {
     }
     crash_and_readopt("bubblewrap", "bubblewrap", "att_crash_bwrap").await;
 }
+
+fn old_record(
+    dir: &Path,
+    id: &str,
+    nonce: &str,
+    identity: ProcIdentity,
+    cgroup: Option<PathBuf>,
+) -> AttemptRecord {
+    let mut spec = spec(id, serde_json::json!({}), serde_json::json!({}));
+    spec.attempt.attempt_id = id.into();
+    AttemptRecord {
+        spec,
+        nonce: nonce.into(),
+        socket: dir.join("x.sock"),
+        phase: AttemptPhase::Exited as i32,
+        workers: vec![mrl_agent::attempts::record::WorkerProc {
+            role_id: "trainer".into(),
+            primary: true,
+            identity,
+            cgroup,
+        }],
+        prepared: Vec::new(),
+        started: Vec::new(),
+        last_step: 0,
+        checkpoints: Default::default(),
+        cancel_requested: false,
+        exit: None,
+        staged_paths: Default::default(),
+        lease_deadline_unix_ms: None,
+        stop_deadline_unix_ms: None,
+        exit_report: None,
+        requests: Vec::new(),
+        uploads: Default::default(),
+    }
+}
+
+/// An old record whose saved cgroup now holds another launch's processes leaves them alone.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn an_old_record_never_kills_another_launchs_cgroup() {
+    use mrl_agent::attempts::runner::{attempt_token, TOKEN_ENV};
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), None);
+    let envs = mrl_agent::envs::Envs::open(ctx.state.root(), Arc::clone(&ctx.cache)).unwrap();
+    let mut newer = std::process::Command::new("sleep")
+        .arg("300")
+        .env(TOKEN_ENV, attempt_token("new-launch"))
+        .spawn()
+        .unwrap();
+    // A stand-in cgroup folder (same files the kernel's has) holding the newer process.
+    let cg = dir.path().join("job-att_same-trainer");
+    std::fs::create_dir_all(&cg).unwrap();
+    std::fs::write(cg.join("cgroup.procs"), format!("{}\n", newer.id())).unwrap();
+    let gone_worker = ProcIdentity::Pid {
+        pid: u32::MAX - 3,
+        start_time: 1,
+    };
+    let rec = old_record(
+        dir.path(),
+        "att_same",
+        "old-launch",
+        gone_worker,
+        Some(cg.clone()),
+    );
+    let report = mrl_agent::janitor::release(&ctx, &envs, &rec, &Default::default()).await;
+    assert!(!cg.join("cgroup.kill").exists(), "nothing was killed");
+    assert!(
+        newer.try_wait().unwrap().is_none(),
+        "the newer launch keeps running"
+    );
+    assert!(
+        report
+            .errors
+            .iter()
+            .any(|e| e.contains("not this launch's")),
+        "{report:?}"
+    );
+    newer.kill().unwrap();
+    newer.wait().unwrap();
+}
+
+fn docker_ready(test: &str) -> bool {
+    let ok = mrl_agent::envs::which("docker").is_some_and(|d| {
+        std::process::Command::new(d)
+            .args(["pull", "-q", "busybox:1.36"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    });
+    if !ok {
+        assert!(
+            std::env::var("MRL_TEST_DOCKER_REQUIRED").is_err(),
+            "{test}: Docker is required but can't run busybox"
+        );
+        eprintln!("SKIPPED {test}: Docker is not available");
+    }
+    ok
+}
+
+/// An old record never removes a container a newer launch runs under the same name.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; runs in ci-attempts"]
+async fn an_old_record_never_removes_a_newer_container() {
+    use mrl_agent::attempts::runner::{attempt_token, TOKEN_ENV};
+    if !docker_ready("an_old_record_never_removes_a_newer_container") {
+        return;
+    }
+    let docker = mrl_agent::envs::which("docker").unwrap();
+    let name = format!("mrl-test-{}", std::process::id());
+    let run = std::process::Command::new(&docker)
+        .args(["run", "-d", "--rm", "--name", &name, "-e"])
+        .arg(format!("{TOKEN_ENV}={}", attempt_token("new-launch")))
+        .args(["busybox:1.36", "sleep", "300"])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert!(run.success());
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), None);
+    let envs = mrl_agent::envs::Envs::open(ctx.state.root(), Arc::clone(&ctx.cache)).unwrap();
+    let identity = ProcIdentity::Container { name: name.clone() };
+    let old = old_record(dir.path(), "att_c1", "old-launch", identity.clone(), None);
+    let report = mrl_agent::janitor::release(&ctx, &envs, &old, &Default::default()).await;
+    assert!(
+        identity.alive(),
+        "the newer launch's container survived: {report:?}"
+    );
+    let new = old_record(dir.path(), "att_c1", "new-launch", identity.clone(), None);
+    mrl_agent::janitor::release(&ctx, &envs, &new, &Default::default()).await;
+    for _ in 0..50 {
+        if !identity.alive() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!identity.alive(), "its own launch removes it");
+}
+
+/// The lease runs out while the event reader is stuck: the launch ends fenced and no worker
+/// is ever started.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs uv; runs in ci-attempts"]
+async fn an_expired_launch_starts_no_worker() {
+    if !ready("an_expired_launch_starts_no_worker") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), None);
+    let (tx, _never_read) = mrl_agent::attempts::attempt_events(1);
+    let attempts = Attempts::new(Arc::clone(&ctx), tx, None).unwrap();
+    attempts
+        .launch(spec(
+            "att_exp",
+            serde_json::json!({"steps": 4}),
+            serde_json::json!({"lease_s": 2, "upload_dir": dir.path().join("out")}),
+        ))
+        .unwrap();
+    let d = tokio::time::timeout(WAIT, attempts.wait("att_exp"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(d.phase, AttemptPhase::SelfFenced as i32, "{d:?}");
+    let rec = AttemptRecord::load(&ctx.state.job_dir("att_exp"))
+        .unwrap()
+        .unwrap();
+    assert!(rec.workers.is_empty(), "no worker was started");
+}

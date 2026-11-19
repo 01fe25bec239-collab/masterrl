@@ -426,11 +426,22 @@ impl AttemptSpec {
                 ));
             }
         }
+        // Expanded worker ids (`<role>.<n>` for replicas) must be unique too.
+        let mut workers = std::collections::BTreeSet::new();
+        for (id, _, _) in self.workers() {
+            if !workers.insert(id.clone()) {
+                return bad(format!(
+                    "worker id {id} is used twice (check role names and counts)"
+                ));
+            }
+        }
         let mut names = std::collections::BTreeSet::new();
         let mut paths: Vec<PathBuf> = Vec::new();
         for input in &self.inputs {
             let p = safe_relative(&input.local_path)?;
             // Two inputs may not share a file, and one may not sit inside another.
+            // Compared without case: on a case-insensitive disk `Model.bin` is `model.bin`.
+            let p = PathBuf::from(p.to_string_lossy().to_lowercase());
             if let Some(other) = paths.iter().find(|o| o.starts_with(&p) || p.starts_with(o)) {
                 return bad(format!(
                     "input {} uses {} which collides with {}",
@@ -660,6 +671,14 @@ mod tests {
         two.inputs = vec![input("model", "m"), input("dataset.train", "m/w.bin")];
         assert!(two.validate().is_err(), "one inside the other");
         two.inputs = vec![
+            input("model", "m/Model.bin"),
+            input("dataset.train", "m/model.bin"),
+        ];
+        assert!(
+            two.validate().is_err(),
+            "same file on a case-insensitive disk"
+        );
+        two.inputs = vec![
             input("model", "m/w.bin"),
             input("dataset.train", "d/t.jsonl"),
         ];
@@ -668,6 +687,23 @@ mod tests {
             assert!(safe_relative(bad).is_err(), "{bad}");
         }
         assert!(safe_relative("model/a.bin").is_ok());
+    }
+
+    #[test]
+    fn expanded_worker_ids_must_be_unique() {
+        let mut l = launch();
+        l.roles[0].role_id = "train.main".into();
+        l.roles[0].count = 2;
+        let spec = AttemptSpec::from_launch(&l, &[], Path::new("/s")).unwrap();
+        let ids: Vec<String> = spec.workers().into_iter().map(|(id, _, _)| id).collect();
+        assert_eq!(ids, ["train.main.0", "train.main.1"]);
+        // An explicit role named like a generated replica id collides.
+        let mut extra = l.roles[0].clone();
+        extra.role_id = "train.main.1".into();
+        extra.primary = false;
+        extra.count = 1;
+        l.roles.push(extra);
+        assert!(AttemptSpec::from_launch(&l, &[], Path::new("/s")).is_err());
     }
 
     #[test]

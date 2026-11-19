@@ -95,6 +95,8 @@ pub enum Control {
 enum Early {
     Failed(AttemptError),
     Cancelled,
+    /// Paused before any worker started (its deadline passed while staging).
+    Paused,
     Fenced,
     Detached,
 }
@@ -208,6 +210,7 @@ pub struct Runner {
     stalled: bool,
     self_fenced: bool,
     agent_stopped: bool,
+    pause_requested: bool,
     lease: Option<Instant>,
     stop_at: Option<Instant>,
     last_seen: Instant,
@@ -316,6 +319,7 @@ impl Runner {
             stalled: false,
             self_fenced: false,
             agent_stopped: false,
+            pause_requested: false,
             lease: None,
             stop_at: None,
             last_seen: Instant::now(),
@@ -349,6 +353,15 @@ impl Runner {
                     Early::Detached => {
                         self.save();
                         None
+                    }
+                    Early::Paused => {
+                        let d = ExitDecision {
+                            phase: AttemptPhase::Exited as i32,
+                            exit_kind: mrl_proto::worker::v1::ExitKind::Paused as i32,
+                            exit_code: -1,
+                            failure: None,
+                        };
+                        Some(self.finish_with(d).await)
                     }
                     Early::Cancelled | Early::Fenced => {
                         let ev = ExitEvidence {
@@ -510,6 +523,9 @@ impl Runner {
                     self.self_fenced = true;
                     return Err(Early::Fenced);
                 }
+                () = tokio::time::sleep_until(self.stop_at.unwrap_or_else(far)), if self.stop_at.is_some() => {
+                    return Err(if self.pause_requested && !self.rec.cancel_requested { Early::Paused } else { Early::Cancelled });
+                }
                 c = control.recv() => match c {
                     Some(Control::Cancel { .. }) | None => {
                         self.rec.cancel_requested = true;
@@ -527,8 +543,18 @@ impl Runner {
                         self.set_lease(now_ms() + margin);
                     }
                     Some(Control::Pause { request_id, deadline_s, reason }) => {
-                        // Sent to the workers when they connect; they pause at once.
+                        // Sent to the workers when they connect (they pause at once); its
+                        // deadline holds from now, as after the launch.
                         self.remember(&AgentBody::Pause(PauseRequest { request_id, deadline_s, reason }));
+                        self.pause_requested = true;
+                        self.set_stop_deadline(Duration::from_secs(deadline_s.into()) + DEADLINE_MARGIN);
+                    }
+                    Some(Control::Checkpoint { request_id, deadline_s, reason }) => {
+                        self.remember(&AgentBody::CheckpointRequest(CheckpointRequest {
+                            request_id,
+                            deadline_s,
+                            reason,
+                        }));
                     }
                     Some(Control::Upload { command_id, checkpoint_id, targets }) => {
                         self.store_plan(checkpoint_id, command_id, targets);
@@ -536,7 +562,6 @@ impl Runner {
                     Some(Control::Hw(events)) => {
                         self.hw_events.extend(events.into_iter().filter(|e| self.gpu_uuids.contains(&e.uuid)));
                     }
-                    Some(Control::Checkpoint { .. }) => {}
                 },
                 r = &mut work => break r.map_err(Early::Failed)?,
             }
@@ -548,9 +573,18 @@ impl Runner {
         self.rec.staged_paths = staged;
         self.save();
         self.set_phase(AttemptPhase::Preparing).await;
+        // Publishing the phase may have waited for a slow reader up to the lease.
+        if self.lease_over() {
+            self.self_fenced = true;
+            return Err(Early::Fenced);
+        }
         self.start_server().await.map_err(Early::Failed)?;
         let spec = self.rec.spec.clone();
         for (role_id, role, primary) in spec.workers() {
+            if self.lease_over() {
+                self.self_fenced = true;
+                return Err(Early::Fenced);
+            }
             let mat = envs.get(&role.runtime_ref).ok_or_else(|| {
                 Early::Failed(AttemptError::Spec(format!(
                     "runtime {} was not prepared",
@@ -600,8 +634,10 @@ impl Runner {
             .unwrap_or_default())
     }
 
+    /// Names the worker's cgroup (`job-<name>`) and container (`mrl-<name>`): derived from the
+    /// launch token, so no other launch (even of the same attempt id) can share them.
     fn exec_name(&self, role_id: &str) -> String {
-        format!("{}-{role_id}", self.id())
+        format!("{}-{role_id}", &attempt_token(&self.rec.nonce)[..16])
     }
 
     async fn start_worker(
@@ -773,6 +809,7 @@ impl Runner {
                 },
                 Some(u) = self.uploads_rx.recv() => self.on_upload(u).await,
                 _ = stall_tick.tick() => {
+                    self.retry_commits().await;
                     if !self.stalled
                         && self.rec.phase == AttemptPhase::Running as i32
                         && self.last_seen.elapsed() > STALL_TIMEOUT
@@ -874,14 +911,14 @@ impl Runner {
         self.emit(AttemptEvent::Relay { lane, relay }).await
     }
 
-    fn role_spec(&self, role_id: &str) -> Option<RoleSpec> {
-        let base = role_id.split_once('.').map_or(role_id, |(b, _)| b);
+    /// The role of a worker id, from the exact worker list the launch expanded.
+    fn role_spec(&self, worker_id: &str) -> Option<RoleSpec> {
         self.rec
             .spec
-            .roles
-            .iter()
-            .find(|r| r.role_id == role_id || r.role_id == base)
-            .cloned()
+            .workers()
+            .into_iter()
+            .find(|(id, _, _)| id == worker_id)
+            .map(|(_, r, _)| r.clone())
     }
 
     async fn on_inbound(&mut self, inb: Inbound) {
@@ -1213,31 +1250,59 @@ impl Runner {
                 Ok(()) => (CommitState::Committed, String::new()),
                 Err((s, r)) => (*s, r.clone()),
             };
-            if let Some(ck) = self.rec.checkpoints.get_mut(id) {
+            let prev = self.rec.checkpoints.get_mut(id).map(|ck| {
+                let prev = ck.state;
                 ck.state = Some(state as i32);
+                prev
+            });
+            if !self.save() {
+                // Not durable yet: nobody hears the outcome; the retry tick uploads again and
+                // reports it once it is saved.
+                if let (Some(ck), Some(prev)) = (self.rec.checkpoints.get_mut(id), prev) {
+                    ck.state = prev;
+                }
+                return;
             }
-            self.save();
             if let Some(role) = self.primary_role() {
                 self.send(&role, commit_ack(id, state, &reason)).await;
             }
         }
         if let Some(command_id) = u.command_id {
-            let result = CommandResult {
-                command_id,
-                accepted: true,
-                failure: u
-                    .result
-                    .err()
-                    .map(|(_, reason)| mrl_proto::common::v1::Failure {
-                        class: mrl_proto::common::v1::FailureClass::InfraTransient as i32,
-                        sub_code: "UPLOAD_FAILED".into(),
-                        message: reason,
-                        retryable_hint: true,
-                        classified_by: mrl_proto::common::v1::ClassifiedBy::Agent as i32,
-                        ..Default::default()
-                    }),
-            };
-            let _ = self.emit(AttemptEvent::CommandDone(result)).await;
+            let failure = u.result.err().map(|(_, reason)| reason);
+            self.command_done(command_id, failure).await;
+        }
+    }
+
+    /// Reports a finished upload command (`failure`: why it failed).
+    async fn command_done(&self, command_id: String, failure: Option<String>) {
+        let result = CommandResult {
+            command_id,
+            accepted: true,
+            failure: failure.map(|reason| mrl_proto::common::v1::Failure {
+                class: mrl_proto::common::v1::FailureClass::InfraTransient as i32,
+                sub_code: "UPLOAD_FAILED".into(),
+                message: reason,
+                retryable_hint: true,
+                classified_by: mrl_proto::common::v1::ClassifiedBy::Agent as i32,
+                ..Default::default()
+            }),
+        };
+        let _ = self.emit(AttemptEvent::CommandDone(result)).await;
+    }
+
+    /// Retries commits whose outcome could not be saved (and any that now have tickets).
+    async fn retry_commits(&mut self) {
+        let waiting: Vec<String> = self
+            .rec
+            .checkpoints
+            .iter()
+            .filter(|(id, c)| {
+                c.commit_requested && c.state.is_none() && !self.in_flight.contains(*id)
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in waiting {
+            self.try_commit(&id).await;
         }
     }
 
@@ -1358,15 +1423,48 @@ impl Runner {
                             .await;
                     });
                 } else {
-                    self.store_plan(checkpoint_id.clone(), command_id, targets);
-                    // New tickets retry a rejected upload (a corrupt checkpoint stays corrupt).
-                    if let Some(ck) = self.rec.checkpoints.get_mut(&checkpoint_id) {
-                        if ck.state == Some(CommitState::Rejected as i32) {
-                            ck.state = None;
+                    let active = self
+                        .rec
+                        .uploads
+                        .get(&checkpoint_id)
+                        .map(|p| p.command_id.clone());
+                    if self.in_flight.contains(&checkpoint_id) {
+                        // One upload per checkpoint at a time; a replay of the running command
+                        // gets its result when it ends.
+                        if active.as_deref() != Some(command_id.as_str()) {
+                            let why = format!(
+                                "checkpoint {checkpoint_id} is already uploading (command {})",
+                                active.unwrap_or_default()
+                            );
+                            self.command_done(command_id, Some(why)).await;
+                        }
+                        return;
+                    }
+                    let state = self
+                        .rec
+                        .checkpoints
+                        .get(&checkpoint_id)
+                        .and_then(|c| c.state)
+                        .and_then(|s| CommitState::try_from(s).ok());
+                    match state {
+                        // Already decided: the saved outcome, no second upload.
+                        Some(CommitState::Committed) => self.command_done(command_id, None).await,
+                        Some(CommitState::Corrupt) => {
+                            let why = format!("checkpoint {checkpoint_id} is corrupt");
+                            self.command_done(command_id, Some(why)).await;
+                        }
+                        _ => {
+                            self.store_plan(checkpoint_id.clone(), command_id, targets);
+                            // New tickets retry a rejected upload.
+                            if let Some(ck) = self.rec.checkpoints.get_mut(&checkpoint_id) {
+                                if ck.state == Some(CommitState::Rejected as i32) {
+                                    ck.state = None;
+                                }
+                            }
+                            self.save();
+                            self.try_commit(&checkpoint_id).await;
                         }
                     }
-                    self.save();
-                    self.try_commit(&checkpoint_id).await;
                 }
             }
             Control::Lease {

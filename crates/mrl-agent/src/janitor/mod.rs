@@ -58,7 +58,22 @@ pub async fn release(
         attempt_id: id.clone(),
         ..CleanupReport::default()
     };
+    let token = crate::attempts::runner::attempt_token(&rec.nonce);
     for w in &rec.workers {
+        // A container is touched only when it carries this launch's token: an old record
+        // never removes a newer launch's container that reused the name.
+        if let ProcIdentity::Container { name } = &w.identity {
+            let (n, t) = (name.clone(), token.clone());
+            let owned = tokio::task::spawn_blocking(move || owns_container(&n, &t))
+                .await
+                .unwrap_or(false);
+            if !owned {
+                report
+                    .errors
+                    .push(format!("container {name} is not this launch's; left alone"));
+                continue;
+            }
+        }
         let identity = w.identity.clone();
         let alive = tokio::task::spawn_blocking(move || identity.alive())
             .await
@@ -79,10 +94,15 @@ pub async fn release(
         }
     }
     for cg in rec.workers.iter().filter_map(|w| w.cgroup.as_deref()) {
-        report.killed += kill_cgroup(cg);
+        match kill_cgroup(cg, &token) {
+            Some(n) => report.killed += n,
+            None => report.errors.push(format!(
+                "cgroup {} is not this launch's; left alone",
+                cg.display()
+            )),
+        }
     }
     let job_dir = ctx.state.job_dir(&id);
-    let token = crate::attempts::runner::attempt_token(&rec.nonce);
     report.killed += kill_leftovers(&job_dir, &token);
     match envs.unpin_all(&id) {
         Ok(n) => report.unpinned = n,
@@ -157,15 +177,53 @@ pub fn job_cgroup_of(pid: u32) -> Option<PathBuf> {
     }
 }
 
-/// Linux: kills everything in a job cgroup and removes it. Returns how many processes it held.
-fn kill_cgroup(cg: &Path) -> usize {
+/// True when container `name` exists and its environment carries this launch's token.
+pub fn owns_container(name: &str, token: &str) -> bool {
+    let mark = format!("{}={token}", crate::attempts::runner::TOKEN_ENV);
+    crate::envs::which("docker").is_some_and(|docker| {
+        std::process::Command::new(docker)
+            .args([
+                "inspect",
+                "--format",
+                "{{range .Config.Env}}{{println .}}{{end}}",
+                name,
+            ])
+            .stderr(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|o| {
+                o.status.success()
+                    && String::from_utf8_lossy(&o.stdout)
+                        .lines()
+                        .any(|l| l == mark)
+            })
+    })
+}
+
+/// True when process `pid`'s environment carries this launch's token (Linux).
+fn has_token(pid: u32, token: &str) -> bool {
+    let mark = format!("{}={token}", crate::attempts::runner::TOKEN_ENV);
+    std::fs::read(format!("/proc/{pid}/environ"))
+        .is_ok_and(|env| env.split(|b| *b == 0).any(|kv| kv == mark.as_bytes()))
+}
+
+/// Linux: kills everything in a job cgroup this launch owns and removes it. Ownership: the
+/// cgroup's name carries the launch token (`job-<token>-<role>`), or (records from before
+/// that naming) one of its processes carries the token. `None`: not ours, left alone. An empty
+/// cgroup is just removed.
+fn kill_cgroup(cg: &Path, token: &str) -> Option<usize> {
     let procs = |cg: &Path| -> Vec<u32> {
         std::fs::read_to_string(cg.join("cgroup.procs"))
             .map(|t| t.lines().filter_map(|l| l.trim().parse().ok()).collect())
             .unwrap_or_default()
     };
-    let found = procs(cg).len();
-    if found > 0 && std::fs::write(cg.join("cgroup.kill"), "1").is_err() {
+    let found = procs(cg);
+    let named = cg
+        .file_name()
+        .is_some_and(|n| n.to_string_lossy().contains(&token[..16]));
+    if !found.is_empty() && !named && !found.iter().any(|p| has_token(*p, token)) {
+        return None;
+    }
+    if !found.is_empty() && std::fs::write(cg.join("cgroup.kill"), "1").is_err() {
         for pid in procs(cg) {
             if let Some(identity) = ProcIdentity::of_pid(pid) {
                 signal_identity(&identity, true);
@@ -179,7 +237,7 @@ fn kill_cgroup(cg: &Path) -> usize {
         std::thread::sleep(Duration::from_millis(20));
     }
     let _ = std::fs::remove_dir(cg);
-    found
+    Some(found.len())
 }
 
 /// Waits a few seconds for the attempt's GPUs to free their memory; reports the ones that don't.

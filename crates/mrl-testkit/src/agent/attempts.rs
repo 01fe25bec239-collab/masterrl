@@ -1066,4 +1066,151 @@ mod runner_tests {
             .unwrap();
         assert_eq!(d.exit_kind, ExitKind::Cancelled as i32);
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn replicas_of_a_dotted_role_are_found() {
+        let rt = format!("uv:sha256:{SHA}");
+        let roles = serde_json::json!({"roles": [
+            {"role_id": "train.main", "primary": true, "count": 2, "runtime_ref": rt}
+        ]});
+        let fx = RunnerFixture::readopt(spec("att_dot", roles), |_| {}).await;
+        for id in ["train.main.0", "train.main.1"] {
+            let (mut w, _) = fx.worker(id).await;
+            read_until(&mut w, |b| matches!(b, AgentBody::Prepare(_)))
+                .await
+                .unwrap_or_else(|e| panic!("{id}: {e}"));
+        }
+    }
+
+    /// A PUT sink that answers after `delay`.
+    async fn slow_sink(delay: Duration) -> (String, Arc<Mutex<Vec<Vec<u8>>>>) {
+        use axum::routing::put;
+        let got: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let g = Arc::clone(&got);
+        let app = axum::Router::new().route(
+            "/up/{*p}",
+            put(move |body: axum::body::Bytes| {
+                let g = Arc::clone(&g);
+                async move {
+                    tokio::time::sleep(delay).await;
+                    g.lock().unwrap().push(body.to_vec());
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}/up"), got)
+    }
+
+    async fn done(fx: &mut RunnerFixture) -> mrl_proto::agent::v1::CommandResult {
+        fx.event(|e| match e {
+            AttemptEvent::CommandDone(r) => Some(r),
+            _ => None,
+        })
+        .await
+    }
+
+    fn upload(id: &str, t: UploadTarget) -> Control {
+        Control::Upload {
+            command_id: id.into(),
+            checkpoint_id: "ckpt_1".into(),
+            targets: vec![t],
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_upload_command_gets_one_result() {
+        let (base, got) = slow_sink(Duration::from_millis(1500)).await;
+        let path = "checkpoints/ckpt_1/w.bin";
+        let sha = sha_hex(b"weights");
+        let mut fx = RunnerFixture::readopt(spec("att_ov", serde_json::json!({})), |r| {
+            r.checkpoints
+                .insert("ckpt_1".into(), staged(path, &sha, 7, None));
+        })
+        .await;
+        let file = fx.staging().join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"weights").unwrap();
+        let (_w, _) = fx.worker("trainer").await;
+        fx.control
+            .send(upload("up-a", target(&base, path, &sha, 7)))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // While A's PUT is open: B is refused, a replay of A waits for A's result.
+        fx.control
+            .send(upload("up-b", target(&base, path, &sha, 7)))
+            .await
+            .unwrap();
+        fx.control
+            .send(upload("up-a", target(&base, path, &sha, 7)))
+            .await
+            .unwrap();
+        let first = done(&mut fx).await;
+        assert_eq!(first.command_id, "up-b");
+        assert!(first.failure.is_some(), "refused while A runs");
+        let second = done(&mut fx).await;
+        assert_eq!(second.command_id, "up-a");
+        assert!(second.failure.is_none());
+        // After the commit, another command gets the saved outcome without a second upload.
+        fx.control
+            .send(upload("up-c", target(&base, path, &sha, 7)))
+            .await
+            .unwrap();
+        let third = done(&mut fx).await;
+        assert_eq!(third.command_id, "up-c");
+        assert!(third.failure.is_none());
+        assert_eq!(got.lock().unwrap().len(), 1, "uploaded once");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_commit_is_acknowledged_only_once_saved() {
+        let (base, _got) = sink().await;
+        let path = "checkpoints/ckpt_1/w.bin";
+        let sha = sha_hex(b"weights");
+        let mut fx = RunnerFixture::readopt(spec("att_du", serde_json::json!({})), |r| {
+            r.checkpoints
+                .insert("ckpt_1".into(), staged(path, &sha, 7, None));
+            r.uploads.insert(
+                "ckpt_1".into(),
+                UploadPlan {
+                    command_id: "up-1".into(),
+                    targets: vec![target(&base, path, &sha, 7)],
+                },
+            );
+        })
+        .await;
+        let file = fx.staging().join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"weights").unwrap();
+        // Every save fails: a folder sits where the record goes.
+        let job = fx.staging().parent().unwrap().to_path_buf();
+        let record = job.join("attempt.json");
+        std::fs::remove_file(&record).unwrap();
+        std::fs::create_dir_all(record.join("blocker")).unwrap();
+        let (mut w, _) = fx.worker("trainer").await;
+        let early = tokio::time::timeout(
+            Duration::from_millis(2500),
+            read_until(&mut w, |b| matches!(b, AgentBody::CheckpointCommitAck(_))),
+        )
+        .await;
+        assert!(early.is_err(), "no ack while the outcome can't be saved");
+        // Saving works again: the retry uploads, saves, and only then acknowledges.
+        std::fs::remove_dir_all(&record).unwrap();
+        fx.record.save(&job).unwrap();
+        let acks = read_until(&mut w, |b| matches!(b, AgentBody::CheckpointCommitAck(_)))
+            .await
+            .unwrap();
+        assert!(matches!(acks.last(),
+            Some(AgentBody::CheckpointCommitAck(a)) if a.state == CommitState::Committed as i32));
+        assert_eq!(
+            fx.saved().checkpoints["ckpt_1"].state,
+            Some(CommitState::Committed as i32)
+        );
+        let r = done(&mut fx).await;
+        assert_eq!(r.command_id, "up-1");
+        assert!(r.failure.is_none());
+    }
 }
