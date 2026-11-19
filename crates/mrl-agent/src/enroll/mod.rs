@@ -114,7 +114,16 @@ struct IdentityFile {
     link: LinkFile,
     cert: String,
     ca: String,
-    key: keys::KeyRef,
+    key: StoredKey,
+}
+
+/// The `key` of `identity.json`: a reference now; the hex key itself in files written before
+/// keys moved to the key store ([`Identity::load_in`] moves such a key).
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum StoredKey {
+    Ref(keys::KeyRef),
+    Hex(String),
 }
 
 fn hex(b: &[u8]) -> String {
@@ -164,15 +173,37 @@ impl Identity {
         let f: IdentityFile = serde_json::from_slice(&bytes).map_err(|e| damaged(e.to_string()))?;
         let unhex =
             |name: &str, v: &str| from_hex(v).ok_or_else(|| damaged(format!("{name} is not hex")));
-        let key = keys::get(&identity_dir(state_root), &f.key)?;
+        let (key, key_ref) = match f.key {
+            StoredKey::Ref(r) => (keys::get(&identity_dir(state_root), &r)?, Some(r)),
+            StoredKey::Hex(h) => (unhex("key", &h)?, None),
+        };
         Ok(Some(Self {
             link: f.link,
             cert: CertificateDer::from(unhex("cert", &f.cert)?),
             ca: CertificateDer::from(unhex("ca", &f.ca)?),
             key,
-            key_store: f.key.store(),
-            key_ref: Some(f.key),
+            key_store: key_ref
+                .as_ref()
+                .map_or(keys::KeyStoreChoice::Auto, keys::KeyRef::store),
+            key_ref,
         }))
+    }
+
+    /// Like [`Identity::load`], and an identity written in the older format (the key inside
+    /// `identity.json`) is moved first: the key goes to `store`, then `identity.json` is
+    /// replaced atomically by one that only refers to it. Same node, certificate and key.
+    pub fn load_in(
+        state_root: &Path,
+        store: keys::KeyStoreChoice,
+    ) -> Result<Option<Self>, LinkError> {
+        match Self::load(state_root)? {
+            Some(mut id) if id.key_ref.is_none() => {
+                id.key_store = store;
+                id.save(state_root)?;
+                Self::load(state_root)
+            }
+            other => Ok(other),
+        }
     }
 
     /// Saves the identity: the key goes to its store first (under a name of its own), then one
@@ -200,7 +231,7 @@ impl Identity {
             link: self.link.clone(),
             cert: hex(&self.cert),
             ca: hex(&self.ca),
-            key: key_ref.clone(),
+            key: StoredKey::Ref(key_ref.clone()),
         };
         let bytes =
             serde_json::to_vec_pretty(&f).map_err(|e| LinkError::Protocol(e.to_string()))?;
@@ -608,6 +639,23 @@ mod tests {
                 .exists(),
             "the replaced key is removed"
         );
+        // An identity from before the key store (hex key inside identity.json) still loads,
+        // and moves its key into the store once.
+        let legacy = serde_json::json!({
+            "link": next.link, "cert": hex(&next.cert), "ca": hex(&next.ca), "key": hex(&next.key),
+        });
+        std::fs::write(idir.join(IDENTITY_FILE), legacy.to_string()).unwrap();
+        let moved = Identity::load_in(dir.path(), keys::KeyStoreChoice::File)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (moved.link.node_id.as_str(), moved.cert_sha256(), &moved.key),
+            (next.link.node_id.as_str(), next.cert_sha256(), &next.key)
+        );
+        assert!(moved.key_ref.is_some());
+        let json = std::fs::read_to_string(idir.join(IDENTITY_FILE)).unwrap();
+        assert!(!json.contains(&hex(&next.key)), "the key left identity.json");
+        assert_eq!(Identity::load(dir.path()).unwrap().unwrap().key, next.key);
         std::fs::write(idir.join(IDENTITY_FILE), b"{oops").unwrap();
         assert_eq!(
             Identity::load(dir.path()).unwrap_err().code(),

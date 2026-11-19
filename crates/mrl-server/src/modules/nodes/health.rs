@@ -11,6 +11,7 @@
 //!   Reconnecting brings it back ONLINE with `session_epoch + 1`.
 //! - Every decision is re-evaluated, from both thresholds and the signals, with the node row
 //!   locked, so a heartbeat that lands after the scan is never followed by a stale transition.
+//! - CONTROL messages a sink did not take yet (`node_control_inbox`) are delivered again.
 //! - PENDING/SENT commands past their deadline → EXPIRED.
 //! - Retention: `node_events` 180 days, final commands 30 days, used/expired tokens 30 days.
 
@@ -92,6 +93,9 @@ pub async fn check_once(gw: &Gateway) -> Result<(), NodesError> {
             .await?;
     for node in nodes {
         settle(gw, node).await?;
+    }
+    for node in store::inbox_nodes(&gw.db).await? {
+        crate::grpc::session::deliver_kept(gw, node).await;
     }
     sqlx::query(
         "UPDATE agent_commands SET state = 'EXPIRED', updated_at = now()

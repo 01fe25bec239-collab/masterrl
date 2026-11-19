@@ -490,6 +490,35 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn an_identity_from_before_the_key_store_moves_its_key_and_reconnects() {
+        let gw = GatewayHarness::start(TestDb::new().await).await;
+        let a = TestAgent::new(1, |_| {});
+        let node = a.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
+        let root = a.ctx.state.root();
+        let id = mrl_agent::enroll::Identity::load(root).unwrap().unwrap();
+        // Rewrite it as the older format did: the hex key inside identity.json, no key store.
+        let hex = |b: &[u8]| b.iter().map(|x| format!("{x:02x}")).collect::<String>();
+        let dir = mrl_agent::enroll::identity_dir(root);
+        let legacy = json!({
+            "link": id.link, "cert": hex(&id.cert), "ca": hex(&id.ca),
+            "key": hex(id.key().secret_der()),
+        });
+        std::fs::write(dir.join(mrl_agent::enroll::IDENTITY_FILE), legacy.to_string()).unwrap();
+        std::fs::remove_dir_all(dir.join("keys")).unwrap();
+
+        let link = a.run();
+        gw.wait_status(&node, "ONLINE").await;
+        link.stop().await;
+        let back = mrl_agent::enroll::Identity::load(root).unwrap().unwrap();
+        assert_eq!(back.link.node_id, node, "same node");
+        assert_eq!(back.cert_sha256(), id.cert_sha256(), "same certificate");
+        let json = std::fs::read_to_string(dir.join(mrl_agent::enroll::IDENTITY_FILE)).unwrap();
+        assert!(!json.contains(&hex(id.key().secret_der())), "the key moved to the store");
+        assert!(dir.join("keys").exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
     async fn commands_without_a_handler_fail_and_senders_refuse_foreign_kinds() {
         let gw = GatewayHarness::start(TestDb::new().await).await;
         let a = TestAgent::new(1, |_| {});
@@ -1231,6 +1260,51 @@ mod tests {
         }
     }
 
+    /// A bare gateway stream on `lane` with the identity `id`, past the hellos.
+    async fn raw_stream(
+        addr: &str,
+        id: &mrl_agent::enroll::Identity,
+        lane: mrl_proto::agent::v1::Lane,
+    ) -> (
+        tokio::sync::mpsc::Sender<mrl_proto::agent::v1::AgentMessage>,
+        tonic::Streaming<mrl_proto::agent::v1::CoreMessage>,
+    ) {
+        use mrl_agent::transports::Transport;
+        let stop = CancellationToken::new();
+        let io = mrl_agent::transports::Direct::new(addr).connect().await.unwrap();
+        let tls = mrl_agent::session::tls::client(&id.ca, id.chain(), id.key()).unwrap();
+        let tls = mrl_agent::session::connect_tls(tls, io, &stop).await.unwrap().unwrap();
+        let channel = mrl_agent::session::channel_over(tls).await.unwrap();
+        let mut client =
+            mrl_proto::agent::v1::agent_gateway_service_client::AgentGatewayServiceClient::new(
+                channel,
+            );
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        tx.send(mrl_proto::agent::v1::AgentMessage {
+            body: Some(agent_message::Body::Hello(mrl_proto::agent::v1::AgentHello {
+                node_id: id.link.node_id.clone(),
+                certificate_sha256: id.cert_sha256(),
+                protocol_versions: vec![mrl_agent::session::PROTOCOL_VERSION.to_owned()],
+                lane: lane as i32,
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+        let mut inbound = client
+            .session(tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(rx))
+            .await
+            .unwrap()
+            .into_inner();
+        let hello = inbound.message().await.unwrap().unwrap();
+        assert!(matches!(
+            hello.body,
+            Some(mrl_proto::agent::v1::core_message::Body::Hello(_))
+        ));
+        (tx, inbound)
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs PostgreSQL (just test-integration)"]
     async fn after_a_takeover_on_another_replica_the_old_stream_sends_and_records_nothing() {
@@ -1273,6 +1347,9 @@ mod tests {
         let e1 = gw.wait_status(&node_s, "ONLINE").await["session_epoch"]
             .as_i64()
             .unwrap();
+        // An old BULK stream on replica A that stays open through the takeover.
+        let (old_bulk, mut old_bulk_in) =
+            raw_stream(&gw.addr().to_string(), &id, mrl_proto::agent::v1::Lane::Bulk).await;
         let new = {
             let (ctx, s, a) = (
                 second.ctx.clone(),
@@ -1312,8 +1389,121 @@ mod tests {
             "the old stream never sent it"
         );
         assert!(Link::of(&second.ctx).unwrap().journal_seq() >= c.seq);
+        // A CONTROL-class message on the old data stream is refused, and recorded nowhere.
+        old_bulk
+            .send(mrl_proto::agent::v1::AgentMessage {
+                seq: 777_777,
+                body: Some(agent_message::Body::AttemptStatus(AttemptStatus::default())),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let refused = loop {
+            match tokio::time::timeout(Duration::from_secs(10), old_bulk_in.message())
+                .await
+                .expect("the old data stream answers")
+            {
+                Ok(Some(_ack)) => continue,
+                Ok(None) => panic!("closed without a status"),
+                Err(status) => break status,
+            }
+        };
+        assert_eq!(refused.code(), tonic::Code::Aborted, "{refused:?}");
+        let kept: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM node_events WHERE node_id = $1 AND kind = 'control_unrouted'
+               AND (details->>'seq')::bigint = 777777",
+        )
+        .bind(uuid_of(&node_s))
+        .fetch_one(gw.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(kept, 0, "the stale stream recorded nothing");
         s2.cancel();
         let _ = new.await;
+    }
+
+    /// A CONTROL sink that answers every item with a command to the same node.
+    struct Answers {
+        sender: std::sync::OnceLock<CommandSender>,
+        seen: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl mrl_server::modules::nodes::lanes::LaneSink for Answers {
+        fn name(&self) -> &'static str {
+            "answers"
+        }
+        fn lanes(&self) -> &'static [mrl_server::modules::nodes::lanes::LaneKind] {
+            &[mrl_server::modules::nodes::lanes::LaneKind::Control]
+        }
+        async fn deliver(
+            &self,
+            item: mrl_server::modules::nodes::lanes::LaneItem,
+        ) -> Result<(), mrl_server::modules::nodes::lanes::SinkError> {
+            let err = |detail: String| mrl_server::modules::nodes::lanes::SinkError {
+                sink: "answers",
+                detail,
+            };
+            let sender = self.sender.get().ok_or_else(|| err("not ready".into()))?;
+            sender
+                .send(NodeId::from_uuid(item.node_id), probe())
+                .await
+                .map_err(|e| err(e.explain()))?;
+            self.seen.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn a_control_sink_may_send_a_command_to_the_same_node() {
+        let router = LaneRouter::new();
+        let sink = Arc::new(Answers {
+            sender: std::sync::OnceLock::new(),
+            seen: AtomicUsize::new(0),
+        });
+        router.register(sink.clone());
+        let gw = GatewayHarness::start_with(
+            TestDb::new().await,
+            fast_config(),
+            Arc::new(InMemorySecretStore::default()),
+            router,
+        )
+        .await;
+        let _ = sink
+            .sender
+            .set(CommandSender::new(&gw.gw, &[CommandKind::Probe]));
+        let a = TestAgent::new(1, |_| {});
+        let node = a.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
+        Link::of(&a.ctx)
+            .unwrap()
+            .send_control(agent_message::Body::AttemptStatus(AttemptStatus::default()))
+            .unwrap();
+        let link = a.run();
+        // The sink's command reaches the agent (no Probe handler there: FAILED), so the gateway
+        // never waited on the sink while holding the node row.
+        let mut answered = None;
+        for _ in 0..100 {
+            answered = sqlx::query_scalar::<_, uuid::Uuid>(
+                "SELECT id FROM agent_commands WHERE node_id = $1 ORDER BY seq LIMIT 1",
+            )
+            .bind(uuid_of(&node))
+            .fetch_optional(gw.db.pool())
+            .await
+            .unwrap();
+            if answered.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        wait_state(&gw, answered.expect("the sink sent a command"), "FAILED").await;
+        assert!(sink.seen.load(Ordering::SeqCst) >= 1);
+        let kept: i64 = sqlx::query_scalar("SELECT count(*) FROM node_control_inbox")
+            .fetch_one(gw.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(kept, 0, "delivered messages leave the inbox");
+        link.stop().await;
     }
 
     /// Records the seq of every LOGS item.

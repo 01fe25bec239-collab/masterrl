@@ -145,12 +145,22 @@ impl Journal {
         Ok(Delivery::New)
     }
 
-    /// Records the outcome of `seq` (`Done`).
-    pub fn complete(&mut self, seq: u64, outcome: &std::result::Result<(), Failure>) -> Result<()> {
+    /// Records the outcome of `seq` (`Done`), only when `seq` is still the command `command_id`
+    /// and still running: an outcome never lands on another command that reused the seq (after
+    /// enrolling again) or on one already finished.
+    pub fn complete(
+        &mut self,
+        seq: u64,
+        command_id: &str,
+        outcome: &std::result::Result<(), Failure>,
+    ) -> Result<()> {
         let mut next = self.state.clone();
-        if let Some(e) = next.entries.get_mut(&seq) {
-            e.step = Step::Done;
-            e.failure = outcome.as_ref().err().map(|f| hex(&f.encode_to_vec()));
+        match next.entries.get_mut(&seq) {
+            Some(e) if e.command_id == command_id && e.step == Step::Received => {
+                e.step = Step::Done;
+                e.failure = outcome.as_ref().err().map(|f| hex(&f.encode_to_vec()));
+            }
+            _ => return Ok(()),
         }
         self.commit(next)
     }
@@ -221,7 +231,7 @@ mod tests {
             Delivery::Repeat,
             "seq at or below last is a repeat"
         );
-        j.complete(1, &Ok(())).unwrap();
+        j.complete(1, "a", &Ok(())).unwrap();
         j.reported(1).unwrap();
         let j = Journal::open(&path).unwrap();
         assert_eq!(j.last_seq(), 3);
@@ -261,8 +271,8 @@ mod tests {
             sub_code: "unsupported_command".into(),
             ..Failure::default()
         };
-        j.complete(1, &Ok(())).unwrap();
-        j.complete(2, &Err(f.clone())).unwrap();
+        j.complete(1, "a", &Ok(())).unwrap();
+        j.complete(2, "b", &Err(f.clone())).unwrap();
         let j2 = Journal::open(&path).unwrap();
         let u = j2.unreported();
         assert_eq!(u.len(), 2);
@@ -274,12 +284,25 @@ mod tests {
     }
 
     #[test]
+    fn an_outcome_only_lands_on_its_own_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut j = Journal::open(&dir.path().join("j.json")).unwrap();
+        j.receive(1, "new").unwrap();
+        j.complete(1, "old", &Ok(())).unwrap();
+        assert!(j.unreported().is_empty(), "another command's outcome is ignored");
+        assert_eq!(j.interrupted(), vec![(1, "new".to_owned())]);
+        j.complete(1, "new", &Ok(())).unwrap();
+        j.complete(1, "new", &Err(Failure::default())).unwrap();
+        assert_eq!(j.unreported()[0].outcome, Ok(()), "finished once");
+    }
+
+    #[test]
     fn keeps_a_bounded_history() {
         let dir = tempfile::tempdir().unwrap();
         let mut j = Journal::open(&dir.path().join("j.json")).unwrap();
         for s in 1..=(KEEP as u64 + 5) {
             j.receive(s, &format!("c{s}")).unwrap();
-            j.complete(s, &Ok(())).unwrap();
+            j.complete(s, &format!("c{s}"), &Ok(())).unwrap();
             j.reported(s).unwrap();
         }
         assert_eq!(j.state.entries.len(), KEEP);

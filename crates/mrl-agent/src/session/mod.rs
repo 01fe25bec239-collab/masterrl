@@ -303,6 +303,9 @@ pub struct Link {
     dir: PathBuf,
     limits: (usize, u64),
     owner: Mutex<Option<String>>,
+    /// Bumped by every [`Link::bind`] that changes the node; an outcome from an earlier
+    /// generation is dropped.
+    generation: std::sync::atomic::AtomicU64,
 }
 
 /// File naming the node the durable link state (spool, journal, stream counters) belongs to.
@@ -402,6 +405,7 @@ impl Link {
             running: Mutex::default(),
             reporting: Mutex::default(),
             data_seq: Mutex::new(data_seq),
+            generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -439,6 +443,14 @@ impl Link {
             *spool = Spool::open(&spool_dir, self.limits.0, self.limits.1)?;
             *journal = Journal::open(&self.dir.join("journal.json"))?;
             *data_seq = DataSeq::open(&self.dir.join("data_seq.json"))?;
+            // Metrics and logs queued for the old node are not the new node's.
+            for q in [&self.metrics, &self.logs] {
+                let mut q = q.lock().map_err(|_| poisoned())?;
+                *q = Queue::new(q.cap, q.decimate);
+            }
+            // Handlers still running for the old node finish into nothing (see `deliver`).
+            self.generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         std::fs::create_dir_all(&self.dir).map_err(|e| AgentError::state(&self.dir, e))?;
         let path = self.dir.join(OWNER_FILE);
@@ -534,7 +546,7 @@ impl Link {
             .lock()
             .map(|j| j.interrupted())
             .unwrap_or_default();
-        for (seq, _) in stuck {
+        for (seq, id) in stuck {
             let outcome = Err(Failure {
                 class: FailureClass::InfraTransient as i32,
                 sub_code: "interrupted".into(),
@@ -545,7 +557,7 @@ impl Link {
             self.journal
                 .lock()
                 .map_err(|_| LinkError::Protocol("journal lock poisoned".into()))?
-                .complete(seq, &outcome)?;
+                .complete(seq, &id, &outcome)?;
         }
         self.report_results()
     }
@@ -595,6 +607,7 @@ impl Link {
         let kind = kind_name(cmd.kind.as_ref());
         let handler = self.handlers.read().ok().and_then(|h| h.get(kind).cloned());
         let link = self.clone();
+        let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
         tokio::spawn(async move {
             let id = cmd.command_id.clone();
             let outcome = match handler {
@@ -610,7 +623,14 @@ impl Link {
                 .journal
                 .lock()
                 .map_err(|_| LinkError::Protocol("journal lock poisoned".into()))
-                .and_then(|mut j| j.complete(seq, &outcome).map_err(LinkError::from));
+                .and_then(|mut j| {
+                    // `bind` swaps the journal under this lock, so the check and the write
+                    // see the same node.
+                    if link.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
+                        return Ok(());
+                    }
+                    j.complete(seq, &id, &outcome).map_err(LinkError::from)
+                });
             let reported = saved.and_then(|()| link.report_results());
             if let Err(e) = reported {
                 eprintln!(
@@ -1075,25 +1095,48 @@ async fn dialed(l: Arc<LaneCtx>, io: BoxIo, stop: CancellationToken) -> Result<O
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let stop = stop.child_token();
+    let lanes = start_lanes(&stop, |lane| {
+        let (l, stop, mut c) = (l.clone(), stop.clone(), client.clone());
+        async move {
+            let (tx, rx) = mpsc::channel(256);
+            let inbound: CoreIn = Box::pin(
+                c.session(ReceiverStream::new(rx))
+                    .await
+                    .map_err(|s| status_error(&s))?
+                    .into_inner(),
+            );
+            Ok::<_, LinkError>(tokio::spawn(run_lane(l, lane, inbound, tx, stop)))
+        }
+    })
+    .await?;
+    supervise(lanes, &stop).await
+}
+
+/// Starts CONTROL, TELEMETRY and BULK with `start`, in that order. When one fails to start, the
+/// lanes already running are stopped (`stop`) and joined before the error is returned, so no
+/// lane task outlives its connection.
+pub async fn start_lanes<T, E, F, Fut>(
+    stop: &CancellationToken,
+    mut start: F,
+) -> Result<Vec<tokio::task::JoinHandle<T>>, E>
+where
+    F: FnMut(Lane) -> Fut,
+    Fut: std::future::Future<Output = Result<tokio::task::JoinHandle<T>, E>>,
+{
     let mut lanes = Vec::new();
     for lane in [Lane::Control, Lane::Telemetry, Lane::Bulk] {
-        let (tx, rx) = mpsc::channel(256);
-        let mut c = client.clone();
-        let inbound: CoreIn = Box::pin(
-            c.session(ReceiverStream::new(rx))
-                .await
-                .map_err(|s| status_error(&s))?
-                .into_inner(),
-        );
-        lanes.push(tokio::spawn(run_lane(
-            l.clone(),
-            lane,
-            inbound,
-            tx,
-            stop.clone(),
-        )));
+        match start(lane).await {
+            Ok(h) => lanes.push(h),
+            Err(e) => {
+                stop.cancel();
+                for h in lanes {
+                    let _ = h.await;
+                }
+                return Err(e);
+            }
+        }
     }
-    supervise(lanes, &stop).await
+    Ok(lanes)
 }
 
 /// Waits for the first of the lane tasks (CONTROL first in `lanes`) to end, then stops the
@@ -1324,7 +1367,7 @@ impl crate::registry::AgentService for GatewayService {
         let mut warned = false;
         let mut listen: Option<(SocketAddr, Arc<dyn Transport>)> = None;
         while !shutdown.is_cancelled() {
-            let id = match Identity::load(ctx.state.root()) {
+            let id = match Identity::load_in(ctx.state.root(), ctx.config.gateway.key_store) {
                 Ok(Some(id)) => id,
                 Ok(None) => {
                     if !warned {
@@ -1620,6 +1663,50 @@ mod tests {
         assert!(!link.bind("node_b").unwrap());
     }
 
+    /// Runs until `go` is notified.
+    struct Gate(tokio::sync::Notify);
+
+    #[async_trait::async_trait]
+    impl CommandHandler for Gate {
+        async fn handle(&self, _: Command) -> Result<(), Failure> {
+            self.0.notified().await;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn an_old_nodes_handler_never_reports_into_the_new_nodes_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = Arc::new(Link::open(dir.path(), &GatewaySettings::default()).unwrap());
+        let gate = Arc::new(Gate(tokio::sync::Notify::new()));
+        link.register("Probe", gate.clone());
+        link.bind("node_a").unwrap();
+        let probe = |id: &str| Command {
+            command_id: id.into(),
+            kind: Some(command::Kind::Probe(Default::default())),
+        };
+        link.deliver(1, probe("old")).unwrap();
+        link.send_logs(WorkerRelay::default());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        link.bind("node_b").unwrap();
+        assert!(link.logs.lock().unwrap().take().is_empty(), "old logs are gone");
+        link.deliver(1, probe("new")).unwrap();
+        gate.0.notify_one(); // the old (or new) handler finishes
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        gate.0.notify_one();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (msgs, _) = link.spool.lock().unwrap().pending(0, false).unwrap();
+        let ids: Vec<String> = msgs
+            .iter()
+            .filter_map(|m| match &m.body {
+                Some(agent_message::Body::CommandResult(r)) => Some(r.command_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ids, vec!["new".to_owned()], "only the new node's command reports");
+    }
+
     #[tokio::test]
     async fn a_data_stream_ending_ends_the_connection() {
         let stop = CancellationToken::new();
@@ -1642,6 +1729,32 @@ mod tests {
         .expect("supervise returns when TELEMETRY ends");
         assert!(matches!(r, Err(LinkError::Unreachable(_))));
         assert!(stop.is_cancelled(), "the other streams were stopped");
+    }
+
+    #[tokio::test]
+    async fn a_lane_that_fails_to_open_stops_the_lanes_already_running() {
+        let stop = CancellationToken::new();
+        let ended = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = start_lanes(&stop, |lane| {
+            let (stop, ended) = (stop.clone(), ended.clone());
+            async move {
+                if lane == Lane::Bulk {
+                    return Err("refused");
+                }
+                Ok(tokio::spawn(async move {
+                    stop.cancelled().await;
+                    ended.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }))
+            }
+        })
+        .await;
+        assert_eq!(r.unwrap_err(), "refused");
+        assert!(stop.is_cancelled());
+        assert_eq!(
+            ended.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "CONTROL and TELEMETRY ended before the error came back"
+        );
     }
 
     #[test]

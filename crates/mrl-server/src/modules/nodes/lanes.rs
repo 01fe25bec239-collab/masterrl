@@ -96,8 +96,9 @@ pub struct SinkError {
 
 /// Where a later part takes the messages of some lanes.
 ///
-/// CONTROL items are delivered before the agent gets its ack; a sink error ends the session, so
-/// the agent replays the message from its spool after reconnecting (at-least-once). METRICS and
+/// CONTROL items are kept in the database (only from the node's current session) before the
+/// agent gets its ack, then delivered with no lock held, so a sink may send commands to the
+/// same node. A sink error keeps the item; it is retried in order (at-least-once). METRICS and
 /// LOGS items come from a bounded queue; TELEMETRY items are the latest reading.
 #[async_trait::async_trait]
 pub trait LaneSink: Send + Sync {

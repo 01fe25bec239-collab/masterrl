@@ -253,18 +253,50 @@ async fn dial_node(
         dialed_node: Some(node),
     };
     let channel = channel_over(tls).await?;
-    let mut client = AgentEndpointServiceClient::new(channel)
+    let client = AgentEndpointServiceClient::new(channel)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
     let stop = lead.child_token();
-    let control = lane(gw, &mut client, Lane::Control, peer.clone(), stop.clone()).await?;
-    let telemetry = lane(gw, &mut client, Lane::Telemetry, peer.clone(), stop.clone()).await?;
-    let bulk = lane(gw, &mut client, Lane::Bulk, peer, stop.clone()).await?;
+    let lanes = start_lanes(&stop, |l| {
+        let (gw, mut client, peer, stop) = (gw.clone(), client.clone(), peer.clone(), stop.clone());
+        async move { lane(&gw, &mut client, l, peer, stop).await }
+    })
+    .await?;
     // All three streams are required: the first to end ends the connection, and the dialer
     // reconnects them together.
-    let _ = futures_util::future::select_all([control, telemetry, bulk]).await;
+    let (_, _, rest) = futures_util::future::select_all(lanes).await;
     stop.cancel();
+    for h in rest {
+        let _ = h.await;
+    }
     Ok(())
+}
+
+/// Starts CONTROL, TELEMETRY and BULK with `start`, in that order. When one fails to start, the
+/// lanes already running are stopped and joined before the error is returned, so no lane task
+/// outlives its connection.
+async fn start_lanes<F, Fut>(
+    stop: &CancellationToken,
+    mut start: F,
+) -> Result<Vec<tokio::task::JoinHandle<()>>, NodesError>
+where
+    F: FnMut(Lane) -> Fut,
+    Fut: std::future::Future<Output = Result<tokio::task::JoinHandle<()>, NodesError>>,
+{
+    let mut lanes = Vec::new();
+    for l in [Lane::Control, Lane::Telemetry, Lane::Bulk] {
+        match start(l).await {
+            Ok(h) => lanes.push(h),
+            Err(e) => {
+                stop.cancel();
+                for h in lanes {
+                    let _ = h.await;
+                }
+                return Err(e);
+            }
+        }
+    }
+    Ok(lanes)
 }
 
 /// Connects to an agent that waits with `enroll --listen` and lets it enroll.
@@ -303,6 +335,28 @@ async fn dial_enroll(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_lane_that_fails_to_open_stops_the_lanes_already_running() {
+        let stop = CancellationToken::new();
+        let ended = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r = start_lanes(&stop, |l| {
+            let (stop, ended) = (stop.clone(), ended.clone());
+            async move {
+                if l == Lane::Bulk {
+                    return Err(NodesError::Protocol("the agent refused the Bulk stream".into()));
+                }
+                Ok(tokio::spawn(async move {
+                    stop.cancelled().await;
+                    ended.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }))
+            }
+        })
+        .await;
+        assert!(r.is_err());
+        assert!(stop.is_cancelled());
+        assert_eq!(ended.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn backoff_grows_to_a_minute_with_jitter() {

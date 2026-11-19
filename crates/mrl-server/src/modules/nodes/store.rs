@@ -7,7 +7,7 @@
 use super::api::{GpuView, NodeDetail, NodeView, PoolView};
 use super::ca::{sha256_hex, Issued};
 use super::{NodesError, Pki};
-use crate::db::{Db, Tx};
+use crate::db::{Db, DbError, Tx};
 use crate::modules::events::{NewEvent, OutboxWriter};
 use mrl_domain::ids::{AttemptId, GpuId, NodeId, PoolId};
 use mrl_domain::state::{Node, NodeEvent, NodeState, StateMachine};
@@ -670,7 +670,7 @@ pub async fn accept(tx: &mut Tx, node: Uuid, epoch: i64, seq: u64) -> Result<Acc
 }
 
 /// True when `epoch` is still the node's session; locks the row (shared) until `tx` ends.
-async fn holds(tx: &mut Tx, node: Uuid, epoch: i64) -> Result<bool, NodesError> {
+pub async fn holds(tx: &mut Tx, node: Uuid, epoch: i64) -> Result<bool, NodesError> {
     let current: Option<i64> =
         sqlx::query_scalar("SELECT session_epoch FROM compute_nodes WHERE id = $1 FOR SHARE")
             .bind(node)
@@ -906,6 +906,104 @@ pub async fn unrouted(
                 "message_b64": base64::engine::general_purpose::STANDARD.encode(msg.encode_to_vec()) }),
     )
     .await
+}
+
+// ---------- CONTROL inbox ----------
+
+/// Keeps a CONTROL-class message for the CONTROL sink (`node_control_inbox`), in the
+/// transaction that checked `epoch`; [`dispatch`] delivers it once that transaction is over.
+/// A message already kept (same node, stream, seq) is not kept twice.
+pub async fn inbox(
+    tx: &mut Tx,
+    node: Uuid,
+    epoch: i64,
+    stream: pb::Lane,
+    msg: &pb::AgentMessage,
+) -> Result<(), NodesError> {
+    use prost::Message;
+    let seq =
+        i64::try_from(msg.seq).map_err(|_| NodesError::Protocol("message seq is too large".into()))?;
+    sqlx::query(
+        "INSERT INTO node_control_inbox (node_id, stream, seq, session_epoch, message)
+         VALUES ($1, $2, $3, $4, $5) ON CONFLICT (node_id, stream, seq) DO NOTHING",
+    )
+    .bind(node)
+    .bind(stream as i16)
+    .bind(seq)
+    .bind(epoch)
+    .bind(msg.encode_to_vec())
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// Delivers `node`'s kept CONTROL messages to `sink` in arrival order, deleting each one the sink
+/// took; stops at the first sink error (that message and later ones stay for the next try).
+/// Holds no node row lock, so the sink may send commands to the same node. One dispatcher per
+/// node at a time: a second one returns at once and the running one picks up its rows.
+// ponytail: a row kept just as the running dispatcher finishes waits for the next try (the next
+// CONTROL message or the health pass, every few seconds).
+pub async fn dispatch(
+    db: &Db,
+    sink: &dyn super::lanes::LaneSink,
+    node: Uuid,
+) -> Result<(), NodesError> {
+    use prost::Message;
+    let mut tx = db.begin().await?;
+    let mine: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(18010, hashtext($1::text))")
+        .bind(node)
+        .fetch_one(&mut *tx)
+        .await?;
+    if !mine {
+        return Ok(());
+    }
+    let mut failed = None;
+    'more: loop {
+        let rows: Vec<(i64, i16, i64, i64, Vec<u8>)> = sqlx::query_as(
+            "SELECT id, stream, seq, session_epoch, message FROM node_control_inbox
+             WHERE node_id = $1 ORDER BY id LIMIT 100",
+        )
+        .bind(node)
+        .fetch_all(&mut *tx)
+        .await?;
+        if rows.is_empty() {
+            break;
+        }
+        for (id, stream, seq, epoch, bytes) in rows {
+            let message = pb::AgentMessage::decode(bytes.as_slice())
+                .map_err(|e| NodesError::Protocol(format!("a kept CONTROL message is damaged: {e}")))?;
+            let item = super::lanes::LaneItem {
+                node_id: node,
+                session_epoch: epoch,
+                lane: super::lanes::LaneKind::Control,
+                stream: pb::Lane::try_from(i32::from(stream)).unwrap_or(pb::Lane::Control),
+                seq: u64::try_from(seq).unwrap_or(0),
+                dropped_before: 0,
+                message,
+            };
+            if let Err(e) = sink.deliver(item).await {
+                failed = Some(NodesError::Protocol(format!(
+                    "the CONTROL sink did not take a message; it is kept and retried: {e}"
+                )));
+                break 'more;
+            }
+            sqlx::query("DELETE FROM node_control_inbox WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+    }
+    tx.commit().await.map_err(DbError::from)?;
+    failed.map_or(Ok(()), Err)
+}
+
+/// Nodes with kept CONTROL messages (for the retry pass).
+pub async fn inbox_nodes(db: &Db) -> Result<Vec<Uuid>, NodesError> {
+    Ok(
+        sqlx::query_scalar("SELECT DISTINCT node_id FROM node_control_inbox")
+            .fetch_all(db.pool())
+            .await?,
+    )
 }
 
 // ---------- commands ----------

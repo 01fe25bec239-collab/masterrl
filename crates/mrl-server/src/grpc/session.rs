@@ -8,14 +8,17 @@
 //!    message with a new `seq` is handled and `control_rx_seq` raised in one transaction (dedupe on
 //!    node, lane, seq), then acked (`CoreMessage{seq: 0, ack_seq}`). Commands go out in `seq`
 //!    order; `AgentMessage.ack_seq` marks them RECEIVED; `CommandResult` finishes them.
-//! 4. TELEMETRY / BULK: lossy lanes (`lanes`), acked on receipt.
+//!    A CONTROL-class message for the sink is kept in `node_control_inbox` in that transaction
+//!    and handed to the sink after it commits (no row lock held while the sink runs).
+//! 4. TELEMETRY / BULK: lossy lanes (`lanes`), acked on receipt. CONTROL-class messages on them
+//!    are kept the same way, only while the stream's session epoch is still the node's.
 //! 5. Every stream re-checks its certificate every `revocation_check_seconds` and closes at
 //!    once when this replica revokes the node.
 
 use super::{PeerInfo, PROTOCOL_VERSION};
 use crate::modules::nodes::lanes::{body_name, LaneItem, LaneKind, LaneMetrics, LossyLane};
 use crate::modules::nodes::store::{self, Accept, CertIdentity};
-use crate::modules::nodes::{codes, commands, Gateway, NodesError};
+use crate::modules::nodes::{commands, Gateway, NodesError};
 use crate::transports::TransportKind;
 use mrl_domain::ids::NodeId;
 use mrl_proto::agent::v1::{
@@ -352,19 +355,33 @@ impl Lossy {
     }
 }
 
-/// Records CONTROL `seq` and its database effects in one transaction.
 /// Where a CONTROL message goes besides the gateway's own tables.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Route {
     /// Handled by the gateway alone.
     None,
-    /// Delivered to this sink while the node row is locked (before the ack).
-    Sink(Arc<dyn crate::modules::nodes::lanes::LaneSink>),
+    /// Kept in `node_control_inbox` for the CONTROL sink ([`deliver_kept`] hands it over).
+    Inbox,
     /// No sink: journaled to `node_events`.
     Journal,
 }
 
-/// Records CONTROL `seq` and its effects in one transaction that holds the node row: a sink
-/// sees the message only while this stream is still the node's session, and a takeover waits.
+/// The route of a message that is not the gateway's own.
+fn route_of(gw: &Gateway, node: Uuid, msg: &AgentMessage) -> Route {
+    if own(&msg.body) {
+        return Route::None;
+    }
+    if gw.lanes.sink_for(LaneKind::Control).is_some() {
+        return Route::Inbox;
+    }
+    tracing::warn!(node = %NodeId::from_uuid(node), body = body_name(msg), "no sink for this CONTROL message; journaled to node_events");
+    LaneMetrics::get().unrouted(body_name(msg));
+    Route::Journal
+}
+
+/// Records CONTROL `seq` and its effects in one transaction that holds the node row, so only the
+/// node's current session records anything and a takeover waits. A message for the sink is only
+/// kept here; it reaches the sink after the row lock is released ([`deliver_kept`]).
 async fn record(
     gw: &Gateway,
     node: Uuid,
@@ -373,11 +390,6 @@ async fn record(
     route: Route,
 ) -> Result<Accept, NodesError> {
     let msg = msg.clone();
-    let sink = match &route {
-        Route::Sink(s) => Some(s.clone()),
-        _ => None,
-    };
-    let journal = matches!(route, Route::Journal);
     let to_db = |e: NodesError| match e {
         NodesError::Db(d) => d,
         o => crate::db::DbError::Query(sqlx::Error::Protocol(o.to_string())),
@@ -385,29 +397,13 @@ async fn record(
     Ok(gw
         .db
         .transaction(move |tx| {
-            let (msg, sink) = (msg.clone(), sink.clone());
+            let msg = msg.clone();
             Box::pin(async move {
                 let accepted = store::accept(tx, node, epoch, msg.seq)
                     .await
                     .map_err(to_db)?;
                 if accepted != Accept::New {
                     return Ok(accepted);
-                }
-                if let Some(sink) = sink {
-                    let item = LaneItem {
-                        node_id: node,
-                        session_epoch: epoch,
-                        lane: LaneKind::Control,
-                        stream: Lane::Control,
-                        seq: msg.seq,
-                        dropped_before: 0,
-                        message: msg.clone(),
-                    };
-                    sink.deliver(item).await.map_err(|e| {
-                        crate::db::DbError::Query(sqlx::Error::Protocol(format!(
-                            "CONTROL sink failed; the agent will resend: {e}"
-                        )))
-                    })?;
                 }
                 match &msg.body {
                     Some(agent_message::Body::Heartbeat(hb)) => {
@@ -421,15 +417,54 @@ async fn record(
                     Some(agent_message::Body::CommandResult(r)) => {
                         store::command_result(tx, node, r).await.map_err(to_db)?
                     }
-                    _ if journal => store::unrouted(tx, node, msg.seq, &msg)
-                        .await
-                        .map_err(to_db)?,
-                    _ => {}
+                    _ => match route {
+                        Route::Inbox => store::inbox(tx, node, epoch, Lane::Control, &msg)
+                            .await
+                            .map_err(to_db)?,
+                        Route::Journal => store::unrouted(tx, node, msg.seq, &msg)
+                            .await
+                            .map_err(to_db)?,
+                        Route::None => {}
+                    },
                 }
                 Ok(Accept::New)
             })
         })
         .await?)
+}
+
+/// Records a CONTROL-class message that came on a TELEMETRY or BULK stream, only while `epoch`
+/// is still the node's session (`Ok(false)`: a newer session took over; nothing was recorded).
+async fn record_on_data(
+    gw: &Gateway,
+    node: Uuid,
+    epoch: i64,
+    stream: Lane,
+    msg: &AgentMessage,
+    route: Route,
+) -> Result<bool, NodesError> {
+    let mut tx = gw.db.begin().await?;
+    if !store::holds(&mut tx, node, epoch).await? {
+        return Ok(false);
+    }
+    match route {
+        Route::Inbox => store::inbox(&mut tx, node, epoch, stream, msg).await?,
+        Route::Journal => store::unrouted(&mut tx, node, msg.seq, msg).await?,
+        Route::None => {}
+    }
+    tx.commit().await.map_err(crate::db::DbError::from)?;
+    Ok(true)
+}
+
+/// Hands the node's kept CONTROL messages to the sink. A sink error is logged; the messages stay
+/// kept and are retried (next message, or the health pass).
+pub async fn deliver_kept(gw: &Gateway, node: Uuid) {
+    let Some(sink) = gw.lanes.sink_for(LaneKind::Control) else {
+        return;
+    };
+    if let Err(e) = store::dispatch(&gw.db, sink.as_ref(), node).await {
+        tracing::warn!(code = e.code(), error = %e, node = %NodeId::from_uuid(node), "CONTROL messages not delivered yet");
+    }
 }
 
 /// True for messages the gateway handles itself (never routed to a sink).
@@ -446,36 +481,6 @@ fn own(body: &Option<agent_message::Body>) -> bool {
                 | B::RenewCertificate(_)
         )
     )
-}
-
-/// Delivers a CONTROL message to its sink; `Ok(true)` when there is no sink (journal it).
-async fn route_control(
-    gw: &Gateway,
-    node: Uuid,
-    epoch: i64,
-    stream: Lane,
-    msg: &AgentMessage,
-) -> Result<bool, Status> {
-    let Some(sink) = gw.lanes.sink_for(LaneKind::Control) else {
-        tracing::warn!(node = %NodeId::from_uuid(node), body = body_name(msg), "no sink for this CONTROL message; journaled to node_events");
-        LaneMetrics::get().unrouted(body_name(msg));
-        return Ok(true);
-    };
-    sink.deliver(LaneItem {
-        node_id: node,
-        session_epoch: epoch,
-        lane: LaneKind::Control,
-        stream,
-        seq: msg.seq,
-        dropped_before: 0,
-        message: msg.clone(),
-    })
-    .await
-    .map_err(|e| {
-        tracing::warn!(error = %e, "CONTROL sink failed; the agent will resend");
-        Status::unavailable(format!("{} {e}; reconnect and resend", codes::PROTOCOL))
-    })?;
-    Ok(false)
 }
 
 async fn renew(
@@ -591,23 +596,15 @@ async fn control(
                         continue;
                     }
                     let lane = LaneKind::of(&m);
-                    let route = if lane == LaneKind::Control && !own(&m.body) {
-                        match gw.lanes.sink_for(LaneKind::Control) {
-                            Some(sink) => Route::Sink(sink),
-                            None => {
-                                tracing::warn!(node = %NodeId::from_uuid(node), body = body_name(&m), "no sink for this CONTROL message; journaled to node_events");
-                                LaneMetrics::get().unrouted(body_name(&m));
-                                Route::Journal
-                            }
-                        }
-                    } else {
-                        Route::None
-                    };
+                    let route = if lane == LaneKind::Control { route_of(gw, node, &m) } else { Route::None };
                     let accepted = record(gw, node, epoch, &m, route).await.map_err(unavailable)?;
                     if accepted == Accept::Stale {
                         return Err(taken_over());
                     }
                     rx_seq = m.seq;
+                    if route == Route::Inbox {
+                        deliver_kept(gw, node).await;
+                    }
                     if accepted == Accept::New {
                         if lane != LaneKind::Control {
                             lossy.offer(lane, LaneItem { node_id: node, session_epoch: epoch, lane, stream: Lane::Control, seq: m.seq, dropped_before: 0, message: m.clone() });
@@ -703,12 +700,16 @@ async fn data(
                 let kind = LaneKind::of(&m);
                 let seq = m.seq;
                 if kind == LaneKind::Control {
-                    // CONTROL-class messages on a data lane (like guard events) are delivered
-                    // without seq dedupe; sinks dedupe on (node, lane, seq) anyway.
-                    if !own(&m.body) && route_control(gw, node, epoch, lane, &m).await? {
-                        let mut tx = gw.db.begin().await.map_err(|e| unavailable(e.into()))?;
-                        store::unrouted(&mut tx, node, seq, &m).await.map_err(unavailable)?;
-                        tx.commit().await.map_err(|e| unavailable(e.into()))?;
+                    // CONTROL-class messages on a data lane (like guard events) are recorded only
+                    // while this stream's session is still the node's, like on CONTROL.
+                    let route = route_of(gw, node, &m);
+                    if route != Route::None {
+                        if !record_on_data(gw, node, epoch, lane, &m, route).await.map_err(unavailable)? {
+                            return Err(taken_over());
+                        }
+                        if route == Route::Inbox {
+                            deliver_kept(gw, node).await;
+                        }
                     }
                 } else {
                     lossy.offer(kind, LaneItem { node_id: node, session_epoch: epoch, lane: kind, stream: lane, seq, dropped_before: 0, message: m });
