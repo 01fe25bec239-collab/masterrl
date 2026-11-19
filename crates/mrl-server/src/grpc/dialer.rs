@@ -344,7 +344,9 @@ mod tests {
             let (stop, ended) = (stop.clone(), ended.clone());
             async move {
                 if l == Lane::Bulk {
-                    return Err(NodesError::Protocol("the agent refused the Bulk stream".into()));
+                    return Err(NodesError::Protocol(
+                        "the agent refused the Bulk stream".into(),
+                    ));
                 }
                 Ok(tokio::spawn(async move {
                     stop.cancelled().await;

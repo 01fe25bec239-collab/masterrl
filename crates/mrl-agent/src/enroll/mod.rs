@@ -654,7 +654,10 @@ mod tests {
         );
         assert!(moved.key_ref.is_some());
         let json = std::fs::read_to_string(idir.join(IDENTITY_FILE)).unwrap();
-        assert!(!json.contains(&hex(&next.key)), "the key left identity.json");
+        assert!(
+            !json.contains(&hex(&next.key)),
+            "the key left identity.json"
+        );
         assert_eq!(Identity::load(dir.path()).unwrap().unwrap().key, next.key);
         std::fs::write(idir.join(IDENTITY_FILE), b"{oops").unwrap();
         assert_eq!(

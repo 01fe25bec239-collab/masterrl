@@ -921,8 +921,8 @@ pub async fn inbox(
     msg: &pb::AgentMessage,
 ) -> Result<(), NodesError> {
     use prost::Message;
-    let seq =
-        i64::try_from(msg.seq).map_err(|_| NodesError::Protocol("message seq is too large".into()))?;
+    let seq = i64::try_from(msg.seq)
+        .map_err(|_| NodesError::Protocol("message seq is too large".into()))?;
     sqlx::query(
         "INSERT INTO node_control_inbox (node_id, stream, seq, session_epoch, message)
          VALUES ($1, $2, $3, $4, $5) ON CONFLICT (node_id, stream, seq) DO NOTHING",
@@ -950,10 +950,11 @@ pub async fn dispatch(
 ) -> Result<(), NodesError> {
     use prost::Message;
     let mut tx = db.begin().await?;
-    let mine: bool = sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(18010, hashtext($1::text))")
-        .bind(node)
-        .fetch_one(&mut *tx)
-        .await?;
+    let mine: bool =
+        sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(18010, hashtext($1::text))")
+            .bind(node)
+            .fetch_one(&mut *tx)
+            .await?;
     if !mine {
         return Ok(());
     }
@@ -970,8 +971,9 @@ pub async fn dispatch(
             break;
         }
         for (id, stream, seq, epoch, bytes) in rows {
-            let message = pb::AgentMessage::decode(bytes.as_slice())
-                .map_err(|e| NodesError::Protocol(format!("a kept CONTROL message is damaged: {e}")))?;
+            let message = pb::AgentMessage::decode(bytes.as_slice()).map_err(|e| {
+                NodesError::Protocol(format!("a kept CONTROL message is damaged: {e}"))
+            })?;
             let item = super::lanes::LaneItem {
                 node_id: node,
                 session_epoch: epoch,

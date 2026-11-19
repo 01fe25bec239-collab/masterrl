@@ -289,7 +289,10 @@ mod tests {
         let mut j = Journal::open(&dir.path().join("j.json")).unwrap();
         j.receive(1, "new").unwrap();
         j.complete(1, "old", &Ok(())).unwrap();
-        assert!(j.unreported().is_empty(), "another command's outcome is ignored");
+        assert!(
+            j.unreported().is_empty(),
+            "another command's outcome is ignored"
+        );
         assert_eq!(j.interrupted(), vec![(1, "new".to_owned())]);
         j.complete(1, "new", &Ok(())).unwrap();
         j.complete(1, "new", &Err(Failure::default())).unwrap();

@@ -503,7 +503,11 @@ mod tests {
             "link": id.link, "cert": hex(&id.cert), "ca": hex(&id.ca),
             "key": hex(id.key().secret_der()),
         });
-        std::fs::write(dir.join(mrl_agent::enroll::IDENTITY_FILE), legacy.to_string()).unwrap();
+        std::fs::write(
+            dir.join(mrl_agent::enroll::IDENTITY_FILE),
+            legacy.to_string(),
+        )
+        .unwrap();
         std::fs::remove_dir_all(dir.join("keys")).unwrap();
 
         let link = a.run();
@@ -513,7 +517,10 @@ mod tests {
         assert_eq!(back.link.node_id, node, "same node");
         assert_eq!(back.cert_sha256(), id.cert_sha256(), "same certificate");
         let json = std::fs::read_to_string(dir.join(mrl_agent::enroll::IDENTITY_FILE)).unwrap();
-        assert!(!json.contains(&hex(id.key().secret_der())), "the key moved to the store");
+        assert!(
+            !json.contains(&hex(id.key().secret_der())),
+            "the key moved to the store"
+        );
         assert!(dir.join("keys").exists());
     }
 
@@ -1271,9 +1278,15 @@ mod tests {
     ) {
         use mrl_agent::transports::Transport;
         let stop = CancellationToken::new();
-        let io = mrl_agent::transports::Direct::new(addr).connect().await.unwrap();
+        let io = mrl_agent::transports::Direct::new(addr)
+            .connect()
+            .await
+            .unwrap();
         let tls = mrl_agent::session::tls::client(&id.ca, id.chain(), id.key()).unwrap();
-        let tls = mrl_agent::session::connect_tls(tls, io, &stop).await.unwrap().unwrap();
+        let tls = mrl_agent::session::connect_tls(tls, io, &stop)
+            .await
+            .unwrap()
+            .unwrap();
         let channel = mrl_agent::session::channel_over(tls).await.unwrap();
         let mut client =
             mrl_proto::agent::v1::agent_gateway_service_client::AgentGatewayServiceClient::new(
@@ -1281,19 +1294,23 @@ mod tests {
             );
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         tx.send(mrl_proto::agent::v1::AgentMessage {
-            body: Some(agent_message::Body::Hello(mrl_proto::agent::v1::AgentHello {
-                node_id: id.link.node_id.clone(),
-                certificate_sha256: id.cert_sha256(),
-                protocol_versions: vec![mrl_agent::session::PROTOCOL_VERSION.to_owned()],
-                lane: lane as i32,
-                ..Default::default()
-            })),
+            body: Some(agent_message::Body::Hello(
+                mrl_proto::agent::v1::AgentHello {
+                    node_id: id.link.node_id.clone(),
+                    certificate_sha256: id.cert_sha256(),
+                    protocol_versions: vec![mrl_agent::session::PROTOCOL_VERSION.to_owned()],
+                    lane: lane as i32,
+                    ..Default::default()
+                },
+            )),
             ..Default::default()
         })
         .await
         .unwrap();
         let mut inbound = client
-            .session(tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(rx))
+            .session(tonic::codegen::tokio_stream::wrappers::ReceiverStream::new(
+                rx,
+            ))
             .await
             .unwrap()
             .into_inner();
@@ -1348,8 +1365,12 @@ mod tests {
             .as_i64()
             .unwrap();
         // An old BULK stream on replica A that stays open through the takeover.
-        let (old_bulk, mut old_bulk_in) =
-            raw_stream(&gw.addr().to_string(), &id, mrl_proto::agent::v1::Lane::Bulk).await;
+        let (old_bulk, mut old_bulk_in) = raw_stream(
+            &gw.addr().to_string(),
+            &id,
+            mrl_proto::agent::v1::Lane::Bulk,
+        )
+        .await;
         let new = {
             let (ctx, s, a) = (
                 second.ctx.clone(),

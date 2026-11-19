@@ -1690,7 +1690,10 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(50)).await;
 
         link.bind("node_b").unwrap();
-        assert!(link.logs.lock().unwrap().take().is_empty(), "old logs are gone");
+        assert!(
+            link.logs.lock().unwrap().take().is_empty(),
+            "old logs are gone"
+        );
         link.deliver(1, probe("new")).unwrap();
         gate.0.notify_one(); // the old (or new) handler finishes
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1704,7 +1707,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(ids, vec!["new".to_owned()], "only the new node's command reports");
+        assert_eq!(
+            ids,
+            vec!["new".to_owned()],
+            "only the new node's command reports"
+        );
     }
 
     #[tokio::test]
