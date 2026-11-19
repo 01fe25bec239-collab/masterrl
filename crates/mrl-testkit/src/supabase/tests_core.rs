@@ -5,6 +5,7 @@ use super::core::{Auth, CoreServer};
 use super::{MockSupabase, MockUser};
 use crate::pg::TestDb;
 use crate::seams::InMemorySecretStore;
+use crate::server::TestResponse;
 use axum::http::Method;
 use mrl_domain::ids::{OrgId, ProjectId, UserId, WorkspaceId};
 use mrl_domain::rbac::{allowed, Action, Role};
@@ -38,8 +39,8 @@ fn profile() -> Value {
     json!({
         "schema": "setup-profile/v1",
         "machines": [
-            {"name": "gpu-box", "address": "10.0.0.7", "transport": {"kind": "ssh", "port": 2222, "user": "ada", "key_ref": "ssh.gpu-box", "options": {}}},
-            {"name": "laptop", "address": "laptop.tail1234.ts.net", "transport": {"kind": "tailscale", "options": {"exit_node": false}}}
+            {"name": "gpu-box", "address": "10.0.0.7", "transport": {"kind": "ssh", "port": 2222, "user": "ada", "key_ref": "ssh.gpu-box"}},
+            {"name": "laptop", "address": "laptop.tail1234.ts.net", "transport": {"kind": "tailscale"}}
         ],
         "preferences": {"theme": "dark", "units": "metric"},
         "team_memberships": [{"name": "Lab", "address": "https://lab.example:8443", "role": "researcher"}],
@@ -583,9 +584,11 @@ async fn every_route_answers_by_role_in_team_mode() {
                 )
                 .await;
             let refused = r.status == 403 && r.json()["code"] == "MRL-PERM-001";
+            // Creating orgs needs the platform grant, which no org role gives.
+            let platform = *method == Method::POST && path == "/api/v1/orgs";
             assert_eq!(
                 refused,
-                !allowed(role, *action),
+                platform || !allowed(role, *action),
                 "{role}: {method} {path} answered {} {}",
                 r.status,
                 r.text()
@@ -1127,6 +1130,56 @@ async fn secrets_never_reach_the_database_logs_or_sync_payload() {
         assert_eq!(r.status, 422, "{key}: {}", r.text());
         assert_eq!(r.json()["errors"][0]["path"], format!("/preferences/{key}"));
     }
+    // Credentials hidden in addresses, transport settings or header-shaped values.
+    let leaks: [(&str, Value, &str); 6] = [
+        (
+            "/machines/0/address",
+            json!("ada:p16-secret-canary@10.0.0.7"),
+            "/machines/0/address",
+        ),
+        (
+            "/team_memberships/0/address",
+            json!("https://ada:p16-secret-canary@lab.example:8443"),
+            "/team_memberships/0/address",
+        ),
+        (
+            "/machines/0/transport/options",
+            json!({"password": "p16-secret-canary"}),
+            "",
+        ),
+        (
+            "/preferences/proxy_header",
+            json!("Bearer p16-secret-canary"),
+            "/preferences/proxy_header",
+        ),
+        (
+            "/ui/proxy",
+            json!("http://ada:p16-secret-canary@proxy:8080"),
+            "/ui/proxy",
+        ),
+        (
+            "/machines/0/transport/user",
+            json!("ada:p16-secret-canary"),
+            "/machines/0/transport/user",
+        ),
+    ];
+    for (pointer, value, path) in leaks {
+        let mut leaky = p.clone();
+        let (parent, key) = pointer.rsplit_once('/').unwrap();
+        leaky.pointer_mut(parent).unwrap()[key] = value;
+        let r = core
+            .call(
+                Method::PUT,
+                "/api/v1/sync/profile",
+                &Auth::Launch,
+                Some(leaky),
+            )
+            .await;
+        assert_eq!(r.status, 422, "{pointer}: {}", r.text());
+        if !path.is_empty() {
+            assert_eq!(r.json()["errors"][0]["path"], path, "{pointer}");
+        }
+    }
     let setup = core
         .call(
             Method::POST,
@@ -1205,8 +1258,14 @@ async fn secrets_never_reach_the_database_logs_or_sync_payload() {
         log_text.contains("listening"),
         "the server's own logs were captured"
     );
+    // bytea columns show as hex in row_to_json: look for the hex form too.
+    let hex = |v: &str| v.bytes().map(|b| format!("{b:02x}")).collect::<String>();
     for (what, value) in &secrets {
         assert!(!dump.contains(value.as_str()), "{what} is in the database");
+        assert!(
+            !dump.contains(&hex(value)),
+            "{what} is in the database as bytes"
+        );
         assert!(!log_text.contains(value.as_str()), "{what} is in the logs");
         assert!(
             !payload.contains(value.as_str()),
@@ -1447,7 +1506,19 @@ async fn tenancy_endpoints_follow_roles_and_hide_other_orgs_in_team_mode() {
     let workspaces = format!("/api/v1/orgs/{lab}/workspaces");
     let projects = format!("/api/v1/workspaces/{ws}/projects");
 
-    // Creating an org needs the platform owner (admin.manage).
+    // Creating an org needs the platform grant: owning an org is not enough.
+    let as_owner = call(
+        &alice,
+        Method::POST,
+        "/api/v1/orgs".into(),
+        item("alice-org"),
+    )
+    .await;
+    assert_eq!(as_owner.status, 403, "{}", as_owner.text());
+    assert_eq!(as_owner.json()["code"], "MRL-PERM-001");
+    let mut tx = core.db.db().begin().await.unwrap();
+    tenancy::set_platform_admin(&mut tx, a, true).await.unwrap();
+    tx.commit().await.unwrap();
     assert_eq!(
         call(
             &alice,
@@ -1459,7 +1530,7 @@ async fn tenancy_endpoints_follow_roles_and_hide_other_orgs_in_team_mode() {
         .status,
         201
     );
-    for jwt in [&bob, &carol, &nobody] {
+    for jwt in [&bob, &carol, &nobody, &eve] {
         let r = call(jwt, Method::POST, "/api/v1/orgs".into(), item("nope")).await;
         assert_eq!(r.status, 403, "{}", r.text());
     }
@@ -1967,4 +2038,311 @@ async fn a_failed_re_setup_keeps_the_old_sync_key_working() {
         .await;
     assert_eq!(newest.json()["version"], 3);
     core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn secrets_are_never_kept_for_idempotent_replay() {
+    let sb = MockSupabase::start().await;
+    let core = solo(&sb).await;
+    assert_eq!(core.sign_in(&sb, &Auth::Launch, false).await.status, 200);
+    let keyed = |path: &'static str, body: Option<Value>, key: &'static str| {
+        let core = &core;
+        async move {
+            core.call_with(
+                Method::POST,
+                path,
+                &Auth::Launch,
+                body,
+                &[("idempotency-key", key)],
+            )
+            .await
+        }
+    };
+    let routes: [(&str, Option<Value>); 3] = [
+        (
+            "/api/v1/auth/tokens",
+            Some(json!({"name": "x", "scopes": ["*"]})),
+        ),
+        ("/api/v1/auth/session", None),
+        (
+            "/api/v1/sync/setup",
+            Some(json!({"passphrase": PASSPHRASE})),
+        ),
+    ];
+    for (path, body) in routes {
+        for attempt in 0..2 {
+            let r = keyed(path, body.clone(), path).await;
+            assert_eq!(r.status, 400, "{path} try {attempt}: {}", r.text());
+            assert_eq!(r.json()["code"], "MRL-IDEM-003");
+            let text = r.text();
+            assert!(
+                !text.contains("mrl_pat_")
+                    && !text.contains("recovery_key")
+                    && !text.contains("csrf_token"),
+                "{text}"
+            );
+        }
+    }
+    assert_eq!(core.db.count("api_tokens").await, 0);
+    assert_eq!(core.db.count("sessions").await, 0);
+    assert_eq!(core.db.count("sync_state").await, 0);
+    let stored: Vec<String> = sqlx::query_scalar(
+        "SELECT encode(coalesce(response_body, ''::bytea), 'escape') FROM idempotency_keys",
+    )
+    .fetch_all(core.db.pool())
+    .await
+    .unwrap();
+    assert!(
+        stored.iter().all(|b| !b.contains("mrl_pat_")
+            && !b.contains("recovery_key")
+            && !b.contains("csrf_token")),
+        "{stored:?}"
+    );
+    // Without the key the same requests work; other endpoints still replay.
+    assert_eq!(
+        core.call(
+            Method::POST,
+            "/api/v1/auth/tokens",
+            &Auth::Launch,
+            Some(json!({"name": "x", "scopes": ["*"]}))
+        )
+        .await
+        .status,
+        201
+    );
+    let first = keyed(
+        "/api/v1/orgs",
+        Some(json!({"slug": "lab", "name": "Lab"})),
+        "k-org-1",
+    )
+    .await;
+    assert_eq!(first.status, 201);
+    let again = keyed(
+        "/api/v1/orgs",
+        Some(json!({"slug": "lab", "name": "Lab"})),
+        "k-org-1",
+    )
+    .await;
+    assert_eq!(again.status, 201, "replayed, not a 409");
+    assert_eq!(again.headers["idempotent-replayed"], "true");
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn org_lists_follow_roles_and_token_limits() {
+    let sb = MockSupabase::start().await;
+    let core = CoreServer::start(Mode::Team, &sb, TestDb::new().await, Arc::default()).await;
+    let (lab, rival, other) = (OrgId::new(), OrgId::new(), OrgId::new());
+    core.db
+        .seed(&format!(
+            "INSERT INTO organizations (id, slug, name, kind) VALUES ('{a}', 'lab', 'Lab', 'team'), ('{b}', 'rival', 'Rival', 'team'), ('{c}', 'other', 'Other', 'team');",
+            a = lab.as_uuid(), b = rival.as_uuid(), c = other.as_uuid()
+        ))
+        .await;
+    let (carol, c) = member(&core, &sb, "carol").await;
+    grant(&core, lab, c, Role::Maintainer, Scope::Org).await;
+    grant(&core, rival, c, Role::Viewer, Scope::Org).await;
+    grant(&core, other, c, Role::Annotator, Scope::Org).await;
+    let slugs = |r: TestResponse| -> Vec<String> {
+        assert_eq!(r.status, 200, "{}", r.text());
+        r.json()["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|o| o["slug"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let get = |auth: Auth| {
+        let core = &core;
+        async move { core.call(Method::GET, "/api/v1/orgs", &auth, None).await }
+    };
+    // An annotator role does not allow tenancy.read, so that org is not listed.
+    let mut both = slugs(get(Auth::Bearer(carol.clone())).await);
+    both.sort();
+    assert_eq!(both, vec!["lab", "rival"]);
+    let token = |scopes: Value| {
+        let (core, carol) = (&core, carol.clone());
+        async move {
+            let r = core
+                .call(
+                    Method::POST,
+                    "/api/v1/auth/tokens",
+                    &Auth::Bearer(carol),
+                    Some(json!({"name": "t", "scopes": scopes})),
+                )
+                .await;
+            assert_eq!(r.status, 201, "{}", r.text());
+            r.json()["token"].as_str().unwrap().to_owned()
+        }
+    };
+    // Carol's token is bound to her first org (lab): it sees only that one.
+    let reader = token(json!(["tenancy:read"])).await;
+    assert_eq!(slugs(get(Auth::Bearer(reader)).await), vec!["lab"]);
+    let runs_only = token(json!(["runs:read"])).await;
+    let refused = get(Auth::Bearer(runs_only)).await;
+    assert_eq!(refused.status, 403, "{}", refused.text());
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_child_token_never_outlives_its_parent() {
+    let sb = MockSupabase::start().await;
+    let core = solo(&sb).await;
+    let parent = core
+        .call(
+            Method::POST,
+            "/api/v1/auth/tokens",
+            &Auth::Launch,
+            Some(json!({"name": "short", "scopes": ["*"], "days": 1})),
+        )
+        .await
+        .json();
+    let child = core
+        .call(
+            Method::POST,
+            "/api/v1/auth/tokens",
+            &Auth::Bearer(parent["token"].as_str().unwrap().to_owned()),
+            Some(json!({"name": "long", "scopes": ["runs:read"], "days": 365})),
+        )
+        .await;
+    assert_eq!(child.status, 201, "{}", child.text());
+    let ends: Vec<time::OffsetDateTime> =
+        sqlx::query_scalar("SELECT expires_at FROM api_tokens ORDER BY created_at")
+            .fetch_all(core.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(ends.len(), 2);
+    assert!(
+        ends[1] <= ends[0],
+        "child {} outlives parent {}",
+        ends[1],
+        ends[0]
+    );
+    // Once the parent's time is up, the child stops too.
+    sqlx::query("UPDATE api_tokens SET expires_at = now() - interval '1 second' WHERE expires_at = $1 AND name = 'short'")
+        .bind(ends[0])
+        .execute(core.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE api_tokens SET expires_at = LEAST(expires_at, now() - interval '1 second') WHERE name = 'long'")
+        .execute(core.db.pool())
+        .await
+        .unwrap();
+    let child_token = child.json()["token"].as_str().unwrap().to_owned();
+    assert_eq!(
+        core.call(
+            Method::GET,
+            "/api/v1/auth/me",
+            &Auth::Bearer(child_token),
+            None
+        )
+        .await
+        .status,
+        401
+    );
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn two_devices_pushing_at_once_both_keep_their_copy() {
+    let sb = MockSupabase::start().await;
+    let (laptop, desktop) = (solo(&sb).await, solo(&sb).await);
+    for core in [&laptop, &desktop] {
+        assert_eq!(core.sign_in(&sb, &Auth::Launch, false).await.status, 200);
+        assert_eq!(
+            core.call(
+                Method::POST,
+                "/api/v1/sync/setup",
+                &Auth::Launch,
+                Some(json!({"passphrase": PASSPHRASE}))
+            )
+            .await
+            .status,
+            200
+        );
+    }
+    let mut versions = Vec::new();
+    for _ in 0..5 {
+        let (a, b) = tokio::join!(push(&laptop), push(&desktop));
+        for r in [a, b] {
+            assert_eq!(r.status, 200, "{}", r.text());
+            versions.push(r.json()["version"].as_i64().unwrap());
+        }
+    }
+    versions.sort_unstable();
+    assert_eq!(
+        versions,
+        (1..=10).collect::<Vec<i64>>(),
+        "every push got its own version"
+    );
+    let kept: Vec<i64> = laptop
+        .call(Method::GET, "/api/v1/sync/status", &Auth::Launch, None)
+        .await
+        .json()["copies"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["version"].as_i64().unwrap())
+        .collect();
+    assert_eq!(kept, vec![10, 9, 8, 7, 6]);
+    laptop.stop().await;
+    desktop.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_rate_limited_refresh_is_temporary() {
+    let sb = MockSupabase::start().await;
+    let core = solo(&sb).await;
+    sb.set_access_ttl(30); // inside the refresh margin: every push refreshes first
+    assert_eq!(core.sign_in(&sb, &Auth::Launch, false).await.status, 200);
+    assert_eq!(
+        core.call(
+            Method::POST,
+            "/api/v1/sync/setup",
+            &Auth::Launch,
+            Some(json!({"passphrase": PASSPHRASE}))
+        )
+        .await
+        .status,
+        200
+    );
+    sb.rate_limit_refreshes(1);
+    let limited = core
+        .call(Method::POST, "/api/v1/sync/push", &Auth::Launch, None)
+        .await;
+    assert_eq!(limited.status, 503, "{}", limited.text());
+    assert_eq!(limited.json()["code"], "MRL-LINK-160");
+    assert_eq!(
+        core.call(Method::GET, "/api/v1/auth/me", &Auth::Launch, None)
+            .await
+            .json()["sign_in"],
+        "active"
+    );
+    let later = core
+        .call(Method::POST, "/api/v1/sync/push", &Auth::Launch, None)
+        .await;
+    assert_eq!(later.status, 200, "{}", later.text());
+    // A dead refresh token still ends the session.
+    sb.revoke_refresh_tokens();
+    let dead = core
+        .call(Method::POST, "/api/v1/sync/push", &Auth::Launch, None)
+        .await;
+    assert_eq!(dead.json()["code"], "MRL-AUTH-160");
+    assert_eq!(
+        core.call(Method::GET, "/api/v1/auth/me", &Auth::Launch, None)
+            .await
+            .json()["sign_in"],
+        "expired"
+    );
+    core.stop().await;
+}
+
+async fn push(core: &CoreServer) -> TestResponse {
+    core.call(Method::POST, "/api/v1/sync/push", &Auth::Launch, None)
+        .await
 }

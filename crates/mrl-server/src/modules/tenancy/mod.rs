@@ -181,6 +181,38 @@ pub async fn upsert_supabase_user(db: &Db, profile: &Profile) -> Result<UserId, 
     Ok(UserId::from_uuid(id))
 }
 
+/// Resource kind of platform-wide actions, like creating an org. Only the solo owner and
+/// users with `platform_admin` pass.
+pub const PLATFORM: &str = "platform";
+
+/// Whether `user` holds the platform grant (`users.platform_admin`).
+pub async fn is_platform_admin(db: &Db, user: UserId) -> Result<bool, DbError> {
+    let flag: Option<bool> = sqlx::query_scalar("SELECT platform_admin FROM users WHERE id = $1")
+        .bind(user.as_uuid())
+        .fetch_optional(db.pool())
+        .await?;
+    Ok(flag == Some(true))
+}
+
+/// Gives or takes the platform grant (team setup, P43). Audit it in the same `tx`.
+pub async fn set_platform_admin(tx: &mut Tx, user: UserId, on: bool) -> Result<(), DbError> {
+    sqlx::query("UPDATE users SET platform_admin = $2, updated_at = now() WHERE id = $1")
+        .bind(user.as_uuid())
+        .bind(on)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
+}
+
+/// Human roles that may take `action` (for filtering lists in SQL).
+pub fn roles_allowing(action: Action) -> Vec<&'static str> {
+    Role::ALL
+        .into_iter()
+        .filter(|&r| r.is_human() && allowed(r, action))
+        .map(Role::as_str)
+        .collect()
+}
+
 /// Whether `user` is active (not disabled).
 pub async fn is_active(db: &Db, user: UserId) -> Result<bool, DbError> {
     let status: Option<String> = sqlx::query_scalar("SELECT status FROM users WHERE id = $1")
@@ -357,6 +389,15 @@ impl Rbac {
             if owner.id == user {
                 return Ok(verdict(&[Role::Owner], action));
             }
+        }
+        // Platform actions (like creating orgs) need the explicit platform grant; an org
+        // role, even owner, does not reach them.
+        if resource.kind == PLATFORM {
+            return Ok(if is_platform_admin(&self.db, user).await? {
+                verdict(&[Role::Owner], action)
+            } else {
+                Decision::Deny
+            });
         }
         if action == Action::AuthSession {
             return Ok(Decision::Allow);

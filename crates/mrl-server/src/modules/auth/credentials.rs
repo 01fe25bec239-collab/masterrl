@@ -79,10 +79,18 @@ pub struct TokenGrant {
     pub scopes: Vec<String>,
     /// The one project it is limited to, if any.
     pub project: Option<ProjectId>,
+    /// When it stops working.
+    pub expires_at: OffsetDateTime,
 }
 
 /// user, org, scopes, project.
-type GrantRow = (Uuid, Option<Uuid>, Vec<String>, Option<Uuid>);
+type GrantRow = (
+    Uuid,
+    Option<Uuid>,
+    Vec<String>,
+    Option<Uuid>,
+    OffsetDateTime,
+);
 
 /// The grant behind a token principal id (`tok_…`), if that token is still live.
 pub async fn token_grant(db: &Db, principal_id: &str) -> Result<Option<TokenGrant>, DbError> {
@@ -90,19 +98,22 @@ pub async fn token_grant(db: &Db, principal_id: &str) -> Result<Option<TokenGran
         return Ok(None);
     };
     let row: Option<GrantRow> = sqlx::query_as(
-        "SELECT user_id, org_id, scopes, project_id FROM api_tokens \
+        "SELECT user_id, org_id, scopes, project_id, expires_at FROM api_tokens \
          WHERE id = $1 AND revoked_at IS NULL AND expires_at > now()",
     )
     .bind(id.as_uuid())
     .fetch_optional(db.pool())
     .await?;
-    Ok(row.map(|(user, org, scopes, project)| TokenGrant {
-        id,
-        user: UserId::from_uuid(user),
-        org: org.map(OrgId::from_uuid),
-        scopes,
-        project: project.map(ProjectId::from_uuid),
-    }))
+    Ok(
+        row.map(|(user, org, scopes, project, expires_at)| TokenGrant {
+            id,
+            user: UserId::from_uuid(user),
+            org: org.map(OrgId::from_uuid),
+            scopes,
+            project: project.map(ProjectId::from_uuid),
+            expires_at,
+        }),
+    )
 }
 
 /// A token just made. `token` is shown to the caller once and never stored.
@@ -133,6 +144,8 @@ pub struct TokenRequest {
     pub scopes: Vec<String>,
     /// Lifetime, 1–365 days.
     pub days: u32,
+    /// Never later than this (a child token ends with its parent).
+    pub not_after: Option<OffsetDateTime>,
 }
 
 /// Makes a token in `tx`.
@@ -146,7 +159,8 @@ pub async fn issue_token(
     let id = TokenId::new();
     let expires_at: OffsetDateTime = sqlx::query_scalar(
         "INSERT INTO api_tokens (id, user_id, org_id, project_id, name, token_prefix, token_hash, scopes, expires_at) \
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, now() + make_interval(days => $9)) RETURNING expires_at",
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, \
+           LEAST(now() + make_interval(days => $9), COALESCE($10, 'infinity'::timestamptz))) RETURNING expires_at",
     )
     .bind(id.as_uuid())
     .bind(req.user.as_uuid())
@@ -157,6 +171,7 @@ pub async fn issue_token(
     .bind(token_hash(pepper, &token)?)
     .bind(&req.scopes)
     .bind(i32::try_from(req.days.clamp(1, MAX_TOKEN_DAYS)).unwrap_or(1))
+    .bind(req.not_after)
     .fetch_one(&mut **tx)
     .await
     .map_err(DbError::from)?;

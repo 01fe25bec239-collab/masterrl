@@ -1418,8 +1418,8 @@ components:
     Transport:
       type: object
       description: |-
-        How the app reaches a machine. Settings only: keys and passwords stay in the keychain,
-        named by `key_ref`.
+        How the app reaches a machine. Only these typed settings: keys and passwords stay in the
+        keychain, named by `key_ref`; free-form options are refused (unknown fields).
       required:
       - kind
       properties:
@@ -1431,9 +1431,6 @@ components:
         kind:
           type: string
           description: '`lan`, `ssh`, `tailscale` or `cloudflare_tunnel`.'
-        options:
-          type: object
-          description: Other settings of this transport.
         port:
           type:
           - integer

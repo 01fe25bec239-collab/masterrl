@@ -40,6 +40,8 @@ pub enum SupabaseError {
         status: u16,
         /// Supabase's reason.
         message: String,
+        /// Supabase's error code, like `refresh_token_not_found` (empty if none).
+        code: String,
     },
     /// The answer was not what Supabase sends.
     #[error("the sign-in service sent an answer the app could not read: {0}")]
@@ -234,9 +236,17 @@ pub async fn send(req: reqwest::RequestBuilder) -> Result<reqwest::Response, Sup
         .chars()
         .take(200)
         .collect();
+    let code = ["error_code", "error"]
+        .iter()
+        .find_map(|k| body.get(*k).and_then(Value::as_str))
+        .unwrap_or_default()
+        .chars()
+        .take(80)
+        .collect();
     Err(SupabaseError::Refused {
         status: status.as_u16(),
         message,
+        code,
     })
 }
 

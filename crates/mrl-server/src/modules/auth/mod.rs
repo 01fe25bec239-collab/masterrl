@@ -135,6 +135,19 @@ fn no_secret_store() -> ApiError {
     ApiError::new(ErrorCode::Unavailable, "This server has no secret store.")
 }
 
+/// Refuses an `Idempotency-Key` on an endpoint that returns a secret once (a token, a session
+/// cookie, a recovery key). P07's idempotency store keeps whole response bodies for replay,
+/// so these must never reach it: the refusal (a 400) is all that gets stored.
+pub fn no_replay(headers: &HeaderMap) -> Result<(), ApiError> {
+    if headers.contains_key(crate::http::idempotency::IDEMPOTENCY_KEY) {
+        return Err(ApiError::new(
+            ErrorCode::IdempotencyKey,
+            "This endpoint returns a secret only once, so it does not take an Idempotency-Key; send the request without it.",
+        ));
+    }
+    Ok(())
+}
+
 /// A database error as an API error (503, details only in the log).
 pub fn db_error(e: DbError) -> ApiError {
     ApiError::from(SeamError::from(e))
@@ -388,8 +401,10 @@ async fn callback(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
     Extension(meta): Extension<RequestMeta>,
+    headers: HeaderMap,
     Json(req): Json<CallbackRequest>,
 ) -> Result<Json<SignedIn>, Fail> {
+    no_replay(&headers)?;
     let (supabase, verifier) = match (&shared.supabase, &shared.verifier) {
         (Some(s), Some(v)) => (s, v),
         _ => return Err(not_set_up()),
@@ -465,6 +480,7 @@ async fn callback(
             .collect(),
         scopes: vec!["*".to_owned()],
         days: shared.config.token_days,
+        not_after: None,
     };
     let actor = user.to_string();
     let at = state.seams.clock.now();
@@ -722,6 +738,7 @@ async fn start_session(
     ctx: RequestContext,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, Fail> {
+    no_replay(&headers)?;
     if ctx.principal.kind == PrincipalKind::Service {
         return Err(ApiError::new(
             ErrorCode::Forbidden,
@@ -892,8 +909,10 @@ async fn create_token(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
     ctx: RequestContext,
+    headers: HeaderMap,
     Json(req): Json<CreateToken>,
 ) -> Result<(StatusCode, Json<NewToken>), Fail> {
+    no_replay(&headers)?;
     let user = authorize_self_shared(&state, &shared, &ctx, "auth.manage_tokens").await?;
     let name = req.name.trim();
     if name.is_empty() || name.chars().count() > 100 {
@@ -911,6 +930,7 @@ async fn create_token(
         .transpose()?;
     let db = &shared.db;
     let mut org = ctx.org.as_deref().and_then(|o| OrgId::from_str(o).ok());
+    let mut not_after = None;
     if ctx.principal.kind == PrincipalKind::Service {
         let grant = credentials::token_grant(db, &ctx.principal.id)
             .await
@@ -942,6 +962,8 @@ async fn create_token(
             (None, _) => {}
         }
         org = grant.org;
+        // A child never outlives the token that made it.
+        not_after = Some(grant.expires_at);
     } else if org.is_none() && shared.mode == Mode::Team {
         org = tenancy::primary_org(db, user).await.map_err(db_error)?;
     }
@@ -981,6 +1003,7 @@ async fn create_token(
         name: name.to_owned(),
         scopes: req.scopes.clone(),
         days,
+        not_after,
     };
     let at = state.seams.clock.now();
     let mut tx = db.begin().await.map_err(db_error)?;

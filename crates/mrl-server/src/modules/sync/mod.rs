@@ -55,8 +55,8 @@ pub const NOTHING_SAVED: &str = "MRL-RES-160";
 /// Shortest passphrase.
 pub const MIN_PASSPHRASE: usize = 12;
 
-/// How the app reaches a machine. Settings only: keys and passwords stay in the keychain,
-/// named by `key_ref`.
+/// How the app reaches a machine. Only these typed settings: keys and passwords stay in the
+/// keychain, named by `key_ref`; free-form options are refused (unknown fields).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct Transport {
@@ -71,10 +71,6 @@ pub struct Transport {
     /// Name of the keychain secret that holds the key (never the key itself).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_ref: Option<String>,
-    /// Other settings of this transport.
-    #[serde(default)]
-    #[schema(value_type = Object)]
-    pub options: Map<String, Value>,
 }
 
 /// One connected machine.
@@ -136,7 +132,11 @@ impl Default for SetupProfile {
     }
 }
 
-const SECRET_WORDS: [&str; 9] = [
+const SECRET_WORDS: [&str; 13] = [
+    "authorization",
+    "cookie",
+    "credential",
+    "bearer",
     "password",
     "passwd",
     "secret",
@@ -155,6 +155,19 @@ const SECRET_PREFIXES: [&str; 6] = [
     "ghp_",
     "github_pat_",
 ];
+
+/// True for text shaped like a credential: a known token prefix, an `Authorization` value
+/// (`Bearer …`, `Basic …`), or an address with a user name or password in it.
+fn secret_shaped(s: &str) -> bool {
+    let t = s.trim_start();
+    let lower = t.to_ascii_lowercase();
+    SECRET_PREFIXES.iter().any(|p| t.starts_with(p))
+        || ["bearer ", "basic ", "token ", "digest "]
+            .iter()
+            .any(|p| lower.starts_with(p))
+        || reqwest::Url::parse(t).is_ok_and(|u| !u.username().is_empty() || u.password().is_some())
+        || (t.contains('@') && t.contains(':') && t.contains("//"))
+}
 
 /// The JSON pointer of the first thing in `v` that looks like a secret: a key named like one
 /// (`password`, `api_key`, …) or a value shaped like one (a PEM key, `hf_…`, `mrl_pat_…`).
@@ -175,10 +188,7 @@ pub fn find_secret(v: &Value, path: &str) -> Option<String> {
             .iter()
             .enumerate()
             .find_map(|(i, v)| find_secret(v, &format!("{path}/{i}"))),
-        Value::String(s) => SECRET_PREFIXES
-            .iter()
-            .any(|p| s.trim_start().starts_with(p))
-            .then(|| path.to_owned()),
+        Value::String(s) => secret_shaped(s).then(|| path.to_owned()),
         _ => None,
     }
 }
@@ -199,7 +209,46 @@ fn check(profile: &SetupProfile) -> Result<(), ApiError> {
             "Send \"schema\": \"setup-profile/v1\".",
         ));
     }
+    let name_ok = |n: &str| (1..=100).contains(&n.trim().chars().count());
+    let word_ok = |w: &str, max: usize| {
+        (1..=max).contains(&w.len())
+            && w.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+    };
     for (i, m) in profile.machines.iter().enumerate() {
+        let at = |f: &str| format!("/machines/{i}/{f}");
+        if !name_ok(&m.name) {
+            return Err(bad(
+                &at("name"),
+                "a machine name needs 1–100 characters",
+                "Use a short name, like gpu-box.",
+            ));
+        }
+        if !host_ok(&m.address) {
+            return Err(bad(
+                &at("address"),
+                "the address must be a host name or IP address only, with no user name, password, port or path",
+                "Put the port and login name in the transport settings, and the key in the keychain.",
+            ));
+        }
+        if m.transport.user.as_deref().is_some_and(|u| !word_ok(u, 64)) {
+            return Err(bad(
+                &at("transport/user"),
+                "the login name may use only letters, digits, '.', '_' and '-'",
+                "Use the plain login name, like ada.",
+            ));
+        }
+        if m.transport
+            .key_ref
+            .as_deref()
+            .is_some_and(|r| !word_ok(r, 128))
+        {
+            return Err(bad(
+                &at("transport/key_ref"),
+                "key_ref must be a keychain name: letters, digits, '.', '_' and '-'",
+                "Use the name of the keychain entry, like ssh.gpu-box.",
+            ));
+        }
         if !matches!(
             m.transport.kind.as_str(),
             "lan" | "ssh" | "tailscale" | "cloudflare_tunnel"
@@ -208,6 +257,22 @@ fn check(profile: &SetupProfile) -> Result<(), ApiError> {
                 &format!("/machines/{i}/transport/kind"),
                 "transport kind must be lan, ssh, tailscale or cloudflare_tunnel",
                 "Pick one of the four transports.",
+            ));
+        }
+    }
+    for (i, t) in profile.team_memberships.iter().enumerate() {
+        if !name_ok(&t.name) {
+            return Err(bad(
+                &format!("/team_memberships/{i}/name"),
+                "a team name needs 1–100 characters",
+                "Use the team's name.",
+            ));
+        }
+        if !team_address_ok(&t.address) {
+            return Err(bad(
+                &format!("/team_memberships/{i}/address"),
+                "the team address must be an https:// address with no user name, password, path or query",
+                "Use the address the team owner gave you, like https://lab.example:8443.",
             ));
         }
     }
@@ -221,6 +286,41 @@ fn check(profile: &SetupProfile) -> Result<(), ApiError> {
         ));
     }
     Ok(())
+}
+
+/// A host name or IP address (IPv6 in brackets or bare), nothing else.
+fn host_ok(a: &str) -> bool {
+    let bare = a
+        .strip_prefix('[')
+        .and_then(|x| x.strip_suffix(']'))
+        .unwrap_or(a);
+    if bare.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    (1..=253).contains(&a.len())
+        && a.split('.').all(|label| {
+            (1..=63).contains(&label.len())
+                && label
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+                && !label.starts_with('-')
+                && !label.ends_with('-')
+        })
+}
+
+/// `https://host[:port]` (or `http://` on loopback), with no credentials, path or query.
+fn team_address_ok(a: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(a) else {
+        return false;
+    };
+    let loopback = matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
+    (u.scheme() == "https" || (u.scheme() == "http" && loopback))
+        && u.host_str().is_some()
+        && u.username().is_empty()
+        && u.password().is_none()
+        && matches!(u.path(), "" | "/")
+        && u.query().is_none()
+        && u.fragment().is_none()
 }
 
 /// One encrypted copy as stored in Supabase.
@@ -275,18 +375,33 @@ async fn remote_copies(sb: &Supabase, access: &Access) -> Result<Vec<Copy>, Supa
         .unwrap_or_default())
 }
 
-async fn put_copies(sb: &Supabase, access: &Access, copies: &[Copy]) -> Result<(), SupabaseError> {
-    supabase::send(
-        sb.request(reqwest::Method::POST, &format!("/rest/v1/{TABLE}"))
-            .bearer_auth(access.token.expose())
-            .query(&[("on_conflict", "user_id")])
-            .header("Prefer", "resolution=merge-duplicates,return=minimal")
-            .json(
-                &serde_json::json!([{ "user_id": access.user.id.to_string(), "copies": copies }]),
-            ),
+/// Supabase SQL function that adds one copy atomically (see the P16 handoff).
+pub const PUSH_FUNCTION: &str = "push_setup_copy";
+
+/// What [`PUSH_FUNCTION`] answers.
+#[derive(Debug, Deserialize)]
+struct PushAnswer {
+    version: i64,
+    at: String,
+    copies: usize,
+}
+
+/// Adds `blob` as the newest copy. Supabase allocates the version and trims to 5 under one
+/// row lock, so two devices pushing at once both keep their copy with different versions.
+async fn push_copy(
+    sb: &Supabase,
+    access: &Access,
+    blob: &Envelope,
+) -> Result<PushAnswer, SupabaseError> {
+    supabase::json(
+        sb.request(
+            reqwest::Method::POST,
+            &format!("/rest/v1/rpc/{PUSH_FUNCTION}"),
+        )
+        .bearer_auth(access.token.expose())
+        .json(&serde_json::json!({ "p_blob": blob })),
     )
     .await
-    .map(drop)
 }
 
 fn remote_error(e: SupabaseError) -> Fail {
@@ -493,8 +608,10 @@ async fn setup(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
     ctx: RequestContext,
+    headers: axum::http::HeaderMap,
     Json(req): Json<SetupRequest>,
 ) -> Result<Json<SetupDone>, Fail> {
+    crate::modules::auth::no_replay(&headers)?;
     let c = caller(&state, &shared, &ctx).await?;
     if req.passphrase.chars().count() < MIN_PASSPHRASE {
         return Err(ApiError::validation(vec![FieldError::new(
@@ -613,11 +730,6 @@ async fn settle_key(
     }
 }
 
-fn now_rfc3339(at: OffsetDateTime) -> String {
-    at.format(&time::format_description::well_known::Rfc3339)
-        .unwrap_or_default()
-}
-
 #[utoipa::path(post, path = "/sync/push", tag = "sync",
     responses((status = 200, body = Pushed), (status = 401, body = crate::error::Problem), (status = 503, body = crate::error::Problem)))]
 async fn push(
@@ -647,25 +759,13 @@ async fn push(
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
     let sealed = crypto::seal(&key, &aad(access.user.id), &plain)
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
-    let mut copies = remote_copies(sb, &access).await.map_err(remote_error)?;
-    let now = state.seams.clock.now();
-    let version = copies.iter().map(|c| c.version).max().unwrap_or(0) + 1;
-    copies.insert(
-        0,
-        Copy {
-            version,
-            at: now_rfc3339(now),
-            blob: Envelope {
-                format: ENVELOPE_FORMAT.to_owned(),
-                kdf,
-                sealed: STANDARD.encode(sealed),
-            },
-        },
-    );
-    copies.truncate(KEEP);
-    put_copies(sb, &access, &copies)
-        .await
-        .map_err(remote_error)?;
+    let blob = Envelope {
+        format: ENVELOPE_FORMAT.to_owned(),
+        kdf,
+        sealed: STANDARD.encode(sealed),
+    };
+    let pushed = push_copy(sb, &access, &blob).await.map_err(remote_error)?;
+    let (version, now) = (pushed.version, state.seams.clock.now());
     let event = audit::event(
         now,
         &ctx.principal.id,
@@ -694,8 +794,8 @@ async fn push(
     commit(tx).await?;
     Ok(Json(Pushed {
         version,
-        at: now_rfc3339(now),
-        copies: copies.len(),
+        at: pushed.at,
+        copies: pushed.copies,
     }))
 }
 
@@ -955,7 +1055,7 @@ mod tests {
     #[test]
     fn secrets_are_spotted_by_name_and_shape() {
         let v = serde_json::json!({
-            "machines": [{"name": "gpu", "transport": {"key_ref": "ssh.gpu", "options": {}}}],
+            "machines": [{"name": "gpu", "transport": {"key_ref": "ssh.gpu"}}],
             "preferences": {"theme": "dark", "hf_token_ref": "hf"}
         });
         assert_eq!(find_secret(&v, ""), None);
@@ -970,8 +1070,64 @@ mod tests {
                 "/ui/note",
             ),
             (serde_json::json!({"m": [{"o": "mrl_pat_abc"}]}), "/m/0/o"),
+            (
+                serde_json::json!({"ui": {"header": "Bearer abc.def"}}),
+                "/ui/header",
+            ),
+            (
+                serde_json::json!({"ui": {"h": "basic dXNlcjpwYXNz"}}),
+                "/ui/h",
+            ),
+            (
+                serde_json::json!({"ui": {"proxy": "http://u:p@proxy:8080"}}),
+                "/ui/proxy",
+            ),
+            (
+                serde_json::json!({"ui": {"Authorization": "x"}}),
+                "/ui/Authorization",
+            ),
+            (
+                serde_json::json!({"ui": {"password": ["x"]}}),
+                "/ui/password",
+            ),
         ] {
             assert_eq!(find_secret(&bad, "").as_deref(), Some(path));
+        }
+    }
+
+    #[test]
+    fn addresses_carry_no_credentials() {
+        for ok in [
+            "gpu-box",
+            "10.0.0.7",
+            "laptop.tail1234.ts.net",
+            "[::1]",
+            "fe80::1",
+        ] {
+            assert!(host_ok(ok), "{ok}");
+        }
+        for bad in [
+            "ada:pw@host",
+            "ada@host",
+            "host:22",
+            "host/path",
+            "http://host",
+            "",
+            "-x.y",
+            "a b",
+        ] {
+            assert!(!host_ok(bad), "{bad}");
+        }
+        assert!(team_address_ok("https://lab.example:8443"));
+        assert!(team_address_ok("http://127.0.0.1:8443"));
+        for bad in [
+            "https://u:p@lab.example",
+            "https://u@lab.example",
+            "http://lab.example",
+            "https://lab.example/x?t=1",
+            "lab.example",
+        ] {
+            assert!(!team_address_ok(bad), "{bad}");
         }
     }
 
@@ -992,7 +1148,6 @@ mod tests {
                 port: None,
                 user: None,
                 key_ref: None,
-                options: Map::new(),
             },
         });
         assert!(check(&p).is_err());

@@ -231,19 +231,56 @@ async fn list_orgs(
     ctx: RequestContext,
     Query(q): Query<PageQuery>,
 ) -> Result<Json<Page<Org>>, Fail> {
-    state
-        .authorize(&ctx, "auth.session", &Resource::kind("org"))
-        .await?;
     let page = q.resolve()?;
     let user = acting_user(&db, &ctx.principal).await.map_err(db_error)?;
+    // A token needs a tenancy scope and sees only the org it is bound to; a one-project
+    // token sees no org list at all (org-wide reads are outside it).
+    let mut only_org = None;
+    if ctx.principal.kind == crate::seams::PrincipalKind::Service {
+        let grant = crate::modules::auth::credentials::token_grant(&db, &ctx.principal.id)
+            .await
+            .map_err(db_error)?;
+        let refuse = || {
+            ApiError::new(
+                ErrorCode::Forbidden,
+                "Your account cannot do tenancy.read on this org.",
+            )
+        };
+        let Some(g) = grant else {
+            return Err(refuse().into());
+        };
+        if !super::is_active(&db, g.user).await.map_err(db_error)? {
+            return Err(refuse().into());
+        }
+        if !crate::modules::auth::credentials::scopes_allow(
+            &g.scopes,
+            mrl_domain::rbac::Action::TenancyRead,
+        ) || g.project.is_some()
+        {
+            return Err(refuse().into());
+        }
+        only_org = g.org;
+    } else {
+        // People: any signed-in, active account; the list below holds only orgs they may read.
+        state
+            .authorize(&ctx, "auth.session", &Resource::kind("account"))
+            .await?;
+    }
+    // Only orgs where an org-wide role allows tenancy.read (as `GET /orgs/{org}/…` checks),
+    // filtered before paging.
+    let readers = super::roles_allowing(mrl_domain::rbac::Action::TenancyRead);
     let rows: Vec<OrgRow> = sqlx::query_as(
         "SELECT o.id, o.slug, o.name, o.kind, o.created_at FROM organizations o \
-         WHERE EXISTS (SELECT 1 FROM role_bindings rb WHERE rb.org_id = o.id AND rb.principal_kind = 'user' AND rb.principal_id = $1) \
+         WHERE EXISTS (SELECT 1 FROM role_bindings rb WHERE rb.org_id = o.id AND rb.principal_kind = 'user' \
+                       AND rb.principal_id = $1 AND rb.scope_kind = 'org' AND rb.role = ANY($4)) \
+           AND ($5::uuid IS NULL OR o.id = $5) \
            AND ($2::uuid IS NULL OR o.id > $2) ORDER BY o.id LIMIT $3",
     )
     .bind(user.map(|u| u.as_uuid()))
     .bind(after_uuid(&page)?)
     .bind(limit(&page))
+    .bind(&readers)
+    .bind(only_org.map(|o| o.as_uuid()))
     .fetch_all(db.pool())
     .await
     .map_err(|e| db_error(e.into()))?;
@@ -266,11 +303,9 @@ async fn create_org(
     ctx: RequestContext,
     Json(item): Json<NewItem>,
 ) -> Result<Response, Fail> {
-    let resource = Resource {
-        org: ctx.org.clone(),
-        ..Resource::kind("org")
-    };
-    state.authorize(&ctx, "admin.manage", &resource).await?;
+    state
+        .authorize(&ctx, "admin.manage", &Resource::kind(super::PLATFORM))
+        .await?;
     check(&item)?;
     let user = acting_user(&db, &ctx.principal)
         .await

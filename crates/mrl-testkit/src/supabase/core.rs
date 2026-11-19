@@ -120,6 +120,18 @@ impl CoreServer {
         auth: &Auth,
         body: Option<Value>,
     ) -> TestResponse {
+        self.call_with(method, path, auth, body, &[]).await
+    }
+
+    /// Like [`CoreServer::call`], with extra request headers (like `Idempotency-Key`).
+    pub async fn call_with(
+        &self,
+        method: Method,
+        path: &str,
+        auth: &Auth,
+        body: Option<Value>,
+        extra: &[(&str, &str)],
+    ) -> TestResponse {
         let bearer;
         let cookie;
         let mut headers: Vec<(&str, &str)> = vec![("content-type", "application/json")];
@@ -150,6 +162,7 @@ impl CoreServer {
                 }
             }
         }
+        headers.extend_from_slice(extra);
         let body = match body {
             Some(v) => Body::from(v.to_string()),
             None => Body::empty(),

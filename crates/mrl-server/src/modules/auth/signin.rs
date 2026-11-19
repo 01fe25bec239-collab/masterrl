@@ -170,7 +170,9 @@ impl SignIn {
                     self.keep(&t).await?;
                     s = self.load().await?.ok_or(SignInError::SignedOut)?;
                 }
-                Err(SupabaseError::Refused { status, .. }) if status < 500 => {
+                // Only a definite "this refresh token is dead" ends the session; a rate limit
+                // or another refusal is temporary.
+                Err(SupabaseError::Refused { code, .. }) if refresh_is_dead(&code) => {
                     s.expired = true;
                     self.save(&s).await?;
                     return Err(SignInError::Expired);
@@ -198,6 +200,20 @@ impl SignIn {
         }
         store.delete(SESSION_SECRET).await.map_err(store_err)
     }
+}
+
+/// Supabase's answers that mean the refresh token can never work again.
+fn refresh_is_dead(code: &str) -> bool {
+    matches!(
+        code,
+        "refresh_token_not_found"
+            | "refresh_token_already_used"
+            | "session_not_found"
+            | "session_expired"
+            | "user_not_found"
+            | "user_banned"
+            | "invalid_grant"
+    )
 }
 
 /// A started sign-in waiting for its callback.

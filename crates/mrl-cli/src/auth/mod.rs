@@ -86,25 +86,34 @@ impl Client {
             )?,
         };
         let server = server.trim_end_matches('/').to_owned();
-        if !(server.starts_with("http://") || server.starts_with("https://")) {
-            return Err(format!(
-                "{server:?} is not a server address; it must start with http:// or https://"
-            ));
-        }
+        check_server(&server)?;
         let token = match env("MRL_TOKEN") {
             Some(t) => Some(t),
             None => store.get(&token_key(&server)).unwrap_or(None),
         };
+        // No redirects: credentials must never follow a response to another origin.
         let http = Http::builder()
             .timeout(Duration::from_secs(120))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| format!("could not set up HTTP: {e}"))?;
         Ok(Self {
-            server,
             token,
-            launch_secret: env("MRL_LAUNCH_SECRET"),
+            // The launch secret opens only this computer's solo core; never send it elsewhere.
+            launch_secret: env("MRL_LAUNCH_SECRET").filter(|_| is_loopback(&server)),
+            server,
             http,
         })
+    }
+
+    /// The same connection signed in with `token` only.
+    fn with_token(&self, token: &str) -> Self {
+        Self {
+            server: self.server.clone(),
+            token: Some(token.to_owned()),
+            launch_secret: None,
+            http: self.http.clone(),
+        }
     }
 
     fn send(
@@ -149,10 +158,73 @@ impl Client {
         self.send(reqwest::Method::GET, path, None)
     }
 
+    /// `DELETE /api/v1{path}`.
+    pub fn delete(&self, path: &str) -> Result<Value, String> {
+        self.send(reqwest::Method::DELETE, path, None)
+    }
+
     /// `POST /api/v1{path}` with a JSON body.
     pub fn post(&self, path: &str, body: &Value) -> Result<Value, String> {
         self.send(reqwest::Method::POST, path, Some(body))
     }
+}
+
+/// True when `server` is this computer's core (`127.0.0.1`, `localhost` or `[::1]`).
+pub fn is_loopback(server: &str) -> bool {
+    reqwest::Url::parse(server)
+        .is_ok_and(|u| matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]")))
+}
+
+/// A core address is an origin only; plain `http://` is allowed only on loopback, because
+/// tokens and sync passphrases travel in it.
+fn check_server(server: &str) -> Result<(), String> {
+    let u = reqwest::Url::parse(server).map_err(|_| {
+        format!(
+            "{server:?} is not a server address; it must start with https:// (or http://127.0.0.1)"
+        )
+    })?;
+    let origin_only = u.username().is_empty()
+        && u.password().is_none()
+        && matches!(u.path(), "" | "/")
+        && u.query().is_none()
+        && u.fragment().is_none();
+    if !origin_only {
+        return Err(format!(
+            "{server:?} must be only the core's address, like https://lab.example:8443"
+        ));
+    }
+    match u.scheme() {
+        "https" => Ok(()),
+        "http" if is_loopback(server) => Ok(()),
+        "http" => Err(format!(
+            "{server:?} uses plain http://, which would send your token unencrypted; use https:// for a core on another computer"
+        )),
+        _ => Err(format!("{server:?} must start with https:// (or http://127.0.0.1 for this computer)")),
+    }
+}
+
+/// Saves a new token (and the server it belongs to). If the keychain refuses, the token is
+/// revoked with `revoke` and the error never contains it.
+pub fn save_or_revoke(
+    store: &dyn Credentials,
+    server: &str,
+    token: &str,
+    revoke: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    let saved = store
+        .set(&token_key(server), token)
+        .and_then(|()| store.set(SERVER_KEY, server));
+    let Err(e) = saved else {
+        return Ok(());
+    };
+    let _ = store.delete(&token_key(server));
+    let undo = match revoke() {
+        Ok(()) => "The new access token was revoked.",
+        Err(_) => "Revoke the access token named \"mrl CLI\" in Settings.",
+    };
+    Err(format!(
+        "you signed in, but the token could not be saved: {e}. {undo} Unlock the keychain, then run `mrl login` again"
+    ))
 }
 
 /// A plain-language message for an error answer (RFC 9457 problem or anything else).
@@ -356,12 +428,14 @@ pub fn login(
         .as_str()
         .or(done["user"]["display_name"].as_str())
         .unwrap_or("your account");
-    store.set(SERVER_KEY, &client.server)?;
-    if let Err(e) = store.set(&token_key(&client.server), token) {
-        println!("Signed in as {who}, but the token could not be saved: {e}.");
-        println!("Set this variable to use it (keep it secret):\n  MRL_TOKEN={token}");
-        return Ok(());
-    }
+    let token_id = done["token"]["id"].as_str().unwrap_or_default().to_owned();
+    let revoke = || {
+        client
+            .with_token(token)
+            .delete(&format!("/auth/tokens/{token_id}"))
+            .map(drop)
+    };
+    save_or_revoke(store, &client.server, token, &revoke)?;
     println!("Signed in as {who}.");
     Ok(())
 }
@@ -466,6 +540,82 @@ pub(crate) mod tests {
         );
     }
 
+    struct Refusing(&'static str);
+
+    impl Credentials for Refusing {
+        fn get(&self, _: &str) -> Result<Option<String>, String> {
+            Ok(None)
+        }
+        fn set(&self, name: &str, _: &str) -> Result<(), String> {
+            if name.starts_with(self.0) {
+                Err("MRL-ENV-161: the keychain is locked".into())
+            } else {
+                Ok(())
+            }
+        }
+        fn delete(&self, _: &str) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_token_that_cannot_be_saved_is_revoked_and_never_shown() {
+        let token = "mrl_pat_SECRETsecretSECRETsecretSECRETsecret1234";
+        for failing in ["token", "server"] {
+            let revoked = std::cell::Cell::new(0);
+            let revoke = || {
+                revoked.set(revoked.get() + 1);
+                Ok(())
+            };
+            let err = save_or_revoke(&Refusing(failing), "https://lab.example", token, &revoke)
+                .unwrap_err();
+            assert_eq!(revoked.get(), 1, "{failing}");
+            assert!(!err.contains(token) && err.contains("was revoked"), "{err}");
+        }
+        let store = Memory::default();
+        assert!(
+            save_or_revoke(&store, "https://lab.example", token, &|| Err(
+                "unused".into()
+            ))
+            .is_ok()
+        );
+        assert_eq!(
+            store
+                .get(&token_key("https://lab.example"))
+                .unwrap()
+                .as_deref(),
+            Some(token)
+        );
+    }
+
+    #[test]
+    fn credentials_go_only_where_they_belong() {
+        assert!(
+            is_loopback("http://127.0.0.1:5")
+                && is_loopback("http://localhost:5")
+                && is_loopback("http://[::1]:5")
+        );
+        assert!(
+            !is_loopback("https://127.0.0.1.evil.example") && !is_loopback("https://lab.example")
+        );
+        assert!(check_server("https://lab.example:8443").is_ok());
+        assert!(check_server("http://127.0.0.1:53111").is_ok());
+        for bad in [
+            "http://lab.example:8443",
+            "https://u:p@lab.example",
+            "https://lab.example/x",
+            "ftp://lab.example",
+            "lab.example",
+        ] {
+            assert!(check_server(bad).is_err(), "{bad}");
+        }
+        let store = Memory::default();
+        if std::env::var_os("MRL_LAUNCH_SECRET").is_none() {
+            let remote = Client::connect(Some("https://lab.example"), &store).unwrap();
+            assert!(remote.launch_secret.is_none());
+        }
+    }
+
     #[test]
     fn the_server_comes_from_the_flag_then_the_last_login() {
         let store = Memory::default();
@@ -474,6 +624,7 @@ pub(crate) mod tests {
             assert!(err.contains("mrl login --server"), "{err}");
         }
         assert!(Client::connect(Some("127.0.0.1:5"), &store).is_err());
+        assert!(Client::connect(Some("http://lab.example"), &store).is_err());
         store.set(SERVER_KEY, "http://127.0.0.1:7/").unwrap();
         store
             .set(&token_key("http://127.0.0.1:7"), "mrl_pat_x")
@@ -484,8 +635,8 @@ pub(crate) mod tests {
             assert_eq!(c.token.as_deref(), Some("mrl_pat_x"));
         }
         assert_eq!(
-            Client::connect(Some("http://h:1"), &store).unwrap().server,
-            "http://h:1"
+            Client::connect(Some("https://h:1"), &store).unwrap().server,
+            "https://h:1"
         );
     }
 }

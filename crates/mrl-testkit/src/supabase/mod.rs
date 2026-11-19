@@ -25,7 +25,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use uuid::Uuid;
 
@@ -64,8 +64,10 @@ struct Mock {
     codes: Mutex<HashMap<String, (String, MockUser)>>,
     refresh: Mutex<HashMap<String, MockUser>>,
     rows: Mutex<HashMap<String, Value>>,
+    versions: Mutex<HashMap<String, i64>>,
     offline: AtomicBool,
     access_ttl: AtomicI64,
+    refresh_limited: AtomicU32,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -127,15 +129,18 @@ impl MockSupabase {
             codes: Mutex::default(),
             refresh: Mutex::default(),
             rows: Mutex::default(),
+            versions: Mutex::default(),
             offline: AtomicBool::new(false),
             access_ttl: AtomicI64::new(3600),
+            refresh_limited: AtomicU32::new(0),
         });
         let app = Router::new()
             .route("/auth/v1/authorize", get(authorize))
             .route("/auth/v1/token", post(token))
             .route("/auth/v1/logout", post(logout))
             .route("/auth/v1/.well-known/jwks.json", get(jwks))
-            .route("/rest/v1/setup_profiles", get(read_rows).post(upsert_rows))
+            .route("/rest/v1/setup_profiles", get(read_rows))
+            .route("/rest/v1/rpc/push_setup_copy", post(push_copy))
             .with_state(mock.clone());
         let task = tokio::spawn(async move {
             if let Err(e) = axum::serve(listener, app).await {
@@ -172,6 +177,11 @@ impl MockSupabase {
     /// While true, every endpoint answers 503 (as if the service were unreachable).
     pub fn set_offline(&self, offline: bool) {
         self.mock.offline.store(offline, Ordering::SeqCst);
+    }
+
+    /// The next `n` refreshes answer 429 (rate limited) and leave the refresh token valid.
+    pub fn rate_limit_refreshes(&self, n: u32) {
+        self.mock.refresh_limited.store(n, Ordering::SeqCst);
     }
 
     /// Lifetime of new access tokens, in seconds (negative: already expired).
@@ -352,6 +362,17 @@ async fn token(
             Json(m.session(user)).into_response()
         }
         Some("refresh_token") => {
+            let limited = m
+                .refresh_limited
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if limited {
+                return (
+                    StatusCode::TOO_MANY_REQUESTS,
+                    Json(json!({ "code": 429, "error_code": "over_request_rate_limit", "msg": "Request rate limit reached" })),
+                )
+                    .into_response();
+            }
             let found = lock(&m.refresh).remove(&field("refresh_token"));
             match found {
                 Some(user) => Json(m.session(user)).into_response(),
@@ -419,11 +440,9 @@ async fn read_rows(
     Json(out).into_response()
 }
 
-async fn upsert_rows(
-    State(m): State<Arc<Mock>>,
-    h: HeaderMap,
-    Json(body): Json<Value>,
-) -> Response {
+/// `public.push_setup_copy(p_blob)`: like the SQL function in the P16 handoff, one lock
+/// per call allocates the next version, prepends the copy and keeps the 5 newest.
+async fn push_copy(State(m): State<Arc<Mock>>, h: HeaderMap, Json(body): Json<Value>) -> Response {
     if let Some(r) = gate(&m, &h) {
         return r;
     }
@@ -434,18 +453,26 @@ async fn upsert_rows(
             "JWT expired or invalid",
         );
     };
-    let rows = body.as_array().cloned().unwrap_or_default();
-    for row in &rows {
-        if row.get("user_id").and_then(Value::as_str) != Some(sub.as_str()) {
-            return (StatusCode::FORBIDDEN, Json(json!({ "code": "42501", "message": "new row violates row-level security policy for table \"setup_profiles\"" }))).into_response();
-        }
-        let copies = row.get("copies").cloned().unwrap_or(json!([]));
-        if copies.as_array().is_none_or(|c| c.len() > 5) {
-            return (StatusCode::BAD_REQUEST, Json(json!({ "code": "23514", "message": "violates check constraint \"at_most_five\"" }))).into_response();
-        }
-        lock(&m.rows).insert(sub.clone(), copies);
-    }
-    StatusCode::CREATED.into_response()
+    let Some(blob) = body.get("p_blob").cloned() else {
+        return error(StatusCode::BAD_REQUEST, "PGRST202", "function needs p_blob");
+    };
+    let mut rows = lock(&m.rows);
+    let mut versions = lock(&m.versions);
+    let version = versions.get(&sub).copied().unwrap_or(0) + 1;
+    versions.insert(sub.clone(), version);
+    let at = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap_or_default();
+    let mut copies = rows
+        .get(&sub)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    copies.insert(0, json!({ "version": version, "at": at, "blob": blob }));
+    copies.truncate(5);
+    let kept = copies.len();
+    rows.insert(sub, Value::Array(copies));
+    Json(json!({ "version": version, "at": at, "copies": kept })).into_response()
 }
 
 #[cfg(test)]
@@ -540,27 +567,18 @@ mod tests {
         assert_eq!(reused.status(), 400, "refresh tokens rotate");
         let access = s["access_token"].as_str().unwrap();
         let other = MockUser::new("eve@example.com", "Eve");
-        let write = |token: String, user: String| {
-            http.post(format!("{}/rest/v1/setup_profiles", sb.url()))
+        let push = |token: String| {
+            http.post(format!("{}/rest/v1/rpc/push_setup_copy", sb.url()))
                 .header("apikey", ANON_KEY)
                 .bearer_auth(token)
-                .json(&json!([{ "user_id": user, "copies": [] }]))
+                .json(&json!({ "p_blob": {"n": 1} }))
                 .send()
         };
-        assert_eq!(
-            write(access.to_owned(), sb.user().id.to_string())
-                .await
-                .unwrap()
-                .status(),
-            201
-        );
-        assert_eq!(
-            write(access.to_owned(), other.id.to_string())
-                .await
-                .unwrap()
-                .status(),
-            403
-        );
+        for want in 1..=6 {
+            let r: Value = push(access.to_owned()).await.unwrap().json().await.unwrap();
+            assert_eq!(r["version"], want);
+            assert_eq!(r["copies"], want.min(5));
+        }
         let eve = sb.access_token(&other, 60);
         let rows: Value = http
             .get(format!(
