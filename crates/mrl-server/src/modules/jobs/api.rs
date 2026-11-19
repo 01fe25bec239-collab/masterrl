@@ -7,7 +7,7 @@ use super::transitions::{job_cols, JobTransitions};
 use crate::app::AppState;
 use crate::error::{ApiError, ErrorCode, FieldError};
 use crate::http::etag;
-use crate::http::pagination::{Page, PageQuery};
+use crate::http::pagination::{encode_cursor, Page, PageQuery};
 use crate::seams::RequestContext;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderMap};
@@ -80,35 +80,55 @@ pub async fn list(
             })
         })
         .transpose()?;
-    let rows = sqlx::query_as::<_, JobRow>(concat!(
-        "SELECT ",
-        job_cols!(),
-        " FROM jobs WHERE org_id = $1 AND ($2::text IS NULL OR state = $2) \
-           AND ($3::text IS NULL OR kind = $3) AND ($4::uuid IS NULL OR project_id = $4) \
-           AND ($5::uuid IS NULL OR id < $5) ORDER BY id DESC LIMIT $6"
-    ))
-    .bind(org)
-    .bind(&f.state)
-    .bind(&f.kind)
-    .bind(project)
-    .bind(after)
-    .bind(i64::try_from(page.fetch()).unwrap_or(i64::MAX))
-    .fetch_all(db.pool())
-    .await?;
-    let (rows, next_cursor) = scope::cut(rows, &page, |r| JobId::from_uuid(r.id).to_string());
-    let mut items = Vec::with_capacity(rows.len());
+    // Scan in id order, keeping only jobs the caller may read, until the page is full. The
+    // cursor is the last *visible* job, so hidden jobs never show up in it.
     // ponytail: one authorizer call per row; add a bulk "visible projects" seam call if pages get slow.
-    for r in rows {
-        let res = resource(
-            "job",
-            Some(JobId::from_uuid(r.id).to_string()),
-            r.org_id,
-            r.project_id,
-        );
-        if scope::allowed(&state, &ctx, "runs.read", &res).await? {
-            items.push(r.view());
+    let batch = i64::try_from(page.fetch()).unwrap_or(i64::MAX);
+    let mut scan_from = after;
+    let mut items: Vec<Job> = Vec::with_capacity(page.limit);
+    let mut last_kept = None;
+    let mut more = false;
+    'scan: loop {
+        let rows = sqlx::query_as::<_, JobRow>(concat!(
+            "SELECT ",
+            job_cols!(),
+            " FROM jobs WHERE org_id = $1 AND ($2::text IS NULL OR state = $2) \
+               AND ($3::text IS NULL OR kind = $3) AND ($4::uuid IS NULL OR project_id = $4) \
+               AND ($5::uuid IS NULL OR id < $5) ORDER BY id DESC LIMIT $6"
+        ))
+        .bind(org)
+        .bind(&f.state)
+        .bind(&f.kind)
+        .bind(project)
+        .bind(scan_from)
+        .bind(batch)
+        .fetch_all(db.pool())
+        .await?;
+        let exhausted = rows.len() < page.fetch();
+        for r in rows {
+            scan_from = Some(r.id);
+            let res = resource(
+                "job",
+                Some(JobId::from_uuid(r.id).to_string()),
+                r.org_id,
+                r.project_id,
+            );
+            if scope::allowed(&state, &ctx, "runs.read", &res).await? {
+                if items.len() == page.limit {
+                    more = true;
+                    break 'scan;
+                }
+                last_kept = Some(r.id);
+                items.push(r.view());
+            }
+        }
+        if exhausted {
+            break;
         }
     }
+    let next_cursor = last_kept
+        .filter(|_| more)
+        .map(|id| encode_cursor(&JobId::from_uuid(id).to_string()));
     Ok(Json(Page { items, next_cursor }))
 }
 

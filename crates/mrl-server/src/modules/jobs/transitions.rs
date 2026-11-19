@@ -191,8 +191,9 @@ impl JobTransitions {
     /// Applies `event` to the job `row` was read as, on behalf of `by`.
     ///
     /// Starting an attempt goes through [`Self::launch`], completion through
-    /// [`Self::verify_completion`] and retries through [`Self::fail_or_retry`], because those
-    /// steps change more than the state.
+    /// [`Self::verify_completion`], retries through [`Self::fail_or_retry`] and cancelling
+    /// through [`Self::request_cancel`] (or an attempt ending), because those steps check or
+    /// change more than the state.
     pub async fn apply(
         tx: &mut Tx,
         row: &JobRow,
@@ -204,6 +205,9 @@ impl JobTransitions {
             JobEvent::Launch => Some("JobTransitions::launch"),
             JobEvent::Complete => Some("JobTransitions::verify_completion"),
             JobEvent::Interrupt => Some("JobTransitions::fail_or_retry"),
+            JobEvent::RequestCancel | JobEvent::ConfirmCancel => {
+                Some("JobTransitions::request_cancel")
+            }
             _ => None,
         };
         if let Some(path) = special {
@@ -354,7 +358,8 @@ impl JobTransitions {
             reason: Some(json!({ "message": "Cancel requested.", "actor": actor })),
             failure: None,
         };
-        let row = Self::apply(tx, row, JobEvent::RequestCancel, Owner::Jobs, asked).await?;
+        let extra = Extra::keep(row);
+        let row = Self::step(tx, row, JobEvent::RequestCancel, Owner::Jobs, asked, extra).await?;
         Self::confirm_cancel_if_idle(tx, &row).await
     }
 
@@ -376,7 +381,8 @@ impl JobTransitions {
             reason: row.state_reason.clone(),
             failure: Some(FailureCode::class_only(FailureClass::CancelledByUser)),
         };
-        Self::apply(tx, row, JobEvent::ConfirmCancel, Owner::Jobs, done).await
+        let extra = Extra::keep(row);
+        Self::step(tx, row, JobEvent::ConfirmCancel, Owner::Jobs, done, extra).await
     }
 
     /// Applies `event` to the attempt `attempt` was read as.
@@ -464,7 +470,9 @@ impl JobTransitions {
         Ok(next)
     }
 
-    /// The checked, compare-and-set write behind every job transition.
+    /// The checked, compare-and-set write behind every job transition. The CAS also checks
+    /// the epoch, because a lost lease bumps it without a state change: a row read before
+    /// that must not write the old epoch back.
     async fn step(
         tx: &mut Tx,
         row: &JobRow,
@@ -503,7 +511,7 @@ impl JobTransitions {
                  ELSE started_at END, \
                finished_at = CASE WHEN $3 IN ('COMPLETED','FAILED','CANCELLED','REJECTED') \
                  THEN now() ELSE finished_at END \
-             WHERE id = $1 AND org_id = $2 AND state_version = $10 RETURNING ",
+             WHERE id = $1 AND org_id = $2 AND state_version = $10 AND epoch = $11 RETURNING ",
             job_cols!()
         ))
         .bind(row.id)
@@ -516,6 +524,7 @@ impl JobTransitions {
         .bind(extra.current_attempt_id)
         .bind(extra.retry_in)
         .bind(row.state_version)
+        .bind(row.epoch)
         .fetch_optional(&mut **tx)
         .await?
         .ok_or_else(|| JobsError::changed("job"))?;

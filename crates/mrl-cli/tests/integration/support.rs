@@ -21,7 +21,7 @@ use mrl_testkit::pg::TestDb;
 use mrl_testkit::seams as ts;
 use mrl_testkit::server::{TestResponse, TestServer};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 
@@ -45,19 +45,31 @@ pub fn test_user(token: &str, id: &str, org: OrgId, role: Role) -> TestUser {
     }
 }
 
+/// Changes a test can make to [`RoleAuthorizer`] while the server runs.
+#[derive(Debug, Default)]
+pub struct AuthRules {
+    /// `(principal id, project id)` pairs the authorizer hides (404).
+    pub hidden: HashSet<(String, String)>,
+    /// The authorizer's backend is down: every call fails.
+    pub down: bool,
+}
+
 /// Authorizes like RBAC: other orgs are hidden (404); inside the org the role table
-/// from `mrl_domain::rbac` decides (403 when refused).
-pub struct RoleAuthorizer(HashMap<String, Role>);
+/// from `mrl_domain::rbac` decides (403 when refused). [`AuthRules`] can hide projects
+/// per user or take the authorizer down.
+pub struct RoleAuthorizer {
+    roles: HashMap<String, Role>,
+    rules: Arc<Mutex<AuthRules>>,
+}
 
 impl RoleAuthorizer {
-    /// Knows these users.
-    pub fn new(users: &[TestUser]) -> Self {
-        Self(
-            users
-                .iter()
-                .map(|u| (u.principal.id.clone(), u.role))
-                .collect(),
-        )
+    /// Knows these users and follows `rules`.
+    pub fn new(users: &[TestUser], rules: Arc<Mutex<AuthRules>>) -> Self {
+        let roles = users
+            .iter()
+            .map(|u| (u.principal.id.clone(), u.role))
+            .collect();
+        Self { roles, rules }
     }
 }
 
@@ -69,10 +81,24 @@ impl Authorizer for RoleAuthorizer {
         action: &str,
         resource: &Resource,
     ) -> Result<Decision, SeamError> {
+        {
+            let rules = self.rules.lock().unwrap();
+            if rules.down {
+                return Err(SeamError::new("authorizer", "the test backend is down"));
+            }
+            if let Some(p) = &resource.project {
+                if rules
+                    .hidden
+                    .contains(&(ctx.principal.id.clone(), p.clone()))
+                {
+                    return Ok(Decision::Hide);
+                }
+            }
+        }
         if resource.org.is_some() && resource.org != ctx.principal.org {
             return Ok(Decision::Hide);
         }
-        let Some(role) = self.0.get(&ctx.principal.id) else {
+        let Some(role) = self.roles.get(&ctx.principal.id) else {
             return Ok(Decision::Hide);
         };
         let action: Option<Action> = serde_json::from_value(json!(action)).ok();
@@ -108,11 +134,22 @@ pub async fn runs_server(
     users: &[TestUser],
     extra: Vec<Box<dyn ServerModule>>,
 ) -> TestServer {
+    runs_server_with_rules(db, chains, users, extra, Arc::default()).await
+}
+
+/// [`runs_server`] whose authorizer follows `rules`.
+pub async fn runs_server_with_rules(
+    db: &TestDb,
+    chains: Chains,
+    users: &[TestUser],
+    extra: Vec<Box<dyn ServerModule>>,
+    rules: Arc<Mutex<AuthRules>>,
+) -> TestServer {
     let tokens: Vec<(&str, Principal)> = users
         .iter()
         .map(|u| (u.token.as_str(), u.principal.clone()))
         .collect();
-    let seams = ts::team(&tokens).authorizer(RoleAuthorizer::new(users));
+    let seams = ts::team(&tokens).authorizer(RoleAuthorizer::new(users, rules));
     let seams = ts::build(seams, Mode::Team);
     let mut modules: Vec<Box<dyn ServerModule>> =
         vec![Box::new(RunsModule::with_chains(db.db().clone(), chains))];
@@ -821,6 +858,31 @@ pub mod sequences {
             .await
             .unwrap_or_else(|e| panic!("{e}"));
             assert_eq!(doubles, 0, "a job has two live attempts");
+            // Every job and attempt has events 0..=state_version (unique per aggregate, so
+            // no gaps), and the last one names the state it is in now.
+            type Events = (String, Uuid, String, i64, i64, Option<i64>, Option<String>);
+            let events: Vec<Events> = sqlx::query_as(
+                "SELECT a.kind, a.id, a.state, a.state_version, count(o.id), \
+                   max(o.aggregate_seq), (array_agg(o.payload->>'to' ORDER BY o.aggregate_seq DESC))[1] \
+                 FROM (SELECT 'job' AS kind, id, state, state_version FROM jobs WHERE org_id = $1 \
+                       UNION ALL SELECT 'attempt', id, state, state_version FROM job_attempts \
+                       WHERE org_id = $1) a \
+                 LEFT JOIN outbox_events o ON o.aggregate_kind = a.kind AND o.aggregate_id = a.id \
+                 GROUP BY a.kind, a.id, a.state, a.state_version",
+            )
+            .bind(self.org)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+            for (kind, id, state, version, count, last, to) in events {
+                let what = format!("{kind} {id} in {state} at version {version}");
+                assert_eq!(
+                    (count, last),
+                    (version + 1, Some(version)),
+                    "{what}: events out of step"
+                );
+                assert_eq!(to.as_deref(), Some(state.as_str()), "{what}: last event");
+            }
             let rows: Vec<(Uuid, String, Option<String>)> = sqlx::query_as(
                 "SELECT j.id, j.state, r.status_summary FROM jobs j LEFT JOIN runs r ON r.id = j.run_id",
             )

@@ -553,13 +553,23 @@ pub async fn submit(
         None => get_or_create(&mut tx, org, project, DEFAULT_EXPERIMENT, &who).await?,
     };
     if let Some(parent) = sub.parent_run_id {
-        let found: Option<Uuid> =
-            sqlx::query_scalar("SELECT id FROM runs WHERE id = $1 AND org_id = $2")
+        // A parent the submitter can't read answers exactly like a missing one.
+        let parent_project: Option<Uuid> =
+            sqlx::query_scalar("SELECT project_id FROM runs WHERE id = $1 AND org_id = $2")
                 .bind(parent.as_uuid())
                 .bind(org)
                 .fetch_optional(&mut *tx)
                 .await?;
-        found.ok_or_else(|| JobsError::not_found("parent run"))?;
+        let readable = match parent_project {
+            Some(p) => {
+                let res = scope::resource("run", Some(parent.to_string()), org, p);
+                scope::allowed(&state, &ctx, "runs.read", &res).await?
+            }
+            None => false,
+        };
+        if !readable {
+            return Err(JobsError::not_found("parent run"));
+        }
     }
     let run_id = Uuid::now_v7();
     let inserted = sqlx::query(

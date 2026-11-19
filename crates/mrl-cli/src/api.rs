@@ -82,10 +82,7 @@ impl Api {
                 "Run `mrl config set-token` or set MRL_TOKEN.",
             ));
         }
-        let http = reqwest::blocking::Client::builder()
-            .timeout(Duration::from_secs(60))
-            .build()
-            .map_err(|e| format!("can't set up the connection: {e}"))?;
+        let http = http_client().map_err(|e| format!("can't set up the connection: {e}"))?;
         Ok(Self {
             base: base.trim_end_matches('/').to_owned(),
             token,
@@ -137,6 +134,12 @@ impl Api {
                 .body(b.to_string());
         }
         let res = req.send().map_err(|e| {
+            if e.is_redirect() {
+                return unreachable(format!(
+                    "{} sent the CLI to another address. Your token is only sent to the configured server.",
+                    self.base
+                ));
+            }
             let what = if e.is_timeout() {
                 "The server took too long to answer"
             } else {
@@ -163,6 +166,28 @@ impl Api {
     }
 }
 
+/// The HTTP client. Redirects are followed only within the server's origin (at most 5), so
+/// the token and launch secret never reach another host.
+fn http_client() -> reqwest::Result<reqwest::blocking::Client> {
+    let policy = reqwest::redirect::Policy::custom(|attempt| {
+        let same = attempt
+            .previous()
+            .first()
+            .is_some_and(|first| first.origin() == attempt.url().origin());
+        if !same {
+            attempt.error("redirect to another origin")
+        } else if attempt.previous().len() > 5 {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    });
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(60))
+        .redirect(policy)
+        .build()
+}
+
 /// A problem document (or any error answer) as plain text.
 pub fn problem(status: u16, json: &Value) -> String {
     let Some(code) = json["code"].as_str() else {
@@ -186,6 +211,70 @@ pub fn problem(status: u16, json: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serves one canned answer per connection and records each request's head.
+    fn serve(answers: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for answer in answers {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut head = String::new();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    head.push_str(&line.to_ascii_lowercase());
+                }
+                seen.push(head);
+                stream.write_all(answer.as_bytes()).unwrap();
+            }
+            seen
+        });
+        (base, handle)
+    }
+
+    fn api(base: &str) -> Api {
+        Api {
+            base: base.to_owned(),
+            token: Some("tok".into()),
+            launch_secret: Some("secret".into()),
+            http: http_client().unwrap(),
+        }
+    }
+
+    fn redirect(to: &str) -> String {
+        format!("HTTP/1.1 302 Found\r\nlocation: {to}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+    }
+
+    #[test]
+    fn redirects_never_take_credentials_to_another_origin() {
+        let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let elsewhere = format!("http://{}/api/v1/x", other.local_addr().unwrap());
+        let (base, server) = serve(vec![redirect(&elsewhere)]);
+        let err = api(&base).get("/x").unwrap_err();
+        assert_eq!(err.status, None);
+        assert!(err.message.contains("another address"), "{}", err.message);
+        assert_eq!(server.join().unwrap().len(), 1);
+        other.set_nonblocking(true).unwrap();
+        assert!(other.accept().is_err(), "the other origin was contacted");
+
+        // Same origin: followed, credentials kept.
+        let ok = "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+        let (base, server) = serve(vec![redirect("/api/v1/y"), ok.to_owned()]);
+        assert_eq!(api(&base).get("/x").unwrap(), serde_json::json!({}));
+        let seen = server.join().unwrap();
+        assert!(seen[1].starts_with("get /api/v1/y "), "{seen:?}");
+        for head in &seen {
+            assert!(head.contains("authorization: bearer tok"), "{head}");
+            assert!(head.contains("x-mrl-launch-secret: secret"), "{head}");
+        }
+    }
 
     #[test]
     fn explain_uses_the_catalog() {

@@ -15,12 +15,14 @@ use mrl_testkit::pg::TestDb;
 use mrl_testkit::server::{TestResponse, TestServer};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 struct Env {
     db: TestDb,
     srv: TestServer,
     org: OrgId,
     project: ProjectId,
+    rules: Arc<Mutex<AuthRules>>,
 }
 
 fn users(org: OrgId, other: OrgId) -> Vec<TestUser> {
@@ -43,12 +45,21 @@ async fn env(accepting: bool) -> Env {
         Chains::registered(db.db())
     };
     let org = OrgId::new();
-    let srv = runs_server(&db, chains, &users(org, OrgId::new()), vec![]).await;
+    let rules = Arc::<Mutex<AuthRules>>::default();
+    let srv = runs_server_with_rules(
+        &db,
+        chains,
+        &users(org, OrgId::new()),
+        vec![],
+        rules.clone(),
+    )
+    .await;
     Env {
         db,
         srv,
         org,
         project: ProjectId::new(),
+        rules,
     }
 }
 
@@ -86,14 +97,23 @@ impl Env {
             .unwrap()
     }
 
+    /// The run's event types in order. Also checks each job's and attempt's events are
+    /// numbered 0, 1, 2, … with no gaps.
     async fn timeline(&self, run: &str) -> Vec<String> {
         let res = self
-            .get("viewer", &format!("/api/v1/runs/{run}/timeline"))
+            .get("viewer", &format!("/api/v1/runs/{run}/timeline?limit=200"))
             .await;
         assert_eq!(res.status, 200, "{}", res.text());
-        res.json()["items"]
-            .as_array()
-            .unwrap()
+        let mut next: HashMap<String, i64> = HashMap::new();
+        let items = res.json()["items"].as_array().unwrap().clone();
+        for e in &items {
+            let seq = next
+                .entry(e["aggregate_id"].as_str().unwrap().to_owned())
+                .or_default();
+            assert_eq!(e["aggregate_seq"].as_i64(), Some(*seq), "{e}");
+            *seq += 1;
+        }
+        items
             .iter()
             .map(|e| e["type"].as_str().unwrap().to_owned())
             .collect()
@@ -584,16 +604,20 @@ async fn live_attempt_cancel_retry_and_verification() {
         .await
         .json();
     assert_eq!(attempts["items"][0]["state"], "KILLED");
-    let tl = e.timeline(&rid).await;
-    assert!(
-        tl.ends_with(&[
-            "job.cancel_requested".into(),
-            "attempt.killed".into(),
-            "job.cancelled".into()
-        ]),
-        "{tl:?}"
+    assert_eq!(
+        e.timeline(&rid).await,
+        [
+            "job.created",
+            "job.submitted",
+            "job.queued",
+            "job.placed",
+            "job.launched",
+            "attempt.created",
+            "job.cancel_requested",
+            "attempt.killed",
+            "job.cancelled",
+        ]
     );
-    assert!(tl.contains(&"attempt.created".to_owned()));
 
     // Retries follow the job's budget, then fail.
     let mut body = submission("retry");
@@ -904,7 +928,13 @@ async fn every_transition_matches_the_p06_tables() {
         .unwrap()
         .as_uuid();
     let owners = [Owner::Jobs, Owner::Scheduler, Owner::ArtifactsVerifier];
-    let special = [JobEvent::Launch, JobEvent::Complete, JobEvent::Interrupt];
+    let special = [
+        JobEvent::Launch,
+        JobEvent::Complete,
+        JobEvent::Interrupt,
+        JobEvent::RequestCancel,
+        JobEvent::ConfirmCancel,
+    ];
     let mut checked = 0;
     for &from in Job::STATES {
         force_job(&e.db, job_id, from.as_str()).await;
@@ -1075,4 +1105,208 @@ async fn a_second_live_attempt_is_always_refused() {
         .unwrap();
     let (_, second) = JobTransitions::launch(&mut tx, &job, None).await.unwrap();
     assert_eq!((second.attempt_no, second.epoch), (2, 2));
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn guarded_steps_and_stale_rows_cannot_bypass_the_rules() {
+    let e = env(true).await;
+    let org = e.org.as_uuid();
+    let run = e.submit("res", "k", &submission("guards")).await.json();
+    let jid = run["job_id"].as_str().unwrap().to_owned();
+    let queued = e.job_row(&jid).await;
+
+    // Cancel steps only go through request_cancel, which checks for live attempts.
+    let mut tx = e.db.db().begin().await.unwrap();
+    for event in [JobEvent::RequestCancel, JobEvent::ConfirmCancel] {
+        let err = JobTransitions::apply(&mut tx, &queued, event, Owner::Jobs, JobChange::default())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "MRL-STATE-170", "{event:?}");
+        assert!(err.to_string().contains("request_cancel"), "{err}");
+    }
+    let job = JobTransitions::apply(
+        &mut tx,
+        &queued,
+        JobEvent::Place,
+        Owner::Scheduler,
+        JobChange::default(),
+    )
+    .await
+    .unwrap();
+    let (job, _) = JobTransitions::launch(&mut tx, &job, None).await.unwrap();
+    let cancelling = JobTransitions::request_cancel(&mut tx, &job, "usr_res")
+        .await
+        .unwrap();
+    assert_eq!(cancelling.state, "CANCELLING", "the attempt is still live");
+    let err = JobTransitions::apply(
+        &mut tx,
+        &cancelling,
+        JobEvent::ConfirmCancel,
+        Owner::Jobs,
+        JobChange::default(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), "MRL-STATE-170");
+    tx.commit().await.unwrap();
+    assert_eq!(e.job_row(&jid).await.state, "CANCELLING");
+
+    // A job row read before a lost lease can't write the old epoch back.
+    let run = e.submit("res", "k2", &submission("fence")).await.json();
+    let jid = run["job_id"].as_str().unwrap().to_owned();
+    let mut tx = e.db.db().begin().await.unwrap();
+    let job = e.job_row(&jid).await;
+    let job = JobTransitions::apply(
+        &mut tx,
+        &job,
+        JobEvent::Place,
+        Owner::Scheduler,
+        JobChange::default(),
+    )
+    .await
+    .unwrap();
+    let (stale, att2) = JobTransitions::launch(&mut tx, &job, None).await.unwrap();
+    let a = JobTransitions::lock_attempt(&mut tx, org, att2.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let a = JobTransitions::apply_attempt(
+        &mut tx,
+        &a,
+        JobAttemptEvent::Acknowledge,
+        AttemptChange::default(),
+    )
+    .await
+    .unwrap();
+    JobTransitions::apply_attempt(
+        &mut tx,
+        &a,
+        JobAttemptEvent::LoseLease,
+        AttemptChange::default(),
+    )
+    .await
+    .unwrap();
+    let err = JobTransitions::apply(
+        &mut tx,
+        &stale,
+        JobEvent::Start,
+        Owner::Jobs,
+        JobChange::default(),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(err.code(), "MRL-CONFLICT-170");
+    tx.commit().await.unwrap();
+    let now = e.job_row(&jid).await;
+    assert_eq!(
+        (now.state.as_str(), now.epoch),
+        ("PREPARING", stale.epoch + 1),
+        "the fence holds"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn hidden_parents_and_jobs_stay_hidden() {
+    let e = env(true).await;
+    let secret = ProjectId::new();
+    e.rules
+        .lock()
+        .unwrap()
+        .hidden
+        .insert(("usr_res".into(), secret.to_string()));
+
+    // A parent in a project the submitter can't read answers like a missing one.
+    let secret_runs = format!("/api/v1/projects/{secret}/runs");
+    let hidden_parent = call(
+        &e.srv,
+        Method::POST,
+        &secret_runs,
+        "maint",
+        Some("p"),
+        Some(&submission("hidden-parent")),
+    )
+    .await
+    .json();
+    let mut body = submission("child");
+    body["parent_run_id"] = hidden_parent["id"].clone();
+    let hidden = e.submit("res", "c1", &body).await;
+    body["parent_run_id"] = json!(RunId::new().to_string());
+    let missing = e.submit("res", "c2", &body).await;
+    assert_eq!(
+        (hidden.status, missing.status),
+        (404, 404),
+        "{}",
+        hidden.text()
+    );
+    assert_eq!(hidden.json()["code"], "MRL-RES-001");
+    assert_eq!(hidden.json()["detail"], missing.json()["detail"]);
+    let mine = e
+        .submit("res", "c3", &submission("own-parent"))
+        .await
+        .json();
+    body["parent_run_id"] = mine["id"].clone();
+    assert_eq!(e.submit("res", "c4", &body).await.status, 201);
+
+    // Jobs, oldest first: the "res" runs are visible, the secret one is hidden. A page of
+    // two must hold two visible jobs and continue after the last visible one.
+    let e2 = env(true).await;
+    e2.rules
+        .lock()
+        .unwrap()
+        .hidden
+        .insert(("usr_res".into(), secret.to_string()));
+    let mut visible = Vec::new();
+    for (i, key) in ["v1", "v2", "h", "v3"].into_iter().enumerate() {
+        let job = if key == "h" {
+            let b = submission("secret");
+            call(
+                &e2.srv,
+                Method::POST,
+                &secret_runs,
+                "maint",
+                Some(key),
+                Some(&b),
+            )
+            .await
+            .json()["job_id"]
+                .clone()
+        } else {
+            let run = e2
+                .submit("res", key, &submission(&format!("run-{i}")))
+                .await;
+            let id = run.json()["job_id"].clone();
+            visible.push(id.clone());
+            id
+        };
+        assert!(job.is_string());
+    }
+    visible.reverse(); // newest first
+    let page = e2.get("res", "/api/v1/jobs?limit=2").await.json();
+    let ids = |p: &Value| -> Vec<Value> {
+        p["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|j| j["id"].clone())
+            .collect()
+    };
+    assert_eq!(ids(&page), visible[..2].to_vec(), "{page}");
+    let cursor = page["next_cursor"].as_str().unwrap().to_owned();
+    let rest = e2
+        .get("res", &format!("/api/v1/jobs?limit=2&cursor={cursor}"))
+        .await
+        .json();
+    assert_eq!(ids(&rest), visible[2..].to_vec(), "{rest}");
+    assert!(rest["next_cursor"].is_null(), "{rest}");
+    let all = e2.get("maint", "/api/v1/jobs?limit=10").await.json();
+    assert_eq!(all["items"].as_array().unwrap().len(), 4);
+
+    // An authorizer outage is an error, not an empty page.
+    e2.rules.lock().unwrap().down = true;
+    let res = e2.get("res", "/api/v1/jobs").await;
+    assert_eq!(res.status, 503, "{}", res.text());
+    let res = e2.submit("res", "c5", &body).await;
+    assert_eq!(res.status, 503, "{}", res.text());
 }

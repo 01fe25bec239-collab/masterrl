@@ -18,7 +18,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from collections.abc import Mapping
-from typing import Any, cast
+from typing import Any, cast, override
 
 from mrl_sdk._generated import OPERATIONS
 from mrl_sdk._generated.models import (
@@ -36,6 +36,38 @@ from mrl_sdk._generated.models import (
 )
 
 LAUNCH_SECRET_HEADER = "x-mrl-launch-secret"
+
+
+def _origin(url: str) -> tuple[str, str, int | None]:
+    parts = urllib.parse.urlsplit(url)
+    default = {"http": 80, "https": 443}.get(parts.scheme)
+    return (parts.scheme, (parts.hostname or "").lower(), parts.port or default)
+
+
+class _SameOriginRedirects(urllib.request.HTTPRedirectHandler):
+    """Follows redirects only within the server's origin, so the token and launch secret
+    are never sent anywhere else."""
+
+    @override
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        if _origin(newurl) != _origin(req.full_url):
+            detail = (
+                f"The server redirected to {newurl}, another address. "
+                "Credentials are only sent to the configured server."
+            )
+            raise MrlError(code, {"code": "MRL-ENV-170", "detail": detail})
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_OPENER = urllib.request.build_opener(_SameOriginRedirects)
 
 
 class MrlError(Exception):
@@ -111,7 +143,7 @@ class Client:
             sent["content-type"] = "application/json"
         req = urllib.request.Request(self.server + url, data=data, headers=sent, method=op.method)
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as res:
+            with _OPENER.open(req, timeout=self.timeout) as res:
                 raw = res.read()
         except urllib.error.HTTPError as e:
             raw = e.read()

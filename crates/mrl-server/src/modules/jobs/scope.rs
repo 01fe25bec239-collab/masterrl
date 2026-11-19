@@ -54,14 +54,16 @@ pub async fn authorize(
     Ok(state.authorize(ctx, action, res).await?)
 }
 
-/// True if the authorizer allows the action (used to filter list pages).
+/// True if the authorizer allows the action, false on Deny or Hide (used to filter list
+/// pages). An authorizer that fails is an error (503), never an empty page.
 pub async fn allowed(
     state: &AppState,
     ctx: &RequestContext,
     action: &str,
     res: &Resource,
 ) -> Result<bool, JobsError> {
-    Ok(state.authorize(ctx, action, res).await.is_ok())
+    let decision = state.seams.authorizer.authorize(ctx, action, res).await?;
+    Ok(decision == crate::seams::Decision::Allow)
 }
 
 /// Cancelling (and pausing) needs `runs.cancel_own` for your own work, else `runs.cancel_any`.
