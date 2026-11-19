@@ -29,19 +29,30 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
 
+      # The container installs openssh-server from the runner's own Azure Ubuntu mirror (the
+      # default archive.ubuntu.com can stall from CI), with apt retries; output stays visible.
       - name: start sshd in a container
+        timeout-minutes: 8
         run: |
           set -euo pipefail
           ssh-keygen -q -t ed25519 -N '' -f "$RUNNER_TEMP/id"
+          docker pull -q ubuntu:24.04
           docker run -d --name mrl-sshd -p 127.0.0.1:2222:22 -e PUBKEY="$(cat "$RUNNER_TEMP/id.pub")" ubuntu:24.04 \
-            bash -c 'apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server \
-              && mkdir -p /root/.ssh /run/sshd && echo "$PUBKEY" > /root/.ssh/authorized_keys \
-              && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys && exec /usr/sbin/sshd -D -e'
-          for _ in $(seq 1 90); do
+            bash -c 'set -e
+              sed -i "s|http://archive.ubuntu.com|http://azure.archive.ubuntu.com|g; s|http://security.ubuntu.com|http://azure.archive.ubuntu.com|g" /etc/apt/sources.list.d/ubuntu.sources
+              apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update
+              DEBIAN_FRONTEND=noninteractive apt-get -o Acquire::Retries=5 install -y --no-install-recommends openssh-server
+              mkdir -p /root/.ssh /run/sshd && echo "$PUBKEY" > /root/.ssh/authorized_keys
+              chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
+              exec /usr/sbin/sshd -D -e'
+          for _ in $(seq 1 180); do
             if ssh-keyscan -p 2222 127.0.0.1 2>/dev/null | grep -q ssh-ed25519; then exit 0; fi
+            if [ "$(docker inspect -f '{{.State.Running}}' mrl-sshd)" != "true" ]; then
+              echo "the sshd container stopped:"; docker logs mrl-sshd; exit 1
+            fi
             sleep 2
           done
-          docker logs mrl-sshd
+          echo "sshd did not start within 6 minutes:"; docker logs mrl-sshd
           exit 1
 
       - name: ssh transport test
