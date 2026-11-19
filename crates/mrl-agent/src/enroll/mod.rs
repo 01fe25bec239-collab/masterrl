@@ -6,6 +6,8 @@
 //! 2. A new ECDSA P-256 key is made here; only a certificate request leaves the machine.
 //! 3. The certificate, the CA and the key go to `<state>/identity/` (folder 0700, key 0600 on Unix).
 
+pub mod keys;
+
 use crate::session::tls::{self, sha256_hex};
 use crate::session::{self as link, LinkError, PROTOCOL_VERSION};
 use crate::state::atomic_write;
@@ -89,6 +91,10 @@ pub struct Identity {
     /// The CA.
     pub ca: CertificateDer<'static>,
     key: Vec<u8>,
+    key_ref: Option<keys::KeyRef>,
+    /// Where `save` stores a new key: the configured store at enrollment, the key's own store
+    /// after `load`.
+    pub key_store: keys::KeyStoreChoice,
 }
 
 impl std::fmt::Debug for Identity {
@@ -99,7 +105,8 @@ impl std::fmt::Debug for Identity {
     }
 }
 
-/// The identity file (in a 0700 folder; the file itself is 0600 on Unix: it holds the key).
+/// The identity file (certificates and a reference to the key; the key itself is in the
+/// [`keys`] store).
 pub const IDENTITY_FILE: &str = "identity.json";
 
 #[derive(Serialize, Deserialize)]
@@ -107,7 +114,7 @@ struct IdentityFile {
     link: LinkFile,
     cert: String,
     ca: String,
-    key: String,
+    key: keys::KeyRef,
 }
 
 fn hex(b: &[u8]) -> String {
@@ -157,16 +164,20 @@ impl Identity {
         let f: IdentityFile = serde_json::from_slice(&bytes).map_err(|e| damaged(e.to_string()))?;
         let unhex =
             |name: &str, v: &str| from_hex(v).ok_or_else(|| damaged(format!("{name} is not hex")));
+        let key = keys::get(&identity_dir(state_root), &f.key)?;
         Ok(Some(Self {
             link: f.link,
             cert: CertificateDer::from(unhex("cert", &f.cert)?),
             ca: CertificateDer::from(unhex("ca", &f.ca)?),
-            key: unhex("key", &f.key)?,
+            key,
+            key_store: f.key.store(),
+            key_ref: Some(f.key),
         }))
     }
 
-    /// Writes the whole identity (link, certificate, CA, key) as one file in one atomic
-    /// replace, so a crash leaves either the old identity or the new one, never a mix.
+    /// Saves the identity: the key goes to its store first (under a name of its own), then one
+    /// atomic replace of `identity.json` publishes the certificate with that key's reference, then
+    /// the previous key is removed. A crash leaves the old identity or the new one, never a mix.
     pub fn save(&self, state_root: &Path) -> Result<(), LinkError> {
         let dir = identity_dir(state_root);
         std::fs::create_dir_all(&dir).map_err(io_err(&dir))?;
@@ -176,21 +187,27 @@ impl Identity {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
                 .map_err(io_err(&dir))?;
         }
+        let name = sha256_hex(&self.cert)[..16].to_owned();
+        let previous = Self::load(state_root)
+            .ok()
+            .flatten()
+            .and_then(|p| p.key_ref);
+        let key_ref = match &self.key_ref {
+            Some(r) => r.clone(),
+            None => keys::put(&dir, self.key_store, &name, &self.key)?,
+        };
         let f = IdentityFile {
             link: self.link.clone(),
             cert: hex(&self.cert),
             ca: hex(&self.ca),
-            key: hex(&self.key),
+            key: key_ref.clone(),
         };
         let bytes =
             serde_json::to_vec_pretty(&f).map_err(|e| LinkError::Protocol(e.to_string()))?;
         let path = dir.join(IDENTITY_FILE);
         atomic_write(&path, &bytes).map_err(io_err(&path))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
-                .map_err(io_err(&path))?;
+        if let Some(old) = previous.filter(|old| *old != key_ref) {
+            keys::delete(&dir, &old);
         }
         Ok(())
     }
@@ -230,6 +247,7 @@ impl Identity {
         let mut next = self.clone();
         next.cert = CertificateDer::from(leaf.clone());
         next.key = key.serialize_der();
+        next.key_ref = None; // a new key: stored on save
         next.link.issued_at = unix_now();
         next.link.not_after = not_after.map_or(next.link.issued_at + 86_400, |t| t.seconds);
         Ok(next)
@@ -304,6 +322,8 @@ fn finish(
         cert: CertificateDer::from(leaf),
         ca: CertificateDer::from(result.ca_bundle_der),
         key: key.serialize_der(),
+        key_ref: None,
+        key_store: ctx.config.gateway.key_store,
     };
     identity.save(ctx.state.root())?;
     Ok(identity)
@@ -539,6 +559,8 @@ mod tests {
             cert: CertificateDer::from(vec![1u8, 2]),
             ca: CertificateDer::from(vec![3u8]),
             key: key.serialize_der(),
+            key_ref: None,
+            key_store: keys::KeyStoreChoice::File,
         };
         id.save(dir.path()).unwrap();
         let back = Identity::load(dir.path()).unwrap().unwrap();
@@ -547,10 +569,18 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(identity_dir(dir.path()).join(IDENTITY_FILE))
-                .unwrap()
-                .permissions()
-                .mode();
+            let json =
+                std::fs::read_to_string(identity_dir(dir.path()).join(IDENTITY_FILE)).unwrap();
+            assert!(
+                !json.contains(&hex(&id.key)),
+                "the key is not in identity.json"
+            );
+            let mode = std::fs::metadata(
+                identity_dir(dir.path()).join(format!("keys/{}.key", &id.cert_sha256()[..16])),
+            )
+            .unwrap()
+            .permissions()
+            .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
 
@@ -572,6 +602,12 @@ mod tests {
         let back = Identity::load(dir.path()).unwrap().unwrap();
         assert_eq!(back.cert_sha256(), next.cert_sha256());
         assert_eq!(back.key, key2.serialize_der());
+        assert!(
+            !identity_dir(dir.path())
+                .join(format!("keys/{}.key", &id.cert_sha256()[..16]))
+                .exists(),
+            "the replaced key is removed"
+        );
         std::fs::write(idir.join(IDENTITY_FILE), b"{oops").unwrap();
         assert_eq!(
             Identity::load(dir.path()).unwrap_err().code(),

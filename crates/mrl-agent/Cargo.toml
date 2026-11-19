@@ -27,6 +27,7 @@ reqwest = { version = "=0.13.5", default-features = false, features = ["rustls",
 tokio-util = { version = "=0.7.20", features = ["io"] }
 toml = "=1.2.0"
 # <mrl:deps P18> P18 dependencies go right below this line.
+keyring = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 rcgen = { workspace = true }

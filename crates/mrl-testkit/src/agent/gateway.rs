@@ -237,6 +237,7 @@ impl TestAgent {
             ..AgentConfig::default()
         };
         config.gateway.telemetry_interval_secs = 1;
+        config.gateway.key_store = mrl_agent::enroll::keys::KeyStoreChoice::File;
         tune(&mut config);
         let hw = Arc::new(FakeHw::with_gpus(
             gpus,

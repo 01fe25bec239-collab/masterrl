@@ -639,31 +639,44 @@ pub enum Accept {
     Stale,
 }
 
-/// Records CONTROL `seq` for `(node, epoch)` (dedupe on node, lane, seq).
+/// Records CONTROL `seq` for `(node, epoch)` (dedupe on node, stream, seq). The node row is
+/// locked first and stays locked until the transaction ends, so a takeover by another stream
+/// (which bumps `session_epoch`) waits for this message to finish, and a stale stream sees
+/// `Stale` before it changes anything.
 pub async fn accept(tx: &mut Tx, node: Uuid, epoch: i64, seq: u64) -> Result<Accept, NodesError> {
     let seq =
         i64::try_from(seq).map_err(|_| NodesError::Protocol("message seq is too large".into()))?;
-    let done = sqlx::query(
-        "UPDATE compute_nodes SET control_rx_seq = $3 WHERE id = $1 AND session_epoch = $2 AND control_rx_seq < $3",
+    let row: Option<(i64, i64)> = sqlx::query_as(
+        "SELECT session_epoch, control_rx_seq FROM compute_nodes WHERE id = $1 FOR UPDATE",
     )
     .bind(node)
-    .bind(epoch)
-    .bind(seq)
-    .execute(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
-    if done.rows_affected() == 1 {
-        return Ok(Accept::New);
+    let Some((current, rx)) = row else {
+        return Ok(Accept::Stale);
+    };
+    if current != epoch {
+        return Ok(Accept::Stale);
     }
+    if seq <= rx {
+        return Ok(Accept::Duplicate);
+    }
+    sqlx::query("UPDATE compute_nodes SET control_rx_seq = $2 WHERE id = $1")
+        .bind(node)
+        .bind(seq)
+        .execute(&mut **tx)
+        .await?;
+    Ok(Accept::New)
+}
+
+/// True when `epoch` is still the node's session; locks the row (shared) until `tx` ends.
+async fn holds(tx: &mut Tx, node: Uuid, epoch: i64) -> Result<bool, NodesError> {
     let current: Option<i64> =
-        sqlx::query_scalar("SELECT session_epoch FROM compute_nodes WHERE id = $1")
+        sqlx::query_scalar("SELECT session_epoch FROM compute_nodes WHERE id = $1 FOR SHARE")
             .bind(node)
             .fetch_optional(&mut **tx)
             .await?;
-    Ok(if current == Some(epoch) {
-        Accept::Duplicate
-    } else {
-        Accept::Stale
-    })
+    Ok(current == Some(epoch))
 }
 
 /// A heartbeat: freshens `last_heartbeat_at`; a node DEGRADED only for a late heartbeat recovers.
@@ -844,35 +857,69 @@ pub async fn unrouted(
 
 // ---------- commands ----------
 
-/// Marks SENT commands with `seq <= upto` as RECEIVED (the agent journaled them).
-pub async fn commands_received(db: &Db, node: Uuid, upto: u64) -> Result<(), NodesError> {
+/// Marks SENT commands with `seq <= upto` as RECEIVED (the agent journaled them), only while
+/// `epoch` is still the node's session. `Ok(false)`: a newer session took over.
+pub async fn commands_received(
+    db: &Db,
+    node: Uuid,
+    epoch: i64,
+    upto: u64,
+) -> Result<bool, NodesError> {
+    let mut tx = db.begin().await?;
+    if !holds(&mut tx, node, epoch).await? {
+        return Ok(false);
+    }
     sqlx::query(
         "UPDATE agent_commands SET state = 'RECEIVED', updated_at = now()
          WHERE node_id = $1 AND seq <= $2 AND state = 'SENT'",
     )
     .bind(node)
     .bind(i64::try_from(upto).unwrap_or(i64::MAX))
-    .execute(db.pool())
+    .execute(&mut *tx)
     .await?;
-    Ok(())
+    tx.commit().await?;
+    Ok(true)
 }
 
-/// Commands to send: PENDING or SENT, `seq > after`, deadline not passed, in seq order.
-pub async fn pending_commands(
+/// Commands claimed for sending.
+#[derive(Debug)]
+pub enum Claim {
+    /// A newer session owns the node: send nothing, close.
+    Stale,
+    /// Rows now SENT, in seq order: send exactly these.
+    Send(Vec<(Uuid, u64, Vec<u8>)>),
+}
+
+/// Atomically claims commands to send for session `epoch`: PENDING (or SENT but not yet
+/// journaled) rows with `seq > after` whose deadline has not passed become SENT. The state and
+/// deadline are re-checked on the locked rows, so a row superseded or expired meanwhile is never
+/// claimed, and only claimed rows may be transmitted.
+pub async fn claim_commands(
     db: &Db,
     node: Uuid,
+    epoch: i64,
     after: u64,
-) -> Result<Vec<(Uuid, u64, Vec<u8>)>, NodesError> {
+) -> Result<Claim, NodesError> {
+    let mut tx = db.begin().await?;
+    if !holds(&mut tx, node, epoch).await? {
+        return Ok(Claim::Stale);
+    }
     let rows = sqlx::query(
-        "SELECT id, seq, payload FROM agent_commands
-         WHERE node_id = $1 AND state IN ('PENDING','SENT') AND seq > $2 AND deadline_at > now()
-         ORDER BY seq LIMIT 64",
+        "UPDATE agent_commands SET state = 'SENT', sent_at = now(), updated_at = now()
+         WHERE id IN (SELECT id FROM agent_commands
+                      WHERE node_id = $1 AND state IN ('PENDING','SENT') AND seq > $2
+                        AND deadline_at > now()
+                      ORDER BY seq LIMIT 64)
+           AND state IN ('PENDING','SENT') AND deadline_at > now()
+         RETURNING id, seq, payload",
     )
     .bind(node)
     .bind(i64::try_from(after).unwrap_or(i64::MAX))
-    .fetch_all(db.pool())
+    .fetch_all(&mut *tx)
     .await?;
-    rows.iter()
+    tx.commit().await?;
+    let mut out = rows
+        .iter()
         .map(|r| {
             Ok((
                 r.try_get("id")?,
@@ -880,20 +927,9 @@ pub async fn pending_commands(
                 r.try_get("payload")?,
             ))
         })
-        .collect::<Result<_, sqlx::Error>>()
-        .map_err(Into::into)
-}
-
-/// PENDING → SENT.
-pub async fn mark_sent(db: &Db, id: Uuid) -> Result<(), NodesError> {
-    sqlx::query(
-        "UPDATE agent_commands SET state = 'SENT', sent_at = now(), updated_at = now()
-         WHERE id = $1 AND state = 'PENDING'",
-    )
-    .bind(id)
-    .execute(db.pool())
-    .await?;
-    Ok(())
+        .collect::<Result<Vec<(Uuid, u64, Vec<u8>)>, sqlx::Error>>()?;
+    out.sort_by_key(|(_, seq, _)| *seq);
+    Ok(Claim::Send(out))
 }
 
 /// A `CommandResult`: COMPLETED when accepted, else FAILED with the failure.

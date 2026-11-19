@@ -263,7 +263,14 @@ async fn check_identity(
 
 /// Re-reads the certificate; `Err` when it may no longer be used.
 async fn still_valid(gw: &Gateway, sha: &str) -> Result<(), Status> {
-    match store::cert_identity(&gw.db, sha).await {
+    verdict(store::cert_identity(&gw.db, sha).await)
+}
+
+/// The re-check's decision. A lookup that fails closes the stream too (fail closed): while this
+/// replica can't confirm the certificate, it delivers nothing more; the agent reconnects and the
+/// handshake checks again.
+fn verdict(lookup: Result<Option<CertIdentity>, NodesError>) -> Result<(), Status> {
+    match lookup {
         Ok(Some(ident)) => match refusal(&ident) {
             Some(why) => Err(denied(NodesError::Certificate(why.into()))),
             None => Ok(()),
@@ -271,8 +278,7 @@ async fn still_valid(gw: &Gateway, sha: &str) -> Result<(), Status> {
         Ok(None) => Err(denied(NodesError::Certificate(
             "this certificate is no longer on file".into(),
         ))),
-        // A database hiccup is not a revocation; check again on the next tick.
-        Err(_) => Ok(()),
+        Err(e) => Err(unavailable(e)),
     }
 }
 
@@ -345,14 +351,31 @@ impl Lossy {
 }
 
 /// Records CONTROL `seq` and its database effects in one transaction.
+/// Where a CONTROL message goes besides the gateway's own tables.
+enum Route {
+    /// Handled by the gateway alone.
+    None,
+    /// Delivered to this sink while the node row is locked (before the ack).
+    Sink(Arc<dyn crate::modules::nodes::lanes::LaneSink>),
+    /// No sink: journaled to `node_events`.
+    Journal,
+}
+
+/// Records CONTROL `seq` and its effects in one transaction that holds the node row: a sink
+/// sees the message only while this stream is still the node's session, and a takeover waits.
 async fn record(
     gw: &Gateway,
     node: Uuid,
     epoch: i64,
     msg: &AgentMessage,
-    unrouted: bool,
+    route: Route,
 ) -> Result<Accept, NodesError> {
     let msg = msg.clone();
+    let sink = match &route {
+        Route::Sink(s) => Some(s.clone()),
+        _ => None,
+    };
+    let journal = matches!(route, Route::Journal);
     let to_db = |e: NodesError| match e {
         NodesError::Db(d) => d,
         o => crate::db::DbError::Query(sqlx::Error::Protocol(o.to_string())),
@@ -360,13 +383,29 @@ async fn record(
     Ok(gw
         .db
         .transaction(move |tx| {
-            let msg = msg.clone();
+            let (msg, sink) = (msg.clone(), sink.clone());
             Box::pin(async move {
                 let accepted = store::accept(tx, node, epoch, msg.seq)
                     .await
                     .map_err(to_db)?;
                 if accepted != Accept::New {
                     return Ok(accepted);
+                }
+                if let Some(sink) = sink {
+                    let item = LaneItem {
+                        node_id: node,
+                        session_epoch: epoch,
+                        lane: LaneKind::Control,
+                        stream: Lane::Control,
+                        seq: msg.seq,
+                        dropped_before: 0,
+                        message: msg.clone(),
+                    };
+                    sink.deliver(item).await.map_err(|e| {
+                        crate::db::DbError::Query(sqlx::Error::Protocol(format!(
+                            "CONTROL sink failed; the agent will resend: {e}"
+                        )))
+                    })?;
                 }
                 match &msg.body {
                     Some(agent_message::Body::Heartbeat(hb)) => {
@@ -380,7 +419,7 @@ async fn record(
                     Some(agent_message::Body::CommandResult(r)) => {
                         store::command_result(tx, node, r).await.map_err(to_db)?
                     }
-                    _ if unrouted => store::unrouted(tx, node, msg.seq, &msg)
+                    _ if journal => store::unrouted(tx, node, msg.seq, &msg)
                         .await
                         .map_err(to_db)?,
                     _ => {}
@@ -512,7 +551,9 @@ async fn control(
     let result = async {
         send(out, hello(gw, Lane::Control, rx_seq + 1), 0, rx_seq).await?;
         let resume = h.resume_from_seq.max(1);
-        store::commands_received(&gw.db, node, resume - 1).await.map_err(unavailable)?;
+        if !store::commands_received(&gw.db, node, epoch, resume - 1).await.map_err(unavailable)? {
+            return Err(taken_over());
+        }
         let mut sent_upto = resume - 1;
         let mut acked = 0u64;
         let lossy = Lossy::start(gw, node, epoch, Lane::Control);
@@ -530,12 +571,14 @@ async fn control(
                     return Err(Status::aborted(NodesError::Protocol("a newer connection from this machine took over".into()).explain()));
                 }
                 _ = recheck.tick() => still_valid(gw, sha).await?,
-                () = wake.notified() => sent_upto = send_commands(gw, node, sent_upto, rx_seq, out).await?,
-                _ = poll.tick() => sent_upto = send_commands(gw, node, sent_upto, rx_seq, out).await?,
+                () = wake.notified() => sent_upto = send_commands(gw, node, epoch, sent_upto, rx_seq, out).await?,
+                _ = poll.tick() => sent_upto = send_commands(gw, node, epoch, sent_upto, rx_seq, out).await?,
                 m = inbound.next() => {
                     let Some(Ok(m)) = m else { return Ok(()) };
                     if m.ack_seq > acked {
-                        store::commands_received(&gw.db, node, m.ack_seq).await.map_err(unavailable)?;
+                        if !store::commands_received(&gw.db, node, epoch, m.ack_seq).await.map_err(unavailable)? {
+                            return Err(taken_over());
+                        }
                         acked = m.ack_seq;
                     }
                     if m.seq == 0 {
@@ -546,21 +589,31 @@ async fn control(
                         continue;
                     }
                     let lane = LaneKind::of(&m);
-                    let mut unrouted = false;
-                    if lane != LaneKind::Control {
-                        lossy.offer(lane, LaneItem { node_id: node, session_epoch: epoch, lane, stream: Lane::Control, seq: m.seq, dropped_before: 0, message: m.clone() });
-                    } else if !own(&m.body) {
-                        unrouted = route_control(gw, node, epoch, Lane::Control, &m).await?;
-                    }
-                    if let Some(agent_message::Body::RenewCertificate(req)) = &m.body {
-                        let result = renew(gw, sha, &ident, req).await;
-                        send(out, core_message::Body::RenewCertificateResult(result), 0, rx_seq).await?;
-                    }
-                    match record(gw, node, epoch, &m, unrouted).await.map_err(unavailable)? {
-                        Accept::Stale => {
-                            return Err(Status::aborted(NodesError::Protocol("a newer connection from this machine took over".into()).explain()));
+                    let route = if lane == LaneKind::Control && !own(&m.body) {
+                        match gw.lanes.sink_for(LaneKind::Control) {
+                            Some(sink) => Route::Sink(sink),
+                            None => {
+                                tracing::warn!(node = %NodeId::from_uuid(node), body = body_name(&m), "no sink for this CONTROL message; journaled to node_events");
+                                LaneMetrics::get().unrouted(body_name(&m));
+                                Route::Journal
+                            }
                         }
-                        Accept::New | Accept::Duplicate => rx_seq = m.seq,
+                    } else {
+                        Route::None
+                    };
+                    let accepted = record(gw, node, epoch, &m, route).await.map_err(unavailable)?;
+                    if accepted == Accept::Stale {
+                        return Err(taken_over());
+                    }
+                    rx_seq = m.seq;
+                    if accepted == Accept::New {
+                        if lane != LaneKind::Control {
+                            lossy.offer(lane, LaneItem { node_id: node, session_epoch: epoch, lane, stream: Lane::Control, seq: m.seq, dropped_before: 0, message: m.clone() });
+                        }
+                        if let Some(agent_message::Body::RenewCertificate(req)) = &m.body {
+                            let result = renew(gw, sha, &ident, req).await;
+                            send(out, core_message::Body::RenewCertificateResult(result), 0, rx_seq).await?;
+                        }
                     }
                     if let Some(agent_message::Body::Heartbeat(hb)) = &m.body {
                         let leases = store::leases(&gw.db, node, &hb.running).await.map_err(unavailable)?;
@@ -580,24 +633,34 @@ async fn control(
     result
 }
 
-/// Sends commands with `seq > after` (PENDING, or SENT but not journaled); returns the last sent seq.
+/// The status that closes a stream a newer session replaced.
+fn taken_over() -> Status {
+    Status::aborted(
+        NodesError::Protocol("a newer connection from this machine took over".into()).explain(),
+    )
+}
+
+/// Claims and sends commands with `seq > after`; returns the last sent seq. Only rows the claim
+/// returned are transmitted (SENT is committed first; a row superseded or expired meanwhile is
+/// never claimed). A stale session sends nothing and closes.
 async fn send_commands(
     gw: &Gateway,
     node: Uuid,
+    epoch: i64,
     after: u64,
     rx_seq: u64,
     out: &Outbound,
 ) -> Result<u64, Status> {
-    let mut last = after;
-    for (id, seq, payload) in store::pending_commands(&gw.db, node, after)
+    let claimed = match store::claim_commands(&gw.db, node, epoch, after)
         .await
         .map_err(unavailable)?
     {
+        store::Claim::Stale => return Err(taken_over()),
+        store::Claim::Send(rows) => rows,
+    };
+    let mut last = after;
+    for (_, seq, payload) in claimed {
         let cmd = commands::decode(&payload).map_err(unavailable)?;
-        // SENT is committed before the command leaves: if the write fails nothing is sent; if
-        // the send fails or the server stops, the SENT row is sent again after the agent
-        // reconnects (its `resume_from_seq` says which seqs it already journaled).
-        store::mark_sent(&gw.db, id).await.map_err(unavailable)?;
         send(out, core_message::Body::Command(cmd), seq, rx_seq).await?;
         last = seq;
     }
@@ -653,5 +716,39 @@ async fn data(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::modules::nodes::store::Lifecycle;
+
+    fn ident(revoked: bool) -> CertIdentity {
+        CertIdentity {
+            node: Uuid::nil(),
+            revoked,
+            expired: false,
+            status: "ONLINE".into(),
+            lifecycle: Lifecycle::Static,
+        }
+    }
+
+    #[test]
+    fn a_failed_revocation_lookup_closes_the_stream() {
+        assert!(verdict(Ok(Some(ident(false)))).is_ok());
+        assert_eq!(
+            verdict(Ok(Some(ident(true)))).unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+        assert_eq!(
+            verdict(Ok(None)).unwrap_err().code(),
+            tonic::Code::PermissionDenied
+        );
+        let down = NodesError::Db(crate::db::DbError::Unavailable(sqlx::Error::PoolTimedOut));
+        assert_eq!(
+            verdict(Err(down)).unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
     }
 }

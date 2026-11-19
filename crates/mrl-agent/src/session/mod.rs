@@ -82,6 +82,9 @@ pub struct GatewaySettings {
     pub metrics_buffer: usize,
     /// Log chunks buffered before dropping (with a marker).
     pub logs_buffer: usize,
+    /// Where the machine's private key is kept: `auto` (OS keychain, else a private file),
+    /// `keychain` or `file`.
+    pub key_store: crate::enroll::keys::KeyStoreChoice,
 }
 
 impl Default for GatewaySettings {
@@ -97,6 +100,7 @@ impl Default for GatewaySettings {
             spool_max_bytes: 256 << 20,
             metrics_buffer: 1024,
             logs_buffer: 1024,
+            key_store: crate::enroll::keys::KeyStoreChoice::Auto,
         }
     }
 }
@@ -295,7 +299,13 @@ pub struct Link {
     running: Mutex<Vec<AttemptRef>>,
     reporting: Mutex<()>,
     data_seq: Mutex<DataSeq>,
+    dir: PathBuf,
+    limits: (usize, u64),
+    owner: Mutex<Option<String>>,
 }
+
+/// File naming the node the durable link state (spool, journal, stream counters) belongs to.
+const OWNER_FILE: &str = "owner";
 
 /// Seq counters of the TELEMETRY and BULK streams. Blocks of [`DataSeq::BLOCK`] are reserved
 /// on disk, so a restart continues above every seq already used (gaps are fine).
@@ -366,7 +376,14 @@ impl Link {
     pub fn open(root: &std::path::Path, g: &GatewaySettings) -> Result<Link, AgentError> {
         let dir = root.join("gateway");
         let data_seq = DataSeq::open(&dir.join("data_seq.json"))?;
+        let owner = std::fs::read_to_string(dir.join(OWNER_FILE))
+            .ok()
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty());
         Ok(Link {
+            dir: dir.clone(),
+            limits: (g.spool_max_entries, g.spool_max_bytes),
+            owner: Mutex::new(owner),
             spool: Mutex::new(Spool::open(
                 &dir.join("spool"),
                 g.spool_max_entries,
@@ -384,6 +401,49 @@ impl Link {
             reporting: Mutex::default(),
             data_seq: Mutex::new(data_seq),
         })
+    }
+
+    /// Binds the durable state to `node_id` (the enrolled identity). State that belongs to
+    /// another node (the machine enrolled again) is discarded: its spooled messages, journaled
+    /// commands and stream counters mean nothing to the new node or its core. State written
+    /// before any enrollment is adopted. Returns true when the binding changed.
+    pub fn bind(&self, node_id: &str) -> Result<bool, LinkError> {
+        let poisoned = || LinkError::Protocol("link lock poisoned".into());
+        let mut owner = self.owner.lock().map_err(|_| poisoned())?;
+        if owner.as_deref() == Some(node_id) {
+            return Ok(false);
+        }
+        let _one = self.reporting.lock().map_err(|_| poisoned())?;
+        let mut spool = self.spool.lock().map_err(|_| poisoned())?;
+        let mut journal = self.journal.lock().map_err(|_| poisoned())?;
+        let mut data_seq = self.data_seq.lock().map_err(|_| poisoned())?;
+        if owner.is_some() {
+            let spool_dir = self.dir.join("spool");
+            match std::fs::remove_dir_all(&spool_dir) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                    return Err(AgentError::state(&spool_dir, e).into())
+                }
+                _ => {}
+            }
+            for f in ["journal.json", "data_seq.json"] {
+                let p = self.dir.join(f);
+                match std::fs::remove_file(&p) {
+                    Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(AgentError::state(&p, e).into())
+                    }
+                    _ => {}
+                }
+            }
+            *spool = Spool::open(&spool_dir, self.limits.0, self.limits.1)?;
+            *journal = Journal::open(&self.dir.join("journal.json"))?;
+            *data_seq = DataSeq::open(&self.dir.join("data_seq.json"))?;
+        }
+        std::fs::create_dir_all(&self.dir).map_err(|e| AgentError::state(&self.dir, e))?;
+        let path = self.dir.join(OWNER_FILE);
+        crate::state::atomic_write(&path, node_id.as_bytes())
+            .map_err(|e| AgentError::state(&path, e))?;
+        *owner = Some(node_id.to_owned());
+        Ok(true)
     }
 
     /// The next seq of a TELEMETRY (`0`) or BULK (`1`) stream: unique across reconnects and
@@ -1186,6 +1246,8 @@ pub async fn connect_once(
     transport: &dyn Transport,
     stop: CancellationToken,
 ) -> Result<Outcome, LinkError> {
+    // Never send one node's spooled data or journal positions as another node's.
+    link.bind(&id.link.node_id)?;
     if transport.waits_for_core() {
         let config = tls::server(&id.ca, id.chain(), id.key())?;
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
@@ -1232,9 +1294,7 @@ impl crate::registry::AgentService for GatewayService {
 
     async fn run(&self, ctx: Arc<AgentContext>, shutdown: CancellationToken) -> crate::Result<()> {
         let link = Link::of(&ctx)?;
-        if let Err(e) = link.report_interrupted() {
-            eprintln!("mrl-agent: {}", e.explain());
-        }
+        let mut reported = false;
         let mut failures = 0u32;
         let mut warned = false;
         let mut listen: Option<(SocketAddr, Arc<dyn Transport>)> = None;
@@ -1261,6 +1321,18 @@ impl crate::registry::AgentService for GatewayService {
                     })
                 }
             };
+            if let Err(e) = link.bind(&id.link.node_id) {
+                return Err(AgentError::Config {
+                    path: crate::enroll::identity_dir(ctx.state.root()),
+                    reason: e.explain(),
+                });
+            }
+            if !reported {
+                if let Err(e) = link.report_interrupted() {
+                    eprintln!("mrl-agent: {}", e.explain());
+                }
+                reported = true;
+            }
             let transport: Arc<dyn Transport> = match transport_for(&ctx.config.gateway, &id) {
                 Ok(t) => {
                     // Keep one listener across reconnects.
@@ -1495,6 +1567,32 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn enrolling_again_starts_with_fresh_link_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = GatewaySettings::default();
+        let link = Link::open(dir.path(), &g).unwrap();
+        link.send_control(agent_message::Body::AttemptStatus(Default::default()))
+            .unwrap();
+        assert!(
+            link.bind("node_a").unwrap(),
+            "state written before enrollment is adopted"
+        );
+        assert_eq!(link.spooled(), 1);
+        link.journal.lock().unwrap().receive(7, "c7").unwrap();
+        assert!(link.next_data_seq(0).unwrap() >= 1);
+        assert!(!link.bind("node_a").unwrap());
+        // Re-enrolled as another node: nothing of node_a is sent or skipped.
+        assert!(link.bind("node_b").unwrap());
+        assert_eq!(link.spooled(), 0);
+        assert_eq!(link.journal_seq(), 0);
+        assert_eq!(link.next_data_seq(0).unwrap(), 1);
+        // The binding survives a restart.
+        drop(link);
+        let link = Link::open(dir.path(), &g).unwrap();
+        assert!(!link.bind("node_b").unwrap());
     }
 
     #[test]
