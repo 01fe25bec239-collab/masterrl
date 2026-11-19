@@ -679,21 +679,29 @@ async fn holds(tx: &mut Tx, node: Uuid, epoch: i64) -> Result<bool, NodesError> 
     Ok(current == Some(epoch))
 }
 
-/// A heartbeat: freshens `last_heartbeat_at`; a node DEGRADED only for a late heartbeat recovers.
-pub async fn heartbeat(tx: &mut Tx, node: Uuid, running: usize) -> Result<(), NodesError> {
-    let row = sqlx::query(
-        "UPDATE compute_nodes SET last_heartbeat_at = now(), running_attempts = $2 WHERE id = $1
-         RETURNING status, status_reason",
+/// A heartbeat: freshens `last_heartbeat_at`, the running-attempt count and the clock skew
+/// (`sent` is the agent's clock). Whether the node is DEGRADED is decided by `health`.
+pub async fn heartbeat(
+    tx: &mut Tx,
+    node: Uuid,
+    running: usize,
+    sent: Option<&prost_types::Timestamp>,
+) -> Result<(), NodesError> {
+    let skew_ms = sent.and_then(|t| {
+        let agent = OffsetDateTime::from_unix_timestamp_nanos(
+            i128::from(t.seconds) * 1_000_000_000 + i128::from(t.nanos),
+        )
+        .ok()?;
+        i64::try_from((agent - OffsetDateTime::now_utc()).whole_milliseconds()).ok()
+    });
+    sqlx::query(
+        "UPDATE compute_nodes SET last_heartbeat_at = now(), running_attempts = $2, clock_skew_ms = $3 WHERE id = $1",
     )
     .bind(node)
     .bind(i32::try_from(running).unwrap_or(i32::MAX))
-    .fetch_one(&mut **tx)
+    .bind(skew_ms)
+    .execute(&mut **tx)
     .await?;
-    let status: String = row.try_get("status")?;
-    let reason: Option<String> = row.try_get("status_reason")?;
-    if status == "DEGRADED" && reason.as_deref() == Some(HEARTBEAT_LATE) {
-        transition(tx, node, NodeEvent::Recover, Some("heartbeat back")).await?;
-    }
     Ok(())
 }
 
@@ -793,12 +801,25 @@ pub async fn inventory(tx: &mut Tx, node: Uuid, inv: &pb::Inventory) -> Result<(
     Ok(())
 }
 
-/// Latest-wins node telemetry and per-GPU readings.
-pub async fn telemetry(db: &Db, node: Uuid, t: &pb::NodeTelemetry) -> Result<(), NodesError> {
+/// Latest-wins node telemetry and per-GPU readings. A reading older than the stored one is
+/// ignored (two writers, e.g. across a reconnect, can't move a reading back in time). GPU
+/// health follows the reading: OK, DEGRADED at `hot_c` or above, FAILED for a present GPU the
+/// reading leaves out (lost).
+pub async fn telemetry(
+    db: &Db,
+    node: Uuid,
+    t: &pb::NodeTelemetry,
+    hot_c: u32,
+) -> Result<(), NodesError> {
     let at = t
         .time
         .as_ref()
-        .and_then(|ts| OffsetDateTime::from_unix_timestamp(ts.seconds).ok())
+        .and_then(|ts| {
+            OffsetDateTime::from_unix_timestamp_nanos(
+                i128::from(ts.seconds) * 1_000_000_000 + i128::from(ts.nanos),
+            )
+            .ok()
+        })
         .unwrap_or_else(OffsetDateTime::now_utc);
     let doc = json!({
         "ram_used_bytes": t.ram_used_bytes, "swap_used_bytes": t.swap_used_bytes,
@@ -806,22 +827,32 @@ pub async fn telemetry(db: &Db, node: Uuid, t: &pb::NodeTelemetry) -> Result<(),
         "on_battery": t.on_battery, "battery_percent": t.battery_percent,
     });
     let mut tx = db.begin().await?;
-    sqlx::query("UPDATE compute_nodes SET telemetry = $2, telemetry_at = $3 WHERE id = $1")
-        .bind(node)
-        .bind(doc)
-        .bind(at)
-        .execute(&mut *tx)
-        .await?;
+    let fresh = sqlx::query(
+        "UPDATE compute_nodes SET telemetry = $2, telemetry_at = $3
+         WHERE id = $1 AND (telemetry_at IS NULL OR telemetry_at < $3)",
+    )
+    .bind(node)
+    .bind(doc)
+    .bind(at)
+    .execute(&mut *tx)
+    .await?;
+    if fresh.rows_affected() == 0 {
+        return Ok(()); // an older (or repeated) reading: keep the newer one
+    }
+    let mut seen = Vec::new();
     for g in &t.gpus {
+        let index = i32::try_from(g.index).unwrap_or(i32::MAX);
+        seen.push(index);
         sqlx::query(
             "INSERT INTO node_telemetry_latest (gpu_device_id, util_pct, mem_used_bytes, temp_c, thermal_throttling, observed_at)
              SELECT id, $3, $4, $5, $6, $7 FROM gpu_devices WHERE node_id = $1 AND index_on_node = $2 AND present
              ON CONFLICT (gpu_device_id) DO UPDATE SET util_pct = EXCLUDED.util_pct,
                mem_used_bytes = EXCLUDED.mem_used_bytes, temp_c = EXCLUDED.temp_c,
-               thermal_throttling = EXCLUDED.thermal_throttling, observed_at = EXCLUDED.observed_at",
+               thermal_throttling = EXCLUDED.thermal_throttling, observed_at = EXCLUDED.observed_at
+             WHERE node_telemetry_latest.observed_at < EXCLUDED.observed_at",
         )
         .bind(node)
-        .bind(i32::try_from(g.index).unwrap_or(i32::MAX))
+        .bind(index)
         .bind(i32::try_from(g.utilization_percent).unwrap_or(i32::MAX))
         .bind(i64::try_from(g.memory_used_bytes).unwrap_or(i64::MAX))
         .bind(i32::try_from(g.temperature_c).unwrap_or(i32::MAX))
@@ -829,7 +860,29 @@ pub async fn telemetry(db: &Db, node: Uuid, t: &pb::NodeTelemetry) -> Result<(),
         .bind(at)
         .execute(&mut *tx)
         .await?;
+        let health = if g.temperature_c >= hot_c {
+            "DEGRADED"
+        } else {
+            "OK"
+        };
+        sqlx::query(
+            "UPDATE gpu_devices SET health = $3 WHERE node_id = $1 AND index_on_node = $2 AND present
+               AND health IN ('OK','DEGRADED','FAILED')",
+        )
+        .bind(node)
+        .bind(index)
+        .bind(health)
+        .execute(&mut *tx)
+        .await?;
     }
+    sqlx::query(
+        "UPDATE gpu_devices SET health = 'FAILED' WHERE node_id = $1 AND present
+           AND NOT (index_on_node = ANY($2)) AND health IN ('OK','DEGRADED')",
+    )
+    .bind(node)
+    .bind(&seen)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(())
 }

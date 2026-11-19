@@ -292,7 +292,8 @@ pub struct Link {
     wake: Notify,
     metrics: Mutex<Queue>,
     logs: Mutex<Queue>,
-    data_wake: Notify,
+    metrics_wake: Notify,
+    logs_wake: Notify,
     handlers: RwLock<HashMap<&'static str, Arc<dyn CommandHandler>>>,
     leases: broadcast::Sender<LeaseGrant>,
     reconcile: broadcast::Sender<ReconcileResult>,
@@ -393,7 +394,8 @@ impl Link {
             wake: Notify::new(),
             metrics: Mutex::new(Queue::new(g.metrics_buffer, true)),
             logs: Mutex::new(Queue::new(g.logs_buffer, false)),
-            data_wake: Notify::new(),
+            metrics_wake: Notify::new(),
+            logs_wake: Notify::new(),
             handlers: RwLock::default(),
             leases: broadcast::channel(64).0,
             reconcile: broadcast::channel(16).0,
@@ -483,7 +485,8 @@ impl Link {
                 ..AgentMessage::default()
             });
         }
-        self.data_wake.notify_waiters();
+        // notify_one keeps the wake-up for a stream that is not waiting right now.
+        self.metrics_wake.notify_one();
     }
 
     /// Queues a worker log chunk (LOGS lane: bounded, truncated with a marker).
@@ -494,7 +497,7 @@ impl Link {
                 ..AgentMessage::default()
             });
         }
-        self.data_wake.notify_waiters();
+        self.logs_wake.notify_one();
     }
 
     /// Lease grants from the core (answers to heartbeats).
@@ -1021,8 +1024,20 @@ async fn data_lane(
             .await
             .map_err(|e| LinkError::Protocol(e.to_string()))?
     };
+    let (queued, wake) = if lane == Lane::Telemetry {
+        (&l.link.metrics, &l.link.metrics_wake)
+    } else {
+        (&l.link.logs, &l.link.logs_wake)
+    };
+    let mut batch: Vec<AgentMessage> = Vec::new();
     loop {
-        let mut batch = Vec::new();
+        // Drain first: items queued while disconnected go out right after the hello.
+        batch.extend(queued.lock().map(|mut q| q.take()).unwrap_or_default());
+        for mut m in batch.drain(..) {
+            m.seq = l.link.next_data_seq(stream)?;
+            m.sent_at = now_ts();
+            put(&out, m).await?;
+        }
         tokio::select! {
             biased;
             () = stop.cancelled() => return Ok(Outcome::Stopped),
@@ -1031,18 +1046,7 @@ async fn data_lane(
                 let t = crate::hw::collect_telemetry(&l.ctx.hw, &inventory, l.ctx.state.root());
                 batch.push(AgentMessage { body: Some(agent_message::Body::Telemetry(t.to_proto())), ..AgentMessage::default() });
             }
-            () = l.link.data_wake.notified() => {}
-        }
-        let queued = if lane == Lane::Telemetry {
-            &l.link.metrics
-        } else {
-            &l.link.logs
-        };
-        batch.extend(queued.lock().map(|mut q| q.take()).unwrap_or_default());
-        for mut m in batch {
-            m.seq = l.link.next_data_seq(stream)?;
-            m.sent_at = now_ts();
-            put(&out, m).await?;
+            () = wake.notified() => {}
         }
     }
 }
@@ -1089,22 +1093,37 @@ async fn dialed(l: Arc<LaneCtx>, io: BoxIo, stop: CancellationToken) -> Result<O
             stop.clone(),
         )));
     }
-    let mut it = lanes.into_iter();
-    let control = match it.next() {
-        Some(h) => h.await.map_err(|e| LinkError::Protocol(e.to_string()))?,
-        None => Ok(Outcome::Closed),
-    };
+    supervise(lanes, &stop).await
+}
+
+/// Waits for the first of the lane tasks (CONTROL first in `lanes`) to end, then stops the
+/// others. All three streams are required: when TELEMETRY or BULK ends the connection ends too,
+/// so the session loop reconnects every stream.
+pub async fn supervise(
+    lanes: Vec<tokio::task::JoinHandle<Result<Outcome, LinkError>>>,
+    stop: &CancellationToken,
+) -> Result<Outcome, LinkError> {
+    if lanes.is_empty() {
+        return Ok(Outcome::Closed);
+    }
+    let (first, index, rest) = futures::future::select_all(lanes).await;
     stop.cancel();
-    for h in it {
+    for h in rest {
         let _ = h.await;
     }
-    control
+    let first = first.map_err(|e| LinkError::Protocol(e.to_string()))?;
+    match (index, first) {
+        (0, r) => r,
+        (_, Ok(_)) => Ok(Outcome::Closed),
+        (_, Err(e)) => Err(e),
+    }
 }
 
 /// `AgentEndpointService` for a core that dialed in.
 struct EndpointSvc {
     lane_ctx: Arc<LaneCtx>,
     stop: CancellationToken,
+    /// The first stream to end reports here.
     control_done: mpsc::Sender<Result<Outcome, LinkError>>,
 }
 
@@ -1139,10 +1158,16 @@ impl AgentEndpointService for EndpointSvc {
             self.control_done.clone(),
         );
         tokio::spawn(async move {
+            // Any stream ending ends the connection (the first report wins), so the core
+            // reconnects all three; a data stream that ends reports `Closed`.
             let r = run_lane(l, lane, inbound, tx, stop).await;
-            if lane == Lane::Control {
-                let _ = done.send(r).await;
-            }
+            let r = match (lane, r) {
+                (Lane::Control, r) => r,
+                (_, Ok(Outcome::Stopped)) => Ok(Outcome::Stopped),
+                (_, Ok(_)) => Ok(Outcome::Closed),
+                (_, Err(e)) => Err(e),
+            };
+            let _ = done.send(r).await;
         });
         Ok(tonic::Response::new(Box::pin(
             ReceiverStream::new(rx).map(Ok),
@@ -1593,6 +1618,30 @@ mod tests {
         drop(link);
         let link = Link::open(dir.path(), &g).unwrap();
         assert!(!link.bind("node_b").unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_data_stream_ending_ends_the_connection() {
+        let stop = CancellationToken::new();
+        let s = stop.clone();
+        let control = tokio::spawn(async move {
+            s.cancelled().await;
+            Ok(Outcome::Stopped)
+        });
+        let telemetry = tokio::spawn(async { Err(LinkError::Unreachable("stream reset".into())) });
+        let s = stop.clone();
+        let bulk = tokio::spawn(async move {
+            s.cancelled().await;
+            Ok(Outcome::Stopped)
+        });
+        let r = tokio::time::timeout(
+            Duration::from_secs(2),
+            supervise(vec![control, telemetry, bulk], &stop),
+        )
+        .await
+        .expect("supervise returns when TELEMETRY ends");
+        assert!(matches!(r, Err(LinkError::Unreachable(_))));
+        assert!(stop.is_cancelled(), "the other streams were stopped");
     }
 
     #[test]

@@ -309,7 +309,9 @@ impl Lossy {
                 let msg = rx.borrow_and_update().clone();
                 let Some(msg) = msg else { continue };
                 if let Some(agent_message::Body::Telemetry(t)) = &msg.body {
-                    if let Err(e) = store::telemetry(&gw2.db, node, t).await {
+                    if let Err(e) =
+                        store::telemetry(&gw2.db, node, t, gw2.config.gpu_hot_celsius).await
+                    {
                         tracing::debug!(code = e.code(), error = %e, "telemetry not saved");
                     }
                 }
@@ -409,7 +411,7 @@ async fn record(
                 }
                 match &msg.body {
                     Some(agent_message::Body::Heartbeat(hb)) => {
-                        store::heartbeat(tx, node, hb.running.len())
+                        store::heartbeat(tx, node, hb.running.len(), hb.time.as_ref())
                             .await
                             .map_err(to_db)?
                     }

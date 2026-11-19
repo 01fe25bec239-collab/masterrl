@@ -474,16 +474,7 @@ mod tests {
         let link = a.run();
         wait_state(&gw, second.id, "COMPLETED").await;
 
-        // A lost ack makes the server resend: the journal stops a second run.
-        sqlx::query("UPDATE agent_commands SET state = 'SENT' WHERE id = $1")
-            .bind(second.id)
-            .execute(gw.db.pool())
-            .await
-            .unwrap();
-        link.stop().await;
-        let link = a.run();
-        wait_state(&gw, second.id, "RECEIVED").await;
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        // (A lost ack is tested for real, through a proxy: see a_lost_ack_neither_reruns_….)
         assert_eq!(
             count.0.load(Ordering::SeqCst),
             2,
@@ -1047,5 +1038,445 @@ mod tests {
             got.len(),
             "a deduplicating sink keeps every item: {got:?}"
         );
+    }
+
+    /// A TCP proxy whose agent→core direction can be silently dropped, and whose connections can
+    /// be cut (new connections still pass).
+    struct Proxy {
+        addr: SocketAddr,
+        drop_up: Arc<std::sync::atomic::AtomicBool>,
+        generation: Arc<std::sync::Mutex<CancellationToken>>,
+    }
+
+    impl Proxy {
+        async fn start(target: SocketAddr) -> Self {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = l.local_addr().unwrap();
+            let drop_up = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let generation = Arc::new(std::sync::Mutex::new(CancellationToken::new()));
+            let (d, g) = (drop_up.clone(), generation.clone());
+            tokio::spawn(async move {
+                while let Ok((agent, _)) = l.accept().await {
+                    let Ok(core) = tokio::net::TcpStream::connect(target).await else {
+                        continue;
+                    };
+                    let cut = g.lock().unwrap().clone();
+                    let (mut ar, mut aw) = agent.into_split();
+                    let (mut cr, mut cw) = core.into_split();
+                    let d = d.clone();
+                    let c1 = cut.clone();
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        loop {
+                            let n = tokio::select! { () = c1.cancelled() => break, r = ar.read(&mut buf) => match r { Ok(0) | Err(_) => break, Ok(n) => n } };
+                            if d.load(Ordering::SeqCst) {
+                                continue; // dropped on the way to the core
+                            }
+                            if cw.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                    tokio::spawn(async move {
+                        let mut buf = vec![0u8; 16 * 1024];
+                        loop {
+                            let n = tokio::select! { () = cut.cancelled() => break, r = cr.read(&mut buf) => match r { Ok(0) | Err(_) => break, Ok(n) => n } };
+                            if aw.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    });
+                }
+            });
+            Self {
+                addr,
+                drop_up,
+                generation,
+            }
+        }
+
+        fn drop_agent_to_core(&self, on: bool) {
+            self.drop_up.store(on, Ordering::SeqCst);
+        }
+
+        fn cut(&self) {
+            let mut g = self.generation.lock().unwrap();
+            g.cancel();
+            *g = CancellationToken::new();
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn a_lost_ack_neither_reruns_the_command_nor_loses_its_result() {
+        let gw = GatewayHarness::start(TestDb::new().await).await;
+        let proxy = Proxy::start(gw.addr()).await;
+        let via = proxy.addr.to_string();
+        let a = TestAgent::new(1, |c| c.gateway.server = Some(via.clone()));
+        let node_s = a.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
+        let node = NodeId::from_str(&node_s).unwrap();
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+        Link::of(&a.ctx).unwrap().register("Probe", count.clone());
+        let link = a.run();
+        gw.wait_status(&node_s, "ONLINE").await;
+
+        // Everything the agent sends from now on is lost: its RECEIVED ack and its result.
+        proxy.drop_agent_to_core(true);
+        let c = CommandSender::new(&gw.gw, &[CommandKind::Probe])
+            .send(node, probe())
+            .await
+            .unwrap();
+        for _ in 0..100 {
+            if count.0.load(Ordering::SeqCst) == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(
+            count.0.load(Ordering::SeqCst),
+            1,
+            "the agent got and ran the command"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            state_of(&gw, c.id).await,
+            "SENT",
+            "the ack never reached the core"
+        );
+
+        // The connection breaks; the agent reconnects through a healthy path.
+        proxy.drop_agent_to_core(false);
+        proxy.cut();
+        wait_state(&gw, c.id, "COMPLETED").await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(count.0.load(Ordering::SeqCst), 1, "ran exactly once");
+        link.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn claims_skip_superseded_and_expired_rows_and_refuse_a_stale_epoch() {
+        use mrl_server::modules::nodes::store::{self, Claim};
+        let gw = GatewayHarness::start(TestDb::new().await).await;
+        let a = TestAgent::new(1, |_| {});
+        let node =
+            NodeId::from_str(&a.enroll(&gw, &gw.token(json!({})).await).await.unwrap()).unwrap();
+        let sender = CommandSender::new(&gw.gw, &[CommandKind::Probe]);
+        let c1 = sender.send(node, probe()).await.unwrap();
+        let c2 = sender.send(node, probe()).await.unwrap();
+        let c3 = sender.send(node, probe()).await.unwrap();
+        sqlx::query("UPDATE compute_nodes SET session_epoch = 5 WHERE id = $1")
+            .bind(node.as_uuid())
+            .execute(gw.db.pool())
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_commands SET state = 'SUPERSEDED' WHERE id = $1")
+            .bind(c1.id)
+            .execute(gw.db.pool())
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE agent_commands SET deadline_at = now() - interval '1 second' WHERE id = $1",
+        )
+        .bind(c2.id)
+        .execute(gw.db.pool())
+        .await
+        .unwrap();
+        assert!(matches!(
+            store::claim_commands(gw.db.db(), node.as_uuid(), 4, 0)
+                .await
+                .unwrap(),
+            Claim::Stale
+        ));
+        assert_eq!(
+            state_of(&gw, c3.id).await,
+            "PENDING",
+            "a stale session claims nothing"
+        );
+        let Claim::Send(rows) = store::claim_commands(gw.db.db(), node.as_uuid(), 5, 0)
+            .await
+            .unwrap()
+        else {
+            panic!("current epoch claims")
+        };
+        assert_eq!(rows.iter().map(|r| r.0).collect::<Vec<_>>(), vec![c3.id]);
+        assert_eq!(
+            (
+                state_of(&gw, c1.id).await,
+                state_of(&gw, c2.id).await,
+                state_of(&gw, c3.id).await
+            ),
+            ("SUPERSEDED".into(), "PENDING".into(), "SENT".into())
+        );
+        assert!(
+            !store::commands_received(gw.db.db(), node.as_uuid(), 4, 10)
+                .await
+                .unwrap(),
+            "a stale ack changes nothing"
+        );
+        assert_eq!(state_of(&gw, c3.id).await, "SENT");
+    }
+
+    fn copy_dir(from: &std::path::Path, to: &std::path::Path) {
+        std::fs::create_dir_all(to).unwrap();
+        for e in std::fs::read_dir(from).unwrap() {
+            let e = e.unwrap();
+            let dest = to.join(e.file_name());
+            if e.file_type().unwrap().is_dir() {
+                copy_dir(&e.path(), &dest);
+            } else {
+                std::fs::copy(e.path(), dest).unwrap();
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn after_a_takeover_on_another_replica_the_old_stream_sends_and_records_nothing() {
+        let gw = GatewayHarness::start(TestDb::new().await).await;
+        let (_replica, b) = gw.replica().await;
+        let first = TestAgent::new(1, |_| {});
+        let node_s = first.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
+        let second = TestAgent::new(1, |_| {});
+        copy_dir(
+            &mrl_agent::enroll::identity_dir(first.ctx.state.root()),
+            &mrl_agent::enroll::identity_dir(second.ctx.state.root()),
+        );
+        let id = mrl_agent::enroll::Identity::load(first.ctx.state.root())
+            .unwrap()
+            .unwrap();
+
+        let (l1, l2) = (
+            Link::of(&first.ctx).unwrap(),
+            Link::of(&second.ctx).unwrap(),
+        );
+        let (s1, s2) = (CancellationToken::new(), CancellationToken::new());
+        let old = {
+            let (ctx, id, s, a) = (
+                first.ctx.clone(),
+                id.clone(),
+                s1.clone(),
+                gw.addr().to_string(),
+            );
+            tokio::spawn(async move {
+                mrl_agent::session::connect_once(
+                    ctx,
+                    l1,
+                    id,
+                    &mrl_agent::transports::Direct::new(&a),
+                    s,
+                )
+                .await
+            })
+        };
+        let e1 = gw.wait_status(&node_s, "ONLINE").await["session_epoch"]
+            .as_i64()
+            .unwrap();
+        let new = {
+            let (ctx, s, a) = (
+                second.ctx.clone(),
+                s2.clone(),
+                b.addr().unwrap().to_string(),
+            );
+            tokio::spawn(async move {
+                mrl_agent::session::connect_once(
+                    ctx,
+                    l2,
+                    id,
+                    &mrl_agent::transports::Direct::new(&a),
+                    s,
+                )
+                .await
+            })
+        };
+        gw.wait(
+            &node_s,
+            |n| n["session_epoch"].as_i64() > Some(e1),
+            "a takeover",
+        )
+        .await;
+        // The old stream, on replica A, learns it is stale from the database and closes.
+        let ended = tokio::time::timeout(Duration::from_secs(10), old)
+            .await
+            .expect("the old stream closes");
+        assert!(ended.unwrap().is_err());
+        let c = CommandSender::new(&gw.gw, &[CommandKind::Probe])
+            .send(NodeId::from_str(&node_s).unwrap(), probe())
+            .await
+            .unwrap();
+        wait_state(&gw, c.id, "FAILED").await; // no Probe handler; delivered through replica B
+        assert_eq!(
+            Link::of(&first.ctx).unwrap().journal_seq(),
+            0,
+            "the old stream never sent it"
+        );
+        assert!(Link::of(&second.ctx).unwrap().journal_seq() >= c.seq);
+        s2.cancel();
+        let _ = new.await;
+    }
+
+    /// Records the seq of every LOGS item.
+    struct Logs(std::sync::Mutex<Vec<u64>>);
+
+    #[async_trait::async_trait]
+    impl mrl_server::modules::nodes::lanes::LaneSink for Logs {
+        fn name(&self) -> &'static str {
+            "logs"
+        }
+        fn lanes(&self) -> &'static [mrl_server::modules::nodes::lanes::LaneKind] {
+            &[mrl_server::modules::nodes::lanes::LaneKind::Logs]
+        }
+        async fn deliver(
+            &self,
+            item: mrl_server::modules::nodes::lanes::LaneItem,
+        ) -> Result<(), mrl_server::modules::nodes::lanes::SinkError> {
+            self.0.lock().unwrap().push(item.seq);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn a_log_queued_offline_arrives_after_an_idle_reconnect() {
+        let router = LaneRouter::new();
+        let logs = Arc::new(Logs(std::sync::Mutex::new(Vec::new())));
+        router.register(logs.clone());
+        let gw = GatewayHarness::start_with(
+            TestDb::new().await,
+            fast_config(),
+            Arc::new(InMemorySecretStore::default()),
+            router,
+        )
+        .await;
+        let a = TestAgent::new(1, |_| {});
+        let _node = a.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
+        Link::of(&a.ctx)
+            .unwrap()
+            .send_logs(mrl_proto::agent::v1::WorkerRelay {
+                message: Some(mrl_proto::worker::v1::WorkerMessage {
+                    body: Some(mrl_proto::worker::v1::worker_message::Body::Log(
+                        Default::default(),
+                    )),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            });
+        let link = a.run(); // nothing else is queued: no further wake-up comes
+        for _ in 0..100 {
+            if !logs.0.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(logs.0.lock().unwrap().len(), 1);
+        link.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn an_older_reading_never_replaces_a_newer_one_and_hot_gpus_degrade_the_node() {
+        use mrl_server::modules::nodes::store;
+        let gw = GatewayHarness::start(TestDb::new().await).await;
+        let a = TestAgent::new(1, |_| {});
+        let node = a.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
+        let link = a.run();
+        gw.wait(
+            &node,
+            |n| n["status"] == "ONLINE" && n["gpus"][0]["observed_at"].is_string(),
+            "telemetry",
+        )
+        .await;
+
+        // Hot GPU while heartbeats stay fresh: DEGRADED, then ONLINE once it cools.
+        a.hw.update_sample(0, |s| s.temperature_c = Some(95));
+        let n = gw.wait_status(&node, "DEGRADED").await;
+        assert_eq!(n["status_reason"], "health:gpu_hot");
+        a.hw.update_sample(0, |s| s.temperature_c = Some(40));
+        gw.wait_status(&node, "ONLINE").await;
+        link.stop().await;
+
+        // Out of order: the newer reading is written first, the older one after it.
+        let ts = |secs: i64, nanos: i32| {
+            Some(prost_types::Timestamp {
+                seconds: secs,
+                nanos,
+            })
+        };
+        let now = time::OffsetDateTime::now_utc().unix_timestamp() + 60;
+        let reading = |t, temp, ram| mrl_proto::agent::v1::NodeTelemetry {
+            time: t,
+            ram_used_bytes: ram,
+            gpus: vec![mrl_proto::agent::v1::GpuSample {
+                index: 0,
+                temperature_c: temp,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let id = uuid_of(&node);
+        store::telemetry(gw.db.db(), id, &reading(ts(now, 500_000_000), 51, 2), 90)
+            .await
+            .unwrap();
+        store::telemetry(gw.db.db(), id, &reading(ts(now, 100_000_000), 77, 1), 90)
+            .await
+            .unwrap();
+        let n = gw.node(&node).await;
+        assert_eq!(n["gpus"][0]["temperature_c"], 51);
+        assert_eq!(n["telemetry"]["ram_used_bytes"], 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn hosts_with_separate_folders_share_the_ca_through_the_sealed_store() {
+        let db = TestDb::new().await;
+        let kek = "ab".repeat(32);
+        let start = |dir: std::path::PathBuf, kek: String| {
+            let db = db.db().clone();
+            async move {
+                let cfg = mrl_server::config::Config {
+                    gateway: GatewayConfig {
+                        secrets_dir: Some(dir),
+                        ..fast_config()
+                    },
+                    ..mrl_server::config::Config::default()
+                };
+                let m = NodesModule::from_config_with_kek(db, &cfg, Some(&kek));
+                let gw = m.gateway();
+                let seams = crate::seams::build(crate::seams::solo(TEST_SECRET), Mode::Solo);
+                TestServer::start(cfg, seams, vec![Box::new(m)])
+                    .await
+                    .map(|s| (s, gw))
+            }
+        };
+        let (h1, h2) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (s1, g1) = start(h1.path().to_path_buf(), kek.clone()).await.unwrap();
+        let (s2, g2) = start(h2.path().to_path_buf(), kek.clone()).await.unwrap();
+        assert_eq!(
+            g1.ca_fingerprint(),
+            g2.ca_fingerprint(),
+            "one CA for both hosts"
+        );
+        assert_eq!(
+            std::fs::read_dir(h1.path()).map(|d| d.count()).unwrap_or(0),
+            0,
+            "nothing in the local folder"
+        );
+        let e = match start(
+            tempfile::tempdir().unwrap().path().to_path_buf(),
+            "cd".repeat(32),
+        )
+        .await
+        {
+            Ok(_) => panic!("another KEK must not start"),
+            Err(e) => e,
+        };
+        assert!(
+            e.detail.contains("key-encryption key differs"),
+            "{}",
+            e.detail
+        );
+        s1.shutdown().await.unwrap();
+        s2.shutdown().await.unwrap();
     }
 }

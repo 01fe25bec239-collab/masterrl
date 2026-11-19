@@ -260,9 +260,10 @@ async fn dial_node(
     let control = lane(gw, &mut client, Lane::Control, peer.clone(), stop.clone()).await?;
     let telemetry = lane(gw, &mut client, Lane::Telemetry, peer.clone(), stop.clone()).await?;
     let bulk = lane(gw, &mut client, Lane::Bulk, peer, stop.clone()).await?;
-    let _ = control.await;
+    // All three streams are required: the first to end ends the connection, and the dialer
+    // reconnects them together.
+    let _ = futures_util::future::select_all([control, telemetry, bulk]).await;
     stop.cancel();
-    let _ = tokio::join!(telemetry, bulk);
     Ok(())
 }
 

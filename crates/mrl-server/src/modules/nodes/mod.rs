@@ -13,6 +13,7 @@ pub mod ca;
 pub mod commands;
 pub mod health;
 pub mod lanes;
+pub mod secrets;
 pub mod store;
 
 use crate::app::{ServerModule, Task};
@@ -40,6 +41,12 @@ pub struct GatewayConfig {
     pub listen: Option<SocketAddr>,
     /// Secret-store name of the internal CA (key and certificate).
     pub ca_secret: String,
+    /// Where the CA secret lives: `database` (sealed rows every replica shares; needs the
+    /// key-encryption key in `kek_env`), `file` (this host's secret folder), or `auto`
+    /// (`database` when `kek_env` is set, else `file`). Several team hosts need `database`.
+    pub ca_store: CaStore,
+    /// Environment variable holding the 64-hex-character key-encryption key.
+    pub kek_env: String,
     /// Folder of the file secret store that holds the CA until the OS keychain store exists.
     /// Default: `<pgbundle data folder>/secrets`.
     pub secrets_dir: Option<PathBuf>,
@@ -70,6 +77,12 @@ pub struct GatewayConfig {
     pub command_deadline_seconds: u64,
     /// METRICS and LOGS items buffered per stream before overflow rules apply.
     pub lane_buffer: usize,
+    /// Agent clock offset (from heartbeats) that makes a node DEGRADED (`clock_skew`).
+    pub max_clock_skew_seconds: u64,
+    /// Free disk below which a node is DEGRADED (`disk_low`).
+    pub min_disk_free_bytes: u64,
+    /// GPU temperature at which the GPU, and its node, are DEGRADED (`gpu_hot`).
+    pub gpu_hot_celsius: u32,
 }
 
 impl Default for GatewayConfig {
@@ -77,6 +90,8 @@ impl Default for GatewayConfig {
         Self {
             listen: None,
             ca_secret: "gateway_ca".to_owned(),
+            ca_store: CaStore::Auto,
+            kek_env: "MRL_GATEWAY_KEK".to_owned(),
             secrets_dir: None,
             known_hosts: None,
             ssh_config: None,
@@ -91,6 +106,9 @@ impl Default for GatewayConfig {
             ephemeral_cert_hours: 24,
             command_deadline_seconds: 600,
             lane_buffer: 1024,
+            max_clock_skew_seconds: 30,
+            min_disk_free_bytes: 5 << 30,
+            gpu_hot_celsius: 90,
         }
     }
 }
@@ -151,6 +169,13 @@ impl GatewayConfig {
             86_400,
         );
         range("lane_buffer", self.lane_buffer as u64, 1, 1_000_000);
+        range(
+            "max_clock_skew_seconds",
+            self.max_clock_skew_seconds,
+            1,
+            3600,
+        );
+        range("gpu_hot_celsius", self.gpu_hot_celsius.into(), 50, 120);
         if self.offline_after_seconds < self.degraded_after_seconds {
             p.push(format!(
                 "gateway.offline_after_seconds: {} is less than gateway.degraded_after_seconds ({})",
@@ -182,6 +207,19 @@ impl GatewayConfig {
         }
         p
     }
+}
+
+/// `gateway.ca_store`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaStore {
+    /// `database` when the key-encryption key is set, else `file`.
+    #[default]
+    Auto,
+    /// Sealed rows in `gateway_secrets`, shared by every replica.
+    Database,
+    /// This host's file secret store (`secrets_dir`).
+    File,
 }
 
 /// Default gateway port in team mode (next to the shared gRPC port 9443).
@@ -478,21 +516,55 @@ impl NodesModule {
     /// The module for this build: the CA lives in a file secret store under
     /// `gateway.secrets_dir` (until P16's keychain store), lanes go to [`lanes::LaneRouter::global`].
     pub fn from_config(db: Db, config: &Config) -> Self {
-        let dir = match &config.gateway.secrets_dir {
-            Some(d) => Ok(d.clone()),
-            None => crate::pgbundle::data_dir(&config.pgbundle).map(|d| d.join("secrets")),
+        let kek = std::env::var(&config.gateway.kek_env)
+            .ok()
+            .filter(|v| !v.is_empty());
+        Self::from_config_with_kek(db, config, kek.as_deref())
+    }
+
+    /// Like [`NodesModule::from_config`] with the key-encryption key given (tests, embedders).
+    pub fn from_config_with_kek(db: Db, config: &Config, kek: Option<&str>) -> Self {
+        let g = &config.gateway;
+        let use_db = match g.ca_store {
+            CaStore::Database => true,
+            CaStore::File => false,
+            CaStore::Auto => kek.is_some(),
         };
-        // ponytail: file store, like the bundled database's password; P16 swaps in the keychain.
-        let (secrets, problem): (Arc<dyn SecretStore>, _) = match dir {
-            Ok(d) => (Arc::new(crate::pgbundle::FileSecretStore::new(d)), None),
-            Err(e) => (
-                Arc::new(crate::pgbundle::FileSecretStore::new(
-                    std::env::temp_dir().join("mrl-unused"),
-                )),
-                Some(format!(
-                    "no folder for the CA secret: {e}; set gateway.secrets_dir"
-                )),
-            ),
+        let fallback = || -> Arc<dyn SecretStore> {
+            Arc::new(crate::pgbundle::FileSecretStore::new(
+                std::env::temp_dir().join("mrl-unused"),
+            ))
+        };
+        let (secrets, problem): (Arc<dyn SecretStore>, Option<String>) = if use_db {
+            match kek.map(secrets::parse_kek) {
+                Some(Ok(k)) => match secrets::PgSecretStore::new(db.clone(), &k) {
+                    Ok(s) => (Arc::new(s), None),
+                    Err(e) => (fallback(), Some(e.to_string())),
+                },
+                Some(Err(e)) => (fallback(), Some(format!("{}: {e}", g.kek_env))),
+                None => (
+                    fallback(),
+                    Some(format!(
+                        "gateway.ca_store is database, but {} is not set",
+                        g.kek_env
+                    )),
+                ),
+            }
+        } else {
+            let dir = match &g.secrets_dir {
+                Some(d) => Ok(d.clone()),
+                None => crate::pgbundle::data_dir(&config.pgbundle).map(|d| d.join("secrets")),
+            };
+            // ponytail: one host's file store; several team hosts set the KEK (database store).
+            match dir {
+                Ok(d) => (Arc::new(crate::pgbundle::FileSecretStore::new(d)), None),
+                Err(e) => (
+                    fallback(),
+                    Some(format!(
+                        "no folder for the CA secret: {e}; set gateway.secrets_dir"
+                    )),
+                ),
+            }
         };
         let mut m = Self::new(db, config, secrets, lanes::LaneRouter::global());
         if let Some(gw) = Arc::get_mut(&mut m.gw) {
