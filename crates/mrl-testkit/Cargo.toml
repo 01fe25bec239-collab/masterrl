@@ -38,6 +38,7 @@ tempfile = "=3.27.0"
 
 # <mrl:deps P20> P20 dependencies go right below this line.
 mrl-proto = { path = "../mrl-proto" }
+prost = { workspace = true }
 tokio-stream = { version = "=0.1.19", features = ["net"] }
 
 [dev-dependencies]

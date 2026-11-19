@@ -479,7 +479,7 @@ async fn janitor_leaves_no_processes_or_scratch() {
     assert_eq!(d.exit_kind, ExitKind::Cancelled as i32, "{d:?}");
     let job = ctx.state.job_dir("att_jan");
     assert!(
-        mrl_agent::janitor::leftovers(&job).is_empty(),
+        mrl_agent::janitor::leftovers(&job, "att_jan").is_empty(),
         "no process left in the attempt folder"
     );
     assert!(!primary_identity(&ctx, "att_jan").alive());
@@ -604,4 +604,192 @@ async fn tampered_lock_hash_is_dependency_env() {
     // A second launch of the same attempt id is refused.
     let again = AttemptSpec::from_json(&v.to_string()).unwrap();
     assert_eq!(attempts.launch(again).unwrap_err().code(), "MRL-STATE-204");
+}
+
+/// An orphan that changed folder and session after the agent crashed is still found (by the
+/// attempt marker in its environment) and stopped. Linux: other processes' environments are
+/// readable there.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+async fn janitor_stops_an_orphan_that_left_folder_and_session() {
+    use mrl_agent::attempts::runner::ATTEMPT_ENV;
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), None);
+    let envs = mrl_agent::envs::Envs::open(ctx.state.root(), Arc::clone(&ctx.cache)).unwrap();
+    let job = ctx.state.job_dir("att_orph");
+    let pid_file = dir.path().join("orphan.pid");
+    let script = format!(
+        "setsid sh -c 'cd /tmp && echo $$ > {} && exec sleep 300' & exec sleep 300",
+        pid_file.display()
+    );
+    let mut exec_spec =
+        mrl_agent::exec::ExecSpec::new("att_orph-trainer", "/bin/sh", &["-c", &script], &job);
+    exec_spec.env.insert(ATTEMPT_ENV.into(), "att_orph".into());
+    let exec = ctx.executor.spawn(exec_spec).await.unwrap();
+    let main = ProcIdentity::of_pid(exec.pid().unwrap()).unwrap();
+    let orphan = loop {
+        if let Some(p) = std::fs::read_to_string(&pid_file)
+            .ok()
+            .and_then(|t| t.trim().parse::<u32>().ok())
+        {
+            break p;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    // The agent crashes: nothing kills the job; then its main process dies on its own.
+    std::mem::forget(exec);
+    nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid_of(&main)),
+        nix::sys::signal::Signal::SIGKILL,
+    )
+    .unwrap();
+    let orphan_id = ProcIdentity::of_pid(orphan).unwrap();
+    assert!(orphan_id.alive());
+
+    let mut rec = AttemptRecord {
+        spec: spec("att_orph", serde_json::json!({}), serde_json::json!({})),
+        nonce: "n".into(),
+        socket: dir.path().join("x.sock"),
+        phase: AttemptPhase::Running as i32,
+        workers: vec![mrl_agent::attempts::record::WorkerProc {
+            role_id: "trainer".into(),
+            primary: true,
+            identity: main,
+            cgroup: None,
+        }],
+        prepared: Vec::new(),
+        started: Vec::new(),
+        last_step: 0,
+        checkpoints: Default::default(),
+        cancel_requested: false,
+        exit: None,
+        staged_paths: Default::default(),
+        lease_deadline_unix_ms: None,
+        exit_report: None,
+        requests: Vec::new(),
+        uploads: Default::default(),
+    };
+    rec.spec.attempt.attempt_id = "att_orph".into();
+    let report = mrl_agent::janitor::release(&ctx, &envs, &rec, &Default::default()).await;
+    assert!(report.killed >= 1, "{report:?}");
+    for _ in 0..50 {
+        if !orphan_id.alive() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(!orphan_id.alive(), "the orphan was stopped");
+}
+
+/// A real agent crash: `mrl-agent attempt run` is SIGKILLed mid-run, its worker keeps running,
+/// and running the command again re-adopts it to a COMPLETED end with every checkpoint.
+async fn crash_and_readopt(test: &str, sandbox: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let config = dir.path().join("agent.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "state_dir = {:?}\n[sandbox]\nbackend = {sandbox:?}\n",
+            state.display().to_string()
+        ),
+    )
+    .unwrap();
+    let out = dir.path().join("out");
+    let mut s = spec(
+        "att_crash",
+        serde_json::json!({"steps": 12, "checkpoint_every": 2, "step_seconds": 0.5}),
+        serde_json::json!({"upload_dir": out}),
+    );
+    s.attempt.attempt_id = "att_crash".into();
+    let spec_file = dir.path().join("spec.json");
+    std::fs::write(&spec_file, serde_json::to_vec(&s).unwrap()).unwrap();
+    let agent = |log: &str| {
+        let log = std::fs::File::create(dir.path().join(log)).unwrap();
+        std::process::Command::new(env!("CARGO_BIN_EXE_mrl-agent"))
+            .args([
+                "--config",
+                &config.display().to_string(),
+                "attempt",
+                "run",
+                "--spec",
+            ])
+            .arg(&spec_file)
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap()
+    };
+    let job = state.join("jobs").join("att_crash");
+    let mut first = agent("first.log");
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        let staged = AttemptRecord::load(&job)
+            .ok()
+            .flatten()
+            .is_some_and(|r| !r.checkpoints.is_empty());
+        if staged {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{test}: no checkpoint before the crash"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    first.kill().unwrap();
+    first.wait().unwrap();
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let worker = AttemptRecord::load(&job).unwrap().unwrap().workers[0]
+        .identity
+        .clone();
+    assert!(worker.alive(), "{test}: the worker outlived the agent");
+
+    let mut second = agent("second.log");
+    let status = tokio::task::spawn_blocking(move || second.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let log = std::fs::read_to_string(dir.path().join("second.log")).unwrap();
+    assert!(status.success(), "{test}: {log}");
+    assert!(log.contains("re-adopted attempt att_crash"), "{log}");
+    assert!(log.contains("Attempt ended: EXIT_KIND_COMPLETED"), "{log}");
+    let ckpts = std::fs::read_dir(out.join("checkpoints")).unwrap().count();
+    assert_eq!(ckpts, 6, "{test}: every checkpoint was committed");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs uv; runs in ci-attempts"]
+async fn real_agent_crash_is_readopted() {
+    if ready("real_agent_crash_is_readopted") {
+        crash_and_readopt("no sandbox", "none").await;
+    }
+}
+
+/// The same crash with the bubblewrap `worker` profile (Linux, needs bwrap and user namespaces;
+/// required in CI with `MRL_TEST_SANDBOX_REQUIRED=1`).
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs uv and bubblewrap; runs in ci-attempts"]
+async fn real_agent_crash_is_readopted_under_bubblewrap() {
+    if !ready("real_agent_crash_is_readopted_under_bubblewrap") {
+        return;
+    }
+    let cfg = mrl_agent::config::SandboxConfig {
+        backend: SandboxChoice::Bubblewrap,
+        bwrap_path: None,
+    };
+    if let Err(e) = mrl_agent::sandbox::select(&cfg) {
+        assert!(
+            std::env::var("MRL_TEST_SANDBOX_REQUIRED").is_err(),
+            "bubblewrap is required but can't run: {}",
+            e.explain()
+        );
+        eprintln!(
+            "SKIPPED real_agent_crash_is_readopted_under_bubblewrap: {}",
+            e.explain()
+        );
+        return;
+    }
+    crash_and_readopt("bubblewrap", "bubblewrap").await;
 }

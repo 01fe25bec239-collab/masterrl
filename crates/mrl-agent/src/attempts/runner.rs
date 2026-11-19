@@ -15,12 +15,15 @@ use mrl_proto::worker::v1::{
     Allocation, CancelRequest, CheckpointCommitAck, CheckpointRequest, CommitState, ExitReport,
     LeaseDeadline, PauseRequest, Prepare, Start, UploadGrant, WorkerMessage,
 };
+use prost::Message;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 use super::exit::{decide, ExitDecision, ExitEvidence};
 use super::files::{self, Destination};
-use super::record::{AttemptRecord, ProcIdentity, StagedCheckpoint, StagedFile, WorkerProc};
+use super::record::{
+    AttemptRecord, ProcIdentity, StagedCheckpoint, StagedFile, UploadPlan, UploadTarget, WorkerProc,
+};
 use super::spec::{safe_relative, RoleSpec, Secret};
 use super::{AttemptError, AttemptEvent, AttemptEventSender};
 use crate::envs::{Envs, Materialized, ProgressFn, WorkerCommand};
@@ -72,8 +75,8 @@ pub enum Control {
         command_id: String,
         /// Checkpoint id, or empty.
         checkpoint_id: String,
-        /// `local_path -> (destination, size, sha256)`.
-        items: Vec<(String, Destination, u64, String)>,
+        /// One authorized target per file.
+        targets: Vec<UploadTarget>,
     },
     /// Lease renewed: `duration_s` from now, stop `kill_budget_s` before it ends.
     Lease {
@@ -149,13 +152,11 @@ pub struct Runner {
     protocol_error: Option<String>,
     stalled: bool,
     self_fenced: bool,
+    agent_stopped: bool,
     lease: Option<Instant>,
     stop_at: Option<Instant>,
     last_seen: Instant,
-    destinations: HashMap<String, HashMap<String, Destination>>,
-    commit_command: HashMap<String, String>,
     in_flight: HashSet<String>,
-    staged_paths: BTreeMap<String, String>,
 }
 
 /// Folders of an attempt.
@@ -171,7 +172,24 @@ pub fn staging_dir(job_dir: &Path) -> PathBuf {
 pub const WORKER_SOCKET_LINK: &str = "w.sock";
 
 /// Longest socket path used (Unix sockets allow 104 bytes on macOS, 108 on Linux).
+#[cfg(unix)]
 const MAX_SOCKET_PATH: usize = 100;
+
+/// Environment variable every worker (and everything it starts) carries, so the janitor can
+/// find the attempt's processes even after they changed folder and session.
+pub const ATTEMPT_ENV: &str = "MRL_ATTEMPT_ID";
+
+/// Keeps an isolating sandbox's launcher (bubblewrap, which uses `--die-with-parent`) alive
+/// when the agent dies, so the worker can be re-adopted. Forwards SIGTERM and exits with the
+/// launcher's status.
+#[cfg(unix)]
+const KEEPER: &str = r#""$@" & c=$!
+trap 'kill -TERM "$c" 2>/dev/null' TERM
+while :; do wait "$c"; s=$?; kill -0 "$c" 2>/dev/null || exit "$s"; done"#;
+
+fn now_ms() -> i64 {
+    (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
+}
 
 /// Socket path: `<state>/sock/<hash>.sock`, or `/tmp/mrl-<uid>/<hash>.sock` when the state
 /// folder is too deep for a Unix socket path.
@@ -233,13 +251,11 @@ impl Runner {
             protocol_error: None,
             stalled: false,
             self_fenced: false,
+            agent_stopped: false,
             lease: None,
             stop_at: None,
             last_seen: Instant::now(),
-            destinations: HashMap::new(),
-            commit_command: HashMap::new(),
             in_flight: HashSet::new(),
-            staged_paths: BTreeMap::new(),
         }
     }
 
@@ -279,10 +295,29 @@ impl Runner {
                 },
             );
         }
-        if self.rec.spec.lease_s > 0 {
-            self.lease = Some(Instant::now() + Duration::from_secs(self.rec.spec.lease_s.into()));
+        self.report = self
+            .rec
+            .exit_report
+            .as_deref()
+            .and_then(|b| ExitReport::decode(b).ok());
+        // The saved deadline, never a fresh one: an expired lease fences at once.
+        if let Some(at) = self.rec.lease_deadline_unix_ms {
+            self.arm_lease(at);
         }
         self.main_loop(control).await
+    }
+
+    /// Arms the lease timer for a wall-clock deadline (Unix ms).
+    fn arm_lease(&mut self, deadline_ms: i64) {
+        let left = u64::try_from(deadline_ms - now_ms()).unwrap_or(0);
+        self.lease = Some(Instant::now() + Duration::from_millis(left));
+    }
+
+    /// Records and arms a new lease deadline.
+    fn set_lease(&mut self, deadline_ms: i64) {
+        self.rec.lease_deadline_unix_ms = Some(deadline_ms);
+        self.arm_lease(deadline_ms);
+        self.save();
     }
 
     fn lookup_gpus(&self) -> HashSet<String> {
@@ -327,22 +362,19 @@ impl Runner {
         }
     }
 
-    fn save(&mut self) {
-        if let Err(e) = self.rec.save(&self.job_dir) {
-            // The attempt keeps running; only re-adoption after a restart is at risk.
-            self.protocol_error.get_or_insert_with(|| {
-                format!(
-                    "the agent could not save the attempt state: {}",
-                    e.explain()
-                )
-            });
+    /// Saves the record. False when it could not be saved: callers that acknowledge a worker
+    /// message must then not acknowledge it, so the worker replays it.
+    fn save(&mut self) -> bool {
+        match self.rec.save(&self.job_dir) {
+            Ok(()) => true,
+            Err(_) => false,
         }
     }
 
     async fn launch(&mut self) -> Result<(), AttemptError> {
         self.set_phase(AttemptPhase::Staging).await;
         let id = self.id().to_owned();
-        self.staged_paths = files::stage_inputs(
+        self.rec.staged_paths = files::stage_inputs(
             &self.sh.ctx,
             &self.rec.spec,
             &inputs_dir(&self.job_dir),
@@ -389,7 +421,7 @@ impl Runner {
             self.start_worker(&role_id, role, primary, mat).await?;
         }
         if spec.lease_s > 0 {
-            self.lease = Some(Instant::now() + Duration::from_secs(spec.lease_s.into()));
+            self.set_lease(now_ms() + i64::from(spec.lease_s) * 1000);
         }
         Ok(())
     }
@@ -464,6 +496,7 @@ impl Runner {
             role.runtime_ref.clone(),
         );
         env.insert("MRL_ROLE_ID".to_owned(), role_id.to_owned());
+        env.insert(ATTEMPT_ENV.to_owned(), self.id().to_owned());
         for (k, v) in &self.secrets {
             env.insert(k.clone(), v.expose().to_owned());
         }
@@ -500,7 +533,14 @@ impl Runner {
                 }
                 let backend = crate::sandbox::select(&cfg.sandbox)?;
                 let profile = crate::sandbox::profile("worker")?;
-                (backend.wrap(&profile, spec, &allowed)?, None)
+                let wrapped = backend.wrap(&profile, spec, &allowed)?;
+                #[cfg(unix)]
+                let wrapped = if backend.isolates() {
+                    keep_alive(wrapped)
+                } else {
+                    wrapped
+                };
+                (wrapped, None)
             }
             WorkerCommand::Container { image } => {
                 let name = format!("mrl-{}", self.exec_name(role_id));
@@ -540,6 +580,7 @@ impl Runner {
                 role_id: role_id.to_owned(),
                 primary,
                 identity,
+                cgroup: None,
             });
         }
         let stop = spawn_exec(role_id.to_owned(), exec, container, self.exits_tx.clone());
@@ -610,6 +651,7 @@ impl Runner {
     }
 
     async fn stop_all(&mut self) {
+        self.agent_stopped = true;
         let grace = Duration::from_secs(self.sh.ctx.config.exec.kill_grace_secs);
         for w in self.workers.values() {
             let _ = w.stop.send(StopMsg::Stop(grace)).await;
@@ -648,13 +690,11 @@ impl Runner {
     }
 
     fn lease_deadline(&self) -> Option<AgentBody> {
-        let at = self.lease?;
-        let left = at.saturating_duration_since(Instant::now());
-        let wall = time::OffsetDateTime::now_utc() + left;
+        let ms = self.rec.lease_deadline_unix_ms?;
         Some(AgentBody::LeaseDeadline(LeaseDeadline {
             deadline: Some(prost_types::Timestamp {
-                seconds: wall.unix_timestamp(),
-                nanos: 0,
+                seconds: ms.div_euclid(1000),
+                nanos: i32::try_from(ms.rem_euclid(1000) * 1_000_000).unwrap_or(0),
             }),
             fencing_epoch: self.rec.spec.attempt.fencing_epoch,
         }))
@@ -665,6 +705,7 @@ impl Runner {
         AgentBody::Prepare(Prepare {
             job_spec_json: spec.job_spec.to_string(),
             staged_paths: self
+                .rec
                 .staged_paths
                 .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
@@ -726,22 +767,23 @@ impl Runner {
                     self.stop_all().await;
                     return;
                 }
-                if !self.rec.prepared.contains(&role_id) {
-                    if self.send(&role_id, self.prepare_msg(&role)).await {
-                        self.rec.prepared.push(role_id.clone());
-                        self.save();
-                    }
-                } else {
-                    self.resend_pending(&role_id).await;
+                self.note_cgroup(&role_id);
+                // Everything the worker may be waiting for is sent again; it ignores repeats.
+                self.send(&role_id, self.prepare_msg(&role)).await;
+                if self.rec.started.contains(&role_id) {
+                    self.send(&role_id, AgentBody::Start(Start {})).await;
                 }
+                self.resend_pending(&role_id).await;
                 if let Some(l) = self.lease_deadline() {
                     self.send(&role_id, l).await;
                 }
             }
             Inbound::Message { role_id, msg, done } => {
-                self.on_message(&role_id, &msg).await;
-                self.relay(&role_id, msg).await;
-                let _ = done.send(());
+                // Not saved: `done` is dropped, so the message is not acked and comes again.
+                if self.on_message(&role_id, &msg).await {
+                    self.relay(&role_id, msg).await;
+                    let _ = done.send(());
+                }
             }
             Inbound::Live { role_id, msg } => {
                 if let Some(WorkerBody::Heartbeat(hb)) = &msg.body {
@@ -764,40 +806,93 @@ impl Runner {
     }
 
     async fn resend_pending(&mut self, role_id: &str) {
+        for raw in self.rec.requests.clone() {
+            if let Some(body) = mrl_proto::worker::v1::AgentMessage::decode(raw.as_slice())
+                .ok()
+                .and_then(|m| m.body)
+            {
+                self.send(role_id, body).await;
+            }
+        }
         let is_primary = self.workers.get(role_id).is_some_and(|w| w.primary);
         if !is_primary {
             return;
         }
-        let pending: Vec<(String, StagedCheckpoint)> = self
-            .rec
-            .checkpoints
-            .iter()
-            .filter(|(_, c)| c.state.is_none())
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
-        for (id, ck) in pending {
-            self.send(role_id, grant(&id, &ck)).await;
-            self.try_commit(&id);
+        for (id, ck) in self.rec.checkpoints.clone() {
+            match ck.state {
+                None => {
+                    self.send(role_id, grant(&id, &ck)).await;
+                    self.try_commit(&id).await;
+                }
+                Some(state) if ck.commit_requested => {
+                    let state = CommitState::try_from(state).unwrap_or(CommitState::Rejected);
+                    self.send(role_id, commit_ack(&id, state, "")).await;
+                }
+                Some(_) => {}
+            }
         }
     }
 
-    async fn on_message(&mut self, role_id: &str, msg: &WorkerMessage) {
+    /// Linux: remembers the worker's own cgroup once it is in it (at its first Hello).
+    fn note_cgroup(&mut self, role_id: &str) {
+        let Some(w) = self
+            .rec
+            .workers
+            .iter_mut()
+            .find(|w| w.role_id == role_id && w.cgroup.is_none())
+        else {
+            return;
+        };
+        if let ProcIdentity::Pid { pid, .. } = w.identity {
+            w.cgroup = crate::janitor::job_cgroup_of(pid);
+            if w.cgroup.is_some() {
+                self.save();
+            }
+        }
+    }
+
+    /// Keeps a control request so a reconnecting worker gets it again.
+    fn remember(&mut self, body: &AgentBody) {
+        let msg = mrl_proto::worker::v1::AgentMessage {
+            ack_seq: 0,
+            body: Some(body.clone()),
+        };
+        self.rec.requests.push(msg.encode_to_vec());
+        self.save();
+    }
+
+    /// Handles one sequenced worker message. False when what it changed could not be saved.
+    async fn on_message(&mut self, role_id: &str, msg: &WorkerMessage) -> bool {
         let primary = self.workers.get(role_id).is_some_and(|w| w.primary);
         match &msg.body {
             Some(WorkerBody::Prepared(p)) => {
                 if !p.ok || self.rec.spec.dry_run {
-                    return;
+                    return true;
                 }
-                if self.rec.spec.barrier && !self.rec.started.contains(&role_id.to_owned()) {
-                    if self.workers.len() == self.rec.prepared.len() {
+                if !self.rec.prepared.iter().any(|r| r == role_id) {
+                    self.rec.prepared.push(role_id.to_owned());
+                }
+                if self.rec.spec.barrier && !self.rec.started.iter().any(|r| r == role_id) {
+                    // The barrier opens only when every worker reported a good Prepared.
+                    if self.rec.prepared.len() == self.rec.spec.workers().len() {
                         self.set_phase(AttemptPhase::Prepared).await;
                     }
-                } else if self.send(role_id, AgentBody::Start(Start {})).await {
-                    self.rec.started.push(role_id.to_owned());
-                    self.set_phase(AttemptPhase::Running).await;
+                    return self.save();
                 }
+                if !self.rec.started.iter().any(|r| r == role_id) {
+                    self.rec.started.push(role_id.to_owned());
+                }
+                if !self.save() {
+                    return false;
+                }
+                self.send(role_id, AgentBody::Start(Start {})).await;
+                self.set_phase(AttemptPhase::Running).await;
+                true
             }
-            Some(WorkerBody::Progress(p)) => self.rec.last_step = self.rec.last_step.max(p.step),
+            Some(WorkerBody::Progress(p)) => {
+                self.rec.last_step = self.rec.last_step.max(p.step);
+                true
+            }
             Some(WorkerBody::CheckpointStaged(s)) if primary => {
                 if let Some(bad) = s.files.iter().find(|f| safe_relative(&f.path).is_err()) {
                     self.protocol_error = Some(format!(
@@ -805,7 +900,7 @@ impl Runner {
                         bad.path
                     ));
                     self.stop_all().await;
-                    return;
+                    return true;
                 }
                 let ck = StagedCheckpoint {
                     step: s.step,
@@ -824,9 +919,14 @@ impl Runner {
                     commit_requested: false,
                     state: None,
                 };
+                self.rec
+                    .checkpoints
+                    .insert(s.checkpoint_id.clone(), ck.clone());
+                if !self.save() {
+                    return false;
+                }
                 self.send(role_id, grant(&s.checkpoint_id, &ck)).await;
-                self.rec.checkpoints.insert(s.checkpoint_id.clone(), ck);
-                self.save();
+                true
             }
             Some(WorkerBody::CheckpointCommit(c)) if primary => {
                 let Some(ck) = self.rec.checkpoints.get_mut(&c.checkpoint_id) else {
@@ -836,53 +936,85 @@ impl Runner {
                         "unknown checkpoint",
                     );
                     self.send(role_id, ack).await;
-                    return;
+                    return true;
                 };
                 ck.commit_requested = true;
-                if ck.manifest_sha256 != c.manifest_sha256 {
+                let corrupt = ck.manifest_sha256 != c.manifest_sha256;
+                if corrupt {
                     ck.state = Some(CommitState::Corrupt as i32);
+                }
+                if !self.save() {
+                    return false;
+                }
+                if corrupt {
                     let ack = commit_ack(
                         &c.checkpoint_id,
                         CommitState::Corrupt,
                         "the manifest changed after staging",
                     );
-                    self.save();
                     self.send(role_id, ack).await;
-                    return;
+                } else {
+                    self.try_commit(&c.checkpoint_id).await;
                 }
-                self.save();
-                self.try_commit(&c.checkpoint_id);
+                true
             }
-            Some(WorkerBody::Exit(r)) if primary => self.report = Some(r.clone()),
-            _ => {}
+            Some(WorkerBody::Exit(r)) if primary => {
+                // Saved before the ack, so an agent restart still knows how the worker ended.
+                self.rec.exit_report = Some(r.encode_to_vec());
+                self.report = Some(r.clone());
+                self.save()
+            }
+            _ => true,
         }
     }
 
-    /// Starts uploading a checkpoint once the worker asked to commit it and every file has a
-    /// destination.
-    fn try_commit(&mut self, id: &str) {
-        let Some(ck) = self.rec.checkpoints.get(id) else {
+    /// Starts uploading a checkpoint once the worker asked to commit it and every file has an
+    /// authorized target whose size and sha256 match what the worker staged.
+    async fn try_commit(&mut self, id: &str) {
+        let Some(ck) = self.rec.checkpoints.get(id).cloned() else {
             return;
         };
         if !ck.commit_requested || ck.state.is_some() || self.in_flight.contains(id) {
             return;
         }
-        let dests: Option<Vec<(StagedFile, Destination)>> = match &self.rec.spec.upload_dir {
-            Some(dir) => Some(
-                ck.files
-                    .iter()
-                    .map(|f| (f.clone(), Destination::Dir(dir.clone())))
-                    .collect(),
-            ),
-            None => self.destinations.get(id).and_then(|m| {
-                ck.files
-                    .iter()
-                    .map(|f| m.get(&f.path).map(|d| (f.clone(), d.clone())))
-                    .collect()
-            }),
-        };
-        let Some(dests) = dests else {
-            return; // waiting for UploadArtifacts with tickets for every file
+        let dests: Vec<(StagedFile, Destination)> = match &self.rec.spec.upload_dir {
+            Some(dir) => ck
+                .files
+                .iter()
+                .map(|f| (f.clone(), Destination::Dir(dir.clone())))
+                .collect(),
+            None => {
+                let Some(plan) = self.rec.uploads.get(id).cloned() else {
+                    return; // waiting for UploadArtifacts
+                };
+                let mut out = Vec::new();
+                for f in &ck.files {
+                    let Some(t) = plan.targets.iter().find(|t| t.local_path == f.path) else {
+                        return; // waiting for a ticket for every file
+                    };
+                    let refused = if t.sha256 != f.sha256 || t.size != f.size {
+                        Some(format!(
+                            "the core expects different content for {} than the worker staged",
+                            f.path
+                        ))
+                    } else {
+                        t.ticket().err().map(|e| e.explain())
+                    };
+                    if let Some(reason) = refused {
+                        let done = UploadDone {
+                            checkpoint_id: Some(id.to_owned()),
+                            command_id: Some(plan.command_id.clone()),
+                            result: Err((CommitState::Rejected, reason)),
+                        };
+                        self.on_upload(done).await;
+                        return;
+                    }
+                    if let Ok(ticket) = t.ticket() {
+                        out.push((f.clone(), Destination::Ticket(ticket)));
+                    }
+                }
+                out
+            }
         };
         self.in_flight.insert(id.to_owned());
         let ctx = Arc::clone(&self.sh.ctx);
@@ -890,7 +1022,7 @@ impl Runner {
         let tx = self.uploads_tx.clone();
         let done = UploadDone {
             checkpoint_id: Some(id.to_owned()),
-            command_id: self.commit_command.get(id).cloned(),
+            command_id: self.rec.uploads.get(id).map(|p| p.command_id.clone()),
             result: Ok(()),
         };
         tokio::spawn(async move {
@@ -949,7 +1081,10 @@ impl Runner {
     async fn on_control(&mut self, c: Control) {
         match c {
             Control::Start(reply) => {
-                let r = if self.rec.spec.barrier && self.rec.phase == AttemptPhase::Prepared as i32
+                let all_prepared = self.rec.prepared.len() == self.rec.spec.workers().len();
+                let r = if self.rec.spec.barrier
+                    && self.rec.phase == AttemptPhase::Prepared as i32
+                    && all_prepared
                 {
                     let waiting: Vec<String> = self
                         .rec
@@ -959,9 +1094,9 @@ impl Runner {
                         .cloned()
                         .collect();
                     for role in waiting {
-                        if self.send(&role, AgentBody::Start(Start {})).await {
-                            self.rec.started.push(role);
-                        }
+                        self.rec.started.push(role.clone());
+                        self.save();
+                        self.send(&role, AgentBody::Start(Start {})).await;
                     }
                     self.set_phase(AttemptPhase::Running).await;
                     Ok(())
@@ -979,13 +1114,13 @@ impl Runner {
                 reason,
             } => {
                 self.rec.cancel_requested = true;
-                self.save();
-                self.send_all(AgentBody::Cancel(CancelRequest {
+                let body = AgentBody::Cancel(CancelRequest {
                     request_id,
                     grace_s,
                     reason,
-                }))
-                .await;
+                });
+                self.remember(&body);
+                self.send_all(body).await;
                 self.stop_at =
                     Some(Instant::now() + Duration::from_secs(grace_s.into()) + DEADLINE_MARGIN);
                 self.set_phase(AttemptPhase::Stopping).await;
@@ -995,16 +1130,14 @@ impl Runner {
                 deadline_s,
                 reason,
             } => {
+                let body = AgentBody::Pause(PauseRequest {
+                    request_id,
+                    deadline_s,
+                    reason,
+                });
+                self.remember(&body);
                 if let Some(role) = self.primary_role() {
-                    self.send(
-                        &role,
-                        AgentBody::Pause(PauseRequest {
-                            request_id,
-                            deadline_s,
-                            reason,
-                        }),
-                    )
-                    .await;
+                    self.send(&role, body).await;
                 }
                 self.stop_at =
                     Some(Instant::now() + Duration::from_secs(deadline_s.into()) + DEADLINE_MARGIN);
@@ -1014,22 +1147,20 @@ impl Runner {
                 deadline_s,
                 reason,
             } => {
+                let body = AgentBody::CheckpointRequest(CheckpointRequest {
+                    request_id,
+                    deadline_s,
+                    reason,
+                });
+                self.remember(&body);
                 if let Some(role) = self.primary_role() {
-                    self.send(
-                        &role,
-                        AgentBody::CheckpointRequest(CheckpointRequest {
-                            request_id,
-                            deadline_s,
-                            reason,
-                        }),
-                    )
-                    .await;
+                    self.send(&role, body).await;
                 }
             }
             Control::Upload {
                 command_id,
                 checkpoint_id,
-                items,
+                targets,
             } => {
                 if checkpoint_id.is_empty() {
                     let ctx = Arc::clone(&self.sh.ctx);
@@ -1037,10 +1168,22 @@ impl Runner {
                     let tx = self.uploads_tx.clone();
                     tokio::spawn(async move {
                         let mut result = Ok(());
-                        for (path, dest, size, sha) in items {
-                            if let Err(e) =
-                                files::send(&ctx, &staging, &path, size, &sha, &dest).await
-                            {
+                        for t in targets {
+                            let sent = match t.ticket() {
+                                Ok(ticket) => {
+                                    files::send(
+                                        &ctx,
+                                        &staging,
+                                        &t.local_path,
+                                        t.size,
+                                        &t.sha256,
+                                        &Destination::Ticket(ticket),
+                                    )
+                                    .await
+                                }
+                                Err(e) => Err(e),
+                            };
+                            if let Err(e) = sent {
                                 result = Err((CommitState::Rejected, e.explain()));
                                 break;
                             }
@@ -1054,22 +1197,30 @@ impl Runner {
                             .await;
                     });
                 } else {
-                    let m = self.destinations.entry(checkpoint_id.clone()).or_default();
-                    for (path, dest, _, _) in items {
-                        m.insert(path, dest);
+                    // Saved, so a restarted agent still has the tickets and the command to answer.
+                    let plan = self
+                        .rec
+                        .uploads
+                        .entry(checkpoint_id.clone())
+                        .or_insert_with(|| UploadPlan {
+                            command_id: command_id.clone(),
+                            targets: Vec::new(),
+                        });
+                    plan.command_id = command_id;
+                    for t in targets {
+                        plan.targets.retain(|x| x.local_path != t.local_path);
+                        plan.targets.push(t);
                     }
-                    self.commit_command
-                        .insert(checkpoint_id.clone(), command_id);
-                    self.try_commit(&checkpoint_id);
+                    self.save();
+                    self.try_commit(&checkpoint_id).await;
                 }
             }
             Control::Lease {
                 duration_s,
                 kill_budget_s,
             } => {
-                let budget = Duration::from_secs(kill_budget_s.into());
-                let at = Instant::now() + Duration::from_secs(duration_s.into());
-                self.lease = Some(at.checked_sub(budget).unwrap_or(at));
+                let margin = i64::from(duration_s.saturating_sub(kill_budget_s)) * 1000;
+                self.set_lease(now_ms() + margin);
                 if let Some(l) = self.lease_deadline() {
                     self.send_all(l).await;
                 }
@@ -1113,8 +1264,6 @@ impl Runner {
 
     async fn finish(&mut self) -> ExitDecision {
         let p = self.primary_exit.take();
-        let needs_final =
-            self.rec.spec.trains() && self.rec.spec.smoke_steps == 0 && !self.rec.spec.dry_run;
         let ev = ExitEvidence {
             report: self.report.clone(),
             exit_code: p.as_ref().and_then(|p| p.code),
@@ -1126,13 +1275,10 @@ impl Runner {
             env_mismatch: self.env_mismatch.clone(),
             cancel_requested: self.rec.cancel_requested,
             protocol_error: self.protocol_error.clone(),
-            final_committed: self
-                .rec
-                .checkpoints
-                .values()
-                .any(|c| c.is_final && c.state == Some(CommitState::Committed as i32)),
-            needs_final_checkpoint: needs_final,
+            final_committed: self.rec.final_committed(),
+            needs_final_checkpoint: self.rec.needs_final_checkpoint(),
             readopted: p.as_ref().is_some_and(|p| p.readopted),
+            agent_stopped: self.agent_stopped,
         };
         self.finish_with(decide(&ev)).await
     }
@@ -1150,6 +1296,23 @@ impl Runner {
         let line = serde_json::to_string(&report).unwrap_or_default();
         let _ = std::fs::write(self.job_dir.join("cleanup.json"), line);
         decision
+    }
+}
+
+/// Runs `spec` under [`KEEPER`] (see there).
+#[cfg(unix)]
+fn keep_alive(spec: ExecSpec) -> ExecSpec {
+    let mut args = vec![
+        "-c".to_owned(),
+        KEEPER.to_owned(),
+        "mrl-keeper".to_owned(),
+        spec.program.clone(),
+    ];
+    args.extend(spec.args.iter().cloned());
+    ExecSpec {
+        program: "/bin/sh".to_owned(),
+        args,
+        ..spec
     }
 }
 
@@ -1447,35 +1610,65 @@ mod tests {
             cpu_millis: Some(1500),
             pids: None,
         };
+        let job = Path::new("/s").join("jobs").join("att");
         let a = docker_run_args(
             "mrl-att-trainer",
             "x@sha256:aa",
-            Path::new("/s/jobs/att"),
-            Some(Path::new("/s/sock")),
+            &job,
+            Some(&Path::new("/s").join("sock")),
             &role,
             &limits,
             ["MRL_WORKER_NONCE", "MRL_CREDENTIAL_HF"].into_iter(),
             &["--engine".into(), "fake".into()],
         );
         let s = a.join(" ");
+        let inputs = job.join("inputs").display().to_string();
         assert!(s.contains("--network none"));
         assert!(s.contains("-e MRL_WORKER_NONCE -e MRL_CREDENTIAL_HF"));
-        assert!(s.contains("-v /s/jobs/att/inputs:/s/jobs/att/inputs:ro"));
+        assert!(s.contains(&format!("-v {inputs}:{inputs}:ro")));
         assert!(s.contains("--gpus \"device=0,1\""));
         assert!(s.contains("--cpus 1.500"));
         assert!(s.ends_with("x@sha256:aa mrl-worker --engine fake"));
+        assert!(!s.contains("secret"), "only names are passed");
     }
 
     #[test]
     fn sockets_are_short_and_nonces_random() {
         let p = socket_path(Path::new("/s"), "att_0123456789abcdef0123456789abcdef");
-        assert!(p.display().to_string().len() < 40);
-        let deep = Path::new("/very").join("deep".repeat(30));
-        let q = socket_path(&deep, "att_1");
-        assert!(q.as_os_str().len() <= MAX_SOCKET_PATH);
-        assert_ne!(q, socket_path(Path::new("/other"), "att_1"));
+        assert!(p.as_os_str().len() < 40);
+        assert_ne!(
+            p,
+            socket_path(Path::new("/other"), "att_0123456789abcdef0123456789abcdef")
+        );
         let (a, b) = (new_nonce().unwrap(), new_nonce().unwrap());
         assert_eq!(a.len(), 64);
         assert_ne!(a, b);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn deep_state_folders_use_a_short_socket_path() {
+        let deep = Path::new("/very").join("deep".repeat(30));
+        let q = socket_path(&deep, "att_1");
+        assert!(q.as_os_str().len() <= MAX_SOCKET_PATH);
+        assert!(q.starts_with("/tmp"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn keeper_wraps_the_sandbox_launcher() {
+        let spec = ExecSpec::new(
+            "j",
+            "/usr/bin/bwrap",
+            &["--die-with-parent", "--", "w"],
+            Path::new("/s"),
+        );
+        let k = keep_alive(spec);
+        assert_eq!(k.program, "/bin/sh");
+        assert_eq!(k.args[2], "mrl-keeper");
+        assert_eq!(
+            &k.args[3..],
+            ["/usr/bin/bwrap", "--die-with-parent", "--", "w"]
+        );
     }
 }

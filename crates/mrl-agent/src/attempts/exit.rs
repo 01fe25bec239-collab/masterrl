@@ -45,6 +45,9 @@ pub struct ExitEvidence {
     pub needs_final_checkpoint: bool,
     /// The worker process was re-adopted after an agent restart (no exit status).
     pub readopted: bool,
+    /// The agent itself stopped the workers (cancel, pause deadline, lease, stall, mismatch),
+    /// so a signal or non-zero status is its own doing, not the worker's.
+    pub agent_stopped: bool,
 }
 
 /// The agent's verdict.
@@ -143,6 +146,22 @@ pub fn decide(ev: &ExitEvidence) -> ExitDecision {
                 true,
             ))
         }
+        _ if abnormal_status(ev) => failed(agent_failure(
+            FailureClass::HarnessError,
+            "EXIT_STATUS_MISMATCH",
+            format!(
+                "The training worker reported {} but its process ended {}.",
+                kind.as_str_name()
+                    .trim_start_matches("EXIT_KIND_")
+                    .to_lowercase(),
+                match (ev.exit_code, ev.signal) {
+                    (_, Some(s)) => format!("after signal {s}"),
+                    (Some(c), _) => format!("with exit code {c}"),
+                    _ => "abnormally".to_owned(),
+                }
+            ),
+            true,
+        )),
         ExitKind::Unspecified => failed(agent_failure(
             FailureClass::HarnessError,
             "EXIT_KIND_MISSING",
@@ -156,6 +175,14 @@ pub fn decide(ev: &ExitEvidence) -> ExitDecision {
             failure: None,
         },
     }
+}
+
+/// The process ended badly although the worker reported success (and the agent did not stop
+/// it itself). A re-adopted worker has no status to compare.
+fn abnormal_status(ev: &ExitEvidence) -> bool {
+    !ev.readopted
+        && !ev.agent_stopped
+        && (ev.signal.is_some() || ev.exit_code.is_some_and(|c| c != 0))
 }
 
 /// Out-of-band evidence, strongest first.
@@ -400,6 +427,45 @@ mod tests {
             ..ExitEvidence::default()
         });
         assert_eq!(d.class(), Some(FailureClass::DependencyEnv));
+    }
+
+    #[test]
+    fn a_bad_exit_status_contradicts_a_completed_report() {
+        let completed = ExitEvidence {
+            report: report(ExitKind::Completed, None),
+            exit_code: Some(1),
+            ..ExitEvidence::default()
+        };
+        let d = decide(&completed);
+        assert_eq!(d.class(), Some(FailureClass::HarnessError));
+        assert_eq!(d.failure.unwrap().sub_code, "EXIT_STATUS_MISMATCH");
+        let d = decide(&ExitEvidence {
+            signal: Some(9),
+            exit_code: None,
+            ..completed.clone()
+        });
+        assert!(d.failure.unwrap().message.contains("signal 9"));
+        // The agent stopped it (cancel): the report stands.
+        let d = decide(&ExitEvidence {
+            report: report(ExitKind::Cancelled, None),
+            signal: Some(15),
+            agent_stopped: true,
+            ..ExitEvidence::default()
+        });
+        assert_eq!(d.exit_kind, ExitKind::Cancelled as i32);
+        // Stronger evidence still wins over the status check.
+        let d = decide(&ExitEvidence {
+            oom_killed: true,
+            ..completed.clone()
+        });
+        assert_eq!(d.class(), Some(FailureClass::Oom));
+        // Re-adopted: no status to compare, the report decides.
+        let d = decide(&ExitEvidence {
+            readopted: true,
+            exit_code: None,
+            ..completed
+        });
+        assert!(d.failure.is_none());
     }
 
     #[test]

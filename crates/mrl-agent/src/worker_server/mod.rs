@@ -91,14 +91,51 @@ struct Shared {
     inbound: mpsc::Sender<Inbound>,
     dedup: Mutex<Dedup>,
     seq_file: PathBuf,
-    outboxes: Mutex<HashMap<String, (u64, Outbox)>>,
+    /// The current session per role: id, outbox, and the token that fences it.
+    outboxes: Mutex<HashMap<String, (u64, Outbox, CancellationToken)>>,
+    /// One message at a time per role, across overlapping sessions.
+    role_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// One seq-file write at a time, in order.
+    save_lock: tokio::sync::Mutex<()>,
     sessions: AtomicU64,
     stop: CancellationToken,
 }
 
 impl Shared {
+    /// The highest seq saved for `role` (the durable watermark).
     fn durable(&self, role: &str) -> u64 {
         lock(&self.dedup).accepted(&self.attempt_id, role)
+    }
+
+    fn role_lock(&self, role: &str) -> Arc<tokio::sync::Mutex<()>> {
+        Arc::clone(lock(&self.role_locks).entry(role.to_owned()).or_default())
+    }
+
+    fn is_current(&self, role: &str, session: u64) -> bool {
+        lock(&self.outboxes)
+            .get(role)
+            .is_some_and(|(s, _, _)| *s == session)
+    }
+
+    /// Saves `seq` as accepted, then publishes it. False (nothing published) if the save failed.
+    async fn persist(&self, role: &str, seq: u64) -> bool {
+        let _one_writer = self.save_lock.lock().await;
+        let snapshot = {
+            let mut d = lock(&self.dedup).clone();
+            d.record(&self.attempt_id, role, seq);
+            serde_json::to_vec(&d)
+        };
+        let Ok(bytes) = snapshot else {
+            return false;
+        };
+        let file = self.seq_file.clone();
+        let saved =
+            tokio::task::spawn_blocking(move || crate::state::atomic_write(&file, &bytes)).await;
+        if !matches!(saved, Ok(Ok(()))) {
+            return false;
+        }
+        lock(&self.dedup).record(&self.attempt_id, role, seq);
+        true
     }
 }
 
@@ -188,7 +225,13 @@ impl WorkerControlService for Svc {
             return Ok(Response::new(ReceiverStream::new(rx)));
         }
         let session = shared.sessions.fetch_add(1, Ordering::Relaxed);
-        lock(&shared.outboxes).insert(role_id.clone(), (session, tx.clone()));
+        let fence = shared.stop.child_token();
+        // A reconnect replaces the role's session: the old reader stops before it reads more.
+        if let Some((_, _, old)) =
+            lock(&shared.outboxes).insert(role_id.clone(), (session, tx.clone(), fence.clone()))
+        {
+            old.cancel();
+        }
         if shared
             .inbound
             .send(Inbound::Hello {
@@ -200,7 +243,7 @@ impl WorkerControlService for Svc {
         {
             return Err(Status::unavailable("the attempt is shutting down"));
         }
-        tokio::spawn(read_loop(shared, role_id, session, stream, tx));
+        tokio::spawn(read_loop(shared, role_id, session, fence, stream, tx));
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
@@ -209,17 +252,25 @@ async fn read_loop(
     shared: Arc<Shared>,
     role_id: String,
     session: u64,
+    fence: CancellationToken,
     mut stream: Streaming<WorkerMessage>,
     tx: Outbox,
 ) {
+    let role_lock = shared.role_lock(&role_id);
     loop {
         let msg = tokio::select! {
-            () = shared.stop.cancelled() => break,
+            () = fence.cancelled() => break,
             m = stream.message() => match m {
                 Ok(Some(m)) => m,
                 _ => break,
             },
         };
+        // Check, hand over, save and ack one message at a time per role; a replaced session
+        // handles nothing more.
+        let _one_at_a_time = role_lock.lock().await;
+        if !shared.is_current(&role_id, session) {
+            break;
+        }
         let verdict = lock(&shared.dedup).check(&shared.attempt_id, &role_id, msg.seq);
         match verdict {
             Verdict::Unsequenced => {
@@ -265,21 +316,12 @@ async fn read_loop(
                     msg,
                     done,
                 };
+                // The runner drops `done` when it could not save what the message changed.
                 if shared.inbound.send(m).await.is_err() || handled.await.is_err() {
                     break;
                 }
-                let snapshot = {
-                    let mut d = lock(&shared.dedup);
-                    d.record(&shared.attempt_id, &role_id, seq);
-                    serde_json::to_vec(&*d).unwrap_or_default()
-                };
-                let file = shared.seq_file.clone();
-                let saved = tokio::task::spawn_blocking(move || {
-                    crate::state::atomic_write(&file, &snapshot)
-                })
-                .await;
-                if !matches!(saved, Ok(Ok(()))) {
-                    // Not saved: don't ack, so the worker keeps the message and replays it.
+                // Not saved: no ack, so the worker keeps the message and replays it.
+                if !shared.persist(&role_id, seq).await {
                     break;
                 }
                 let ack = AgentMessage {
@@ -294,7 +336,7 @@ async fn read_loop(
     }
     let current = {
         let mut boxes = lock(&shared.outboxes);
-        let is_current = boxes.get(&role_id).is_some_and(|(s, _)| *s == session);
+        let is_current = boxes.get(&role_id).is_some_and(|(s, _, _)| *s == session);
         if is_current {
             boxes.remove(&role_id);
         }
@@ -338,6 +380,8 @@ impl WorkerServer {
             dedup: Mutex::new(dedup),
             seq_file,
             outboxes: Mutex::default(),
+            role_locks: Mutex::default(),
+            save_lock: tokio::sync::Mutex::new(()),
             sessions: AtomicU64::new(0),
             stop: CancellationToken::new(),
         });
@@ -413,7 +457,7 @@ impl WorkerServer {
     pub async fn send(&self, role_id: &str, body: AgentBody) -> bool {
         let outbox = lock(&self.shared.outboxes)
             .get(role_id)
-            .map(|(_, tx)| tx.clone());
+            .map(|(_, tx, _)| tx.clone());
         let Some(tx) = outbox else {
             return false;
         };

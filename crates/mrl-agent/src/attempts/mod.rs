@@ -34,11 +34,11 @@ use mrl_proto::agent::v1::{
     StageItem, WorkerRelay,
 };
 use mrl_proto::common::v1::{AttemptRef, ClassifiedBy, Failure, FailureClass};
+use mrl_proto::worker::v1::ExitReport;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use self::exit::ExitDecision;
-use self::files::Destination;
-use self::record::AttemptRecord;
+use self::record::{AttemptRecord, UploadTarget};
 use self::runner::{Control, Runner, Shared};
 use self::spec::Secret;
 use crate::envs::{Envs, ProgressFn};
@@ -181,6 +181,11 @@ impl Attempts {
             checkpoints: BTreeMap::new(),
             cancel_requested: false,
             exit: None,
+            staged_paths: BTreeMap::new(),
+            lease_deadline_unix_ms: None,
+            exit_report: None,
+            requests: Vec::new(),
+            uploads: BTreeMap::new(),
         };
         std::fs::create_dir_all(&job_dir).map_err(|e| crate::AgentError::state(&job_dir, e))?;
         rec.save(&job_dir)?;
@@ -342,6 +347,31 @@ impl Attempts {
                 let runner = Runner::new(Arc::clone(&self.shared), rec.clone(), Vec::new());
                 self.spawn(&rec, true, runner);
                 status_of(&rec, None)
+            } else if let Some(report) = rec
+                .exit_report
+                .as_deref()
+                .and_then(|b| <ExitReport as prost::Message>::decode(b).ok())
+            {
+                // The worker ended after its report was saved: the report decides.
+                let d = exit::decide(&exit::ExitEvidence {
+                    report: Some(report),
+                    readopted: true,
+                    cancel_requested: rec.cancel_requested,
+                    final_committed: rec.final_committed(),
+                    needs_final_checkpoint: rec.needs_final_checkpoint(),
+                    ..exit::ExitEvidence::default()
+                });
+                rec.phase = d.phase;
+                rec.exit = Some(d.clone());
+                let _ = rec.save(&dir);
+                let _ = crate::janitor::release(
+                    &self.shared.ctx,
+                    &self.shared.envs,
+                    &rec,
+                    &HashSet::new(),
+                )
+                .await;
+                status_of(&rec, Some(&d))
             } else {
                 let d = ExitDecision {
                     phase: AttemptPhase::Exited as i32,
@@ -455,27 +485,19 @@ impl Attempts {
                 .await
             }
             Kind::UploadArtifacts(u) => {
-                let items: Result<Vec<_>, AttemptError> = u
+                match u
                     .items
                     .iter()
-                    .map(|i| {
-                        spec::safe_relative(&i.local_path)?;
-                        Ok((
-                            i.local_path.clone(),
-                            Destination::Ticket(spec::upload_ticket(i)?),
-                            i.size,
-                            i.sha256.clone(),
-                        ))
-                    })
-                    .collect();
-                match items {
-                    Ok(items) => {
+                    .map(|i| spec::safe_relative(&i.local_path).map(|_| UploadTarget::from_item(i)))
+                    .collect::<Result<Vec<_>, _>>()
+                {
+                    Ok(targets) => {
                         self.control(
                             u.attempt.as_ref(),
                             Control::Upload {
                                 command_id: cmd.command_id.clone(),
                                 checkpoint_id: u.checkpoint_id.clone(),
-                                items,
+                                targets,
                             },
                         )
                         .await
@@ -550,6 +572,12 @@ impl Attempts {
             .as_ref()
             .map(|a| a.attempt_id.clone())
             .unwrap_or_default();
+        // The id names a folder: anything but a plain name (like `../x`) is refused.
+        if !id.is_empty() && !spec::safe_name(&id) {
+            return Err(AttemptError::Spec(format!(
+                "attempt id {id:?} may use only letters, digits, '.', '_' and '-'"
+            )));
+        }
         if id.is_empty() {
             let live: HashSet<String> = lock(&self.live).keys().cloned().collect();
             crate::janitor::sweep(ctx, &self.shared.envs, &live).await?;

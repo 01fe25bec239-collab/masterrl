@@ -5,7 +5,7 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-use mrl_proto::agent::v1::{LaunchAttempt, StageItem, UploadItem};
+use mrl_proto::agent::v1::{LaunchAttempt, StageItem};
 use mrl_storage::{TicketMethod, TransferTicket};
 use serde::{Deserialize, Serialize};
 
@@ -523,38 +523,6 @@ impl InputSpec {
             headers: BTreeMap::new(),
         })
     }
-}
-
-/// The upload ticket for one `UploadItem`.
-pub fn upload_ticket(item: &UploadItem) -> Result<TransferTicket, AttemptError> {
-    ticket(
-        &item.local_path,
-        &item.url,
-        item.size,
-        item.expires_at.as_ref(),
-        TicketMethod::Put,
-    )
-}
-
-fn ticket(
-    key: &str,
-    url: &str,
-    size: u64,
-    expires: Option<&prost_types::Timestamp>,
-    method: TicketMethod,
-) -> Result<TransferTicket, AttemptError> {
-    let expires_at = expires
-        .and_then(|t| time::OffsetDateTime::from_unix_timestamp(t.seconds).ok())
-        .ok_or_else(|| AttemptError::Spec(format!("the link for {key} has no expiry time")))?;
-    Ok(TransferTicket {
-        method,
-        key: key.to_owned(),
-        max_size: size,
-        expires_at,
-        url: url.to_owned(),
-        presigned: url.starts_with("http://") || url.starts_with("https://"),
-        headers: BTreeMap::new(),
-    })
 }
 
 /// Letters, digits, `.`, `_`, `-`; not empty, not `.` or `..`.

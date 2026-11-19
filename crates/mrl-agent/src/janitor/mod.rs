@@ -78,8 +78,11 @@ pub async fn release(
             }
         }
     }
+    for cg in rec.workers.iter().filter_map(|w| w.cgroup.as_deref()) {
+        report.killed += kill_cgroup(cg);
+    }
     let job_dir = ctx.state.job_dir(&id);
-    report.killed += kill_leftovers(&job_dir);
+    report.killed += kill_leftovers(&job_dir, &id);
     match envs.unpin_all(&id) {
         Ok(n) => report.unpinned = n,
         Err(e) => report.errors.push(e.explain()),
@@ -88,19 +91,22 @@ pub async fn release(
     report
 }
 
-/// Processes whose working folder is inside `job_dir` (not this agent).
-pub fn leftovers(job_dir: &Path) -> Vec<u32> {
+/// Processes of the attempt `attempt_id` that are still alive (not this agent): those whose
+/// environment carries `MRL_ATTEMPT_ID=<attempt_id>` (inherited by every child, even one that
+/// changed folder and session; readable on Linux) or whose working folder is inside `job_dir`.
+pub fn leftovers(job_dir: &Path, attempt_id: &str) -> Vec<u32> {
     use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
-    let Ok(dir) = std::fs::canonicalize(job_dir) else {
-        return Vec::new();
-    };
+    let dir = std::fs::canonicalize(job_dir).ok();
+    let mark = format!("{}={attempt_id}", crate::attempts::runner::ATTEMPT_ENV);
     let Ok(mut sys) = System::new() else {
-        return Default::default();
+        return Vec::new();
     };
     sys.refresh_processes_specifics(
         ProcessesToUpdate::All,
         true,
-        ProcessRefreshKind::nothing().with_cwd(UpdateKind::Always),
+        ProcessRefreshKind::nothing()
+            .with_cwd(UpdateKind::Always)
+            .with_environ(UpdateKind::Always),
     );
     let me = std::process::id();
     sys.processes()
@@ -108,20 +114,70 @@ pub fn leftovers(job_dir: &Path) -> Vec<u32> {
         .filter(|(pid, p)| {
             pid.as_u32() != me
                 && !matches!(p.status(), sysinfo::ProcessStatus::Zombie)
-                && p.cwd().is_some_and(|c| c.starts_with(&dir))
+                && (p
+                    .environ()
+                    .iter()
+                    .any(|e| e.as_encoded_bytes() == mark.as_bytes())
+                    || dir
+                        .as_ref()
+                        .is_some_and(|d| p.cwd().is_some_and(|c| c.starts_with(d))))
         })
         .map(|(pid, _)| pid.as_u32())
         .collect()
 }
 
-fn kill_leftovers(job_dir: &Path) -> usize {
-    let found = leftovers(job_dir);
+fn kill_leftovers(job_dir: &Path, attempt_id: &str) -> usize {
+    let found = leftovers(job_dir, attempt_id);
     for pid in &found {
         if let Some(identity) = ProcIdentity::of_pid(*pid) {
             signal_identity(&identity, true);
         }
     }
     found.len()
+}
+
+/// Linux: the job cgroup (`…/job-<name>`) process `pid` is in, if it is in one.
+pub fn job_cgroup_of(pid: u32) -> Option<PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+        let rel = text.lines().find_map(|l| l.strip_prefix("0::"))?;
+        let path = Path::new("/sys/fs/cgroup").join(rel.trim().trim_start_matches('/'));
+        let is_job = path
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().starts_with("job-"));
+        is_job.then_some(path)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Linux: kills everything in a job cgroup and removes it. Returns how many processes it held.
+fn kill_cgroup(cg: &Path) -> usize {
+    let procs = |cg: &Path| -> Vec<u32> {
+        std::fs::read_to_string(cg.join("cgroup.procs"))
+            .map(|t| t.lines().filter_map(|l| l.trim().parse().ok()).collect())
+            .unwrap_or_default()
+    };
+    let found = procs(cg).len();
+    if found > 0 && std::fs::write(cg.join("cgroup.kill"), "1").is_err() {
+        for pid in procs(cg) {
+            if let Some(identity) = ProcIdentity::of_pid(pid) {
+                signal_identity(&identity, true);
+            }
+        }
+    }
+    for _ in 0..50 {
+        if procs(cg).is_empty() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let _ = std::fs::remove_dir(cg);
+    found
 }
 
 /// Waits a few seconds for the attempt's GPUs to free their memory; reports the ones that don't.
@@ -328,6 +384,6 @@ mod tests {
     #[test]
     fn no_leftovers_in_an_empty_folder() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(leftovers(dir.path()).is_empty());
+        assert!(leftovers(dir.path(), "att_none_here").is_empty());
     }
 }

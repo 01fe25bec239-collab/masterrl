@@ -30,6 +30,7 @@ toml = "=1.2.0"
 
 # <mrl:deps P20> P20 dependencies go right below this line.
 getrandom = "=0.3.4"
+prost = { workspace = true }
 tokio-stream = { version = "=0.1.19", features = ["net", "io-util"] }
 tonic = { workspace = true }
 

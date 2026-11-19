@@ -31,7 +31,7 @@ pub struct AttemptRecord {
     pub phase: i32,
     /// The started worker processes.
     pub workers: Vec<WorkerProc>,
-    /// Roles that were sent Prepare.
+    /// Roles whose `Prepared` came back ok.
     pub prepared: Vec<String>,
     /// Roles that were sent Start.
     pub started: Vec<String>,
@@ -43,6 +43,82 @@ pub struct AttemptRecord {
     pub cancel_requested: bool,
     /// How it ended, once it has.
     pub exit: Option<ExitDecision>,
+    /// Input role -> path, as sent in `Prepare`.
+    #[serde(default)]
+    pub staged_paths: BTreeMap<String, String>,
+    /// When the agent must stop the attempt unless the lease is renewed (Unix ms, wall clock,
+    /// kill budget already taken off). Kept across restarts so a restart never extends a lease.
+    #[serde(default)]
+    pub lease_deadline_unix_ms: Option<i64>,
+    /// The primary worker's ExitReport (protobuf bytes), saved before it is acknowledged.
+    #[serde(default)]
+    pub exit_report: Option<Vec<u8>>,
+    /// Control requests (cancel, pause, checkpoint) sent to the workers, as protobuf
+    /// `AgentMessage` bytes; sent again when a worker reconnects (workers ignore repeats).
+    #[serde(default)]
+    pub requests: Vec<Vec<u8>>,
+    /// Upload tickets per checkpoint id, from `UploadArtifacts`.
+    #[serde(default)]
+    pub uploads: BTreeMap<String, UploadPlan>,
+}
+
+/// The tickets for one checkpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadPlan {
+    /// The `UploadArtifacts` command to report on.
+    pub command_id: String,
+    /// One target per file.
+    pub targets: Vec<UploadTarget>,
+}
+
+/// One authorized upload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadTarget {
+    /// Path relative to staging.
+    pub local_path: String,
+    /// Upload link.
+    pub url: String,
+    /// Size the core expects.
+    pub size: u64,
+    /// sha256 the core expects.
+    pub sha256: String,
+    /// Link expiry, Unix seconds.
+    pub expires_unix: i64,
+}
+
+impl UploadTarget {
+    /// From an `UploadItem`.
+    pub fn from_item(item: &mrl_proto::agent::v1::UploadItem) -> Self {
+        Self {
+            local_path: item.local_path.clone(),
+            url: item.url.clone(),
+            size: item.size,
+            sha256: item.sha256.clone(),
+            expires_unix: item.expires_at.as_ref().map_or(0, |t| t.seconds),
+        }
+    }
+
+    /// The PUT ticket.
+    pub fn ticket(&self) -> Result<mrl_storage::TransferTicket, AttemptError> {
+        let expires_at = time::OffsetDateTime::from_unix_timestamp(self.expires_unix)
+            .ok()
+            .filter(|_| self.expires_unix > 0)
+            .ok_or_else(|| {
+                AttemptError::Spec(format!(
+                    "the link for {} has no expiry time",
+                    self.local_path
+                ))
+            })?;
+        Ok(mrl_storage::TransferTicket {
+            method: mrl_storage::TicketMethod::Put,
+            key: self.local_path.clone(),
+            max_size: self.size,
+            expires_at,
+            url: self.url.clone(),
+            presigned: self.url.starts_with("http://") || self.url.starts_with("https://"),
+            headers: BTreeMap::new(),
+        })
+    }
 }
 
 /// One worker process.
@@ -54,6 +130,10 @@ pub struct WorkerProc {
     pub primary: bool,
     /// How to find it again.
     pub identity: ProcIdentity,
+    /// Linux: the worker's own cgroup (`/sys/fs/cgroup/.../job-…`), so a later agent can stop
+    /// everything in it.
+    #[serde(default)]
+    pub cgroup: Option<PathBuf>,
 }
 
 /// How a worker is recognised after an agent restart.
@@ -148,6 +228,18 @@ pub struct StagedFile {
 }
 
 impl AttemptRecord {
+    /// A final checkpoint was committed.
+    pub fn final_committed(&self) -> bool {
+        self.checkpoints.values().any(|c| {
+            c.is_final && c.state == Some(mrl_proto::worker::v1::CommitState::Committed as i32)
+        })
+    }
+
+    /// The attempt must commit a final checkpoint when it completes (TRAIN, not smoke or dry).
+    pub fn needs_final_checkpoint(&self) -> bool {
+        self.spec.trains() && self.spec.smoke_steps == 0 && !self.spec.dry_run
+    }
+
     /// Saves the record (owner-only permissions on Unix).
     pub fn save(&self, job_dir: &Path) -> Result<(), AttemptError> {
         let path = job_dir.join(RECORD_FILE);

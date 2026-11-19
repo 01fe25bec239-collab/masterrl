@@ -2,8 +2,10 @@ name: ci-attempts
 
 # The agent attempt runtime on real Linux: FakeEngine attempts through the real mrl-worker
 # harness (full lifecycle with ticket uploads, killed worker, re-adoption after an agent
-# restart, janitor cleanup, environment cache hit/miss, GPU OOM class, tampered lock hash).
-# MRL_TEST_ATTEMPTS_REQUIRED=1 turns a missing uv into a failure instead of a skip.
+# restart and after a real agent crash, also under bubblewrap, janitor cleanup and orphans,
+# environment cache hit/miss, GPU OOM class, tampered lock hash).
+# MRL_TEST_ATTEMPTS_REQUIRED=1 / MRL_TEST_SANDBOX_REQUIRED=1 turn a missing uv or bubblewrap
+# into a failure instead of a skip.
 on:
   pull_request:
   push:
@@ -36,9 +38,19 @@ jobs:
           version: ${{ env.UV_VERSION }}
           enable-cache: true
 
+      # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor; bubblewrap needs them.
+      - name: install bubblewrap and allow user namespaces
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
       - name: attempt lifecycle tests
         env:
           MRL_TEST_ATTEMPTS_REQUIRED: "1"
+          MRL_TEST_SANDBOX_REQUIRED: "1"
         run: cargo test -p mrl-agent --locked --test attempts -- --include-ignored
 
       - name: worker protocol tests (Rust client)

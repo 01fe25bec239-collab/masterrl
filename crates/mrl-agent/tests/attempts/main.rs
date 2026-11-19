@@ -2,5 +2,6 @@
 //! error-code registry check (every OS).
 
 mod codes;
+mod commands;
 #[cfg(unix)]
 mod lifecycle;

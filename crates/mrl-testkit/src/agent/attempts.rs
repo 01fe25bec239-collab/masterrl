@@ -236,6 +236,11 @@ impl ServerFixture {
         self.server.as_ref().map_or("", |s| s.target())
     }
 
+    /// The temporary folder holding the socket and `seq.json`.
+    pub fn dir(&self) -> &std::path::Path {
+        self.dir.path()
+    }
+
     /// A copy of what was received so far.
     pub fn received(&self) -> Vec<Received> {
         self.received
@@ -251,6 +256,199 @@ fn short_tmp() -> PathBuf {
         PathBuf::from("/tmp")
     } else {
         std::env::temp_dir()
+    }
+}
+
+/// An attempt runner re-adopting a saved record, with sleeping stand-in processes as its
+/// workers (Unix): connect [`FakeWorker`]s to drive it as a restarted agent would see them.
+#[cfg(unix)]
+pub struct RunnerFixture {
+    /// The fake agent (its state folder holds the record).
+    pub agent: super::FakeAgent,
+    /// Events the runner sends.
+    pub events: mrl_agent::attempts::AttemptEvents,
+    /// Commands to the runner.
+    pub control: mpsc::Sender<mrl_agent::attempts::runner::Control>,
+    /// The runner task; its result is the attempt's outcome (`None`: detached).
+    pub task: tokio::task::JoinHandle<Option<mrl_agent::attempts::exit::ExitDecision>>,
+    /// The record as saved before re-adoption.
+    pub record: mrl_agent::attempts::record::AttemptRecord,
+    stand_ins: Vec<std::process::Child>,
+}
+
+#[cfg(unix)]
+impl RunnerFixture {
+    /// Saves a record for `spec` (one stand-in process per worker, phase RUNNING), lets `edit`
+    /// change it, then re-adopts it.
+    pub async fn readopt(
+        spec: serde_json::Value,
+        edit: impl FnOnce(&mut mrl_agent::attempts::record::AttemptRecord),
+    ) -> Self {
+        use mrl_agent::attempts::record::{AttemptRecord, ProcIdentity, WorkerProc};
+        use mrl_agent::attempts::runner::{socket_path, Runner, Shared};
+        let agent = super::FakeAgent::start(0).unwrap_or_else(|e| panic!("{}", e.explain()));
+        let spec = mrl_agent::attempts::AttemptSpec::from_json(&spec.to_string())
+            .unwrap_or_else(|e| panic!("{}", e.explain()));
+        let id = spec.attempt.attempt_id.clone();
+        let mut stand_ins = Vec::new();
+        let mut workers = Vec::new();
+        for (role_id, _, primary) in spec.workers() {
+            let child = std::process::Command::new("sleep")
+                .arg("300")
+                .spawn()
+                .unwrap_or_else(|e| panic!("sleep: {e}"));
+            let identity =
+                ProcIdentity::of_pid(child.id()).unwrap_or_else(|| panic!("no identity"));
+            stand_ins.push(child);
+            workers.push(WorkerProc {
+                role_id,
+                primary,
+                identity,
+                cgroup: None,
+            });
+        }
+        let mut record = AttemptRecord {
+            socket: socket_path(agent.ctx.state.root(), &id),
+            nonce: "n0nce".into(),
+            spec,
+            phase: mrl_proto::agent::v1::AttemptPhase::Running as i32,
+            workers,
+            prepared: Vec::new(),
+            started: Vec::new(),
+            last_step: 0,
+            checkpoints: Default::default(),
+            cancel_requested: false,
+            exit: None,
+            staged_paths: Default::default(),
+            lease_deadline_unix_ms: None,
+            exit_report: None,
+            requests: Vec::new(),
+            uploads: Default::default(),
+        };
+        edit(&mut record);
+        let job = agent.ctx.state.job_dir(&id);
+        std::fs::create_dir_all(job.join("staging")).unwrap_or_else(|e| panic!("{e}"));
+        record
+            .save(&job)
+            .unwrap_or_else(|e| panic!("{}", e.explain()));
+        let (tx, events) = mrl_agent::attempts::attempt_events(256);
+        let envs =
+            mrl_agent::envs::Envs::open(agent.ctx.state.root(), Arc::clone(&agent.ctx.cache))
+                .unwrap_or_else(|e| panic!("{}", e.explain()));
+        let shared = Arc::new(Shared {
+            ctx: Arc::clone(&agent.ctx),
+            envs: Arc::new(envs),
+            events: tx,
+            progress: None,
+        });
+        let (control, rx) = mpsc::channel(16);
+        let runner = Runner::new(shared, record.clone(), Vec::new());
+        let task = tokio::spawn(runner.readopt(rx));
+        Self {
+            agent,
+            events,
+            control,
+            task,
+            record,
+            stand_ins,
+        }
+    }
+
+    /// Connects a worker for `role_id` (retrying until the runner's server is up).
+    pub async fn worker(&self, role_id: &str) -> (FakeWorker, HelloAck) {
+        let target = self.record.socket.display().to_string();
+        let mut last = None;
+        for _ in 0..100 {
+            let h = hello(
+                &self.record.spec.attempt.attempt_id,
+                &self.record.nonce,
+                role_id,
+            );
+            match FakeWorker::connect(&target, h).await {
+                Ok(w) => return w,
+                Err(e) => last = Some(e),
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("the worker could not connect: {last:?}")
+    }
+
+    /// The attempt's staging folder.
+    pub fn staging(&self) -> PathBuf {
+        self.agent
+            .ctx
+            .state
+            .job_dir(&self.record.spec.attempt.attempt_id)
+            .join("staging")
+    }
+
+    /// The record as saved on disk now.
+    pub fn saved(&self) -> mrl_agent::attempts::record::AttemptRecord {
+        let job = self
+            .agent
+            .ctx
+            .state
+            .job_dir(&self.record.spec.attempt.attempt_id);
+        mrl_agent::attempts::record::AttemptRecord::load(&job)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| panic!("no saved record"))
+    }
+
+    /// Stops the stand-in processes (the "workers" exit).
+    pub fn end_workers(&mut self) {
+        for c in &mut self.stand_ins {
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    /// The next event the runner sends that `pick` accepts.
+    pub async fn event<T>(
+        &mut self,
+        mut pick: impl FnMut(mrl_agent::attempts::AttemptEvent) -> Option<T>,
+    ) -> T {
+        let found = tokio::time::timeout(RECV_TIMEOUT, async {
+            while let Some(e) = self.events.recv().await {
+                if let Some(t) = pick(e) {
+                    return Some(t);
+                }
+            }
+            None
+        })
+        .await;
+        match found {
+            Ok(Some(t)) => t,
+            _ => panic!("the expected event did not come"),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RunnerFixture {
+    fn drop(&mut self) {
+        self.end_workers();
+    }
+}
+
+/// Agent messages with a body, read until `until` matches one (included).
+pub async fn read_until(
+    w: &mut FakeWorker,
+    until: impl Fn(&AgentBody) -> bool,
+) -> Result<Vec<AgentBody>, Status> {
+    let mut out = Vec::new();
+    loop {
+        let m = w
+            .recv()
+            .await?
+            .ok_or_else(|| Status::unavailable("the stream ended"))?;
+        if let Some(b) = m.body {
+            let done = until(&b);
+            out.push(b);
+            if done {
+                return Ok(out);
+            }
+        }
     }
 }
 
@@ -356,5 +554,387 @@ mod tests {
         .await;
         let e = w2.recv().await.expect_err("stream error");
         assert_eq!(e.code(), tonic::Code::OutOfRange);
+    }
+
+    #[tokio::test]
+    async fn a_replaced_session_handles_nothing_more() {
+        let fx = ServerFixture::start("att_1", "n").await;
+        let (mut old, _) = FakeWorker::connect(fx.target(), hello("att_1", "n", "trainer"))
+            .await
+            .unwrap();
+        let (mut new, _) = FakeWorker::connect(fx.target(), hello("att_1", "n", "trainer"))
+            .await
+            .unwrap();
+        // Both send seq 1: only the current session's copy is handled.
+        old.send(progress(1)).await;
+        let seq = new.send(progress(1)).await;
+        new.wait_ack(seq).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let ones = fx
+            .received()
+            .iter()
+            .filter(|r| matches!(r, Received::Message(_, 1)))
+            .count();
+        assert_eq!(ones, 1);
+        assert!(
+            old.recv().await.unwrap_or(None).is_none(),
+            "the old stream ends"
+        );
+    }
+
+    async fn twenty_steps(w: &mut FakeWorker) {
+        for step in 1..=20 {
+            let seq = w.send(progress(step)).await;
+            w.wait_ack(seq).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unsaved_seq_is_not_acked_or_skipped() {
+        let mut fx = ServerFixture::start("att_1", "n").await;
+        // A folder where seq.json should go makes every save fail.
+        std::fs::create_dir(fx.dir().join("seq.json")).unwrap();
+        let (mut w, _) = FakeWorker::connect(fx.target(), hello("att_1", "n", "trainer"))
+            .await
+            .unwrap();
+        w.send(progress(1)).await;
+        assert!(
+            w.recv().await.unwrap_or(None).is_none(),
+            "no ack; the stream ends"
+        );
+        std::fs::remove_dir(fx.dir().join("seq.json")).unwrap();
+        let (_, ack) = FakeWorker::connect(fx.target(), hello("att_1", "n", "trainer"))
+            .await
+            .unwrap();
+        assert_eq!(ack.resume_from_seq, 1, "the unsaved seq is asked for again");
+        // Saves from two roles at once all reach the file.
+        let mut ws = Vec::new();
+        for role in ["a", "b"] {
+            ws.push(
+                FakeWorker::connect(fx.target(), hello("att_1", "n", role))
+                    .await
+                    .unwrap()
+                    .0,
+            );
+        }
+        let (mut a, mut b) = (ws.remove(0), ws.remove(0));
+        tokio::join!(twenty_steps(&mut a), twenty_steps(&mut b));
+        fx.restart().await;
+        for role in ["a", "b"] {
+            let (_, ack) = FakeWorker::connect(fx.target(), hello("att_1", "n", role))
+                .await
+                .unwrap();
+            assert_eq!(ack.resume_from_seq, 21, "{role}");
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod runner_tests {
+    use super::*;
+    use mrl_agent::attempts::record::{StagedCheckpoint, StagedFile, UploadPlan, UploadTarget};
+    use mrl_agent::attempts::runner::Control;
+    use mrl_agent::attempts::AttemptEvent;
+    use mrl_proto::agent::v1::AttemptPhase;
+    use mrl_proto::common::v1::FailureClass;
+    use mrl_proto::worker::v1::{CheckpointRequest, CommitState, ExitKind, ExitReport, Prepared};
+    use prost::Message;
+
+    const SHA: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn spec(id: &str, extra: serde_json::Value) -> serde_json::Value {
+        let rt = format!("uv:sha256:{SHA}");
+        let mut v = serde_json::json!({
+            "attempt": {"job_id": "job_r", "attempt_id": id, "fencing_epoch": 1},
+            "engine": "fake",
+            "job_spec": {"job_kind": "EXPORT"},
+            "runtimes": [{"runtime_ref": rt, "project": "/nowhere"}],
+            "roles": [{"role_id": "trainer", "primary": true, "runtime_ref": rt}]
+        });
+        if let (Some(b), Some(m)) = (v.as_object_mut(), extra.as_object()) {
+            b.extend(m.clone());
+        }
+        v
+    }
+
+    fn sha_hex(b: &[u8]) -> String {
+        use sha2::Digest;
+        sha2::Sha256::digest(b)
+            .iter()
+            .map(|x| format!("{x:02x}"))
+            .collect()
+    }
+
+    fn now_ms() -> i64 {
+        (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
+    }
+
+    fn staged(path: &str, sha: &str, size: u64, state: Option<i32>) -> StagedCheckpoint {
+        StagedCheckpoint {
+            step: 4,
+            is_final: true,
+            manifest_sha256: SHA.into(),
+            files: vec![StagedFile {
+                path: path.into(),
+                size,
+                sha256: sha.into(),
+                role: "weights".into(),
+            }],
+            commit_requested: true,
+            state,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reconnect_replays_start_acks_and_requests() {
+        let request = mrl_proto::worker::v1::AgentMessage {
+            ack_seq: 0,
+            body: Some(AgentBody::CheckpointRequest(CheckpointRequest {
+                request_id: "r1".into(),
+                deadline_s: 30,
+                reason: "guard".into(),
+            })),
+        };
+        let fx = RunnerFixture::readopt(spec("att_rp", serde_json::json!({})), |r| {
+            r.prepared = vec!["trainer".into()];
+            r.started = vec!["trainer".into()];
+            r.checkpoints.insert(
+                "ckpt_1".into(),
+                staged(
+                    "checkpoints/ckpt_1/w.bin",
+                    SHA,
+                    1,
+                    Some(CommitState::Committed as i32),
+                ),
+            );
+            r.requests.push(request.encode_to_vec());
+        })
+        .await;
+        for _ in 0..2 {
+            let (mut w, _) = fx.worker("trainer").await;
+            let got = read_until(&mut w, |b| matches!(b, AgentBody::CheckpointCommitAck(_)))
+                .await
+                .unwrap();
+            assert!(got.iter().any(|b| matches!(b, AgentBody::Prepare(_))));
+            assert!(got.iter().any(|b| matches!(b, AgentBody::Start(_))));
+            assert!(got
+                .iter()
+                .any(|b| matches!(b, AgentBody::CheckpointRequest(r) if r.request_id == "r1")));
+            assert!(got.iter().any(|b| matches!(b,
+                AgentBody::CheckpointCommitAck(a) if a.checkpoint_id == "ckpt_1" && a.state == CommitState::Committed as i32)));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_keeps_the_lease_deadline() {
+        let deadline = now_ms() + 3_600_000;
+        let fx = RunnerFixture::readopt(spec("att_ls", serde_json::json!({"lease_s": 30})), |r| {
+            r.lease_deadline_unix_ms = Some(deadline);
+        })
+        .await;
+        let (mut w, _) = fx.worker("trainer").await;
+        let got = read_until(&mut w, |b| matches!(b, AgentBody::LeaseDeadline(_)))
+            .await
+            .unwrap();
+        let Some(AgentBody::LeaseDeadline(l)) = got.last() else {
+            panic!("lease deadline")
+        };
+        assert_eq!(
+            l.deadline.as_ref().unwrap().seconds,
+            deadline.div_euclid(1000)
+        );
+        drop(fx);
+
+        // Expired while the agent was away: fenced at once, never extended.
+        let fx = RunnerFixture::readopt(spec("att_lx", serde_json::json!({"lease_s": 30})), |r| {
+            r.lease_deadline_unix_ms = Some(now_ms() - 1000);
+        })
+        .await;
+        let mut fx = fx;
+        let d = tokio::time::timeout(Duration::from_secs(30), &mut fx.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.phase, AttemptPhase::SelfFenced as i32);
+        assert_eq!(d.class(), Some(FailureClass::NodeLost));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_exit_report_is_saved_before_its_ack() {
+        let mut fx = RunnerFixture::readopt(spec("att_ex", serde_json::json!({})), |_| {}).await;
+        let (mut w, ack) = fx.worker("trainer").await;
+        assert_eq!(ack.resume_from_seq, 1);
+        let seq = w
+            .send(Body::Exit(ExitReport {
+                kind: ExitKind::Completed as i32,
+                ..ExitReport::default()
+            }))
+            .await;
+        w.wait_ack(seq).await.unwrap();
+        assert!(fx.saved().exit_report.is_some(), "saved before the ack");
+        // The agent goes away right after the ack, then the worker exits.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        fx.control.send(Control::Detach(tx)).await.unwrap();
+        rx.await.unwrap();
+        fx.end_workers();
+        let (etx, _erx) = mrl_agent::attempts::attempt_events(64);
+        let next =
+            mrl_agent::attempts::Attempts::new(Arc::clone(&fx.agent.ctx), etx, None).unwrap();
+        let statuses = next.readopt().await;
+        assert_eq!(statuses.len(), 1);
+        assert!(statuses[0].failure.is_none(), "{:?}", statuses[0]);
+        assert_eq!(statuses[0].exit_kind, ExitKind::Completed as i32);
+    }
+
+    async fn sink() -> (String, Arc<Mutex<Vec<Vec<u8>>>>) {
+        use axum::routing::put;
+        let got: Arc<Mutex<Vec<Vec<u8>>>> = Arc::default();
+        let g = Arc::clone(&got);
+        let app = axum::Router::new().route(
+            "/up/{*p}",
+            put(move |body: axum::body::Bytes| {
+                let g = Arc::clone(&g);
+                async move {
+                    g.lock().unwrap().push(body.to_vec());
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (format!("http://{addr}/up"), got)
+    }
+
+    fn target(base: &str, path: &str, sha: &str, size: u64) -> UploadTarget {
+        UploadTarget {
+            local_path: path.into(),
+            url: format!("{base}/{path}"),
+            size,
+            sha256: sha.into(),
+            expires_unix: time::OffsetDateTime::now_utc().unix_timestamp() + 600,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn saved_tickets_finish_the_upload_after_a_restart() {
+        let (base, got) = sink().await;
+        let path = "checkpoints/ckpt_1/w.bin";
+        let sha = sha_hex(b"weights");
+        let mut fx = RunnerFixture::readopt(spec("att_up", serde_json::json!({})), |r| {
+            r.checkpoints
+                .insert("ckpt_1".into(), staged(path, &sha, 7, None));
+            r.uploads.insert(
+                "ckpt_1".into(),
+                UploadPlan {
+                    command_id: "up-1".into(),
+                    targets: vec![target(&base, path, &sha, 7)],
+                },
+            );
+        })
+        .await;
+        let file = fx.staging().join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"weights").unwrap();
+        let (mut w, _) = fx.worker("trainer").await;
+        let got_ack = read_until(&mut w, |b| matches!(b, AgentBody::CheckpointCommitAck(_)))
+            .await
+            .unwrap();
+        assert!(matches!(got_ack.last(),
+            Some(AgentBody::CheckpointCommitAck(a)) if a.state == CommitState::Committed as i32));
+        let done = fx
+            .event(|e| match e {
+                AttemptEvent::CommandDone(r) => Some(r),
+                _ => None,
+            })
+            .await;
+        assert_eq!(done.command_id, "up-1");
+        assert!(done.failure.is_none());
+        assert_eq!(got.lock().unwrap().as_slice(), [b"weights".to_vec()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tickets_for_other_content_are_rejected() {
+        let (base, got) = sink().await;
+        let path = "checkpoints/ckpt_1/w.bin";
+        let sha = sha_hex(b"weights");
+        let mut fx = RunnerFixture::readopt(spec("att_hm", serde_json::json!({})), |r| {
+            r.checkpoints
+                .insert("ckpt_1".into(), staged(path, &sha, 7, None));
+        })
+        .await;
+        let file = fx.staging().join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"weights").unwrap();
+        let (mut w, _) = fx.worker("trainer").await;
+        fx.control
+            .send(Control::Upload {
+                command_id: "up-2".into(),
+                checkpoint_id: "ckpt_1".into(),
+                targets: vec![target(&base, path, SHA, 7)],
+            })
+            .await
+            .unwrap();
+        let acks = read_until(&mut w, |b| matches!(b, AgentBody::CheckpointCommitAck(_)))
+            .await
+            .unwrap();
+        assert!(matches!(acks.last(),
+            Some(AgentBody::CheckpointCommitAck(a)) if a.state == CommitState::Rejected as i32));
+        let done = fx
+            .event(|e| match e {
+                AttemptEvent::CommandDone(r) => Some(r),
+                _ => None,
+            })
+            .await;
+        assert!(done.failure.is_some());
+        assert!(got.lock().unwrap().is_empty(), "nothing was uploaded");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_barrier_waits_for_every_good_prepared() {
+        let rt = format!("uv:sha256:{SHA}");
+        let extra = serde_json::json!({
+            "barrier": true,
+            "roles": [
+                {"role_id": "trainer", "primary": true, "runtime_ref": rt},
+                {"role_id": "rollout", "runtime_ref": rt}
+            ]
+        });
+        let mut fx = RunnerFixture::readopt(spec("att_bar", extra), |r| {
+            r.phase = AttemptPhase::Preparing as i32;
+        })
+        .await;
+        let (mut trainer, _) = fx.worker("trainer").await;
+        let (mut rollout, _) = fx.worker("rollout").await;
+        let prepared = || {
+            Body::Prepared(Prepared {
+                ok: true,
+                ..Prepared::default()
+            })
+        };
+        let seq = trainer.send(prepared()).await;
+        trainer.wait_ack(seq).await.unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        fx.control.send(Control::Start(tx)).await.unwrap();
+        assert!(
+            rx.await.unwrap().is_err(),
+            "one Prepared does not open the barrier"
+        );
+        let seq = rollout.send(prepared()).await;
+        rollout.wait_ack(seq).await.unwrap();
+        fx.event(|e| match e {
+            AttemptEvent::Status(s) if s.phase == AttemptPhase::Prepared as i32 => Some(()),
+            _ => None,
+        })
+        .await;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        fx.control.send(Control::Start(tx)).await.unwrap();
+        assert!(rx.await.unwrap().is_ok());
+        for w in [&mut trainer, &mut rollout] {
+            read_until(w, |b| matches!(b, AgentBody::Start(_)))
+                .await
+                .unwrap();
+        }
     }
 }
