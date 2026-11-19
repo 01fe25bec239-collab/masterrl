@@ -293,6 +293,55 @@ pub struct Link {
     leases: broadcast::Sender<LeaseGrant>,
     reconcile: broadcast::Sender<ReconcileResult>,
     running: Mutex<Vec<AttemptRef>>,
+    reporting: Mutex<()>,
+    data_seq: Mutex<DataSeq>,
+}
+
+/// Seq counters of the TELEMETRY and BULK streams. Blocks of [`DataSeq::BLOCK`] are reserved
+/// on disk, so a restart continues above every seq already used (gaps are fine).
+struct DataSeq {
+    path: PathBuf,
+    next: [u64; 2],
+    reserved: [u64; 2],
+}
+
+impl DataSeq {
+    const BLOCK: u64 = 10_000;
+
+    fn open(path: &std::path::Path) -> Result<Self, AgentError> {
+        let reserved: [u64; 2] = match std::fs::read(path) {
+            Ok(b) => serde_json::from_slice(&b).map_err(|e| AgentError::Config {
+                path: path.to_path_buf(),
+                reason: format!("the stream counters are damaged ({e}); remove the file"),
+            })?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => [0, 0],
+            Err(e) => return Err(AgentError::state(path, e)),
+        };
+        Ok(Self {
+            path: path.to_path_buf(),
+            next: [reserved[0] + 1, reserved[1] + 1],
+            reserved,
+        })
+    }
+
+    fn next(&mut self, stream: usize) -> Result<u64, AgentError> {
+        let i = stream.min(1);
+        if self.next[i] > self.reserved[i] {
+            let mut r = self.reserved;
+            r[i] = self.next[i] + Self::BLOCK;
+            if let Some(d) = self.path.parent() {
+                std::fs::create_dir_all(d).map_err(|e| AgentError::state(d, e))?;
+            }
+            let bytes =
+                serde_json::to_vec(&r).map_err(|e| AgentError::exec("stream counters", e))?;
+            crate::state::atomic_write(&self.path, &bytes)
+                .map_err(|e| AgentError::state(&self.path, e))?;
+            self.reserved = r;
+        }
+        let seq = self.next[i];
+        self.next[i] += 1;
+        Ok(seq)
+    }
 }
 
 impl Link {
@@ -308,9 +357,16 @@ impl Link {
         if let Some(l) = map.get(&root) {
             return Ok(l.clone());
         }
-        let g = &ctx.config.gateway;
+        let link = Arc::new(Self::open(&root, &ctx.config.gateway)?);
+        map.insert(root, link.clone());
+        Ok(link)
+    }
+
+    /// A link on the state folder `root` (use [`Link::of`]; this is for tests).
+    pub fn open(root: &std::path::Path, g: &GatewaySettings) -> Result<Link, AgentError> {
         let dir = root.join("gateway");
-        let link = Arc::new(Link {
+        let data_seq = DataSeq::open(&dir.join("data_seq.json"))?;
+        Ok(Link {
             spool: Mutex::new(Spool::open(
                 &dir.join("spool"),
                 g.spool_max_entries,
@@ -325,9 +381,19 @@ impl Link {
             leases: broadcast::channel(64).0,
             reconcile: broadcast::channel(16).0,
             running: Mutex::default(),
-        });
-        map.insert(root, link.clone());
-        Ok(link)
+            reporting: Mutex::default(),
+            data_seq: Mutex::new(data_seq),
+        })
+    }
+
+    /// The next seq of a TELEMETRY (`0`) or BULK (`1`) stream: unique across reconnects and
+    /// restarts, so sinks can dedupe on `(node, stream, seq)`.
+    fn next_data_seq(&self, stream: usize) -> Result<u64, LinkError> {
+        self.data_seq
+            .lock()
+            .map_err(|_| LinkError::Protocol("seq lock poisoned".into()))?
+            .next(stream)
+            .map_err(LinkError::from)
     }
 
     /// Registers the handler for one command kind (like `"LaunchAttempt"`). Do it at the start
@@ -398,37 +464,59 @@ impl Link {
         self.spool.lock().map_or(0, |s| s.len())
     }
 
+    /// Commands a restart interrupted are reported FAILED `interrupted` (never run again).
     fn report_interrupted(&self) -> Result<(), LinkError> {
         let stuck = self
             .journal
             .lock()
             .map(|j| j.interrupted())
             .unwrap_or_default();
-        for (seq, id) in stuck {
-            self.result(
-                &id,
-                Err(Failure {
-                    class: FailureClass::InfraTransient as i32,
-                    sub_code: "interrupted".into(),
-                    message: "the agent restarted while running this command; it was not run again"
-                        .into(),
-                    ..Failure::default()
-                }),
-            )?;
-            if let Ok(mut j) = self.journal.lock() {
-                j.finish(seq)?;
-            }
+        for (seq, _) in stuck {
+            let outcome = Err(Failure {
+                class: FailureClass::InfraTransient as i32,
+                sub_code: "interrupted".into(),
+                message: "the agent restarted while running this command; it was not run again"
+                    .into(),
+                ..Failure::default()
+            });
+            self.journal
+                .lock()
+                .map_err(|_| LinkError::Protocol("journal lock poisoned".into()))?
+                .complete(seq, &outcome)?;
         }
-        Ok(())
+        self.report_results()
     }
 
-    fn result(&self, command_id: &str, outcome: Result<(), Failure>) -> Result<(), LinkError> {
-        self.send_control(agent_message::Body::CommandResult(CommandResult {
-            command_id: command_id.to_owned(),
-            accepted: outcome.is_ok(),
-            failure: outcome.err(),
-        }))
-        .map(|_| ())
+    /// Moves finished commands' results from the journal into the CONTROL spool, oldest
+    /// first. A full spool stops here and leaves the rest for the next call (after acks, on
+    /// every heartbeat); results are never dropped and handlers never rerun.
+    pub fn report_results(&self) -> Result<(), LinkError> {
+        let _one = self
+            .reporting
+            .lock()
+            .map_err(|_| LinkError::Protocol("report lock poisoned".into()))?;
+        let pending = self
+            .journal
+            .lock()
+            .map(|j| j.unreported())
+            .unwrap_or_default();
+        for u in pending {
+            let body = agent_message::Body::CommandResult(CommandResult {
+                command_id: u.command_id.clone(),
+                accepted: u.outcome.is_ok(),
+                failure: u.outcome.err(),
+            });
+            match self.send_control(body) {
+                Ok(_) => {}
+                Err(LinkError::SpoolFull(_)) => return Ok(()),
+                Err(e) => return Err(e),
+            }
+            self.journal
+                .lock()
+                .map_err(|_| LinkError::Protocol("journal lock poisoned".into()))?
+                .reported(u.seq)?;
+        }
+        Ok(())
     }
 
     /// Journals and runs a delivered command (once).
@@ -455,15 +543,17 @@ impl Link {
                     ..Failure::default()
                 }),
             };
-            if let Err(e) = link.result(&id, outcome) {
+            let saved = link
+                .journal
+                .lock()
+                .map_err(|_| LinkError::Protocol("journal lock poisoned".into()))
+                .and_then(|mut j| j.complete(seq, &outcome).map_err(LinkError::from));
+            let reported = saved.and_then(|()| link.report_results());
+            if let Err(e) = reported {
                 eprintln!(
-                    "mrl-agent: could not record the result of command {id}: {}",
+                    "mrl-agent: the result of command {id} is not recorded yet: {}",
                     e.explain()
                 );
-                return;
-            }
-            if let Ok(mut j) = link.journal.lock() {
-                let _ = j.finish(seq);
             }
         });
         Ok(())
@@ -525,7 +615,17 @@ where
         .keep_alive_while_idle(true)
         .connect_with_connector(connector)
         .await
-        .map_err(|e| LinkError::Unreachable(format!("HTTP/2 to the core failed: {e}")))
+        .map_err(|e| {
+            // With TLS 1.3 the core's verdict on our certificate arrives after the handshake.
+            let detail = format!("{e:?}");
+            if detail.contains("CertificateRevoked") {
+                LinkError::Certificate(
+                    "the core refused this machine's certificate: it was revoked".into(),
+                )
+            } else {
+                LinkError::Unreachable(format!("HTTP/2 to the core failed: {e}"))
+            }
+        })
 }
 
 struct OneShot<T>(Arc<Mutex<Option<T>>>);
@@ -660,6 +760,13 @@ fn hello(l: &LaneCtx, lane: Lane, resume_from_seq: u64) -> AgentMessage {
 }
 
 fn status_error(s: &tonic::Status) -> LinkError {
+    // With TLS 1.3 the core's verdict on our certificate arrives after the handshake, as the
+    // cause of a transport error.
+    if format!("{s:?}").contains("CertificateRevoked") {
+        return LinkError::Certificate(
+            "the core refused this machine's certificate: it was revoked".into(),
+        );
+    }
     let msg = s.message().to_owned();
     match msg.split_whitespace().next() {
         Some(code) if code.starts_with("MRL-") => LinkError::Refused {
@@ -789,6 +896,8 @@ async fn control_lane(
                 let m = m?;
                 if m.ack_seq > 0 {
                     l.link.spool.lock().map_err(|_| LinkError::Protocol("spool lock poisoned".into()))?.ack(m.ack_seq)?;
+                    // The ack freed spool space: results that waited for it go in now.
+                    l.link.report_results()?;
                 }
                 match m.body {
                     Some(core_message::Body::Command(cmd)) if m.seq > 0 => {
@@ -820,6 +929,7 @@ async fn control_lane(
             }
             () = l.link.wake.notified() => { flush(l, &out, &mut last, None).await?; }
             _ = heartbeat.tick() => {
+                l.link.report_results()?;
                 let running = l.link.running.lock().map(|r| r.clone()).unwrap_or_default();
                 flush(l, &out, &mut last, Some(agent_message::Body::Heartbeat(Heartbeat { time: now_ts(), running }))).await?;
             }
@@ -842,7 +952,7 @@ async fn data_lane(
 ) -> Result<Outcome, LinkError> {
     put(&out, hello(l, lane, 0)).await?;
     wait_hello(&mut inbound).await?;
-    let mut seq = 0u64;
+    let stream = usize::from(lane == Lane::Bulk);
     let every = Duration::from_secs(l.ctx.config.gateway.telemetry_interval_secs.clamp(1, 300));
     let mut tick = tokio::time::interval(every);
     let inventory = {
@@ -870,8 +980,7 @@ async fn data_lane(
         };
         batch.extend(queued.lock().map(|mut q| q.take()).unwrap_or_default());
         for mut m in batch {
-            seq += 1;
-            m.seq = seq;
+            m.seq = l.link.next_data_seq(stream)?;
             m.sent_at = now_ts();
             put(&out, m).await?;
         }
@@ -894,12 +1003,9 @@ async fn run_lane(
 /// Dials the core and runs the three lanes until CONTROL ends.
 async fn dialed(l: Arc<LaneCtx>, io: BoxIo, stop: CancellationToken) -> Result<Outcome, LinkError> {
     let config = tls::client(&l.id.ca, l.id.chain(), l.id.key())?;
-    let name =
-        ServerName::try_from(tls::CORE_NAME).map_err(|e| LinkError::Protocol(e.to_string()))?;
-    let tls_io = tokio_rustls::TlsConnector::from(Arc::new(config))
-        .connect(name, io)
-        .await
-        .map_err(|e| LinkError::Certificate(format!("TLS with the core failed: {e}")))?;
+    let Some(tls_io) = connect_tls(config, io, &stop).await? else {
+        return Ok(Outcome::Stopped);
+    };
     let channel = channel_over(tls_io).await?;
     let client = AgentGatewayServiceClient::new(channel)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
@@ -985,27 +1091,74 @@ impl AgentEndpointService for EndpointSvc {
 }
 
 /// Serves a core that dialed in, until its CONTROL lane ends.
+/// Longest a TLS handshake may take, on every path (listen, dial, enroll).
+pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// True when the TLS peer presented the core's certificate.
+pub fn peer_is_core(conn: &tokio_rustls::rustls::ServerConnection) -> bool {
+    conn.peer_certificates()
+        .and_then(|c| c.first())
+        .is_some_and(tls::is_core)
+}
+
+/// Accepts connections from `listen` until one finishes the TLS handshake and passes `check`.
+/// Handshakes run side by side, each limited to [`HANDSHAKE_TIMEOUT`], so a peer that connects
+/// and stays silent never blocks the core; `stop` ends the wait at once (`Ok(None)`).
+pub async fn accept_tls(
+    listen: &dyn Transport,
+    acceptor: tokio_rustls::TlsAcceptor,
+    check: fn(&tokio_rustls::rustls::ServerConnection) -> bool,
+    stop: &CancellationToken,
+) -> Result<Option<tokio_rustls::server::TlsStream<BoxIo>>, LinkError> {
+    let mut handshakes = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            () = stop.cancelled() => return Ok(None),
+            io = listen.connect() => {
+                let acceptor = acceptor.clone();
+                handshakes.spawn(async move {
+                    tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(io?))
+                        .await
+                        .map_err(|_| LinkError::Unreachable("the peer did not finish the TLS handshake in time".into()))?
+                        .map_err(|e| LinkError::Certificate(format!("TLS with the connecting peer failed: {e}")))
+                });
+            }
+            Some(done) = handshakes.join_next(), if !handshakes.is_empty() => {
+                match done {
+                    Ok(Ok(tls_io)) if check(tls_io.get_ref().1) => return Ok(Some(tls_io)),
+                    Ok(Ok(_)) => eprintln!("mrl-agent: dropped a connection that is not from the MasterRL core"),
+                    Ok(Err(e)) => eprintln!("mrl-agent: {}", e.explain()),
+                    Err(_) => {}
+                }
+            }
+        }
+    }
+}
+
+/// TLS client handshake with a time limit and `stop`.
+pub async fn connect_tls(
+    config: tokio_rustls::rustls::ClientConfig,
+    io: BoxIo,
+    stop: &CancellationToken,
+) -> Result<Option<tokio_rustls::client::TlsStream<BoxIo>>, LinkError> {
+    let name =
+        ServerName::try_from(tls::CORE_NAME).map_err(|e| LinkError::Protocol(e.to_string()))?;
+    let connect = tokio_rustls::TlsConnector::from(Arc::new(config)).connect(name, io);
+    tokio::select! {
+        () = stop.cancelled() => Ok(None),
+        r = tokio::time::timeout(HANDSHAKE_TIMEOUT, connect) => match r {
+            Err(_) => Err(LinkError::Unreachable("the core did not finish the TLS handshake in time".into())),
+            Ok(Err(e)) => Err(LinkError::Certificate(format!("TLS with the core failed: {e}"))),
+            Ok(Ok(t)) => Ok(Some(t)),
+        },
+    }
+}
+
 async fn accepted(
     l: Arc<LaneCtx>,
-    io: BoxIo,
+    tls_io: tokio_rustls::server::TlsStream<BoxIo>,
     stop: CancellationToken,
 ) -> Result<Outcome, LinkError> {
-    let config = tls::server(&l.id.ca, l.id.chain(), l.id.key())?;
-    let tls_io = tokio_rustls::TlsAcceptor::from(Arc::new(config))
-        .accept(io)
-        .await
-        .map_err(|e| LinkError::Certificate(format!("TLS with the connecting peer failed: {e}")))?;
-    let is_core = tls_io
-        .get_ref()
-        .1
-        .peer_certificates()
-        .and_then(|c| c.first())
-        .is_some_and(tls::is_core);
-    if !is_core {
-        return Err(LinkError::Certificate(
-            "the connecting peer is not the MasterRL core".into(),
-        ));
-    }
     let stop = stop.child_token();
     let (done_tx, mut done_rx) = mpsc::channel(1);
     let svc = AgentEndpointServiceServer::new(EndpointSvc {
@@ -1033,6 +1186,20 @@ pub async fn connect_once(
     transport: &dyn Transport,
     stop: CancellationToken,
 ) -> Result<Outcome, LinkError> {
+    if transport.waits_for_core() {
+        let config = tls::server(&id.ca, id.chain(), id.key())?;
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let Some(tls_io) = accept_tls(transport, acceptor, peer_is_core, &stop).await? else {
+            return Ok(Outcome::Stopped);
+        };
+        let l = Arc::new(LaneCtx {
+            ctx,
+            link,
+            id,
+            transport: transport.kind(),
+        });
+        return accepted(l, tls_io, stop).await;
+    }
     let io = tokio::select! {
         () = stop.cancelled() => return Ok(Outcome::Stopped),
         io = transport.connect() => io?,
@@ -1043,11 +1210,7 @@ pub async fn connect_once(
         id,
         transport: transport.kind(),
     });
-    if transport.waits_for_core() {
-        accepted(l, io, stop).await
-    } else {
-        dialed(l, io, stop).await
-    }
+    dialed(l, io, stop).await
 }
 
 /// The gateway link as an agent service.
@@ -1197,6 +1360,154 @@ mod tests {
         };
         assert!(String::from_utf8_lossy(&c.data).contains("2 log chunk(s) dropped"));
         assert_eq!(w.role_id, "trainer");
+    }
+
+    struct Count(std::sync::atomic::AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl CommandHandler for Count {
+        async fn handle(&self, _: Command) -> Result<(), Failure> {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_result_waits_for_spool_space_and_the_command_runs_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let g = GatewaySettings {
+            spool_max_entries: 1,
+            ..GatewaySettings::default()
+        };
+        let link = Arc::new(Link::open(dir.path(), &g).unwrap());
+        let count = Arc::new(Count(Default::default()));
+        link.register("Probe", count.clone());
+        let first = link
+            .send_control(agent_message::Body::AttemptStatus(Default::default()))
+            .unwrap();
+        let cmd = Command {
+            command_id: "c1".into(),
+            kind: Some(command::Kind::Probe(Default::default())),
+        };
+        link.deliver(1, cmd.clone()).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(count.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            link.journal.lock().unwrap().unreported().len(),
+            1,
+            "kept, not dropped"
+        );
+        assert_eq!(link.spooled(), 1, "the spool is full");
+
+        link.spool.lock().unwrap().ack(first).unwrap();
+        link.report_results().unwrap();
+        assert!(link.journal.lock().unwrap().unreported().is_empty());
+        let (msgs, _) = link.spool.lock().unwrap().pending(0, false).unwrap();
+        assert!(
+            matches!(&msgs[0].body, Some(agent_message::Body::CommandResult(r)) if r.command_id == "c1" && r.accepted)
+        );
+
+        // The result survives a restart of the link, and a redelivery never reruns it.
+        drop(link);
+        let link = Arc::new(Link::open(dir.path(), &g).unwrap());
+        link.register("Probe", count.clone());
+        link.deliver(1, cmd).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(count.0.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(link.spooled(), 1);
+    }
+
+    /// A CA, and a server config for `localhost` plus a client config that trusts it.
+    fn tls_pair() -> (
+        tokio_rustls::rustls::ServerConfig,
+        tokio_rustls::rustls::ClientConfig,
+    ) {
+        use tokio_rustls::rustls;
+        let ca_key = rcgen::KeyPair::generate().unwrap();
+        let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let ca_cert = ca.self_signed(&ca_key).unwrap();
+        let issuer = rcgen::Issuer::new(ca, ca_key);
+        let key = rcgen::KeyPair::generate().unwrap();
+        let leaf = rcgen::CertificateParams::new(vec!["localhost".to_owned()])
+            .unwrap()
+            .signed_by(&key, &issuer)
+            .unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let server = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![leaf.der().clone()],
+                rustls::pki_types::PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+            )
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(ca_cert.der().clone()).unwrap();
+        let client = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        (server, client)
+    }
+
+    #[tokio::test]
+    async fn a_silent_peer_never_blocks_the_core_and_stop_ends_the_wait() {
+        let (server, client) = tls_pair();
+        let listen = transports::Listen::new("127.0.0.1:0".parse().unwrap(), TransportKind::Direct);
+        let addr = listen.bind().await.unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        // Connects and never speaks.
+        let _silent = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+        let good = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let name = ServerName::try_from("localhost").unwrap();
+            let tls = connector.connect(name, tcp).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            drop(tls);
+        });
+        let started = std::time::Instant::now();
+        let stop = CancellationToken::new();
+        let got = accept_tls(&listen, acceptor.clone(), |_| true, &stop)
+            .await
+            .unwrap();
+        assert!(got.is_some());
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the silent peer did not hold the accept"
+        );
+        good.await.unwrap();
+
+        // Only a silent peer: stopping ends the wait at once.
+        let _silent2 = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let s2 = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            s2.cancel();
+        });
+        let started = std::time::Instant::now();
+        assert!(accept_tls(&listen, acceptor, |_| true, &stop)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn stream_seqs_never_repeat_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("g").join("data_seq.json");
+        let mut s = DataSeq::open(&path).unwrap();
+        assert_eq!(
+            (s.next(0).unwrap(), s.next(0).unwrap(), s.next(1).unwrap()),
+            (1, 2, 1)
+        );
+        let mut again = DataSeq::open(&path).unwrap();
+        assert!(again.next(0).unwrap() > 2 && again.next(1).unwrap() > 1);
     }
 
     #[test]

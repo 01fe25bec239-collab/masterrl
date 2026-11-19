@@ -1,8 +1,9 @@
 //! The internal certificate authority (rcgen, ECDSA P-256).
 //!
 //! The CA key and certificate live in the `SecretStore` under one name (`gateway.ca_secret`),
-//! never in the database or a plain file. The first replica that finds no CA creates one under
-//! a PostgreSQL advisory lock, so replicas never race to make two.
+//! never in the database. The database records only the CA's fingerprint (`gateway_ca`): the
+//! first replica creates the CA under an advisory lock, and a replica whose secret store holds
+//! no key or another CA refuses to start (MRL-NODE-183) instead of making a second CA.
 //!
 //! - Node certificates: SAN `<node uuid>.node.masterrl.internal`, client + server auth (the
 //!   agent also serves TLS when the core dials in), 30 days (static) or ≤ 24 h (ephemeral).
@@ -77,9 +78,6 @@ impl Ca {
         name: &str,
         db: &Db,
     ) -> Result<Self, NodesError> {
-        if let Some(s) = secrets.get(name).await.map_err(ca_err)? {
-            return Self::from_secret(&s);
-        }
         let mut conn = db.dedicated().await?;
         sqlx::query("SELECT pg_advisory_lock($1)")
             .bind(CREATE_LOCK)
@@ -87,12 +85,41 @@ impl Ca {
             .await
             .map_err(crate::db::DbError::from)?;
         let result = async {
-            if let Some(s) = secrets.get(name).await.map_err(ca_err)? {
-                return Self::from_secret(&s);
-            }
-            let (ca, secret) = Self::generate()?;
-            secrets.set(name, secret).await.map_err(ca_err)?;
-            tracing::info!(fingerprint = %ca.sha256, "created the internal CA");
+            let recorded: Option<String> =
+                sqlx::query_scalar("SELECT fingerprint FROM gateway_ca WHERE id = 1")
+                    .fetch_optional(&mut conn)
+                    .await
+                    .map_err(crate::db::DbError::from)?;
+            let stored = secrets.get(name).await.map_err(ca_err)?;
+            let ca = match (stored, recorded.as_deref()) {
+                (Some(s), Some(fp)) => {
+                    let ca = Self::from_secret(&s)?;
+                    if ca.sha256 != fp {
+                        return Err(NodesError::Ca(format!(
+                            "this server's secret store holds another CA ({}) than the one the database records ({fp}); every server must use the same secret store",
+                            ca.sha256
+                        )));
+                    }
+                    return Ok(ca);
+                }
+                (None, Some(fp)) => {
+                    return Err(NodesError::Ca(format!(
+                        "the database records the CA {fp}, but its key is not in this server's secret store under {name:?}; give every server the same secret store"
+                    )))
+                }
+                (Some(s), None) => Self::from_secret(&s)?,
+                (None, None) => {
+                    let (ca, secret) = Self::generate()?;
+                    secrets.set(name, secret).await.map_err(ca_err)?;
+                    tracing::info!(fingerprint = %ca.sha256, "created the internal CA");
+                    ca
+                }
+            };
+            sqlx::query("INSERT INTO gateway_ca (id, fingerprint) VALUES (1, $1)")
+                .bind(&ca.sha256)
+                .execute(&mut conn)
+                .await
+                .map_err(crate::db::DbError::from)?;
             Ok(ca)
         }
         .await;

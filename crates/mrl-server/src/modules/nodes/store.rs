@@ -5,7 +5,7 @@
 //! the outbox in the same transaction.
 
 use super::api::{GpuView, NodeDetail, NodeView, PoolView};
-use super::ca::{sha256_hex, Ca, Issued};
+use super::ca::{sha256_hex, Issued};
 use super::{NodesError, Pki};
 use crate::db::{Db, Tx};
 use crate::modules::events::{NewEvent, OutboxWriter};
@@ -467,41 +467,68 @@ pub async fn cert_identity(db: &Db, sha256: &str) -> Result<Option<CertIdentity>
     .map_err(|e: sqlx::Error| e.into())
 }
 
-/// Signs a new certificate for `node`, revokes the others (`rotated`).
+/// Signs a new certificate for `node`, after re-checking — in the same transaction, with the
+/// presenting certificate's row locked — that the certificate this request came with
+/// (`presented_sha256`) is still valid. Older certificates stay valid until the new one first
+/// authenticates ([`retire_older`]), so a lost reply never strands the agent.
 pub async fn renew(
     db: &Db,
-    ca: &Ca,
+    pki: std::sync::Arc<Pki>,
     cfg: &super::GatewayConfig,
     node: Uuid,
     lifecycle: Lifecycle,
+    presented_sha256: &str,
     csr_der: &[u8],
 ) -> Result<Issued, NodesError> {
-    let cert = ca.issue_node(csr_der, node, lifecycle.cert_lifetime(cfg))?;
-    let c = cert.clone();
+    let lifetime = lifecycle.cert_lifetime(cfg);
+    let (sha, csr) = (presented_sha256.to_owned(), csr_der.to_vec());
     db.transaction(move |tx| {
-        let c = c.clone();
+        let (sha, csr, pki) = (sha.clone(), csr.clone(), pki.clone());
         Box::pin(async move {
-            sqlx::query(
-                "UPDATE node_certificates SET revoked_at = now(), revoked_reason = 'rotated'
-                 WHERE node_id = $1 AND revoked_at IS NULL",
+            let valid: Option<bool> = sqlx::query_scalar(
+                "SELECT c.revoked_at IS NULL AND c.not_after > now() AND n.status <> 'DECOMMISSIONED'
+                 FROM node_certificates c JOIN compute_nodes n ON n.id = c.node_id
+                 WHERE c.sha256 = $1 AND c.node_id = $2 FOR UPDATE OF c",
             )
+            .bind(&sha)
             .bind(node)
-            .execute(&mut **tx)
+            .fetch_optional(&mut **tx)
             .await?;
-            insert_cert(tx, node, &c).await.map_err(db_of)?;
-            sqlx::query(
-                "UPDATE compute_nodes SET cert_serial = $2, cert_expires_at = $3 WHERE id = $1",
-            )
-            .bind(node)
-            .bind(&c.serial)
-            .bind(c.not_after)
-            .execute(&mut **tx)
-            .await?;
-            Ok(())
+            if valid != Some(true) {
+                return Ok(Err(NodesError::Certificate(
+                    "the certificate this request came with is revoked or expired; no new one was issued".into(),
+                )));
+            }
+            let cert = match pki.ca.issue_node(&csr, node, lifetime) {
+                Ok(c) => c,
+                Err(e) => return Ok(Err(e)),
+            };
+            insert_cert(tx, node, &cert).await.map_err(db_of)?;
+            sqlx::query("UPDATE compute_nodes SET cert_serial = $2, cert_expires_at = $3 WHERE id = $1")
+                .bind(node)
+                .bind(&cert.serial)
+                .bind(cert.not_after)
+                .execute(&mut **tx)
+                .await?;
+            Ok(Ok(cert))
         })
     })
-    .await?;
-    Ok(cert)
+    .await?
+}
+
+/// The node authenticated with `sha256`: revoke (`rotated`) its certificates issued before it.
+/// Returns the revoked fingerprints.
+pub async fn retire_older(db: &Db, node: Uuid, sha256: &str) -> Result<Vec<String>, NodesError> {
+    Ok(sqlx::query_scalar(
+        "UPDATE node_certificates SET revoked_at = now(), revoked_reason = 'rotated'
+         WHERE node_id = $1 AND revoked_at IS NULL AND sha256 <> $2
+           AND issued_at < (SELECT issued_at FROM node_certificates WHERE sha256 = $2)
+         RETURNING sha256",
+    )
+    .bind(node)
+    .bind(sha256)
+    .fetch_all(db.pool())
+    .await?)
 }
 
 /// Revokes every certificate of `node`.
@@ -558,6 +585,24 @@ pub async fn open_control(
             })
         })
         .await?)
+}
+
+/// The epoch of the node's CONTROL session. A data stream may open first, so this waits (up to
+/// 5 s) until a CONTROL session holds the node, then returns its epoch.
+pub async fn session_epoch(db: &Db, node: Uuid) -> Result<i64, NodesError> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let (epoch, held): (i64, bool) = sqlx::query_as(
+            "SELECT session_epoch, session_holder IS NOT NULL FROM compute_nodes WHERE id = $1",
+        )
+        .bind(node)
+        .fetch_one(db.pool())
+        .await?;
+        if held || tokio::time::Instant::now() >= deadline {
+            return Ok(epoch);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
 }
 
 /// The CONTROL session `epoch` ended.
@@ -868,7 +913,7 @@ pub async fn command_result(
     let done = sqlx::query(
         "UPDATE agent_commands SET state = CASE WHEN $3 THEN 'COMPLETED' ELSE 'FAILED' END,
             result = $4, updated_at = now()
-         WHERE id = $1 AND node_id = $2 AND state IN ('SENT','RECEIVED')",
+         WHERE id = $1 AND node_id = $2 AND state IN ('SENT','RECEIVED','EXPIRED')",
     )
     .bind(id)
     .bind(node)

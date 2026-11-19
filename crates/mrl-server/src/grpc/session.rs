@@ -295,7 +295,7 @@ struct Lossy {
 }
 
 impl Lossy {
-    fn start(gw: &Arc<Gateway>, node: Uuid) -> Self {
+    fn start(gw: &Arc<Gateway>, node: Uuid, epoch: i64, stream: Lane) -> Self {
         let (tx, mut rx) = watch::channel::<Option<AgentMessage>>(None);
         let gw2 = gw.clone();
         tokio::spawn(async move {
@@ -310,8 +310,9 @@ impl Lossy {
                 if let Some(sink) = gw2.lanes.sink_for(LaneKind::Telemetry) {
                     let item = LaneItem {
                         node_id: node,
-                        session_epoch: 0,
+                        session_epoch: epoch,
                         lane: LaneKind::Telemetry,
+                        stream,
                         seq: msg.seq,
                         dropped_before: 0,
                         message: msg,
@@ -411,6 +412,7 @@ async fn route_control(
     gw: &Gateway,
     node: Uuid,
     epoch: i64,
+    stream: Lane,
     msg: &AgentMessage,
 ) -> Result<bool, Status> {
     let Some(sink) = gw.lanes.sink_for(LaneKind::Control) else {
@@ -422,6 +424,7 @@ async fn route_control(
         node_id: node,
         session_epoch: epoch,
         lane: LaneKind::Control,
+        stream,
         seq: msg.seq,
         dropped_before: 0,
         message: msg.clone(),
@@ -436,6 +439,7 @@ async fn route_control(
 
 async fn renew(
     gw: &Gateway,
+    sha: &str,
     ident: &CertIdentity,
     req: &RenewCertificateRequest,
 ) -> RenewCertificateResult {
@@ -450,10 +454,11 @@ async fn renew(
     };
     match store::renew(
         &gw.db,
-        &pki.ca,
+        pki.clone(),
         &gw.config,
         ident.node,
         ident.lifecycle,
+        sha,
         &req.csr_der,
     )
     .await
@@ -496,6 +501,12 @@ async fn control(
     .await
     .map_err(unavailable)?;
     let (superseded, revoked, wake) = gw.sessions.open_control(node, epoch);
+    // This certificate authenticated: certificates issued before it are retired now (rotation
+    // keeps the old one valid until the new one is proven to work).
+    let retired = store::retire_older(&gw.db, node, sha)
+        .await
+        .map_err(unavailable)?;
+    gw.revoked_locally(&retired);
     let mut rx_seq = rx.max(0) as u64;
     tracing::info!(node = %NodeId::from_uuid(node), epoch, "machine connected");
     let result = async {
@@ -504,7 +515,7 @@ async fn control(
         store::commands_received(&gw.db, node, resume - 1).await.map_err(unavailable)?;
         let mut sent_upto = resume - 1;
         let mut acked = 0u64;
-        let lossy = Lossy::start(gw, node);
+        let lossy = Lossy::start(gw, node, epoch, Lane::Control);
         let mut poll = tokio::time::interval(COMMAND_POLL);
         let mut recheck = tokio::time::interval(Duration::from_secs(gw.config.revocation_check_seconds));
         recheck.tick().await;
@@ -537,12 +548,12 @@ async fn control(
                     let lane = LaneKind::of(&m);
                     let mut unrouted = false;
                     if lane != LaneKind::Control {
-                        lossy.offer(lane, LaneItem { node_id: node, session_epoch: epoch, lane, seq: m.seq, dropped_before: 0, message: m.clone() });
+                        lossy.offer(lane, LaneItem { node_id: node, session_epoch: epoch, lane, stream: Lane::Control, seq: m.seq, dropped_before: 0, message: m.clone() });
                     } else if !own(&m.body) {
-                        unrouted = route_control(gw, node, epoch, &m).await?;
+                        unrouted = route_control(gw, node, epoch, Lane::Control, &m).await?;
                     }
                     if let Some(agent_message::Body::RenewCertificate(req)) = &m.body {
-                        let result = renew(gw, &ident, req).await;
+                        let result = renew(gw, sha, &ident, req).await;
                         send(out, core_message::Body::RenewCertificateResult(result), 0, rx_seq).await?;
                     }
                     match record(gw, node, epoch, &m, unrouted).await.map_err(unavailable)? {
@@ -569,7 +580,7 @@ async fn control(
     result
 }
 
-/// Sends commands with `seq > after`; returns the last sent seq.
+/// Sends commands with `seq > after` (PENDING, or SENT but not journaled); returns the last sent seq.
 async fn send_commands(
     gw: &Gateway,
     node: Uuid,
@@ -583,8 +594,11 @@ async fn send_commands(
         .map_err(unavailable)?
     {
         let cmd = commands::decode(&payload).map_err(unavailable)?;
-        send(out, core_message::Body::Command(cmd), seq, rx_seq).await?;
+        // SENT is committed before the command leaves: if the write fails nothing is sent; if
+        // the send fails or the server stops, the SENT row is sent again after the agent
+        // reconnects (its `resume_from_seq` says which seqs it already journaled).
         store::mark_sent(&gw.db, id).await.map_err(unavailable)?;
+        send(out, core_message::Body::Command(cmd), seq, rx_seq).await?;
         last = seq;
     }
     Ok(last)
@@ -603,7 +617,11 @@ async fn data(
     let lane = Lane::try_from(h.lane).unwrap_or(Lane::Telemetry);
     let revoked = gw.sessions.revoked_token(node);
     send(out, hello(gw, lane, 0), 0, 0).await?;
-    let lossy = Lossy::start(gw, node);
+    // The node's current session epoch (data streams don't open sessions of their own).
+    let epoch = store::session_epoch(&gw.db, node)
+        .await
+        .map_err(unavailable)?;
+    let lossy = Lossy::start(gw, node, epoch, lane);
     let mut recheck =
         tokio::time::interval(Duration::from_secs(gw.config.revocation_check_seconds));
     recheck.tick().await;
@@ -622,13 +640,13 @@ async fn data(
                 if kind == LaneKind::Control {
                     // CONTROL-class messages on a data lane (like guard events) are delivered
                     // without seq dedupe; sinks dedupe on (node, lane, seq) anyway.
-                    if !own(&m.body) && route_control(gw, node, 0, &m).await? {
+                    if !own(&m.body) && route_control(gw, node, epoch, lane, &m).await? {
                         let mut tx = gw.db.begin().await.map_err(|e| unavailable(e.into()))?;
                         store::unrouted(&mut tx, node, seq, &m).await.map_err(unavailable)?;
                         tx.commit().await.map_err(|e| unavailable(e.into()))?;
                     }
                 } else {
-                    lossy.offer(kind, LaneItem { node_id: node, session_epoch: 0, lane: kind, seq, dropped_before: 0, message: m });
+                    lossy.offer(kind, LaneItem { node_id: node, session_epoch: epoch, lane: kind, stream: lane, seq, dropped_before: 0, message: m });
                 }
                 if seq > 0 {
                     ack(out, seq).await?;

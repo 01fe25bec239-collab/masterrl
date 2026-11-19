@@ -116,6 +116,15 @@ impl GatewayHarness {
         }
     }
 
+    /// A second server (replica) on the same database and secret store, with its own gateway port.
+    pub async fn replica(&self) -> (TestServer, Arc<Gateway>) {
+        let config = GatewayConfig {
+            listen: None,
+            ..self.config.clone()
+        };
+        Self::boot(&self.db, &config, self.secrets.clone(), self.lanes.clone()).await
+    }
+
     /// Stops the server and starts a new one on the same database, CA and gateway port.
     pub async fn restart(self) -> Self {
         let addr = self.addr();
@@ -358,6 +367,17 @@ mod tests {
         let e = b.enroll(&gw, &expired).await.unwrap_err();
         assert!(e.to_string().contains("expired"), "{e}");
 
+        // The command shown to the user names the port the gateway really listens on.
+        let r = gw
+            .post(
+                &format!("/api/v1/pools/{}/enrollment-tokens", gw.pool),
+                json!({}),
+            )
+            .await;
+        let cmd = r.json()["enroll_command"].as_str().unwrap().to_owned();
+        assert!(cmd.contains(&format!(":{} ", gw.addr().port())), "{cmd}");
+        assert_ne!(gw.addr().port(), 0);
+
         let pin = gw.gw.ca_fingerprint().unwrap();
         let unknown = format!("mrlj_{}_{pin}", "0".repeat(64));
         assert!(b
@@ -551,17 +571,49 @@ mod tests {
         assert!(holder.is_none(), "the revoked stream was closed");
         link.stop().await;
 
-        // And a new connection is refused at the handshake.
+        // And a new connection is refused in the TLS handshake itself (certificate_revoked).
         let id = mrl_agent::enroll::Identity::load(a.ctx.state.root())
             .unwrap()
             .unwrap();
+        {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let cfg = mrl_agent::session::tls::client(&id.ca, id.chain(), id.key()).unwrap();
+            let tcp = tokio::net::TcpStream::connect(gw.addr()).await.unwrap();
+            let name = tokio_rustls::rustls::pki_types::ServerName::try_from(
+                mrl_agent::session::tls::CORE_NAME,
+            )
+            .unwrap();
+            let refused = match tokio_rustls::TlsConnector::from(Arc::new(cfg))
+                .connect(name, tcp)
+                .await
+            {
+                Err(e) => e.to_string(),
+                Ok(mut tls) => {
+                    let _ = tls.write_all(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n").await;
+                    let mut buf = [0u8; 64];
+                    match tls.read(&mut buf).await {
+                        Err(e) => e.to_string(),
+                        Ok(n) => format!("read {n} bytes"),
+                    }
+                }
+            };
+            assert!(
+                refused.contains("CertificateRevoked"),
+                "TLS must refuse a revoked certificate: {refused}"
+            );
+        }
         let t = mrl_agent::transports::Direct::new(&gw.addr().to_string());
         let link = Link::of(&a.ctx).unwrap();
         let e =
             mrl_agent::session::connect_once(a.ctx.clone(), link, id, &t, CancellationToken::new())
                 .await
                 .unwrap_err();
-        assert_eq!(e.code(), "MRL-NODE-181", "{e}");
+        // The TLS refusal is proven above; the agent reports it as the certificate problem, or —
+        // when the connection drops before the alert is read — as an unreachable core.
+        assert!(
+            matches!(e.code().as_str(), "MRL-NODE-181" | "MRL-LINK-184"),
+            "{e}"
+        );
         let now: i64 = gw.node(&node).await["session_epoch"].as_i64().unwrap();
         assert_eq!(now, epoch, "no new session was opened");
     }
@@ -597,13 +649,22 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         assert!(renewed, "the agent saved a renewed certificate");
-        let reason: String =
-            sqlx::query_scalar("SELECT revoked_reason FROM node_certificates WHERE sha256 = $1")
-                .bind(&old)
-                .fetch_one(gw.db.pool())
-                .await
-                .unwrap();
-        assert_eq!(reason, "rotated");
+        // The old certificate is retired once the new one has authenticated.
+        let mut reason = None;
+        for _ in 0..100 {
+            reason = sqlx::query_scalar::<_, Option<String>>(
+                "SELECT revoked_reason FROM node_certificates WHERE sha256 = $1",
+            )
+            .bind(&old)
+            .fetch_one(gw.db.pool())
+            .await
+            .unwrap();
+            if reason.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(reason.as_deref(), Some("rotated"));
         let n = gw.wait_status(&node, "ONLINE").await;
         assert_eq!(n["lifecycle"], "EPHEMERAL");
 
@@ -718,5 +779,272 @@ mod tests {
         )
         .await;
         link.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn renewal_rechecks_the_presenting_cert_and_a_lost_reply_strands_nobody() {
+        use mrl_server::modules::nodes::store::{self, Lifecycle};
+        let gw = GatewayHarness::start(TestDb::new().await).await;
+        let a = TestAgent::new(1, |_| {});
+        let node = uuid_of(&a.enroll(&gw, &gw.token(json!({})).await).await.unwrap());
+        let id = mrl_agent::enroll::Identity::load(a.ctx.state.root())
+            .unwrap()
+            .unwrap();
+        // Revoked by another replica, then a renewal arrives before any periodic check.
+        sqlx::query("UPDATE node_certificates SET revoked_at = now(), revoked_reason = 'operator' WHERE node_id = $1")
+            .bind(node)
+            .execute(gw.db.pool())
+            .await
+            .unwrap();
+        let (_, csr) = mrl_agent::enroll::new_key().unwrap();
+        let pki = gw.gw.pki().unwrap();
+        let e = store::renew(
+            gw.db.db(),
+            pki.clone(),
+            gw.gw.config(),
+            node,
+            Lifecycle::Static,
+            &id.cert_sha256(),
+            &csr,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.code(), "MRL-NODE-181", "{e}");
+        let certs: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM node_certificates WHERE node_id = $1")
+                .bind(node)
+                .fetch_one(gw.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(certs, 1, "no certificate was issued");
+
+        // A renewal whose reply never reaches the agent: the old certificate still works.
+        let b = TestAgent::new(1, |_| {});
+        let b_node = b.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
+        let b_id = mrl_agent::enroll::Identity::load(b.ctx.state.root())
+            .unwrap()
+            .unwrap();
+        let lost = store::renew(
+            gw.db.db(),
+            pki,
+            gw.gw.config(),
+            uuid_of(&b_node),
+            Lifecycle::Static,
+            &b_id.cert_sha256(),
+            &csr,
+        )
+        .await
+        .unwrap();
+        let link = b.run();
+        gw.wait_status(&b_node, "ONLINE").await;
+        let open: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM node_certificates WHERE node_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(uuid_of(&b_node))
+        .fetch_one(gw.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            open, 2,
+            "the unused new certificate does not retire the one in use"
+        );
+        assert_ne!(lost.sha256, b_id.cert_sha256());
+        link.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn a_sent_command_the_agent_never_got_is_sent_again() {
+        let gw = GatewayHarness::start(TestDb::new().await).await;
+        let a = TestAgent::new(1, |_| {});
+        let node =
+            NodeId::from_str(&a.enroll(&gw, &gw.token(json!({})).await).await.unwrap()).unwrap();
+        let count = Arc::new(Count(AtomicUsize::new(0)));
+        Link::of(&a.ctx).unwrap().register("Probe", count.clone());
+        let c = CommandSender::new(&gw.gw, &[CommandKind::Probe])
+            .send(node, probe())
+            .await
+            .unwrap();
+        // SENT committed, then the server stopped before the bytes left.
+        sqlx::query("UPDATE agent_commands SET state = 'SENT', sent_at = now() WHERE id = $1")
+            .bind(c.id)
+            .execute(gw.db.pool())
+            .await
+            .unwrap();
+        let link = a.run();
+        wait_state(&gw, c.id, "COMPLETED").await;
+        assert_eq!(count.0.load(Ordering::SeqCst), 1);
+        link.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn replicas_share_one_ca_and_a_replica_with_another_store_refuses_to_start() {
+        let gw = GatewayHarness::start(TestDb::new().await).await;
+        let (replica, replica_gw) = gw.replica().await;
+        assert_eq!(replica_gw.ca_fingerprint(), gw.gw.ca_fingerprint());
+        // Enrolled through replica A, connected through replica B.
+        let b_addr = replica_gw.addr().unwrap().to_string();
+        let a = TestAgent::new(1, |c| c.gateway.server = Some(b_addr.clone()));
+        let node = a.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
+        let link = a.run();
+        gw.wait_status(&node, "ONLINE").await;
+        link.stop().await;
+        replica.shutdown().await.unwrap();
+
+        // Another secret store (another machine's local files): refused, no second CA.
+        let cfg = mrl_server::config::Config {
+            gateway: fast_config(),
+            ..mrl_server::config::Config::default()
+        };
+        let other = NodesModule::new(
+            gw.db.db().clone(),
+            &cfg,
+            Arc::new(InMemorySecretStore::default()),
+            LaneRouter::new(),
+        );
+        let seams = crate::seams::build(crate::seams::solo(TEST_SECRET), Mode::Solo);
+        let e = match TestServer::start(cfg, seams, vec![Box::new(other)]).await {
+            Ok(_) => panic!("a replica without the CA key must not start"),
+            Err(e) => e,
+        };
+        assert!(
+            e.detail.contains("MRL-NODE-183")
+                && e.detail.contains("not in this server's secret store"),
+            "{}",
+            e.detail
+        );
+        let cas: i64 = sqlx::query_scalar("SELECT count(*) FROM gateway_ca")
+            .fetch_one(gw.db.pool())
+            .await
+            .unwrap();
+        assert_eq!(cas, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn the_gateway_and_shared_grpc_services_start_together_in_team_mode() {
+        let db = TestDb::new().await;
+        let grpc_port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let mut cfg = mrl_server::config::Config::default();
+        cfg.server.mode = Mode::Team;
+        cfg.server.listeners.api = "127.0.0.1:0".parse().unwrap();
+        cfg.server.listeners.internal = "127.0.0.1:0".parse().unwrap();
+        cfg.server.listeners.grpc = format!("127.0.0.1:{grpc_port}").parse().unwrap();
+        cfg.gateway = GatewayConfig {
+            listen: Some("127.0.0.1:0".parse().unwrap()),
+            ..fast_config()
+        };
+        cfg.validate().unwrap();
+        let nodes = NodesModule::new(
+            db.db().clone(),
+            &cfg,
+            Arc::new(InMemorySecretStore::default()),
+            LaneRouter::new(),
+        );
+        let gw = nodes.gateway();
+        let other = crate::server::TestModule {
+            grpc: true,
+            ..Default::default()
+        };
+        let seams = crate::seams::build(crate::seams::team(&[]), Mode::Team);
+        let server =
+            match TestServer::start(cfg, seams, vec![Box::new(nodes), Box::new(other)]).await {
+                Ok(s) => s,
+                Err(e) => panic!("both must start: {}", e.explain()),
+            };
+        assert_eq!(
+            server.running().grpc_addr().map(|a| a.port()),
+            Some(grpc_port)
+        );
+        assert_ne!(gw.addr().unwrap().port(), grpc_port);
+        server.shutdown().await.unwrap();
+    }
+
+    /// Records `(stream, seq)` of every metrics item.
+    struct Seen(std::sync::Mutex<Vec<(i32, u64)>>);
+
+    #[async_trait::async_trait]
+    impl mrl_server::modules::nodes::lanes::LaneSink for Seen {
+        fn name(&self) -> &'static str {
+            "seen"
+        }
+        fn lanes(&self) -> &'static [mrl_server::modules::nodes::lanes::LaneKind] {
+            &[mrl_server::modules::nodes::lanes::LaneKind::Metrics]
+        }
+        async fn deliver(
+            &self,
+            item: mrl_server::modules::nodes::lanes::LaneItem,
+        ) -> Result<(), mrl_server::modules::nodes::lanes::SinkError> {
+            assert!(item.session_epoch > 0, "items carry the real session epoch");
+            self.0.lock().unwrap().push((item.stream as i32, item.seq));
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn data_items_keep_unique_ids_across_reconnects() {
+        let router = LaneRouter::new();
+        let seen = Arc::new(Seen(std::sync::Mutex::new(Vec::new())));
+        router.register(seen.clone());
+        let gw = GatewayHarness::start_with(
+            TestDb::new().await,
+            fast_config(),
+            Arc::new(InMemorySecretStore::default()),
+            router,
+        )
+        .await;
+        let a = TestAgent::new(1, |_| {});
+        let node = a.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
+        let link = Link::of(&a.ctx).unwrap();
+        let relay = || mrl_proto::agent::v1::WorkerRelay {
+            message: Some(mrl_proto::worker::v1::WorkerMessage {
+                body: Some(mrl_proto::worker::v1::worker_message::Body::Metrics(
+                    Default::default(),
+                )),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let wait = |n: usize| {
+            let seen = seen.clone();
+            async move {
+                for _ in 0..100 {
+                    if seen.0.lock().unwrap().len() >= n {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                panic!("only {:?} arrived", seen.0.lock().unwrap());
+            }
+        };
+        let run = a.run();
+        gw.wait_status(&node, "ONLINE").await;
+        for _ in 0..3 {
+            link.send_metrics(relay());
+        }
+        wait(3).await;
+        run.stop().await;
+        let run = a.run();
+        gw.wait_status(&node, "ONLINE").await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        for _ in 0..3 {
+            link.send_metrics(relay());
+        }
+        wait(6).await;
+        run.stop().await;
+        let got = seen.0.lock().unwrap().clone();
+        let unique: std::collections::HashSet<_> = got.iter().collect();
+        assert_eq!(
+            unique.len(),
+            got.len(),
+            "a deduplicating sink keeps every item: {got:?}"
+        );
     }
 }

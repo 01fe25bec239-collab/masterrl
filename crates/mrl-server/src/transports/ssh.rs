@@ -147,6 +147,31 @@ pub fn fingerprint(key: &PublicKey) -> String {
     key.fingerprint(HashAlg::Sha256).to_string()
 }
 
+/// Decides what [`Ssh::trust_host_key`] saves from one handshake's verdict: `None` when the
+/// key is already trusted, the shown key when its fingerprint is `expected`, else an error.
+fn key_to_save(
+    verdict: Option<HostKey>,
+    expected: &str,
+    host: &str,
+) -> Result<Option<PublicKey>, TransportError> {
+    match verdict {
+        Some(HostKey::Known) => Ok(None),
+        Some(HostKey::Unknown(k)) if fingerprint(&k) == expected => Ok(Some(k)),
+        Some(HostKey::Unknown(k)) => Err(TransportError::Unreachable(format!(
+            "{host} now shows the key {}, not the confirmed {expected}; nothing was saved",
+            fingerprint(&k)
+        ))),
+        Some(HostKey::Changed(line)) => Err(TransportError::HostKeyChanged {
+            host: host.to_owned(),
+            line,
+        }),
+        Some(HostKey::Unreadable(e)) => Err(TransportError::Unreachable(e)),
+        None => Err(TransportError::Unreachable(format!(
+            "{host} did not show a host key"
+        ))),
+    }
+}
+
 /// What the host key check decided.
 #[derive(Debug, Clone)]
 enum HostKey {
@@ -226,46 +251,27 @@ impl Ssh {
     }
 
     /// Records the host's key as trusted, after the user confirmed `expected` (the fingerprint
-    /// from [`TransportError::HostKeyUnknown`]). Fails when the host now shows another key.
+    /// from [`TransportError::HostKeyUnknown`]). One handshake: the key that is compared with
+    /// `expected` is the key that is saved, so a host that shows another key is never trusted.
     pub async fn trust_host_key(&self, expected: &str) -> Result<(), TransportError> {
-        match self.handshake().await {
-            Ok(_) => Ok(()), // already trusted
-            Err(TransportError::HostKeyUnknown { fingerprint, .. }) if fingerprint != expected => {
-                Err(TransportError::Unreachable(format!(
-                    "{} now shows the key {fingerprint}, not the confirmed {expected}; nothing was saved",
-                    self.host_port()
-                )))
-            }
-            Err(TransportError::HostKeyUnknown { .. }) => {
-                let key = self.fetch_unknown_key().await?;
-                russh::keys::known_hosts::learn_known_hosts_path(
-                    &self.target.hostname,
-                    self.target.port,
-                    &key,
-                    &self.known_hosts,
-                )
-                .map_err(|e| {
-                    TransportError::Unreachable(format!(
-                        "could not save the host key to {}: {e}",
-                        self.known_hosts.display()
-                    ))
-                })
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    async fn fetch_unknown_key(&self) -> Result<PublicKey, TransportError> {
         let seen = Arc::new(Mutex::new(None));
         let _ = self.raw_handshake(seen.clone()).await;
         let verdict = seen.lock().ok().and_then(|s| s.clone());
-        match verdict {
-            Some(HostKey::Unknown(k)) => Ok(k),
-            _ => Err(TransportError::Unreachable(format!(
-                "{} did not show its host key again",
-                self.host_port()
-            ))),
-        }
+        let Some(key) = key_to_save(verdict, expected, &self.host_port())? else {
+            return Ok(()); // already trusted
+        };
+        russh::keys::known_hosts::learn_known_hosts_path(
+            &self.target.hostname,
+            self.target.port,
+            &key,
+            &self.known_hosts,
+        )
+        .map_err(|e| {
+            TransportError::Unreachable(format!(
+                "could not save the host key to {}: {e}",
+                self.known_hosts.display()
+            ))
+        })
     }
 
     async fn raw_handshake(
@@ -561,6 +567,34 @@ Host *
         assert!(!r.ok);
         assert_eq!(r.steps.last().unwrap().name, "host_key");
         assert!(r.problem().unwrap().contains("SSH handshake"), "{r:?}");
+    }
+
+    #[test]
+    fn only_the_confirmed_key_is_saved() {
+        let a = russh::keys::parse_public_key_base64(
+            "AAAAC3NzaC1lZDI1NTE5AAAAIFO3B00ltJOm7PCGwKQuYou7uZ/NBr5Uw0M25OC6o7t0",
+        )
+        .unwrap();
+        let b = russh::keys::parse_public_key_base64(
+            "AAAAC3NzaC1lZDI1NTE5AAAAIBbJ9jiHIfAuBVlRrQlCgVt0dx07250b7SS/47uxjYjx",
+        )
+        .unwrap();
+        let fa = fingerprint(&a);
+        // The user confirmed A, but the handshake now shows B: nothing is saved.
+        let e = key_to_save(Some(HostKey::Unknown(b.clone())), &fa, "h:22").unwrap_err();
+        assert!(e.to_string().contains("nothing was saved"), "{e}");
+        assert_eq!(
+            key_to_save(Some(HostKey::Unknown(a.clone())), &fa, "h:22").unwrap(),
+            Some(a)
+        );
+        assert!(key_to_save(Some(HostKey::Known), &fa, "h:22")
+            .unwrap()
+            .is_none());
+        assert!(matches!(
+            key_to_save(Some(HostKey::Changed(3)), &fa, "h:22"),
+            Err(TransportError::HostKeyChanged { line: 3, .. })
+        ));
+        assert!(key_to_save(None, &fa, "h:22").is_err());
     }
 
     /// One named secret.

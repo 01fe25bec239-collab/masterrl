@@ -9,7 +9,7 @@
 use crate::session::tls::{self, sha256_hex};
 use crate::session::{self as link, LinkError, PROTOCOL_VERSION};
 use crate::state::atomic_write;
-use crate::transports::{Transport, TransportKind};
+use crate::transports::TransportKind;
 use crate::AgentContext;
 use mrl_proto::agent::v1::agent_endpoint_service_server::{
     AgentEndpointService, AgentEndpointServiceServer,
@@ -24,9 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
-use tokio_rustls::rustls::pki_types::{
-    CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName,
-};
+use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
@@ -101,6 +99,31 @@ impl std::fmt::Debug for Identity {
     }
 }
 
+/// The identity file (in a 0700 folder; the file itself is 0600 on Unix: it holds the key).
+pub const IDENTITY_FILE: &str = "identity.json";
+
+#[derive(Serialize, Deserialize)]
+struct IdentityFile {
+    link: LinkFile,
+    cert: String,
+    ca: String,
+    key: String,
+}
+
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+fn from_hex(s: &str) -> Option<Vec<u8>> {
+    if !s.len().is_multiple_of(2) {
+        return None;
+    }
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+        .collect()
+}
+
 /// The identity folder inside the state folder.
 pub fn identity_dir(state_root: &Path) -> PathBuf {
     state_root.join("identity")
@@ -119,38 +142,31 @@ fn unix_now() -> i64 {
 impl Identity {
     /// Loads the identity, or `None` when this machine has not enrolled.
     pub fn load(state_root: &Path) -> Result<Option<Self>, LinkError> {
-        let dir = identity_dir(state_root);
-        let read = |name: &str| -> Result<Option<Vec<u8>>, LinkError> {
-            let p = dir.join(name);
-            match std::fs::read(&p) {
-                Ok(b) => Ok(Some(b)),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(e) => Err(io_err(&p)(e)),
-            }
+        let path = identity_dir(state_root).join(IDENTITY_FILE);
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(io_err(&path)(e)),
         };
-        let (Some(link), Some(cert), Some(ca), Some(key)) = (
-            read("link.json")?,
-            read("node.crt.der")?,
-            read("ca.crt.der")?,
-            read("node.key.der")?,
-        ) else {
-            return Ok(None);
-        };
-        let link: LinkFile = serde_json::from_slice(&link).map_err(|e| {
+        let damaged = |why: String| {
             LinkError::NotEnrolled(format!(
-                "{} is damaged ({e}); enroll again",
-                dir.join("link.json").display()
+                "{} is damaged ({why}); enroll again",
+                path.display()
             ))
-        })?;
+        };
+        let f: IdentityFile = serde_json::from_slice(&bytes).map_err(|e| damaged(e.to_string()))?;
+        let unhex =
+            |name: &str, v: &str| from_hex(v).ok_or_else(|| damaged(format!("{name} is not hex")));
         Ok(Some(Self {
-            link,
-            cert: CertificateDer::from(cert),
-            ca: CertificateDer::from(ca),
-            key,
+            link: f.link,
+            cert: CertificateDer::from(unhex("cert", &f.cert)?),
+            ca: CertificateDer::from(unhex("ca", &f.ca)?),
+            key: unhex("key", &f.key)?,
         }))
     }
 
-    /// Writes the identity (key last, so a crash never leaves a key without its certificate).
+    /// Writes the whole identity (link, certificate, CA, key) as one file in one atomic
+    /// replace, so a crash leaves either the old identity or the new one, never a mix.
     pub fn save(&self, state_root: &Path) -> Result<(), LinkError> {
         let dir = identity_dir(state_root);
         std::fs::create_dir_all(&dir).map_err(io_err(&dir))?;
@@ -160,23 +176,23 @@ impl Identity {
             std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
                 .map_err(io_err(&dir))?;
         }
-        let write = |name: &str, bytes: &[u8]| {
-            let p = dir.join(name);
-            atomic_write(&p, bytes).map_err(io_err(&p))
+        let f = IdentityFile {
+            link: self.link.clone(),
+            cert: hex(&self.cert),
+            ca: hex(&self.ca),
+            key: hex(&self.key),
         };
-        let link = serde_json::to_vec_pretty(&self.link)
-            .map_err(|e| LinkError::Protocol(e.to_string()))?;
-        write("node.crt.der", &self.cert)?;
-        write("ca.crt.der", &self.ca)?;
-        write("node.key.der", &self.key)?;
+        let bytes =
+            serde_json::to_vec_pretty(&f).map_err(|e| LinkError::Protocol(e.to_string()))?;
+        let path = dir.join(IDENTITY_FILE);
+        atomic_write(&path, &bytes).map_err(io_err(&path))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let p = dir.join("node.key.der");
-            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600))
-                .map_err(io_err(&p))?;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .map_err(io_err(&path))?;
         }
-        write("link.json", &link)
+        Ok(())
     }
 
     /// The private key.
@@ -329,16 +345,16 @@ pub async fn enroll_dial(
     let (key, csr) = new_key()?;
     let t = link::dial_transport(&ctx.config.gateway, transport, server);
     let io = t.connect().await?;
-    let name =
-        ServerName::try_from(tls::CORE_NAME).map_err(|e| LinkError::Protocol(e.to_string()))?;
-    let tls_io = tokio_rustls::TlsConnector::from(Arc::new(tls::enroll_client(&token.ca_sha256)?))
-        .connect(name, io)
-        .await
-        .map_err(|e| {
-            LinkError::Certificate(format!(
+    let tls_io = match link::connect_tls(tls::enroll_client(&token.ca_sha256)?, io, &CancellationToken::new()).await {
+        Ok(Some(t)) => t,
+        Ok(None) => return Err(LinkError::Unreachable("stopped".into())),
+        Err(LinkError::Certificate(e)) => {
+            return Err(LinkError::Certificate(format!(
                 "the server at {server} is not the app this token came from, or its certificate can't be used ({e})"
-            ))
-        })?;
+            )))
+        }
+        Err(e) => return Err(e),
+    };
     let channel = link::channel_over(tls_io).await?;
     let mut client = AgentGatewayServiceClient::new(channel);
     let (tx, rx) = mpsc::channel(4);
@@ -441,12 +457,13 @@ pub async fn enroll_listen(
     let (done_tx, mut done_rx) = mpsc::channel(1);
     let slot: Slot = Arc::new(Mutex::new(Some(done_tx)));
     loop {
-        let io = tokio::select! {
-            () = cancel.cancelled() => return Err(LinkError::Unreachable("stopped before the app connected".into())),
-            io = l.connect() => io?,
-        };
-        let Ok(tls_io) = acceptor.accept(io).await else {
-            continue; // not the pinned core
+        // Handshakes are bounded and run side by side; peers that aren't the pinned core are dropped.
+        let Some(tls_io) =
+            link::accept_tls(&l, acceptor.clone(), link::peer_is_core, &cancel).await?
+        else {
+            return Err(LinkError::Unreachable(
+                "stopped before the app connected".into(),
+            ));
         };
         let stop = CancellationToken::new();
         let svc = AgentEndpointServiceServer::new(EnrollSvc {
@@ -459,6 +476,8 @@ pub async fn enroll_listen(
             () = cancel.cancelled() => return Err(LinkError::Unreachable("stopped during enrollment".into())),
             _ = &mut serve => None,
             r = done_rx.recv() => r,
+            // A core that connects but never enrolls doesn't hold the agent forever.
+            () = tokio::time::sleep(Duration::from_secs(60)) => None,
         };
         stop.cancel();
         if let Some(r) = result {
@@ -528,11 +547,35 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(identity_dir(dir.path()).join("node.key.der"))
+            let mode = std::fs::metadata(identity_dir(dir.path()).join(IDENTITY_FILE))
                 .unwrap()
                 .permissions()
                 .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
+
+        // An interrupted save leaves only a temporary file: the old identity loads whole.
+        let idir = identity_dir(dir.path());
+        std::fs::write(
+            idir.join(".identity.json.tmp-1-0"),
+            b"{\"link\": {\"node_id\"",
+        )
+        .unwrap();
+        assert_eq!(
+            Identity::load(dir.path()).unwrap().unwrap().cert_sha256(),
+            id.cert_sha256()
+        );
+        // A renewed identity replaces certificate and key together.
+        let (key2, _) = new_key().unwrap();
+        let next = id.renewed(&[vec![9u8, 9]], &key2, None).unwrap();
+        next.save(dir.path()).unwrap();
+        let back = Identity::load(dir.path()).unwrap().unwrap();
+        assert_eq!(back.cert_sha256(), next.cert_sha256());
+        assert_eq!(back.key, key2.serialize_der());
+        std::fs::write(idir.join(IDENTITY_FILE), b"{oops").unwrap();
+        assert_eq!(
+            Identity::load(dir.path()).unwrap_err().code(),
+            "MRL-NODE-182"
+        );
     }
 }

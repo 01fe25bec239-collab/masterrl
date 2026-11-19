@@ -8,21 +8,37 @@
 //! - Dialing an agent that waits to enroll: its temporary certificate is not checked; the
 //!   agent checks the core's certificate against the CA it pinned, and the join token proves
 //!   the machine to the core.
+//! - Revocation is enforced inside both verifiers: a certificate on the revocation list
+//!   (`Gateway::refresh_revocations`, reloaded every `revocation_check_seconds` and at once on
+//!   local revocation) fails the TLS handshake with `certificate_revoked`.
 
 use crate::modules::nodes::ca::Ca;
 use crate::modules::nodes::{NodesError, Pki};
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, RwLock};
 use tokio_rustls::rustls::client::danger::{
     HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
 };
+use tokio_rustls::rustls::client::WebPkiServerVerifier;
 use tokio_rustls::rustls::crypto::{
     ring, verify_tls12_signature, verify_tls13_signature, CryptoProvider,
 };
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName, UnixTime};
+use tokio_rustls::rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::{
-    self, ClientConfig, DigitallySignedStruct, RootCertStore, ServerConfig, SignatureScheme,
+    self, CertificateError, ClientConfig, DigitallySignedStruct, DistinguishedName, RootCertStore,
+    ServerConfig, SignatureScheme,
 };
+
+/// Revoked certificate fingerprints (hex SHA-256 of the DER).
+pub type Revoked = Arc<RwLock<HashSet<String>>>;
+
+fn is_revoked(revoked: &Revoked, cert: &CertificateDer<'_>) -> bool {
+    let sha = crate::modules::nodes::ca::sha256_hex(cert);
+    // A poisoned lock fails closed.
+    revoked.read().map_or(true, |set| set.contains(&sha))
+}
 
 fn provider() -> Arc<CryptoProvider> {
     Arc::new(ring::default_provider())
@@ -33,17 +49,20 @@ fn err(e: impl std::fmt::Display) -> NodesError {
 }
 
 /// Builds every TLS setting from the CA (and a fresh core certificate).
-pub fn build(ca: Ca) -> Result<Pki, NodesError> {
+pub fn build(ca: Ca, revoked: Revoked) -> Result<Pki, NodesError> {
     let (core_cert, core_key) = ca.issue_core()?;
     let chain = vec![core_cert, ca.cert().clone()];
     let mut roots = RootCertStore::empty();
     roots.add(ca.cert().clone()).map_err(err)?;
     let roots = Arc::new(roots);
 
-    let verifier = WebPkiClientVerifier::builder_with_provider(roots.clone(), provider())
-        .allow_unauthenticated()
-        .build()
-        .map_err(err)?;
+    let verifier = Arc::new(CheckedClient {
+        inner: WebPkiClientVerifier::builder_with_provider(roots.clone(), provider())
+            .allow_unauthenticated()
+            .build()
+            .map_err(err)?,
+        revoked: revoked.clone(),
+    });
     let mut server = ServerConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .map_err(err)?
@@ -52,10 +71,17 @@ pub fn build(ca: Ca) -> Result<Pki, NodesError> {
         .map_err(err)?;
     server.alpn_protocols = vec![b"h2".to_vec()];
 
+    let dial_verifier = Arc::new(CheckedServer {
+        inner: WebPkiServerVerifier::builder_with_provider(roots, provider())
+            .build()
+            .map_err(err)?,
+        revoked,
+    });
     let mut dial = ClientConfig::builder_with_provider(provider())
         .with_safe_default_protocol_versions()
         .map_err(err)?
-        .with_root_certificates(roots)
+        .dangerous()
+        .with_custom_certificate_verifier(dial_verifier)
         .with_client_auth_cert(chain.clone(), PrivateKeyDer::Pkcs8(core_key.clone_key()))
         .map_err(err)?;
     dial.alpn_protocols = vec![b"h2".to_vec()];
@@ -75,6 +101,112 @@ pub fn build(ca: Ca) -> Result<Pki, NodesError> {
         dial_tls: Arc::new(dial),
         enroll_tls: Arc::new(enroll),
     })
+}
+
+/// The CA check plus the revocation list, for client certificates (agents dialing in).
+#[derive(Debug)]
+struct CheckedClient {
+    inner: Arc<dyn ClientCertVerifier>,
+    revoked: Revoked,
+}
+
+impl ClientCertVerifier for CheckedClient {
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<ClientCertVerified, rustls::Error> {
+        let ok = self
+            .inner
+            .verify_client_cert(end_entity, intermediates, now)?;
+        if is_revoked(&self.revoked, end_entity) {
+            return Err(rustls::Error::InvalidCertificate(CertificateError::Revoked));
+        }
+        Ok(ok)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+/// The CA and name check plus the revocation list, for agents the core dials.
+#[derive(Debug)]
+struct CheckedServer {
+    inner: Arc<WebPkiServerVerifier>,
+    revoked: Revoked,
+}
+
+impl ServerCertVerifier for CheckedServer {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, rustls::Error> {
+        let ok =
+            self.inner
+                .verify_server_cert(end_entity, intermediates, server_name, ocsp, now)?;
+        if is_revoked(&self.revoked, end_entity) {
+            return Err(rustls::Error::InvalidCertificate(CertificateError::Revoked));
+        }
+        Ok(ok)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, rustls::Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
 }
 
 /// Accepts the temporary certificate of an agent that waits to enroll (signatures are still

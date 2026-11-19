@@ -421,7 +421,7 @@ async fn create_token(
     let enroll_command = match &body.endpoint {
         None => format!(
             "mrl-agent enroll --server <this server>:{} --token {token}",
-            gw.listen.port()
+            gw.addr().map_or(gw.listen.port(), |a| a.port())
         ),
         Some(Endpoint::Ssh { agent_port, .. }) => {
             format!("mrl-agent enroll --listen 127.0.0.1:{agent_port} --token {token}")
@@ -551,6 +551,10 @@ async fn node_action(
         .await
         .map_err(|e| internal(e.into()))??;
     if outcome {
+        // Refuse the revoked certificates in TLS right away, then close open streams.
+        if let Err(e) = gw.refresh_revocations().await {
+            tracing::warn!(code = e.code(), error = %e, "revocation list not reloaded; the periodic reload will catch up");
+        }
         gw.kick(node);
     }
     let detail = store::get_node(&gw.db, node)

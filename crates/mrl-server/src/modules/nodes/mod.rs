@@ -25,6 +25,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
+use std::time::Duration;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -33,8 +34,9 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct GatewayConfig {
-    /// mTLS gRPC address agents dial. Default: `server.listeners.grpc` in team mode,
-    /// `127.0.0.1:<random>` in solo mode (set it to let other machines dial in).
+    /// mTLS gRPC address agents dial. Default: `0.0.0.0:9444` in team mode, `127.0.0.1:<random>`
+    /// in solo mode (set it to let other machines dial in). Never `server.listeners.grpc`: that
+    /// listener belongs to the shared gRPC services, which can't check client certificates.
     pub listen: Option<SocketAddr>,
     /// Secret-store name of the internal CA (key and certificate).
     pub ca_secret: String,
@@ -94,8 +96,16 @@ impl Default for GatewayConfig {
 }
 
 impl GatewayConfig {
+    /// The gateway address for `mode` (see [`GatewayConfig::listen`]).
+    pub fn listen_addr(&self, mode: Mode) -> SocketAddr {
+        self.listen.unwrap_or(match mode {
+            Mode::Team => SocketAddr::from(([0, 0, 0, 0], DEFAULT_TEAM_PORT)),
+            Mode::Solo => SocketAddr::from(([127, 0, 0, 1], 0)),
+        })
+    }
+
     /// Problems with the values (pushed into `Config::validate`).
-    pub fn problems(&self) -> Vec<String> {
+    pub fn problems(&self, server: &crate::config::ServerConfig) -> Vec<String> {
         let mut p = Vec::new();
         let mut range = |name: &str, v: u64, lo: u64, hi: u64| {
             if !(lo..=hi).contains(&v) {
@@ -147,12 +157,35 @@ impl GatewayConfig {
                 self.offline_after_seconds, self.degraded_after_seconds
             ));
         }
+        let listen = self.listen_addr(server.mode);
+        if server.mode == Mode::Team
+            && listen.port() != 0
+            && [
+                server.listeners.grpc,
+                server.listeners.api,
+                server.listeners.internal,
+            ]
+            .iter()
+            .any(|a| {
+                a.port() == listen.port()
+                    && (a.ip() == listen.ip()
+                        || a.ip().is_unspecified()
+                        || listen.ip().is_unspecified())
+            })
+        {
+            p.push(format!(
+                "gateway.listen: {listen} clashes with a server.listeners address; the gateway needs its own port"
+            ));
+        }
         if self.ca_secret.trim().is_empty() {
             p.push("gateway.ca_secret: give the secret-store name of the CA".to_owned());
         }
         p
     }
 }
+
+/// Default gateway port in team mode (next to the shared gRPC port 9443).
+pub const DEFAULT_TEAM_PORT: u16 = 9444;
 
 /// Error codes this part adds (guidance/fragments/errors/p18.yaml).
 pub mod codes {
@@ -360,6 +393,8 @@ pub struct Gateway {
     pub(crate) listener: Mutex<Option<std::net::TcpListener>>,
     pub(crate) addr: OnceLock<SocketAddr>,
     pub(crate) known_hosts: PathBuf,
+    /// Revoked, unexpired certificate fingerprints; the TLS verifiers refuse them.
+    pub(crate) revoked: Arc<RwLock<std::collections::HashSet<String>>>,
 }
 
 impl Gateway {
@@ -411,6 +446,26 @@ impl Gateway {
     pub fn kick(&self, node: Uuid) {
         self.sessions.revoke(node);
     }
+
+    /// Reloads the revocation list the TLS verifiers use (revoked and not yet expired).
+    pub async fn refresh_revocations(&self) -> Result<(), NodesError> {
+        let list: Vec<String> = sqlx::query_scalar(
+            "SELECT sha256 FROM node_certificates WHERE revoked_at IS NOT NULL AND not_after > now()",
+        )
+        .fetch_all(self.db.pool())
+        .await?;
+        if let Ok(mut set) = self.revoked.write() {
+            *set = list.into_iter().collect();
+        }
+        Ok(())
+    }
+
+    /// Adds certificates this replica just revoked, so handshakes refuse them at once.
+    pub(crate) fn revoked_locally(&self, shas: &[String]) {
+        if let Ok(mut set) = self.revoked.write() {
+            set.extend(shas.iter().cloned());
+        }
+    }
 }
 
 /// The `nodes` module.
@@ -454,10 +509,7 @@ impl NodesModule {
         lanes: Arc<lanes::LaneRouter>,
     ) -> Self {
         let g = &config.gateway;
-        let listen = g.listen.unwrap_or(match config.server.mode {
-            Mode::Team => config.server.listeners.grpc,
-            Mode::Solo => SocketAddr::from(([127, 0, 0, 1], 0)),
-        });
+        let listen = g.listen_addr(config.server.mode);
         let known_hosts = g.known_hosts.clone().unwrap_or_else(|| {
             g.secrets_dir
                 .clone()
@@ -483,6 +535,7 @@ impl NodesModule {
                 listener: Mutex::new(None),
                 addr: OnceLock::new(),
                 known_hosts,
+                revoked: Arc::default(),
             }),
             roles: config.server.roles.clone(),
         }
@@ -517,7 +570,8 @@ impl StartupStep for PkiStep {
             &self.gw.db,
         )
         .await?;
-        let pki = crate::grpc::tls::build(ca)?;
+        self.gw.refresh_revocations().await?;
+        let pki = crate::grpc::tls::build(ca, self.gw.revoked.clone())?;
         if let Ok(mut slot) = self.gw.pki.write() {
             *slot = Some(Arc::new(pki));
         }
@@ -580,7 +634,8 @@ impl ServerModule for NodesModule {
     }
 
     fn background_tasks(&self) -> Vec<Task> {
-        let (a, b, c, d) = (
+        let (a, b, c, d, e) = (
+            self.gw.clone(),
             self.gw.clone(),
             self.gw.clone(),
             self.gw.clone(),
@@ -602,6 +657,22 @@ impl ServerModule for NodesModule {
                 crate::grpc::dialer::run(c, cancel).await;
                 Ok(())
             }),
+            Task::new(
+                "nodes.revocations",
+                Role::Gateway,
+                move |cancel| async move {
+                    let every = Duration::from_secs(e.config.revocation_check_seconds);
+                    loop {
+                        tokio::select! {
+                            () = cancel.cancelled() => return Ok(()),
+                            () = tokio::time::sleep(every) => {}
+                        }
+                        if let Err(err) = e.refresh_revocations().await {
+                            tracing::warn!(code = err.code(), error = %err, "could not reload the revocation list");
+                        }
+                    }
+                },
+            ),
             Task::new("nodes.health", Role::Background, move |cancel| async move {
                 health::run(d, cancel).await;
                 Ok(())
@@ -616,7 +687,8 @@ mod tests {
 
     #[test]
     fn defaults_are_valid_and_ranges_checked() {
-        assert!(GatewayConfig::default().problems().is_empty());
+        let server = crate::config::ServerConfig::default();
+        assert!(GatewayConfig::default().problems(&server).is_empty());
         let bad = GatewayConfig {
             heartbeat_interval_seconds: 0,
             offline_after_seconds: 5,
@@ -624,8 +696,26 @@ mod tests {
             ca_secret: " ".into(),
             ..GatewayConfig::default()
         };
-        let p = bad.problems();
+        let p = bad.problems(&server);
         assert_eq!(p.len(), 3, "{p:?}");
+        // In team mode the gateway never takes the shared gRPC port.
+        let team = crate::config::ServerConfig {
+            mode: Mode::Team,
+            ..crate::config::ServerConfig::default()
+        };
+        let g = GatewayConfig::default();
+        assert_eq!(g.listen_addr(Mode::Team).port(), DEFAULT_TEAM_PORT);
+        assert_ne!(g.listen_addr(Mode::Team), team.listeners.grpc);
+        assert!(g.problems(&team).is_empty());
+        let clash = GatewayConfig {
+            listen: Some(team.listeners.grpc),
+            ..GatewayConfig::default()
+        };
+        assert!(
+            clash.problems(&team)[0].contains("clashes"),
+            "{:?}",
+            clash.problems(&team)
+        );
     }
 
     #[test]

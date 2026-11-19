@@ -6,8 +6,8 @@
 //! | Lane | Messages | On overflow | Acked |
 //! |---|---|---|---|
 //! | CONTROL | hello, heartbeat, inventory, command results, attempt/deployment status, reconcile, probe results, guard events, other worker messages | never dropped: the stream waits | after it is handled and recorded |
-//! | METRICS | worker metrics, samples, rollout and reward stats | dropped; the next delivered item counts them (`dropped_before`) | on receipt |
-//! | LOGS | worker log chunks | dropped; the next delivered item counts them (truncation marker) | on receipt |
+//! | METRICS | worker metrics, samples, rollout and reward stats | decimated: every other queued item dropped; kept items after a gap count it (`dropped_before`) | on receipt |
+//! | LOGS | worker log chunks | new chunks dropped; the first chunk after the gap counts them (truncation marker) | on receipt |
 //! | TELEMETRY | node telemetry | latest wins, never queued | on receipt |
 //!
 //! Later parts consume lanes through a [`LaneSink`] registered on a [`LaneRouter`]. With no
@@ -18,9 +18,7 @@
 use mrl_proto::agent::v1::{agent_message::Body, AgentMessage};
 use mrl_proto::worker::v1::worker_message::Body as WorkerBody;
 use prometheus::{IntCounterVec, Opts};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, RwLock};
-use tokio::sync::mpsc;
 use uuid::Uuid;
 
 /// A logical lane (D-04-05).
@@ -75,10 +73,12 @@ pub struct LaneItem {
     pub session_epoch: i64,
     /// The logical lane.
     pub lane: LaneKind,
-    /// `AgentMessage.seq` (per protobuf lane). Delivery is at-least-once: dedupe on
-    /// `(node_id, lane, seq)`.
+    /// The protobuf stream it came on (CONTROL, TELEMETRY or BULK); `seq` counts per stream.
+    pub stream: mrl_proto::agent::v1::Lane,
+    /// `AgentMessage.seq`: unique per `(node, stream)` across reconnects and agent restarts.
+    /// Delivery is at-least-once: dedupe on `(node_id, stream, seq)`.
     pub seq: u64,
-    /// METRICS/LOGS: how many items of this lane were dropped just before this one.
+    /// METRICS/LOGS: how many items of this lane were dropped right before this one (the gap).
     pub dropped_before: u64,
     /// The message.
     pub message: AgentMessage,
@@ -105,7 +105,7 @@ pub trait LaneSink: Send + Sync {
     fn name(&self) -> &'static str;
     /// The lanes this sink takes (the first registered sink for a lane wins).
     fn lanes(&self) -> &'static [LaneKind];
-    /// Handles one item. Must be idempotent per `(node_id, lane, seq)`.
+    /// Handles one item. Must be idempotent per `(node_id, stream, seq)`.
     async fn deliver(&self, item: LaneItem) -> Result<(), SinkError>;
 }
 
@@ -222,49 +222,125 @@ impl LaneMetrics {
 }
 
 /// A bounded METRICS or LOGS queue for one stream, drained into the sink by its own task.
+///
+/// - METRICS, when full: every other queued item is dropped (oldest first), so the series stays
+///   even but coarser; the new item is kept.
+/// - LOGS, when full: the new item is dropped.
+///
+/// Each kept item that follows dropped ones carries their count in `dropped_before`, so the
+/// marker sits exactly at the gap.
 pub(crate) struct LossyLane {
     lane: LaneKind,
-    tx: Option<mpsc::Sender<LaneItem>>,
-    dropped: Arc<AtomicU64>,
+    cap: usize,
+    shared: Option<Arc<Shared>>,
+}
+
+struct Shared {
+    q: std::sync::Mutex<Queue>,
+    notify: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct Queue {
+    items: std::collections::VecDeque<LaneItem>,
+    gap: u64,
+    closed: bool,
+}
+
+impl Queue {
+    /// Drops every other item (oldest first); kept items carry the count dropped before them.
+    fn decimate(&mut self) -> u64 {
+        let mut kept = std::collections::VecDeque::with_capacity(self.items.len());
+        let (mut run, mut dropped) = (self.gap, 0);
+        for (i, mut item) in self.items.drain(..).enumerate() {
+            if i % 2 == 0 {
+                run += 1;
+                dropped += 1;
+            } else {
+                item.dropped_before += run;
+                run = 0;
+                kept.push_back(item);
+            }
+        }
+        self.items = kept;
+        self.gap = run;
+        dropped
+    }
 }
 
 impl LossyLane {
     /// A queue of `capacity` items feeding `router`'s sink for `lane` (none: discard).
     pub fn start(router: &LaneRouter, lane: LaneKind, capacity: usize) -> Self {
-        let dropped = Arc::new(AtomicU64::new(0));
-        let tx = router.sink_for(lane).map(|sink| {
-            let (tx, mut rx) = mpsc::channel::<LaneItem>(capacity.max(1));
-            let pending = dropped.clone();
+        let shared = router.sink_for(lane).map(|sink| {
+            let shared = Arc::new(Shared {
+                q: std::sync::Mutex::new(Queue::default()),
+                notify: tokio::sync::Notify::new(),
+            });
+            let s = shared.clone();
             tokio::spawn(async move {
-                while let Some(mut item) = rx.recv().await {
-                    item.dropped_before = pending.swap(0, Ordering::Relaxed);
-                    if let Err(e) = sink.deliver(item).await {
-                        tracing::warn!(lane = lane.as_str(), error = %e, "lane sink failed; item dropped");
+                loop {
+                    let next = match s.q.lock() {
+                        Ok(mut q) => match q.items.pop_front() {
+                            Some(i) => Some(i),
+                            None if q.closed => return,
+                            None => None,
+                        },
+                        Err(_) => return,
+                    };
+                    match next {
+                        Some(item) => {
+                            if let Err(e) = sink.deliver(item).await {
+                                tracing::warn!(lane = lane.as_str(), error = %e, "lane sink failed; item dropped");
+                            }
+                        }
+                        None => s.notify.notified().await,
                     }
                 }
             });
-            tx
+            shared
         });
-        Self { lane, tx, dropped }
-    }
-
-    /// Queues `item`, or drops and counts it when the queue is full. Never waits.
-    pub fn offer(&self, item: LaneItem) {
-        let m = LaneMetrics::get();
-        let Some(tx) = &self.tx else {
-            m.discarded(self.lane);
-            return;
-        };
-        if tx.try_send(item).is_err() {
-            self.dropped.fetch_add(1, Ordering::Relaxed);
-            m.dropped(self.lane);
+        Self {
+            lane,
+            cap: capacity.max(2),
+            shared,
         }
     }
 
-    /// Items dropped and not yet reported to the sink.
-    #[cfg(test)]
-    pub fn pending_drops(&self) -> u64 {
-        self.dropped.load(Ordering::Relaxed)
+    /// Queues `item` under the lane's overflow rule. Never waits.
+    pub fn offer(&self, mut item: LaneItem) {
+        let m = LaneMetrics::get();
+        let Some(shared) = &self.shared else {
+            m.discarded(self.lane);
+            return;
+        };
+        let Ok(mut q) = shared.q.lock() else { return };
+        if q.items.len() >= self.cap {
+            if self.lane == LaneKind::Metrics {
+                for _ in 0..q.decimate() {
+                    m.dropped(self.lane);
+                }
+            } else {
+                q.gap += 1;
+                m.dropped(self.lane);
+                return;
+            }
+        }
+        item.dropped_before += q.gap;
+        q.gap = 0;
+        q.items.push_back(item);
+        drop(q);
+        shared.notify.notify_one();
+    }
+}
+
+impl Drop for LossyLane {
+    fn drop(&mut self) {
+        if let Some(s) = &self.shared {
+            if let Ok(mut q) = s.q.lock() {
+                q.closed = true;
+            }
+            s.notify.notify_one();
+        }
     }
 }
 
@@ -343,7 +419,7 @@ mod tests {
             "gate"
         }
         fn lanes(&self) -> &'static [LaneKind] {
-            &[LaneKind::Metrics]
+            &[LaneKind::Metrics, LaneKind::Logs]
         }
         async fn deliver(&self, item: LaneItem) -> Result<(), SinkError> {
             self.open.notified().await;
@@ -355,40 +431,65 @@ mod tests {
         }
     }
 
-    fn item(seq: u64) -> LaneItem {
+    fn item(seq: u64, lane: LaneKind) -> LaneItem {
         LaneItem {
             node_id: Uuid::nil(),
             session_epoch: 1,
-            lane: LaneKind::Metrics,
+            lane,
+            stream: mrl_proto::agent::v1::Lane::Telemetry,
             seq,
             dropped_before: 0,
             message: AgentMessage::default(),
         }
     }
 
-    #[tokio::test]
-    async fn overflow_drops_counts_and_reports_on_the_next_item() {
+    async fn drain(gate: &Gate, n: usize) -> Vec<(u64, u64)> {
+        for _ in 0..n {
+            gate.open.notify_one();
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        }
+        gate.got.lock().unwrap().clone()
+    }
+
+    fn gate() -> (Arc<LaneRouter>, Arc<Gate>) {
         let router = LaneRouter::new();
         let gate = Arc::new(Gate {
             open: Notify::new(),
             got: Mutex::new(Vec::new()),
         });
         router.register(gate.clone());
-        let lane = LossyLane::start(&router, LaneKind::Metrics, 2);
-        // The sink task holds #1, the queue holds #2 and #3, so #4..#6 overflow.
-        lane.offer(item(1));
+        (router, gate)
+    }
+
+    #[tokio::test]
+    async fn metrics_overflow_decimates_and_marks_the_gaps() {
+        let (router, gate) = gate();
+        let lane = LossyLane::start(&router, LaneKind::Metrics, 4);
+        lane.offer(item(1, LaneKind::Metrics)); // taken by the sink task, held at the gate
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        for s in 2..=6 {
-            lane.offer(item(s));
+        for s in 2..=7 {
+            lane.offer(item(s, LaneKind::Metrics));
         }
-        assert_eq!(lane.pending_drops(), 3);
-        for _ in 0..3 {
-            gate.open.notify_one();
-            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+        // Queue [2,3,4,5] was full at #6: 2 and 4 dropped, 3 and 5 each mark one lost item.
+        assert_eq!(
+            drain(&gate, 5).await,
+            vec![(1, 0), (3, 1), (5, 1), (6, 0), (7, 0)]
+        );
+    }
+
+    #[tokio::test]
+    async fn logs_overflow_drops_new_chunks_and_marks_the_first_after_the_gap() {
+        let (router, gate) = gate();
+        let lane = LossyLane::start(&router, LaneKind::Logs, 2);
+        lane.offer(item(1, LaneKind::Logs));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        for s in 2..=5 {
+            lane.offer(item(s, LaneKind::Logs)); // 2, 3 queued; 4, 5 dropped
         }
-        let got = gate.got.lock().unwrap().clone();
-        // #2 was taken after the drops happened, so it carries the marker.
-        assert_eq!(got, vec![(1, 0), (2, 3), (3, 0)]);
+        let first = drain(&gate, 2).await; // delivers 1 and 2, frees space
+        assert_eq!(first, vec![(1, 0), (2, 0)]);
+        lane.offer(item(6, LaneKind::Logs));
+        assert_eq!(drain(&gate, 2).await, vec![(1, 0), (2, 0), (3, 0), (6, 2)]);
     }
 
     #[tokio::test]
@@ -396,8 +497,8 @@ mod tests {
         let router = LaneRouter::new();
         let lane = LossyLane::start(&router, LaneKind::Logs, 4);
         let before = LaneMetrics::get().discarded_count(LaneKind::Logs);
-        lane.offer(item(1));
-        lane.offer(item(2));
+        lane.offer(item(1, LaneKind::Logs));
+        lane.offer(item(2, LaneKind::Logs));
         let after = LaneMetrics::get().discarded_count(LaneKind::Logs);
         assert_eq!(after - before, 2);
         assert!(router.sink_for(LaneKind::Control).is_none());

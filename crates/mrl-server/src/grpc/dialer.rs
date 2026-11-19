@@ -239,9 +239,12 @@ async fn dial_node(
     let pki = gw.pki()?;
     let name =
         ServerName::try_from(node_name(node)).map_err(|e| NodesError::Protocol(e.to_string()))?;
-    let tls = TlsConnector::from(pki.dial_tls.clone())
-        .connect(name, io)
+    let tls = TlsConnector::from(pki.dial_tls.clone()).connect(name, io);
+    let tls = tokio::time::timeout(super::HANDSHAKE_TIMEOUT, tls)
         .await
+        .map_err(|_| {
+            NodesError::Protocol("the machine did not finish the TLS handshake in time".into())
+        })?
         .map_err(|e| NodesError::Certificate(format!("TLS with the machine failed: {e}")))?;
     let peer = PeerInfo {
         cert_sha256: super::tls::peer_sha256(tls.get_ref().1.peer_certificates()),
@@ -273,9 +276,14 @@ async fn dial_enroll(
     let pki = gw.pki()?;
     let name = ServerName::try_from("enroll.masterrl.internal")
         .map_err(|e| NodesError::Protocol(e.to_string()))?;
-    let tls = TlsConnector::from(pki.enroll_tls.clone())
-        .connect(name, io)
+    let tls = TlsConnector::from(pki.enroll_tls.clone()).connect(name, io);
+    let tls = tokio::time::timeout(super::HANDSHAKE_TIMEOUT, tls)
         .await
+        .map_err(|_| {
+            NodesError::Protocol(
+                "the waiting machine did not finish the TLS handshake in time".into(),
+            )
+        })?
         .map_err(|e| {
             NodesError::Certificate(format!("TLS with the waiting machine failed: {e}"))
         })?;

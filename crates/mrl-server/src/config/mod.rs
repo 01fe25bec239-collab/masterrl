@@ -464,7 +464,7 @@ impl Config {
         // <mrl:validate P17> P17 checks (push to `problems`) go right below this line.
 
         // <mrl:validate P18> P18 checks (push to `problems`) go right below this line.
-        problems.extend(self.gateway.problems());
+        problems.extend(self.gateway.problems(&self.server));
 
         // <mrl:validate P19> P19 checks (push to `problems`) go right below this line.
         if problems.is_empty() {
