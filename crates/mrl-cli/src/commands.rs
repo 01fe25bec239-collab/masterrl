@@ -61,11 +61,6 @@ pub enum ProjectsCommand {
         #[command(flatten)]
         out: Output,
     },
-    /// Show one project.
-    Get {
-        /// Project id, `prj_…`.
-        project: String,
-    },
 }
 
 /// `mrl experiments …`
@@ -369,33 +364,8 @@ pub fn projects(cmd: ProjectsCommand) -> Result<(), String> {
             ))?;
             print_page(&page, &out, &["id", "slug", "name"]);
         }
-        ProjectsCommand::Get { project } => print_json(&find_project(&api, &project)?),
     }
     Ok(())
-}
-
-/// The project `id`, found through the tenancy lists (`/orgs` → workspaces → projects),
-/// since the API has no `GET /projects/{id}`.
-// ponytail: one call per org and workspace; use a direct lookup if the API gains one.
-fn find_project(api: &Api, id: &str) -> Result<Value, String> {
-    let get = |p: &str| api.get(p).map_err(String::from);
-    for org in crate::api::all_items(get, "/orgs")? {
-        let org = encode(org["id"].as_str().unwrap_or_default());
-        for ws in crate::api::all_items(get, &format!("/orgs/{org}/workspaces"))? {
-            let ws = encode(ws["id"].as_str().unwrap_or_default());
-            let list = format!("/workspaces/{ws}/projects");
-            if let Some(p) = crate::api::all_items(get, &list)?
-                .into_iter()
-                .find(|p| p["id"] == id)
-            {
-                return Ok(p);
-            }
-        }
-    }
-    Err(crate::api::explain(
-        "MRL-RES-001",
-        &format!("No project you can see has the id {id}."),
-    ))
 }
 
 /// `mrl experiments …`

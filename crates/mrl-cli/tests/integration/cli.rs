@@ -184,19 +184,6 @@ fn seed_then_submit_returns_a_rejected_run_with_code_and_hint() {
         .ok(&["projects", "list", "--workspace", ws])
         .contains("demo"));
     assert!(config.contains("project = \"prj_"), "{config}");
-    // `projects get` walks the tenancy lists (one item per page, two orgs).
-    let prj = config
-        .split("project = \"")
-        .nth(1)
-        .unwrap()
-        .split('"')
-        .next()
-        .unwrap();
-    let shown = cli.ok(&["projects", "get", prj]);
-    assert!(shown.contains("\"slug\": \"demo\""), "{shown}");
-    let missing = mrl_domain::ids::ProjectId::new().to_string();
-    let err = cli.fails(Some("tok"), &["projects", "get", &missing]);
-    assert!(err.contains("MRL-RES-001"), "{err}");
 
     rt.block_on(async { srv.shutdown().await.unwrap() });
     drop(db);

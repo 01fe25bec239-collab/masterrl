@@ -45,19 +45,28 @@ async fn env(accepting: bool) -> Env {
         Chains::registered(db.db())
     };
     let org = OrgId::new();
+    let project = ProjectId::new();
     let harness = Harness::default();
+    *harness.rules.lock().unwrap() = AuthRules::with_projects(&[(project, org)]);
     let rules = harness.rules.clone();
     let srv = runs_server_with(db.db(), chains, &users(org, OrgId::new()), vec![], &harness).await;
     Env {
         db,
         srv,
         org,
-        project: ProjectId::new(),
+        project,
         rules,
     }
 }
 
 impl Env {
+    /// Another project in this env's org.
+    fn add_project(&self, project: ProjectId) {
+        let mut rules = self.rules.lock().unwrap();
+        let owners = rules.projects.get_or_insert_with(HashMap::new);
+        owners.insert(project.to_string(), self.org.to_string());
+    }
+
     fn runs_path(&self) -> String {
         format!("/api/v1/projects/{}/runs", self.project)
     }
@@ -282,8 +291,9 @@ async fn other_orgs_see_404_everywhere() {
     assert_eq!(patch.status, 404);
     let jobs = e.get("outsider", "/api/v1/jobs").await.json();
     assert_eq!(jobs["items"].as_array().unwrap().len(), 0);
-    let theirs = e.get("outsider", &e.runs_path()).await.json();
-    assert_eq!(theirs["items"].as_array().unwrap().len(), 0);
+    // Another org's project is hidden like a missing one.
+    let theirs = e.get("outsider", &e.runs_path()).await;
+    assert_eq!(theirs.status, 404, "{}", theirs.text());
     // Still running for its owner.
     assert_eq!(
         e.get("owner", &format!("/api/v1/jobs/{jid}")).await.json()["state"],
@@ -1205,6 +1215,7 @@ async fn guarded_steps_and_stale_rows_cannot_bypass_the_rules() {
 async fn hidden_parents_and_jobs_stay_hidden() {
     let e = env(true).await;
     let secret = ProjectId::new();
+    e.add_project(secret);
     e.rules
         .lock()
         .unwrap()
@@ -1246,6 +1257,7 @@ async fn hidden_parents_and_jobs_stay_hidden() {
     // Jobs, oldest first: the "res" runs are visible, the secret one is hidden. A page of
     // two must hold two visible jobs and continue after the last visible one.
     let e2 = env(true).await;
+    e2.add_project(secret);
     e2.rules
         .lock()
         .unwrap()
@@ -1319,7 +1331,10 @@ async fn one_connection_is_enough_and_audits_name_the_project() {
         ..mrl_testkit::pg::test_config()
     });
     let harness = Harness::default();
-    harness.rules.lock().unwrap().pool = Some(small.clone());
+    *harness.rules.lock().unwrap() = AuthRules {
+        pool: Some(small.clone()),
+        ..AuthRules::with_projects(&[(project, org)])
+    };
     let srv = runs_server_with(
         &small,
         accepting_chains(),
@@ -1401,4 +1416,61 @@ async fn one_connection_is_enough_and_audits_name_the_project() {
         ]
     );
     srv.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn foreign_and_missing_projects_are_404_with_no_writes() {
+    let e = env(true).await;
+    let foreign = ProjectId::new();
+    e.rules
+        .lock()
+        .unwrap()
+        .projects
+        .get_or_insert_with(HashMap::new)
+        .insert(foreign.to_string(), OrgId::new().to_string());
+    let missing = ProjectId::new();
+    for project in [foreign, missing] {
+        let runs = format!("/api/v1/projects/{project}/runs");
+        let exps = format!("/api/v1/projects/{project}/experiments");
+        for path in [&runs, &exps] {
+            let res = e.get("owner", path).await;
+            assert_eq!(res.status, 404, "GET {path}: {}", res.text());
+            assert_eq!(res.json()["code"], "MRL-RES-001");
+        }
+        let key = project.to_string();
+        let res = call(
+            &e.srv,
+            Method::POST,
+            &runs,
+            "owner",
+            Some(&key),
+            Some(&submission("x")),
+        )
+        .await;
+        assert_eq!(res.status, 404, "POST {runs}: {}", res.text());
+        let body = json!({"name": "sweep"});
+        let res = call(&e.srv, Method::POST, &exps, "owner", None, Some(&body)).await;
+        assert_eq!(res.status, 404, "POST {exps}: {}", res.text());
+    }
+    for table in [
+        "experiments",
+        "runs",
+        "run_configs",
+        "jobs",
+        "job_attempts",
+        "outbox_events",
+    ] {
+        let n: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+                .fetch_one(e.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(n, 0, "{table} has rows");
+    }
+    // The org's own project still works.
+    assert_eq!(
+        e.submit("owner", "ok", &submission("mine")).await.status,
+        201
+    );
 }

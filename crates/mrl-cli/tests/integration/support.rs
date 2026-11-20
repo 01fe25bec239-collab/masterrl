@@ -54,6 +54,25 @@ pub struct AuthRules {
     pub down: bool,
     /// Like P16's authorizer, read the database on this pool for every decision.
     pub pool: Option<Db>,
+    /// Which org owns each project (`prj_…` → `org_…`). Like P16's Rbac (A1 decision): a
+    /// project that is missing here, or in another org than the one named, is hidden (404)
+    /// for every principal. `None` skips the check, for servers whose projects come from
+    /// [`TenancyDouble`].
+    pub projects: Option<HashMap<String, String>>,
+}
+
+impl AuthRules {
+    /// Rules that know these `(project, org)` pairs.
+    pub fn with_projects(projects: &[(ProjectId, OrgId)]) -> Self {
+        let map = projects
+            .iter()
+            .map(|(p, o)| (p.to_string(), o.to_string()))
+            .collect();
+        Self {
+            projects: Some(map),
+            ..Self::default()
+        }
+    }
 }
 
 /// Authorizes like RBAC: other orgs are hidden (404); inside the org the role table
@@ -87,6 +106,11 @@ impl Authorizer for RoleAuthorizer {
             let rules = self.rules.lock().unwrap();
             if rules.down {
                 return Err(SeamError::new("authorizer", "the test backend is down"));
+            }
+            if let (Some(owners), Some(p)) = (&rules.projects, &resource.project) {
+                if owners.get(p) != resource.org.as_ref() {
+                    return Ok(Decision::Hide);
+                }
             }
             if let Some(p) = &resource.project {
                 if rules
