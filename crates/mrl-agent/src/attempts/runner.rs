@@ -2004,8 +2004,10 @@ mod tests {
     use super::*;
 
     /// A started program that never ends on its own (stands in for `docker run`).
+    #[cfg(unix)]
     struct Forever;
 
+    #[cfg(unix)]
     #[async_trait::async_trait]
     impl Execution for Forever {
         fn pid(&self) -> Option<u32> {
