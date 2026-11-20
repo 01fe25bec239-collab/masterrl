@@ -494,6 +494,7 @@ pub async fn submit(
     let (org, project) = project_scope(&state, &ctx, &projects, &prj, "runs.submit").await?;
     let submitted: Value = serde_json::from_slice(&body)
         .map_err(|e| bad_body(format!("The body is not JSON: {e}.")))?;
+    scope::no_nul(&submitted)?;
     let sub: RunSubmission = serde_json::from_value(submitted.clone())
         .map_err(|e| bad_body(format!("The run could not be read: {e}.")))?;
     check_submission(&sub)?;
@@ -677,18 +678,12 @@ pub async fn submit(
             JobTransitions::apply(&mut tx, &job, JobEvent::Reject, Owner::Jobs, change).await?
         }
     };
+    let target = RunId::from_uuid(run_id).to_string();
+    scope::audit(&mut tx, &state, &ctx, (org, project), "runs.submit", target).await?;
     tx.commit().await?;
     let row = find_run(&db, run_id)
         .await?
         .ok_or_else(|| JobsError::not_found("run"))?;
-    scope::audit(
-        &state,
-        &ctx,
-        project,
-        "runs.submit",
-        RunId::from_uuid(run_id).to_string(),
-    )
-    .await;
     Ok(created(&row))
 }
 

@@ -6,9 +6,9 @@
 //! With nothing registered (P17 on its own), a request acts in the caller's org.
 //!
 //! [`RehomeLocalRows`] runs at startup: rows stored under the nil org (by a solo build
-//! without a directory) move to their project's org once a directory can say which. All of
-//! an org's projects move in one transaction (runs can link across projects), and an
-//! experiment the org already has under the same name absorbs the local one.
+//! without a directory) move to their project's org once a directory can say which.
+//! Projects linked by a parent run move together in one transaction; a local experiment
+//! whose name the org already uses gets a fixed new name, keeping its id and metadata.
 
 use super::error::JobsError;
 use super::scope;
@@ -84,16 +84,15 @@ impl RehomeLocalRows {
             .execute(&mut *tx)
             .await?;
         for sql in [
-            // An experiment the org already has under the same name (like `default`, made
-            // once per credential) absorbs the local one: its runs point at the org's copy.
-            // ponytail: the local copy's description and tags are dropped with it.
-            "UPDATE runs r SET experiment_id = keep.id FROM experiments dup \
-               JOIN experiments keep ON keep.org_id = $1 AND keep.project_id = dup.project_id \
-                AND keep.name = dup.name \
-             WHERE dup.org_id = $3 AND dup.project_id = ANY($2) AND r.experiment_id = dup.id",
-            "DELETE FROM experiments dup USING experiments keep \
-             WHERE dup.org_id = $3 AND dup.project_id = ANY($2) AND keep.org_id = $1 \
-               AND keep.project_id = dup.project_id AND keep.name = dup.name",
+            // A local experiment whose name the org already uses in the project (like a
+            // `default` made once per credential) keeps its id, runs and metadata and gets
+            // a fixed new name: `<name> (local <last 8 hex of its id>)`, within 200 chars.
+            "UPDATE experiments dup \
+                SET name = left(dup.name, 183) || ' (local ' || right(replace(dup.id::text, '-', ''), 8) || ')', \
+                    version = dup.version + 1, updated_at = now() \
+               FROM experiments keep \
+              WHERE dup.org_id = $3 AND dup.project_id = ANY($2) AND keep.org_id = $1 \
+                AND keep.project_id = dup.project_id AND keep.name = dup.name",
             "UPDATE experiments SET org_id = $1 WHERE org_id = $3 AND project_id = ANY($2)",
             "UPDATE runs SET org_id = $1 WHERE org_id = $3 AND project_id = ANY($2)",
             "UPDATE run_configs SET org_id = $1 WHERE org_id = $3 \
@@ -104,6 +103,13 @@ impl RehomeLocalRows {
             "UPDATE attempt_placements SET org_id = $1 WHERE org_id = $3 AND attempt_id IN \
                (SELECT a.id FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
                 WHERE j.project_id = ANY($2))",
+            // The retained job and attempt events (the timeline) follow their rows.
+            "UPDATE outbox_events SET org_id = $1 WHERE org_id = $3 AND ( \
+               (aggregate_kind = 'job' AND aggregate_id IN \
+                  (SELECT id FROM jobs WHERE project_id = ANY($2))) OR \
+               (aggregate_kind = 'attempt' AND aggregate_id IN \
+                  (SELECT a.id FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
+                   WHERE j.project_id = ANY($2))))",
         ] {
             sqlx::query(sql)
                 .bind(org)
@@ -114,6 +120,30 @@ impl RehomeLocalRows {
         }
         tx.commit().await
     }
+}
+
+/// Groups `projects` so that projects linked by a parent run are in the same group.
+// ponytail: relabels groups on every merge (quadratic); fine for the few local projects.
+fn linked_groups(projects: &[Uuid], links: &[(Uuid, Uuid)]) -> Vec<Vec<Uuid>> {
+    let mut group: std::collections::BTreeMap<Uuid, usize> =
+        projects.iter().enumerate().map(|(i, p)| (*p, i)).collect();
+    for (a, b) in links {
+        let (Some(&ga), Some(&gb)) = (group.get(a), group.get(b)) else {
+            continue;
+        };
+        if ga != gb {
+            for g in group.values_mut() {
+                if *g == gb {
+                    *g = ga;
+                }
+            }
+        }
+    }
+    let mut out: std::collections::BTreeMap<usize, Vec<Uuid>> = Default::default();
+    for (p, g) in group {
+        out.entry(g).or_default().push(p);
+    }
+    out.into_values().collect()
 }
 
 #[async_trait]
@@ -136,24 +166,62 @@ impl StartupStep for RehomeLocalRows {
         .fetch_all(self.db.pool())
         .await
         .map_err(fail)?;
-        let mut by_org: std::collections::BTreeMap<Uuid, Vec<Uuid>> = Default::default();
-        for project in projects {
-            let id = ProjectId::from_uuid(project);
-            match directory.owner(id).await? {
-                Some(org) => by_org.entry(org.as_uuid()).or_default().push(project),
-                None => {
-                    tracing::warn!(project = %id, "local runs name a project that no longer exists; left as they are")
-                }
-            }
+        // Projects linked by a parent run must move together, so each group moves in one
+        // transaction. A group with a project the directory doesn't know, or spanning two
+        // orgs, can't keep its links and is left as it is (logged); other groups still move.
+        let links: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT DISTINCT c.project_id, p.project_id FROM runs c \
+               JOIN runs p ON p.id = c.parent_run_id \
+              WHERE c.org_id = $1 AND c.project_id <> p.project_id",
+        )
+        .bind(Uuid::nil())
+        .fetch_all(self.db.pool())
+        .await
+        .map_err(fail)?;
+        let mut owners = std::collections::BTreeMap::new();
+        for project in &projects {
+            owners.insert(
+                *project,
+                directory.owner(ProjectId::from_uuid(*project)).await?,
+            );
         }
-        for (org, projects) in by_org {
-            // An org whose rows can't move is logged and left as it is, rather than
-            // stopping the server; the next start tries again.
-            if let Err(e) = self.rehome(org, &projects).await {
-                let org = OrgId::from_uuid(org);
-                tracing::error!(%org, error = %e, "could not move local runs to their project's org");
+        for group in linked_groups(&projects, &links) {
+            let orgs: std::collections::BTreeSet<Option<OrgId>> = group
+                .iter()
+                .map(|p| owners.get(p).copied().flatten())
+                .collect();
+            let names: Vec<String> = group
+                .iter()
+                .map(|p| ProjectId::from_uuid(*p).to_string())
+                .collect();
+            let org = match orgs.into_iter().collect::<Vec<_>>().as_slice() {
+                [Some(org)] => *org,
+                _ => {
+                    tracing::warn!(projects = ?names, "local runs are linked to a project that is missing or in another org; left as they are");
+                    continue;
+                }
+            };
+            // A group that can't move is logged and left as it is, rather than stopping
+            // the server; the next start tries again.
+            if let Err(e) = self.rehome(org.as_uuid(), &group).await {
+                tracing::error!(%org, projects = ?names, error = %e, "could not move local runs to their project's org");
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn linked_projects_group_together() {
+        let [a, b, c, d] = [1u128, 2, 3, 4].map(Uuid::from_u128);
+        let groups = linked_groups(&[a, b, c, d], &[(a, c), (c, d)]);
+        assert_eq!(groups, vec![vec![a, c, d], vec![b]]);
+        assert_eq!(linked_groups(&[a, b], &[]), vec![vec![a], vec![b]]);
+        // Links to projects with no local rows are ignored.
+        assert_eq!(linked_groups(&[a], &[(a, b)]), vec![vec![a]]);
     }
 }

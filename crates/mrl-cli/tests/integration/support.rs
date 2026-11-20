@@ -17,7 +17,8 @@ use mrl_server::modules::jobs::{
 };
 use mrl_server::modules::runs::RunsModule;
 use mrl_server::seams::{
-    Authorizer, Decision, Principal, PrincipalKind, RequestContext, Resource, SeamError,
+    AuditEvent, AuditSink, Authorizer, Decision, Principal, PrincipalKind, RequestContext,
+    Resource, SeamError,
 };
 use mrl_server::{AppState, Db, ServerModule};
 use mrl_testkit::pg::TestDb;
@@ -136,7 +137,12 @@ impl Authorizer for RoleAuthorizer {
         if ctx.principal.kind == PrincipalKind::LocalOwner {
             return Ok(Decision::Allow);
         }
-        if resource.org.is_some() && resource.org != ctx.principal.org {
+        // A principal bound to an org can't reach another one. One with no org (a token the
+        // solo owner made without a project) has its role wherever it is asked.
+        if ctx.principal.org.is_some()
+            && resource.org.is_some()
+            && resource.org != ctx.principal.org
+        {
             return Ok(Decision::Hide);
         }
         let Some(role) = self.roles.get(&ctx.principal.id) else {
@@ -200,7 +206,33 @@ pub struct Harness {
     /// The authorizer's rules.
     pub rules: Arc<Mutex<AuthRules>>,
     /// Every audit event the server records.
-    pub audit: Arc<ts::RecordingAuditSink>,
+    pub audit: Arc<TestAudit>,
+}
+
+/// Keeps audit events in memory; `fail` makes every write fail (like a broken audit store).
+#[derive(Default)]
+pub struct TestAudit {
+    events: Mutex<Vec<AuditEvent>>,
+    /// Refuse every write.
+    pub fail: std::sync::atomic::AtomicBool,
+}
+
+impl TestAudit {
+    /// Events so far.
+    pub fn events(&self) -> Vec<AuditEvent> {
+        self.events.lock().unwrap().clone()
+    }
+}
+
+#[async_trait]
+impl AuditSink for TestAudit {
+    async fn record(&self, event: AuditEvent) -> Result<(), SeamError> {
+        if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(SeamError::new("audit", "the test audit store is down"));
+        }
+        self.events.lock().unwrap().push(event);
+        Ok(())
+    }
 }
 
 /// [`runs_server`] with the runs module on `db` (any pool) and this `harness`.
@@ -871,9 +903,13 @@ pub mod sequences {
                         .await
                         .map(|_| ())
                 }
-                Op::Verify(_) => JobTransitions::verify_completion(&mut tx, &row, &chains)
-                    .await
-                    .map(|_| ()),
+                Op::Verify(_) => JobTransitions::verify_completion(
+                    &mut tx,
+                    &row,
+                    chains.verify(&row).await.unwrap(),
+                )
+                .await
+                .map(|_| ()),
                 Op::Fail(_, c) => {
                     let failure = FailureCode::class_only(FailureClass::ALL[*c]);
                     JobTransitions::fail_or_retry(&mut tx, &row, failure, "test failure")

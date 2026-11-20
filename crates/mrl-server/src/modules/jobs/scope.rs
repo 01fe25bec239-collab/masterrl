@@ -79,27 +79,62 @@ pub async fn authorize_cancel(
     authorize(state, ctx, "runs.cancel_any", res).await
 }
 
-/// Records a successful action on something in `project`. The change is already
-/// committed, so a failing sink is logged instead of failing the request.
+/// Records a successful action on something in `org`/`project`, inside the change's
+/// transaction `tx` and before it commits: if the record can't be written, the change rolls
+/// back. `_tx` is that transaction: P16 adds `AuditSink::record_in(tx, …)`, which stores
+/// the record in it, and at merge this call becomes `record_in(_tx, event)`.
 pub async fn audit(
+    _tx: &mut crate::db::Tx,
     state: &AppState,
     ctx: &RequestContext,
-    project: Uuid,
+    (org, project): (Uuid, Uuid),
     action: &str,
     target: String,
-) {
+) -> Result<(), JobsError> {
     let event = AuditEvent {
         at: state.seams.clock.now(),
         actor: ctx.principal.id.clone(),
-        org: ctx.org.clone(),
+        org: org_text(org),
         project: Some(ProjectId::from_uuid(project).to_string()),
         action: action.to_owned(),
         target,
         outcome: AuditOutcome::Success,
         trace_id: ctx.trace_id.clone(),
     };
-    if let Err(e) = state.seams.audit.record(event).await {
-        tracing::error!(error = %e, action, "could not record an audit event");
+    state.seams.audit.record(event).await?;
+    Ok(())
+}
+
+/// Refuses text PostgreSQL can't store: a NUL character in any string or key of `v`.
+/// The field error points at the first place it is found.
+pub fn no_nul(v: &serde_json::Value) -> Result<(), JobsError> {
+    fn find(v: &serde_json::Value, at: &str) -> Option<String> {
+        match v {
+            serde_json::Value::String(s) if s.contains('\0') => Some(at.to_owned()),
+            serde_json::Value::Array(items) => items
+                .iter()
+                .enumerate()
+                .find_map(|(i, x)| find(x, &format!("{at}/{i}"))),
+            serde_json::Value::Object(map) => map.iter().find_map(|(k, x)| {
+                let here = format!("{at}/{}", k.replace('~', "~0").replace('/', "~1"));
+                if k.contains('\0') {
+                    Some(here)
+                } else {
+                    find(x, &here)
+                }
+            }),
+            _ => None,
+        }
+    }
+    match find(v, "") {
+        None => Ok(()),
+        Some(path) => Err(ApiError::validation(vec![crate::error::FieldError::new(
+            if path.is_empty() { "/" } else { &path },
+            ErrorCode::FieldValue,
+            "Text can't contain the NUL character (\\u0000).",
+            "Remove the NUL character from this value.",
+        )])
+        .into()),
     }
 }
 

@@ -91,7 +91,9 @@ pub async fn list(
             scope::authorize(&state, &ctx, "runs.read", &res).await?;
             Some(org)
         }
-        None if ctx.principal.kind == crate::seams::PrincipalKind::LocalOwner => None,
+        // A caller bound to an org scans it; one with no org (the solo owner, or a token
+        // the solo owner made without a project) scans every org.
+        None if ctx.org.is_none() => None,
         None => Some(scope::tenant(&ctx)?),
     };
     let project = project.map(|p| p.as_uuid());
@@ -218,8 +220,9 @@ pub async fn cancel(
         .await?
         .ok_or_else(|| JobsError::not_found("job"))?;
     let row = JobTransitions::request_cancel(&mut tx, &row, &ctx.principal.id).await?;
+    let at = (row.org_id, row.project_id);
+    scope::audit(&mut tx, state, ctx, at, "runs.cancel", job).await?;
     tx.commit().await?;
-    scope::audit(state, ctx, row.project_id, "runs.cancel", job).await;
     Ok(row)
 }
 
@@ -278,7 +281,8 @@ pub async fn patch(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or_else(|| JobsError::changed("job"))?;
+    let at = (next.org_id, next.project_id);
+    scope::audit(&mut tx, &state, &ctx, at, "jobs.set_priority", job).await?;
     tx.commit().await?;
-    scope::audit(&state, &ctx, next.project_id, "jobs.set_priority", job).await;
     Ok(with_etag(next.version, next.view()))
 }

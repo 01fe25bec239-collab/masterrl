@@ -42,8 +42,11 @@ pub fn path() -> Result<PathBuf, String> {
 impl CliConfig {
     /// Reads the file (missing = empty settings).
     pub fn load() -> Result<Self, String> {
-        let path = path()?;
-        match std::fs::read_to_string(&path) {
+        Self::load_from(&path()?)
+    }
+
+    fn load_from(path: &std::path::Path) -> Result<Self, String> {
+        match std::fs::read_to_string(path) {
             Ok(text) => toml::from_str(&text)
                 .map_err(|e| format!("can't read the settings in {}: {e}", path.display())),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
@@ -51,16 +54,44 @@ impl CliConfig {
         }
     }
 
-    /// Writes the file, readable only by you on Unix (it holds the token).
-    pub fn save(&self) -> Result<PathBuf, String> {
-        let path = path()?;
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| format!("can't create {}: {e}", dir.display()))?;
+    /// Changes the saved settings with `change` and returns the file's path. Two `mrl`
+    /// commands can't lose each other's changes: the file is locked (`cli.toml.lock`),
+    /// read again under the lock, changed, written to a private temporary file next to it
+    /// and renamed over it, so a crash leaves the old file or the new one, never half.
+    pub fn update(change: impl FnOnce(&mut Self)) -> Result<PathBuf, String> {
+        Self::update_at(&path()?, change)
+    }
+
+    fn update_at(
+        path: &std::path::Path,
+        change: impl FnOnce(&mut Self),
+    ) -> Result<PathBuf, String> {
+        let shown = path.display();
+        let dir = path.parent().unwrap_or(std::path::Path::new("."));
+        std::fs::create_dir_all(dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let lock = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(format!("{name}.lock")))
+            .map_err(|e| format!("can't lock {shown}: {e}"))?;
+        // Held until `lock` is dropped at the end of this function.
+        lock.lock()
+            .map_err(|e| format!("can't lock {shown}: {e}"))?;
+        let mut cfg = Self::load_from(path)?;
+        change(&mut cfg);
+        let text = toml::to_string(&cfg).map_err(|e| format!("can't write settings: {e}"))?;
+        let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
+        let written = write_private(&tmp, &text).and_then(|()| std::fs::rename(&tmp, path));
+        if let Err(e) = written {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(format!("can't write {shown}: {e}"));
         }
-        let text = toml::to_string(self).map_err(|e| format!("can't write settings: {e}"))?;
-        write_private(&path, &text).map_err(|e| format!("can't write {}: {e}", path.display()))?;
-        Ok(path)
+        Ok(path.to_path_buf())
     }
 
     /// The server address after `MRL_SERVER`.
@@ -93,15 +124,19 @@ fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
         .truncate(true)
         .mode(0o600)
         .open(path)?;
-    // An older file may have wider permissions; narrow them too.
+    // A leftover file may have wider permissions; narrow them too.
     f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    f.write_all(text.as_bytes())
+    f.write_all(text.as_bytes())?;
+    f.sync_all()
 }
 
 #[cfg(not(unix))]
 fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
     // ponytail: on Windows the file inherits the user profile's ACL; move the token to the OS keychain (P16) for more.
-    std::fs::write(path, text)
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+    f.write_all(text.as_bytes())?;
+    f.sync_all()
 }
 
 #[cfg(test)]
@@ -119,5 +154,48 @@ mod tests {
         assert!(!text.contains("project"));
         assert_eq!(toml::from_str::<CliConfig>(&text).unwrap(), c);
         assert!(toml::from_str::<CliConfig>("bogus = 1").is_err());
+    }
+
+    #[test]
+    fn concurrent_updates_keep_every_change() {
+        let dir = std::env::temp_dir().join(format!("mrl-cli-cfg-{}", std::process::id()));
+        let path = dir.join("cli.toml");
+        let _ = std::fs::remove_dir_all(&dir);
+        let threads: Vec<_> = (0..8)
+            .map(|i| {
+                let path = path.clone();
+                std::thread::spawn(move || {
+                    CliConfig::update_at(&path, |c| match i % 3 {
+                        0 => c.token = Some(format!("tok{i}")),
+                        1 => c.server = Some(format!("http://h{i}")),
+                        _ => c.project = Some(format!("prj{i}")),
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+        for t in threads {
+            t.join().unwrap();
+        }
+        let saved = CliConfig::load_from(&path).unwrap();
+        assert!(
+            saved.token.is_some() && saved.server.is_some() && saved.project.is_some(),
+            "{saved:?}"
+        );
+        // No temporary files are left behind.
+        let left: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -707,7 +707,7 @@ async fn live_attempt_cancel_retry_and_verification() {
     .await
     .unwrap();
     let none = Chains::new(vec![], vec![], vec![]);
-    let failed = JobTransitions::verify_completion(&mut tx, &job, &none)
+    let failed = JobTransitions::verify_completion(&mut tx, &job, none.verify(&job).await.unwrap())
         .await
         .unwrap();
     assert_eq!(failed.failure_class.as_deref(), Some("VERIFICATION_FAILED"));
@@ -982,7 +982,12 @@ async fn every_transition_matches_the_p06_tables() {
         );
         drop(tx);
         let mut tx = e.db.db().begin().await.unwrap();
-        let verified = JobTransitions::verify_completion(&mut tx, &row, &accepting_chains()).await;
+        let verified = JobTransitions::verify_completion(
+            &mut tx,
+            &row,
+            accepting_chains().verify(&row).await.unwrap(),
+        )
+        .await;
         assert_eq!(
             verified.is_ok(),
             from == JobState::Finalizing,
@@ -1637,11 +1642,12 @@ async fn solo_runs_are_stored_under_the_project_org_for_every_credential() {
 
 #[tokio::test]
 #[ignore = "needs DATABASE_URL"]
-async fn legacy_duplicates_and_cross_project_lineage_move_together() {
+async fn legacy_rows_move_keeping_experiments_lineage_and_events() {
     use mrl_server::seams::{Principal, PrincipalKind};
     let db = TestDb::new().await;
     let org = OrgId::new();
-    let (p, q) = (ProjectId::new(), ProjectId::new());
+    // P and Q are linked by a parent run; U links to M, which the directory doesn't know.
+    let [p, q, u, m] = [(); 4].map(|_| ProjectId::new());
     let person = |token: &str, id: &str, kind, org: Option<String>, role| TestUser {
         token: token.to_owned(),
         principal: Principal {
@@ -1670,18 +1676,19 @@ async fn legacy_duplicates_and_cross_project_lineage_move_together() {
     async fn post(
         srv: &TestServer,
         token: &str,
-        project: ProjectId,
-        key: &str,
+        path: String,
+        key: Option<&str>,
         body: &Value,
     ) -> Value {
-        let path = format!("/api/v1/projects/{project}/runs");
-        let res = call(srv, Method::POST, &path, token, Some(key), Some(body)).await;
-        assert_eq!(res.status, 201, "{}", res.text());
+        let res = call(srv, Method::POST, &path, token, key, Some(body)).await;
+        assert_eq!(res.status, 201, "{path}: {}", res.text());
         res.json()
     }
+    let runs = |p: ProjectId| format!("/api/v1/projects/{p}/runs");
+    let exps = |p: ProjectId| format!("/api/v1/projects/{p}/experiments");
 
     // Before the directory: the solo owner writes under the nil org, the token under its
-    // org, so project P gets a `default` experiment in each; a child in P has its parent in Q.
+    // org, so P gets a `default` and a `sweep` in each, with different descriptions.
     let old = runs_server_with(
         db.db(),
         accepting_chains(),
@@ -1690,28 +1697,67 @@ async fn legacy_duplicates_and_cross_project_lineage_move_together() {
         &Harness::default(),
     )
     .await;
-    let solo_run = post(&old, "solo", p, "a", &submission("solo")).await;
-    let pat_run = post(&old, "pat", p, "b", &submission("pat")).await;
-    let parent = post(&old, "solo", q, "c", &submission("parent")).await;
+    let solo_run = post(&old, "solo", runs(p), Some("a"), &submission("solo")).await;
+    let pat_run = post(&old, "pat", runs(p), Some("b"), &submission("pat")).await;
+    let local_sweep = post(
+        &old,
+        "solo",
+        exps(p),
+        None,
+        &json!({"name": "sweep", "description": "local", "tags": ["x"]}),
+    )
+    .await;
+    let org_sweep = post(
+        &old,
+        "pat",
+        exps(p),
+        None,
+        &json!({"name": "sweep", "description": "org"}),
+    )
+    .await;
+    let parent = post(&old, "solo", runs(q), Some("c"), &submission("parent")).await;
     let mut child = submission("child");
     child["parent_run_id"] = parent["id"].clone();
-    let child = post(&old, "solo", p, "d", &child).await;
+    let child = post(&old, "solo", runs(p), Some("d"), &child).await;
+    let orphan_parent = post(
+        &old,
+        "solo",
+        runs(m),
+        Some("e"),
+        &submission("orphan-parent"),
+    )
+    .await;
+    let mut orphan = submission("orphan");
+    orphan["parent_run_id"] = orphan_parent["id"].clone();
+    post(&old, "solo", runs(u), Some("f"), &orphan).await;
     old.shutdown().await.unwrap();
-    assert_ne!(solo_run["experiment_id"], pat_run["experiment_id"]);
 
     let harness = Harness::default();
-    *harness.rules.lock().unwrap() = AuthRules::with_projects(&[(p, org), (q, org)]);
+    *harness.rules.lock().unwrap() = AuthRules::with_projects(&[(p, org), (q, org), (u, org)]);
     for start in ["first start", "second start"] {
         let srv = runs_server_with(db.db(), accepting_chains(), &people, vec![], &harness).await;
-        let nil: i64 = sqlx::query_scalar(
-            "SELECT (SELECT count(*) FROM runs WHERE org_id = $1) \
-                  + (SELECT count(*) FROM experiments WHERE org_id = $1)",
+        // P and Q moved, events included; U and M (linked to a project nobody knows) stayed.
+        let left: Vec<uuid::Uuid> = sqlx::query_scalar(
+            "SELECT DISTINCT project_id FROM runs WHERE org_id = $1 ORDER BY project_id",
         )
         .bind(uuid::Uuid::nil())
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        let mut want = vec![u.as_uuid(), m.as_uuid()];
+        want.sort();
+        assert_eq!(left, want, "{start}");
+        let nil_events: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM outbox_events o JOIN jobs j ON o.aggregate_id = j.id \
+              WHERE o.org_id = $1 AND j.project_id = ANY($2)",
+        )
+        .bind(uuid::Uuid::nil())
+        .bind([p.as_uuid(), q.as_uuid()])
         .fetch_one(db.pool())
         .await
         .unwrap();
-        assert_eq!(nil, 0, "{start}: rows left under the nil org");
+        assert_eq!(nil_events, 0, "{start}: job events still under the nil org");
+
         let get = |path: String| {
             let srv = &srv;
             async move {
@@ -1720,37 +1766,532 @@ async fn legacy_duplicates_and_cross_project_lineage_move_together() {
                 res.json()
             }
         };
-        let in_p = get(format!("/api/v1/projects/{p}/runs")).await;
-        let in_q = get(format!("/api/v1/projects/{q}/runs")).await;
-        let ids = |page: &Value| -> Vec<Value> {
-            page["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|r| r["id"].clone())
-                .collect()
-        };
+        // Every run is visible to the token and kept its experiment.
+        let in_p = get(runs(p)).await;
+        let listed = in_p["items"].as_array().unwrap();
         for run in [&solo_run, &pat_run, &child] {
-            assert!(
-                ids(&in_p).contains(&run["id"]),
-                "{start}: {} missing from P",
-                run["id"]
-            );
+            let got = listed.iter().find(|r| r["id"] == run["id"]);
+            let got = got.unwrap_or_else(|| panic!("{start}: {} missing from P", run["id"]));
+            assert_eq!(got["experiment_id"], run["experiment_id"], "{start}");
         }
-        assert_eq!(ids(&in_q), vec![parent["id"].clone()], "{start}");
-        // One `default` experiment in P, holding every run.
-        let exps: Vec<Value> = in_p["items"]
+        assert_ne!(solo_run["experiment_id"], pat_run["experiment_id"]);
+        // Both `sweep`s keep their ids and metadata; the local one has a fixed new name.
+        let local = get(format!(
+            "/api/v1/experiments/{}",
+            local_sweep["id"].as_str().unwrap()
+        ))
+        .await;
+        let suffix = local_sweep["id"].as_str().unwrap();
+        assert!(
+            local["name"].as_str().unwrap().starts_with("sweep (local "),
+            "{start}: {local}"
+        );
+        assert_eq!(
+            (&local["description"], &local["tags"]),
+            (&json!("local"), &json!(["x"])),
+            "{start}"
+        );
+        let theirs = get(format!(
+            "/api/v1/experiments/{}",
+            org_sweep["id"].as_str().unwrap()
+        ))
+        .await;
+        assert_eq!(
+            (&theirs["name"], &theirs["description"]),
+            (&json!("sweep"), &json!("org")),
+            "{start}"
+        );
+        let names: Vec<Value> = get(exps(p)).await["items"]
             .as_array()
             .unwrap()
             .iter()
-            .map(|r| r["experiment_id"].clone())
+            .map(|e| e["name"].clone())
             .collect();
-        assert!(exps.windows(2).all(|w| w[0] == w[1]), "{start}: {exps:?}");
-        let e = get(format!("/api/v1/projects/{p}/experiments")).await;
-        assert_eq!(e["items"].as_array().unwrap().len(), 1, "{start}: {e}");
+        assert_eq!(names.len(), 4, "{start}: {names:?} ({suffix})");
         // Lineage survives.
         let got = get(format!("/api/v1/runs/{}", child["id"].as_str().unwrap())).await;
         assert_eq!(got["parent_run_id"], parent["id"], "{start}");
+        let tl = get(format!(
+            "/api/v1/runs/{}/timeline",
+            child["id"].as_str().unwrap()
+        ))
+        .await;
+        assert_eq!(tl["items"][0]["type"], "job.created", "{start}");
         srv.shutdown().await.unwrap();
     }
+}
+
+/// A job of a new run in `e`, moved to ALLOCATING.
+async fn allocating(e: &Env, key: &str) -> JobRow {
+    let run = e.submit("res", key, &submission(key)).await.json();
+    let job = e.job_row(run["job_id"].as_str().unwrap()).await;
+    let mut tx = e.db.db().begin().await.unwrap();
+    let job = JobTransitions::apply(
+        &mut tx,
+        &job,
+        JobEvent::Place,
+        Owner::Scheduler,
+        JobChange::default(),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    job
+}
+
+async fn attempts_and_events(e: &Env, job: uuid::Uuid) -> (i64, i64) {
+    sqlx::query_as(
+        "SELECT (SELECT count(*) FROM job_attempts WHERE job_id = $1), \
+                (SELECT count(*) FROM outbox_events WHERE aggregate_kind = 'attempt' \
+                   AND aggregate_id IN (SELECT id FROM job_attempts WHERE job_id = $1))",
+    )
+    .bind(job)
+    .fetch_one(e.db.pool())
+    .await
+    .unwrap()
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn stale_launches_add_nothing() {
+    let e = env(true).await;
+    let org = e.org.as_uuid();
+    // Cancelled after the scheduler read it: the stale launch is refused and adds nothing,
+    // even if the caller commits.
+    let stale = allocating(&e, "cancelled").await;
+    let mut tx = e.db.db().begin().await.unwrap();
+    let fresh = JobTransitions::lock(&mut tx, org, stale.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let done = JobTransitions::request_cancel(&mut tx, &fresh, "usr_res")
+        .await
+        .unwrap();
+    assert_eq!(done.state, "CANCELLED");
+    tx.commit().await.unwrap();
+    let mut tx = e.db.db().begin().await.unwrap();
+    let err = JobTransitions::launch(&mut tx, &stale, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "MRL-CONFLICT-170");
+    tx.commit().await.unwrap();
+    assert_eq!(attempts_and_events(&e, stale.id).await, (0, 0));
+
+    // Two launches from the same read: the second is a conflict, not a uniqueness error.
+    let row = allocating(&e, "twice").await;
+    let mut tx = e.db.db().begin().await.unwrap();
+    JobTransitions::launch(&mut tx, &row, None).await.unwrap();
+    tx.commit().await.unwrap();
+    let mut tx = e.db.db().begin().await.unwrap();
+    let err = JobTransitions::launch(&mut tx, &row, None)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "MRL-CONFLICT-170");
+    tx.commit().await.unwrap();
+    assert_eq!(attempts_and_events(&e, row.id).await, (1, 1));
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn job_and_attempt_locks_never_deadlock() {
+    let e = env(true).await;
+    let org = e.org.as_uuid();
+    let job = allocating(&e, "locks").await;
+    let mut tx = e.db.db().begin().await.unwrap();
+    let (_, att) = JobTransitions::launch(&mut tx, &job, None).await.unwrap();
+    tx.commit().await.unwrap();
+    // A locks the job, waits, then works on the attempt. B starts meanwhile from the attempt.
+    let a = async {
+        let mut tx = e.db.db().begin().await.unwrap();
+        JobTransitions::lock(&mut tx, org, job.id)
+            .await
+            .unwrap()
+            .unwrap();
+        sqlx::query("SELECT pg_sleep(0.3)")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let att = JobTransitions::lock_attempt(&mut tx, org, att.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let r = JobTransitions::apply_attempt(
+            &mut tx,
+            &att,
+            JobAttemptEvent::Acknowledge,
+            AttemptChange::default(),
+        )
+        .await;
+        tx.commit().await.unwrap();
+        r
+    };
+    let b = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let mut tx = e.db.db().begin().await.unwrap();
+        let att = JobTransitions::lock_attempt(&mut tx, org, att.id)
+            .await
+            .unwrap()
+            .unwrap();
+        let r = JobTransitions::apply_attempt(
+            &mut tx,
+            &att,
+            JobAttemptEvent::Kill,
+            AttemptChange::default(),
+        )
+        .await;
+        tx.commit().await.unwrap();
+        r
+    };
+    let (ra, rb) = tokio::join!(a, b);
+    assert_eq!(ra.unwrap().state, "LAUNCHING");
+    assert_eq!(
+        rb.unwrap().state,
+        "KILLED",
+        "B waited for A instead of deadlocking"
+    );
+}
+
+/// A verifier that reads the database through `pool`, like a real one would.
+struct DbVerifier(mrl_server::Db);
+
+#[async_trait::async_trait]
+impl mrl_server::modules::jobs::CompletionVerifier for DbVerifier {
+    fn name(&self) -> &'static str {
+        "db-verifier"
+    }
+    async fn verify(
+        &self,
+        _: &JobRow,
+    ) -> Result<mrl_server::modules::jobs::Verification, mrl_server::seams::SeamError> {
+        sqlx::query("SELECT 1")
+            .execute(self.0.pool())
+            .await
+            .map_err(|e| mrl_server::seams::SeamError::new("verifier", e.to_string()))?;
+        Ok(mrl_server::modules::jobs::Verification::Verified)
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_database_verifier_works_on_one_connection() {
+    let e = env(true).await;
+    let org = e.org.as_uuid();
+    let job = allocating(&e, "verify").await;
+    let mut tx = e.db.db().begin().await.unwrap();
+    let (job, _) = JobTransitions::launch(&mut tx, &job, None).await.unwrap();
+    let job = JobTransitions::apply(
+        &mut tx,
+        &job,
+        JobEvent::Start,
+        Owner::Jobs,
+        JobChange::default(),
+    )
+    .await
+    .unwrap();
+    let job = JobTransitions::apply(
+        &mut tx,
+        &job,
+        JobEvent::Finish,
+        Owner::Jobs,
+        JobChange::default(),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let small = e.db.replica_with(&mrl_server::config::DatabaseConfig {
+        max_connections: 1,
+        acquire_timeout_seconds: 3,
+        ..mrl_testkit::pg::test_config()
+    });
+    let chains = Chains::new(
+        vec![],
+        vec![std::sync::Arc::new(DbVerifier(small.clone()))],
+        vec![],
+    );
+    // Verify first, then write: the verifier never waits for the transaction's connection.
+    let verdict = chains.verify(&job).await.unwrap();
+    let mut tx = small.begin().await.unwrap();
+    let row = JobTransitions::lock(&mut tx, org, job.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let done = JobTransitions::verify_completion(&mut tx, &row, verdict)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(done.state, "COMPLETED");
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn submits_racing_renames_of_default_never_fail() {
+    let e = env(true).await;
+    for i in 0..10 {
+        let key = format!("race-{i}");
+        let body = submission(&key);
+        let submit = e.submit("res", &key, &body);
+        let rename = async {
+            let exps = e
+                .get(
+                    "res",
+                    &format!("/api/v1/projects/{}/experiments", e.project),
+                )
+                .await
+                .json();
+            let default = exps["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|x| x["name"] == "default")
+                .cloned();
+            if let Some(d) = default {
+                let path = format!("/api/v1/experiments/{}", d["id"].as_str().unwrap());
+                let body = json!({"name": format!("renamed-{i}")});
+                let res = call(&e.srv, Method::PATCH, &path, "res", None, Some(&body)).await;
+                assert!(res.status == 200 || res.status == 409, "{}", res.text());
+            }
+        };
+        let (res, ()) = tokio::join!(submit, rename);
+        assert_eq!(res.status, 201, "round {i}: {}", res.text());
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_token_without_an_org_sees_its_jobs() {
+    use mrl_server::seams::{Principal, PrincipalKind};
+    let db = TestDb::new().await;
+    let org = OrgId::new();
+    let project = ProjectId::new();
+    let people = vec![TestUser {
+        token: "solo-pat".into(),
+        principal: Principal {
+            id: "tok_solo".into(),
+            kind: PrincipalKind::Service,
+            org: None,
+        },
+        role: Role::Owner,
+    }];
+    let harness = Harness::default();
+    *harness.rules.lock().unwrap() = AuthRules::with_projects(&[(project, org)]);
+    let srv = runs_server_with(db.db(), accepting_chains(), &people, vec![], &harness).await;
+    let path = format!("/api/v1/projects/{project}/runs");
+    let run = call(
+        &srv,
+        Method::POST,
+        &path,
+        "solo-pat",
+        Some("k"),
+        Some(&submission("x")),
+    )
+    .await;
+    assert_eq!(run.status, 201, "{}", run.text());
+    let job = run.json()["job_id"].as_str().unwrap().to_owned();
+    let one = call(
+        &srv,
+        Method::GET,
+        &format!("/api/v1/jobs/{job}"),
+        "solo-pat",
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(one.status, 200, "{}", one.text());
+    let all = call(&srv, Method::GET, "/api/v1/jobs", "solo-pat", None, None)
+        .await
+        .json();
+    let ids: Vec<&str> = all["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| j["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [job.as_str()], "{all}");
+    srv.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn nul_characters_are_field_errors() {
+    let e = env(true).await;
+    let mut named = submission("a\u{0}b");
+    named["name"] = json!("a\u{0}b");
+    let mut configured = submission("cfg");
+    configured["config"] = json!({"note": "x\u{0}"});
+    for (body, path) in [(named, "/name"), (configured, "/config/note")] {
+        let res = e.submit("res", path, &body).await;
+        assert_eq!(res.status, 422, "{}", res.text());
+        assert_eq!(res.json()["errors"][0]["path"], path, "{}", res.text());
+    }
+    let exps = format!("/api/v1/projects/{}/experiments", e.project);
+    let res = call(
+        &e.srv,
+        Method::POST,
+        &exps,
+        "res",
+        None,
+        Some(&json!({"name": "s", "tags": ["ok", "b\u{0}"]})),
+    )
+    .await;
+    assert_eq!(
+        (res.status, res.json()["errors"][0]["path"].clone()),
+        (422, json!("/tags/1")),
+        "{}",
+        res.text()
+    );
+    let made = call(
+        &e.srv,
+        Method::POST,
+        &exps,
+        "res",
+        None,
+        Some(&json!({"name": "s"})),
+    )
+    .await
+    .json();
+    let path = format!("/api/v1/experiments/{}", made["id"].as_str().unwrap());
+    let res = call(
+        &e.srv,
+        Method::PATCH,
+        &path,
+        "res",
+        None,
+        Some(&json!({"description": "d\u{0}"})),
+    )
+    .await;
+    assert_eq!(
+        (res.status, res.json()["errors"][0]["path"].clone()),
+        (422, json!("/description")),
+        "{}",
+        res.text()
+    );
+    let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM runs")
+        .fetch_one(e.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(runs, 0);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_failed_audit_write_rolls_the_change_back() {
+    use std::sync::atomic::Ordering;
+    let db = TestDb::new().await;
+    let org = OrgId::new();
+    let project = ProjectId::new();
+    let harness = Harness::default();
+    *harness.rules.lock().unwrap() = AuthRules::with_projects(&[(project, org)]);
+    let srv = runs_server_with(
+        db.db(),
+        accepting_chains(),
+        &users(org, OrgId::new()),
+        vec![],
+        &harness,
+    )
+    .await;
+    let runs = format!("/api/v1/projects/{project}/runs");
+    let exps = format!("/api/v1/projects/{project}/experiments");
+    let run = call(
+        &srv,
+        Method::POST,
+        &runs,
+        "res",
+        Some("ok"),
+        Some(&submission("kept")),
+    )
+    .await
+    .json();
+    let exp = call(
+        &srv,
+        Method::POST,
+        &exps,
+        "res",
+        None,
+        Some(&json!({"name": "e"})),
+    )
+    .await
+    .json();
+    let count = |table: &'static str| {
+        let db = &db;
+        async move {
+            let n: i64 =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {table}")))
+                    .fetch_one(db.pool())
+                    .await
+                    .unwrap();
+            n
+        }
+    };
+    let before = (
+        count("runs").await,
+        count("experiments").await,
+        count("outbox_events").await,
+    );
+    harness.audit.fail.store(true, Ordering::SeqCst);
+    let job = run["job_id"].as_str().unwrap();
+    let rid = run["id"].as_str().unwrap();
+    let eid = exp["id"].as_str().unwrap();
+    for (method, path, key, body) in [
+        (
+            Method::POST,
+            runs.clone(),
+            Some("new"),
+            Some(submission("lost")),
+        ),
+        (
+            Method::POST,
+            exps.clone(),
+            None,
+            Some(json!({"name": "lost"})),
+        ),
+        (
+            Method::PATCH,
+            format!("/api/v1/experiments/{eid}"),
+            None,
+            Some(json!({"description": "lost"})),
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/jobs/{job}:cancel"),
+            None,
+            None,
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/runs/{rid}:cancel"),
+            None,
+            None,
+        ),
+        (
+            Method::PATCH,
+            format!("/api/v1/jobs/{job}"),
+            None,
+            Some(json!({"priority": 9})),
+        ),
+    ] {
+        let res = call(&srv, method.clone(), &path, "maint", key, body.as_ref()).await;
+        assert_eq!(res.status, 503, "{method} {path}: {}", res.text());
+    }
+    let after = (
+        count("runs").await,
+        count("experiments").await,
+        count("outbox_events").await,
+    );
+    assert_eq!(after, before, "nothing was written");
+    harness.audit.fail.store(false, Ordering::SeqCst);
+    let get = |path: String| {
+        let srv = &srv;
+        async move {
+            call(srv, Method::GET, &path, "res", None, None)
+                .await
+                .json()
+        }
+    };
+    let job_now = get(format!("/api/v1/jobs/{job}")).await;
+    assert_eq!(
+        (&job_now["state"], &job_now["priority"]),
+        (&json!("QUEUED"), &json!(0))
+    );
+    assert!(get(format!("/api/v1/experiments/{eid}")).await["description"].is_null());
+    srv.shutdown().await.unwrap();
 }

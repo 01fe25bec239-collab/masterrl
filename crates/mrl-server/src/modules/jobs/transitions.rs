@@ -5,7 +5,7 @@
 //! outbox event, all in the caller's transaction. The outbox rows are the timeline.
 //! A lost compare-and-set is reported (MRL-CONFLICT-170), never retried here.
 
-use super::chains::{Chains, Completion};
+use super::chains::Completion;
 use super::error::JobsError;
 use super::model::{reason, AttemptRow, JobRow};
 use crate::db::Tx;
@@ -136,12 +136,27 @@ impl JobTransitions {
         .await?)
     }
 
-    /// Reads an attempt and locks it for this transaction.
+    /// Reads an attempt and locks it for this transaction. Its job is locked first: every
+    /// transition locks the job before the attempt, so two transactions can't deadlock.
     pub async fn lock_attempt(
         tx: &mut Tx,
         org: Uuid,
         id: Uuid,
     ) -> Result<Option<AttemptRow>, JobsError> {
+        let job: Option<Uuid> =
+            sqlx::query_scalar("SELECT job_id FROM job_attempts WHERE id = $1 AND org_id = $2")
+                .bind(id)
+                .bind(org)
+                .fetch_optional(&mut **tx)
+                .await?;
+        let Some(job) = job else {
+            return Ok(None);
+        };
+        sqlx::query("SELECT 1 FROM jobs WHERE id = $1 AND org_id = $2 FOR UPDATE")
+            .bind(job)
+            .bind(org)
+            .execute(&mut **tx)
+            .await?;
         Ok(sqlx::query_as::<_, AttemptRow>(concat!(
             "SELECT ",
             attempt_cols!(),
@@ -220,11 +235,23 @@ impl JobTransitions {
     }
 
     /// ALLOCATING → PREPARING: bumps the epoch and creates the next attempt in PENDING.
+    /// The job is locked and `row` checked against it (version and epoch) before the
+    /// attempt is inserted, so a stale row adds nothing.
     pub async fn launch(
         tx: &mut Tx,
         row: &JobRow,
         resume_from_checkpoint: Option<Uuid>,
     ) -> Result<(JobRow, AttemptRow), JobsError> {
+        let current: Option<(i64, i64)> = sqlx::query_as(
+            "SELECT state_version, epoch FROM jobs WHERE id = $1 AND org_id = $2 FOR UPDATE",
+        )
+        .bind(row.id)
+        .bind(row.org_id)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if current != Some((row.state_version, row.epoch)) {
+            return Err(JobsError::changed("job"));
+        }
         Job::can_transition(row.job_state()?, JobEvent::Launch)?;
         let epoch = row.epoch + 1;
         let attempt = sqlx::query_as::<_, AttemptRow>(concat!(
@@ -314,15 +341,17 @@ impl JobTransitions {
         }
     }
 
-    /// FINALIZING → COMPLETED, FAILED (VERIFICATION_FAILED) or RETRY_WAIT, as the
-    /// completion verifiers decide.
+    /// FINALIZING → COMPLETED, FAILED (VERIFICATION_FAILED) or RETRY_WAIT, as `verdict`
+    /// says. Get `verdict` from [`super::chains::Chains::verify`] **before** opening the write
+    /// transaction (a verifier may need a pool connection); the compare-and-set here
+    /// refuses a row that changed meanwhile (MRL-CONFLICT-170).
     pub async fn verify_completion(
         tx: &mut Tx,
         row: &JobRow,
-        chains: &Chains,
+        verdict: Completion,
     ) -> Result<JobRow, JobsError> {
         Job::can_transition(row.job_state()?, JobEvent::Complete)?;
-        match chains.verify(row).await? {
+        match verdict {
             Completion::Verified => {
                 let extra = Extra::keep(row);
                 let change = JobChange::default();

@@ -154,6 +154,11 @@ fn check_fields(name: Option<&str>, tags: Option<&[String]>) -> Result<(), JobsE
     }
 }
 
+/// Refuses a NUL character (which PostgreSQL can't store) in the name, description or tags.
+fn no_nul(name: &str, description: Option<&str>, tags: &[String]) -> Result<(), JobsError> {
+    scope::no_nul(&serde_json::json!({ "name": name, "description": description, "tags": tags }))
+}
+
 fn name_taken(e: JobsError) -> JobsError {
     if e.is_unique_violation("experiments_org_id_project_id_name_key") {
         JobsError::domain(
@@ -183,7 +188,9 @@ pub async fn project_scope(
     Ok((org, project.as_uuid()))
 }
 
-/// The id of experiment `name` in the project, created when missing.
+/// The id of experiment `name` in the project, created when missing. One statement that
+/// also locks the row until `tx` ends, so a concurrent rename can't make it vanish between
+/// "it exists" and "read its id".
 pub async fn get_or_create(
     tx: &mut crate::Tx,
     org: Uuid,
@@ -191,23 +198,17 @@ pub async fn get_or_create(
     name: &str,
     created_by: &str,
 ) -> Result<Uuid, JobsError> {
-    sqlx::query(
+    Ok(sqlx::query_scalar(
         "INSERT INTO experiments (id, org_id, project_id, name, created_by) \
-         VALUES ($1, $2, $3, $4, $5) ON CONFLICT (org_id, project_id, name) DO NOTHING",
+         VALUES ($1, $2, $3, $4, $5) \
+         ON CONFLICT (org_id, project_id, name) DO UPDATE SET name = EXCLUDED.name \
+         RETURNING id",
     )
     .bind(Uuid::now_v7())
     .bind(org)
     .bind(project)
     .bind(name)
     .bind(created_by)
-    .execute(&mut **tx)
-    .await?;
-    Ok(sqlx::query_scalar(
-        "SELECT id FROM experiments WHERE org_id = $1 AND project_id = $2 AND name = $3",
-    )
-    .bind(org)
-    .bind(project)
-    .bind(name)
     .fetch_one(&mut **tx)
     .await?)
 }
@@ -228,6 +229,8 @@ pub async fn create(
 ) -> Result<Response, JobsError> {
     let (org, project) = project_scope(&state, &ctx, &projects, &prj, "runs.submit").await?;
     check_fields(Some(&body.name), Some(&body.tags))?;
+    no_nul(&body.name, body.description.as_deref(), &body.tags)?;
+    let mut tx = db.begin().await?;
     let row = sqlx::query_as::<_, ExperimentRow>(concat!(
         "INSERT INTO experiments (id, org_id, project_id, name, description, tags, created_by) \
          VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING ",
@@ -240,12 +243,14 @@ pub async fn create(
     .bind(&body.description)
     .bind(&body.tags)
     .bind(&ctx.principal.id)
-    .fetch_one(db.pool())
+    .fetch_one(&mut *tx)
     .await
     .map_err(JobsError::from)
     .map_err(name_taken)?;
     let id = ExperimentId::from_uuid(row.id).to_string();
-    scope::audit(&state, &ctx, project, "experiments.create", id.clone()).await;
+    let at = (org, project);
+    scope::audit(&mut tx, &state, &ctx, at, "experiments.create", id.clone()).await?;
+    tx.commit().await?;
     let location = format!("/api/v1/experiments/{id}");
     Ok((
         StatusCode::CREATED,
@@ -354,7 +359,13 @@ pub async fn patch(
     Json(body): Json<ExperimentPatch>,
 ) -> Result<Response, JobsError> {
     check_fields(body.name.as_deref(), body.tags.as_deref())?;
+    no_nul(
+        body.name.as_deref().unwrap_or(""),
+        body.description.as_deref(),
+        body.tags.as_deref().unwrap_or(&[]),
+    )?;
     let row = read(&state, &db, &ctx, &exp, "runs.submit").await?;
+    let mut tx = db.begin().await?;
     etag::check_if_match(&headers, &etag::from_version(row.version), false)?;
     let next = sqlx::query_as::<_, ExperimentRow>(concat!(
         "UPDATE experiments SET name = COALESCE($3, name), \
@@ -369,11 +380,13 @@ pub async fn patch(
     .bind(&body.description)
     .bind(&body.tags)
     .bind(row.version)
-    .fetch_optional(db.pool())
+    .fetch_optional(&mut *tx)
     .await
     .map_err(JobsError::from)
     .map_err(name_taken)?
     .ok_or_else(|| JobsError::changed("experiment"))?;
-    scope::audit(&state, &ctx, next.project_id, "experiments.update", exp).await;
+    let at = (next.org_id, next.project_id);
+    scope::audit(&mut tx, &state, &ctx, at, "experiments.update", exp).await?;
+    tx.commit().await?;
     Ok(with_etag(next.version, next.view()))
 }

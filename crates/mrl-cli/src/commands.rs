@@ -295,7 +295,7 @@ fn print_run(run: &Value, out: &Output) {
 
 /// `mrl config …`
 pub fn config(cmd: ConfigCommand) -> Result<(), String> {
-    let mut cfg = CliConfig::load()?;
+    let cfg = CliConfig::load()?;
     match cmd {
         ConfigCommand::SetToken { token } => {
             let token = match token {
@@ -314,19 +314,19 @@ pub fn config(cmd: ConfigCommand) -> Result<(), String> {
             if token.is_empty() {
                 return Err("the token is empty; nothing was saved".to_owned());
             }
-            cfg.token = Some(token);
-            println!("saved the token in {}", cfg.save()?.display());
+            let saved = CliConfig::update(|c| c.token = Some(token))?;
+            println!("saved the token in {}", saved.display());
         }
         ConfigCommand::SetServer { url } => {
             if !(url.starts_with("http://") || url.starts_with("https://")) {
                 return Err(format!("`{url}` must start with http:// or https://"));
             }
-            cfg.server = Some(url);
-            println!("saved the server in {}", cfg.save()?.display());
+            let saved = CliConfig::update(|c| c.server = Some(url))?;
+            println!("saved the server in {}", saved.display());
         }
         ConfigCommand::SetProject { project } => {
-            cfg.project = Some(project);
-            println!("saved the project in {}", cfg.save()?.display());
+            let saved = CliConfig::update(|c| c.project = Some(project))?;
+            println!("saved the project in {}", saved.display());
         }
         ConfigCommand::Show => {
             println!("file     {}", config_file::path()?.display());
@@ -503,11 +503,10 @@ pub fn jobs(cmd: JobsCommand) -> Result<(), String> {
 pub fn dev(cmd: DevCommand) -> Result<(), String> {
     match cmd {
         DevCommand::Seed => {
-            let (mut cfg, api) = connect()?;
+            let (_, api) = connect()?;
             let state = crate::seed::run(&api)?;
             if let Some(prj) = state.project {
-                cfg.project = Some(prj.clone());
-                cfg.save()?;
+                CliConfig::update(|c| c.project = Some(prj.clone()))?;
                 println!("saved {prj} as the default project");
             }
             Ok(())
