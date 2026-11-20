@@ -100,7 +100,6 @@ pub struct InstalledEnv {
 pub struct Envs {
     root: PathBuf,
     cache: Arc<NodeCache>,
-    locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     free_space: Arc<FreeSpaceFn>,
 }
 
@@ -128,7 +127,6 @@ impl Envs {
         Ok(Self {
             root,
             cache,
-            locks: std::sync::Mutex::default(),
             free_space: Arc::new(disk_free),
         })
     }
@@ -164,7 +162,11 @@ impl Envs {
                 return Ok(());
             }
             if let Some(i) = envs.iter().position(|(e, _)| e.pinned_by.is_empty()) {
-                remove_env(&envs.remove(i).0)?;
+                let (mut env, bytes) = envs.remove(i);
+                if !remove_env(&env)? {
+                    env.pinned_by.push(String::new()); // in use now: counts as pinned
+                    envs.push((env, bytes));
+                }
                 continue;
             }
             // No environment left to remove: free cache entries instead.
@@ -191,7 +193,11 @@ impl Envs {
                 return Ok(());
             }
             if let Some(i) = envs.iter().position(|(e, _)| e.pinned_by.is_empty()) {
-                remove_env(&envs.remove(i).0)?;
+                let (mut env, bytes) = envs.remove(i);
+                if !remove_env(&env)? {
+                    env.pinned_by.push(String::new()); // in use now: counts as pinned
+                    envs.push((env, bytes));
+                }
                 continue;
             }
             self.shrink_cache(limit.saturating_sub(env_bytes));
@@ -248,10 +254,10 @@ impl Envs {
         holder: &str,
         progress: &ProgressFn,
     ) -> Result<Materialized, AttemptError> {
-        let lock = {
-            let mut locks = self.locks.lock().unwrap_or_else(|p| p.into_inner());
-            Arc::clone(locks.entry(rt.runtime_ref.clone()).or_default())
-        };
+        let dir = self.dir_for(rt);
+        // Held until the pin is written, so eviction (any `Envs` of this agent) never removes
+        // it in between.
+        let lock = env_lock(&dir);
         let _one_at_a_time = lock.lock().await;
         let say = |stage, detail: String| {
             progress(EnvProgress {
@@ -260,7 +266,6 @@ impl Envs {
                 detail,
             })
         };
-        let dir = self.dir_for(rt);
         std::fs::create_dir_all(&dir).map_err(|e| AgentError::state(&dir, e))?;
         let m = match rt.kind()? {
             RuntimeKind::Process { lock_sha256 } => {
@@ -358,7 +363,9 @@ impl Envs {
             let dirs: Vec<PathBuf> = plan.local.iter().map(|p| p.dir.clone()).collect();
             let copy = snapshot_project(project, &dirs, &lock, &snap.0, &self.root)
                 .map_err(|e| install_err(format!("the project could not be copied ({e})")))?;
-            plan.check_build_backends(&copy).map_err(install_err)?;
+            let uv_version = uv_version(&uv).await.map_err(install_err)?;
+            plan.check_build_backends(&copy, &uv_version)
+                .map_err(install_err)?;
             let snap_project = copy.project.clone();
             let mut cmd = tokio::process::Command::new(uv);
             cmd.args(["sync", "--frozen", "--no-dev", "--no-editable", "--project"])
@@ -447,15 +454,35 @@ impl Envs {
             if !env.pinned_by.is_empty() {
                 continue;
             }
-            remove_env(&env)?;
-            removed.push(env.runtime_ref);
+            if remove_env(&env)? {
+                removed.push(env.runtime_ref);
+            }
         }
         Ok(removed)
     }
 }
 
-/// Deletes an environment (and its image, in container mode).
-fn remove_env(env: &InstalledEnv) -> Result<(), AttemptError> {
+/// One lock per environment folder for the whole agent process: materializing (up to the pin)
+/// and removing hold it.
+fn env_lock(dir: &Path) -> Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let mut locks = LOCKS.lock().unwrap_or_else(|p| p.into_inner());
+    Arc::clone(locks.entry(dir.to_path_buf()).or_default())
+}
+
+/// Deletes an environment (and its image, in container mode) unless it is being prepared or
+/// has gained a pin since `env` was read: both are checked under its lock. True if removed.
+fn remove_env(env: &InstalledEnv) -> Result<bool, AttemptError> {
+    let lock = env_lock(&env.dir);
+    let Ok(_held) = lock.try_lock() else {
+        return Ok(false); // being prepared or pinned right now
+    };
+    let pinned = std::fs::read_dir(env.dir.join(PINS)).is_ok_and(|mut rd| rd.next().is_some());
+    if pinned {
+        return Ok(false);
+    }
     if let Some(image) = env.runtime_ref.strip_prefix("oci:") {
         if let Some(docker) = which("docker") {
             let _ = std::process::Command::new(docker)
@@ -466,7 +493,7 @@ fn remove_env(env: &InstalledEnv) -> Result<(), AttemptError> {
         }
     }
     std::fs::remove_dir_all(&env.dir).map_err(|e| AgentError::state(&env.dir, e))?;
-    Ok(())
+    Ok(true)
 }
 
 /// Environments with the disk bytes each holds.
@@ -594,12 +621,13 @@ impl LockPlan {
     }
 
     /// Local packages are built here (all but virtual projects). Their only build backend
-    /// allowed is `uv_build`, pinned to one exact version (`uv_build==X.Y.Z`): it has no
-    /// dependencies of its own and uv builds it natively, so no unlocked build tools are
-    /// resolved. Anything else (no `pyproject.toml` or `[build-system]`, which means uv's
-    /// legacy setuptools build; another backend; extra build requirements; a range or
-    /// wildcard) is refused.
-    fn check_build_backends(&self, copy: &Snapshot) -> Result<(), String> {
+    /// allowed is `uv_build` pinned to exactly the installed uv's version
+    /// (`uv_build==<uv_version>`): that is the one version uv builds natively, with nothing
+    /// resolved. Any other version would be fetched and resolved at install time, outside the
+    /// lock. Anything else (no `pyproject.toml` or `[build-system]`, which means uv's legacy
+    /// setuptools build; another backend; extra build requirements; a range or wildcard) is
+    /// refused.
+    fn check_build_backends(&self, copy: &Snapshot, uv_version: &str) -> Result<(), String> {
         for pkg in self.local.iter().filter(|p| !p.is_virtual) {
             let pyproject = copy.copy_of(&pkg.dir).join("pyproject.toml");
             let legacy = || {
@@ -620,22 +648,32 @@ impl LockPlan {
                 .flatten()
                 .filter_map(|r| r.as_str())
                 .collect();
-            let exact = |r: &str| {
-                r.strip_prefix("uv_build==").is_some_and(|v| {
-                    !v.is_empty()
-                        && v.split('.')
-                            .all(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
-                })
-            };
-            if backend != Some("uv_build") || requires.len() != 1 || !exact(requires[0]) {
+            let wanted = format!("uv_build=={uv_version}");
+            if backend != Some("uv_build") || requires != [wanted.as_str()] {
                 return Err(format!(
-                    "{} must build with uv_build pinned to one exact version (uv_build==X.Y.Z), not {requires:?}",
+                    "{} must build with {wanted} (the uv installed here builds only that version itself), not {requires:?}",
                     pyproject.display()
                 ));
             }
         }
         Ok(())
     }
+}
+
+/// The installed uv's version (`uv --version` → `uv 0.11.28 (...)`).
+async fn uv_version(uv: &Path) -> Result<String, String> {
+    let out = tokio::process::Command::new(uv)
+        .arg("--version")
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("uv could not start ({e})"))?;
+    String::from_utf8_lossy(&out.stdout)
+        .split_whitespace()
+        .nth(1)
+        .filter(|v| out.status.success() && v.bytes().all(|b| b.is_ascii_digit() || b == b'.'))
+        .map(str::to_owned)
+        .ok_or_else(|| "uv did not report its version".to_owned())
 }
 
 /// A folder removed when this value is dropped.
@@ -1070,29 +1108,42 @@ source = { registry = "https://pypi.org/simple" }
         assert!(!sp.project.join(".venv").exists() && !sp.project.join("target").exists());
         // The runtime's build tool is a range, not a pin.
         // The runtime outside the project is checked in its copy: a range is refused...
-        let e = plan.check_build_backends(&sp).unwrap_err();
+        let e = plan.check_build_backends(&sp, "0.11.28").unwrap_err();
         assert!(e.contains("uv_build>=0.11"), "{e}");
         let runtime_copy = sp.copy_of(&runtime).join("pyproject.toml");
         let set = |text: &str| std::fs::write(&runtime_copy, text).unwrap();
         // ...as are a wildcard and a backend with build dependencies of its own...
         set("[build-system]\nrequires = [\"uv_build==0.11.*\"]\nbuild-backend = \"uv_build\"\n");
-        assert!(plan.check_build_backends(&sp).is_err(), "wildcard");
+        assert!(
+            plan.check_build_backends(&sp, "0.11.28").is_err(),
+            "wildcard"
+        );
         set("[build-system]\nrequires = [\"hatchling==1.27.0\"]\nbuild-backend = \"hatchling.build\"\n");
-        assert!(plan.check_build_backends(&sp).is_err(), "other backend");
+        assert!(
+            plan.check_build_backends(&sp, "0.11.28").is_err(),
+            "other backend"
+        );
         set("[build-system]\nrequires = [\"uv_build==0.11.28\", \"setuptools==80.0.0\"]\nbuild-backend = \"uv_build\"\n");
         assert!(
-            plan.check_build_backends(&sp).is_err(),
+            plan.check_build_backends(&sp, "0.11.28").is_err(),
             "extra build requirement"
         );
         // ...a legacy package (no [build-system], or no pyproject.toml at all)...
         set("[project]\nname = \"runtime\"\nversion = \"1\"\n");
-        let e = plan.check_build_backends(&sp).unwrap_err();
+        let e = plan.check_build_backends(&sp, "0.11.28").unwrap_err();
         assert!(e.contains("no [build-system]"), "{e}");
         std::fs::remove_file(&runtime_copy).unwrap();
-        assert!(plan.check_build_backends(&sp).is_err(), "no pyproject.toml");
-        // ...and one exact uv_build passes.
+        assert!(
+            plan.check_build_backends(&sp, "0.11.28").is_err(),
+            "no pyproject.toml"
+        );
+        // ...an exact pin of another uv_build version (uv would resolve it)...
+        set("[build-system]\nrequires = [\"uv_build==0.10.0\"]\nbuild-backend = \"uv_build\"\n");
+        let e = plan.check_build_backends(&sp, "0.11.28").unwrap_err();
+        assert!(e.contains("uv_build==0.11.28"), "{e}");
+        // ...and the installed uv's own version passes.
         set("[build-system]\nrequires = [\"uv_build==0.11.28\"]\nbuild-backend = \"uv_build\"\n");
-        assert!(plan.check_build_backends(&sp).is_ok());
+        assert!(plan.check_build_backends(&sp, "0.11.28").is_ok());
         // Only a virtual project may have no build system: uv never builds it.
         let virt = br#"version = 1
 [[package]]
@@ -1105,7 +1156,7 @@ source = { virtual = "." }
             "[project]\nname = \"a\"\nversion = \"1\"\n",
         )
         .unwrap();
-        assert!(vplan.check_build_backends(&sp).is_ok());
+        assert!(vplan.check_build_backends(&sp, "0.11.28").is_ok());
         let git = b"[[package]]\nname = \"g\"\nsource = { git = \"https://x\" }\n";
         assert!(LockPlan::parse(git, &project).is_err());
     }
@@ -1189,6 +1240,44 @@ source = { virtual = "." }
         let err = e.materialize(&rt, "att_new", &|_| {}).await.unwrap_err();
         assert_eq!(err.code(), "MRL-ENV-004", "{}", err.explain());
         assert!(kept.exists());
+    }
+
+    /// Cold cache: a local package pinned to a uv_build version the installed uv doesn't
+    /// build itself is refused before uv runs (uv would resolve that version from an index).
+    #[tokio::test]
+    async fn a_cold_install_refuses_another_uv_build_version() {
+        if which("uv").is_none() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("pyproject.toml"),
+            "[project]\nname = \"p\"\nversion = \"1\"\n[build-system]\nrequires = [\"uv_build==0.10.0\"]\nbuild-backend = \"uv_build\"\n",
+        )
+        .unwrap();
+        let lock = b"version = 1\n[[package]]\nname = \"p\"\nsource = { editable = \".\" }\n";
+        std::fs::write(project.join("uv.lock"), lock).unwrap();
+        let rt = RuntimeSpec {
+            runtime_ref: format!("uv:sha256:{}", mrl_storage::sha256_hex(lock)),
+            project: Some(project),
+            package: None,
+        };
+        let stages: Arc<std::sync::Mutex<Vec<&'static str>>> = Arc::default();
+        let seen = Arc::clone(&stages);
+        let e = envs(dir.path())
+            .materialize(&rt, "att_v", &move |p| seen.lock().unwrap().push(p.stage))
+            .await
+            .unwrap_err();
+        let lines = stages.lock().unwrap().clone();
+        assert_eq!(e.code(), "MRL-ENV-202", "{}", e.explain());
+        assert!(
+            e.explain().contains("builds only that version"),
+            "{}",
+            e.explain()
+        );
+        assert!(!lines.contains(&"installing"), "uv sync never ran");
     }
 
     #[tokio::test]
@@ -1285,6 +1374,33 @@ source = { virtual = "." }
             "unpinned entry evicted"
         );
         assert!(cache.get(&shas[1]).unwrap().is_some(), "pinned entry kept");
+    }
+
+    /// Eviction from another `Envs` (the janitor's) never removes an environment that is being
+    /// prepared or that was pinned after the scan.
+    #[tokio::test]
+    async fn eviction_respects_a_racing_cache_hit() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = (envs(dir.path()), envs(dir.path()));
+        let rt = RuntimeSpec {
+            runtime_ref: format!("uv:sha256:{}", "6".repeat(64)),
+            project: None,
+            package: None,
+        };
+        let d = a.dir_for(&rt);
+        std::fs::create_dir_all(d.join(PINS)).unwrap();
+        write_marker(&d, &rt).unwrap();
+        // `a` is materializing it (holds the folder's lock): `b` leaves it.
+        let lock = env_lock(&d);
+        let held = lock.lock().await;
+        assert!(b.evict_unused(u64::MAX).unwrap().is_empty());
+        assert!(d.exists());
+        // Pinned after `b` read the list: the recheck under the lock keeps it.
+        let stale = b.installed().remove(0);
+        std::fs::write(d.join(PINS).join("att_hit"), b"").unwrap();
+        drop(held);
+        assert!(!remove_env(&stale).unwrap());
+        assert!(d.exists());
     }
 
     #[test]

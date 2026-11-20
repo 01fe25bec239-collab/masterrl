@@ -135,6 +135,23 @@ async fn inputs_are_read_only_and_ended_attempts_are_reconciled() {
         std::fs::metadata(&staged).unwrap().permissions().readonly(),
         "inputs are read-only"
     );
+    // A process-mode worker runs as the agent's user: undoing the read-only bit and writing
+    // its input never reaches the cached object.
+    let mut perms = std::fs::metadata(&staged).unwrap().permissions();
+    #[allow(clippy::permissions_set_readonly_false)]
+    perms.set_readonly(false);
+    std::fs::set_permissions(&staged, perms).unwrap();
+    std::fs::write(&staged, b"tampered").unwrap();
+    let object = ctx
+        .cache
+        .get(&mrl_storage::sha256_hex(b"{}\n"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        std::fs::read(&object).unwrap(),
+        b"{}\n",
+        "the cache kept its bytes"
+    );
 
     // A new agent on the same state: the ended attempt is reported, its epoch remembered.
     let (tx, _rx2) = mrl_agent::attempts::attempt_events(16);
@@ -187,6 +204,100 @@ async fn credentials_sent_before_launch_reach_the_worker_environment() {
         mrl_storage::sha256_hex(b"tok-123")
     );
     assert!(!format!("{env:?}").contains("tok-123"), "never printed");
+}
+
+/// Two managers on one state folder (two `attempt run`s, or an agent and an `attempt run`):
+/// the second never re-adopts, declares lost or relaunches what the first runs.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_manager_leaves_a_running_attempt_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, first, _rx) = manager(dir.path());
+    let url = stuck_link().await;
+    let spec = bad_lock_spec(dir.path(), "att_own", "job_o", 1, slow_input(&url));
+    first.launch(spec.clone()).unwrap();
+    let (tx, _rx2) = mrl_agent::attempts::attempt_events(16);
+    let second = Attempts::new(Arc::clone(&ctx), tx, None).unwrap();
+    assert!(
+        second.readopt().await.is_empty(),
+        "nothing taken over or reported"
+    );
+    assert!(second.running().is_empty());
+    assert!(second.launch(spec).is_err());
+    let rec = mrl_agent::attempts::record::AttemptRecord::load(&ctx.state.job_dir("att_own"))
+        .unwrap()
+        .unwrap();
+    assert!(
+        rec.exit.is_none(),
+        "still the first manager's, not declared lost"
+    );
+    assert_eq!(first.running().len(), 1);
+    first.handle(&cancel_cmd("job_o", "att_own")).await.unwrap();
+    tokio::time::timeout(WAIT, first.wait("att_own"))
+        .await
+        .unwrap();
+}
+
+/// Data sent ahead of a launch belongs to the job and epoch that sent it: another job or an
+/// older epoch is refused, a launch for another epoch is refused, and an accepted launch
+/// consumes the credentials.
+#[tokio::test(flavor = "multi_thread")]
+async fn pre_launch_data_must_match_the_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_ctx, attempts, _rx) = manager(dir.path());
+    let cred = |job: &str, epoch: u64| Command {
+        command_id: "cred".into(),
+        kind: Some(Kind::UpdateCredentials(
+            mrl_proto::agent::v1::UpdateCredentials {
+                attempt: Some(AttemptRef {
+                    job_id: job.into(),
+                    attempt_id: "att_m".into(),
+                    fencing_epoch: epoch,
+                }),
+                credentials: vec![mrl_proto::agent::v1::Credential {
+                    name: "hf_hub".into(),
+                    value: b"tok".to_vec(),
+                    expires_at: None,
+                }],
+            },
+        )),
+    };
+    assert!(attempts.handle(&cred("job_m", 2)).await.unwrap().accepted);
+    assert!(
+        !attempts
+            .handle(&cred("job_other", 2))
+            .await
+            .unwrap()
+            .accepted,
+        "another job"
+    );
+    assert!(
+        !attempts.handle(&cred("job_m", 1)).await.unwrap().accepted,
+        "older epoch"
+    );
+    let url = stuck_link().await;
+    let other_epoch = bad_lock_spec(dir.path(), "att_m", "job_m", 3, slow_input(&url));
+    let e = attempts.launch(other_epoch).unwrap_err();
+    assert_eq!(e.code(), "MRL-STATE-204", "{}", e.explain());
+    let spec = bad_lock_spec(dir.path(), "att_m", "job_m", 2, slow_input(&url));
+    attempts.launch(spec.clone()).unwrap();
+    // Used by the launch, then gone: nothing is left for this attempt id.
+    let env = attempts.secrets_for(&spec).unwrap();
+    assert!(
+        env.iter().all(|(n, _)| n != "MRL_CREDENTIAL_HF_HUB"),
+        "consumed"
+    );
+    assert!(
+        !attempts.handle(&cred("job_m", 2)).await.unwrap().accepted,
+        "after the launch"
+    );
+    let mut cancel = cancel_cmd("job_m", "att_m");
+    if let Some(Kind::CancelAttempt(c)) = &mut cancel.kind {
+        c.attempt.as_mut().unwrap().fencing_epoch = 2;
+    }
+    assert!(attempts.handle(&cancel).await.unwrap().accepted);
+    tokio::time::timeout(WAIT, attempts.wait("att_m"))
+        .await
+        .unwrap();
 }
 
 /// A link that never answers, so staging hangs.
@@ -681,4 +792,70 @@ async fn node_cleanup_purges_ended_attempts_and_prunes_unpinned_data() {
     tokio::time::timeout(WAIT, attempts.wait("att_live"))
         .await
         .unwrap();
+}
+
+/// Windows: a restarted agent can't reconnect to a surviving worker (its TCP port is gone),
+/// so the worker is stopped and reported lost, never "re-adopted".
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread")]
+async fn windows_reports_a_surviving_worker_lost() {
+    use mrl_agent::attempts::record::{AttemptRecord, ProcIdentity, WorkerProc};
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, _first, _rx) = manager(dir.path());
+    let mut worker = std::process::Command::new("ping")
+        .args(["-n", "300", "127.0.0.1"])
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let identity = ProcIdentity::of_pid(worker.id()).unwrap();
+    let spec = bad_lock_spec(dir.path(), "att_win", "job_w", 1, serde_json::json!({}));
+    let rec = AttemptRecord {
+        socket: dir.path().join("w.sock"),
+        nonce: "n".into(),
+        spec,
+        phase: mrl_proto::agent::v1::AttemptPhase::Running as i32,
+        workers: vec![WorkerProc {
+            role_id: "trainer".into(),
+            primary: true,
+            identity: identity.clone(),
+            cgroup: None,
+        }],
+        prepared: Vec::new(),
+        started: Vec::new(),
+        last_step: 0,
+        checkpoints: Default::default(),
+        cancel_requested: false,
+        exit: None,
+        staged_paths: Default::default(),
+        lease_deadline_unix_ms: None,
+        stop_deadline_unix_ms: None,
+        exit_report: None,
+        requests: Vec::new(),
+        uploads: Default::default(),
+    };
+    let job = ctx.state.job_dir("att_win");
+    std::fs::create_dir_all(&job).unwrap();
+    rec.save(&job).unwrap();
+    let (tx, _rx2) = mrl_agent::attempts::attempt_events(16);
+    let restarted = Attempts::new(Arc::clone(&ctx), tx, None).unwrap();
+    let statuses = restarted.readopt().await;
+    let s = statuses
+        .iter()
+        .find(|s| {
+            s.attempt
+                .as_ref()
+                .is_some_and(|a| a.attempt_id == "att_win")
+        })
+        .unwrap();
+    assert_eq!(s.failure.as_ref().unwrap().sub_code, "WORKER_LOST", "{s:?}");
+    assert!(restarted.running().is_empty(), "not re-adopted");
+    for _ in 0..50 {
+        if !identity.alive() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(!identity.alive(), "the worker was stopped");
+    let _ = worker.kill();
+    let _ = worker.wait();
 }

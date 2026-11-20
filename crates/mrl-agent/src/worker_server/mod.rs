@@ -40,6 +40,18 @@ pub const PROTOCOL_VERSIONS: &[&str] = &["1.0"];
 pub const HEARTBEAT_INTERVAL_S: u32 = 5;
 /// Largest message the agent accepts, bytes.
 pub const MAX_MESSAGE_BYTES: u32 = 8 << 20;
+/// Longest the agent waits to hand one message to a worker whose queue is full. A worker that
+/// stops reading for this long is disconnected, so a send never holds up lease expiry or a
+/// cancel for longer.
+pub const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Queues `msg` for the worker, giving up when the session is fenced.
+async fn push(tx: &Outbox, fence: &CancellationToken, msg: Result<AgentMessage, Status>) -> bool {
+    tokio::select! {
+        () = fence.cancelled() => false,
+        r = tx.send(msg) => r.is_ok(),
+    }
+}
 
 /// What the server hands the attempt runner.
 #[derive(Debug)]
@@ -275,11 +287,8 @@ async fn read_loop(
         match verdict {
             Verdict::Unsequenced => {
                 if matches!(msg.body, Some(WorkerBody::Hello(_))) {
-                    let _ = tx
-                        .send(Err(Status::failed_precondition(
-                            "Hello sent twice on one stream",
-                        )))
-                        .await;
+                    let twice = Status::failed_precondition("Hello sent twice on one stream");
+                    let _ = push(&tx, &fence, Err(twice)).await;
                     break;
                 }
                 let live = Inbound::Live {
@@ -295,17 +304,16 @@ async fn read_loop(
                     ack_seq: shared.durable(&role_id),
                     body: None,
                 };
-                if tx.send(Ok(ack)).await.is_err() {
+                if !push(&tx, &fence, Ok(ack)).await {
                     break;
                 }
             }
             Verdict::Gap { expected } => {
-                let _ = tx
-                    .send(Err(Status::out_of_range(format!(
-                        "expected seq {expected}, got {}; reconnect and replay",
-                        msg.seq
-                    ))))
-                    .await;
+                let gap = Status::out_of_range(format!(
+                    "expected seq {expected}, got {}; reconnect and replay",
+                    msg.seq
+                ));
+                let _ = push(&tx, &fence, Err(gap)).await;
                 break;
             }
             Verdict::New => {
@@ -328,7 +336,7 @@ async fn read_loop(
                     ack_seq: seq,
                     body: None,
                 };
-                if tx.send(Ok(ack)).await.is_err() {
+                if !push(&tx, &fence, Ok(ack)).await {
                     break;
                 }
             }
@@ -398,6 +406,7 @@ impl WorkerServer {
             if let Some(dir) = socket.parent() {
                 use std::os::unix::fs::PermissionsExt;
                 std::fs::create_dir_all(dir).map_err(|e| sock_err(e.to_string()))?;
+                // The attempt's own folder: owner only, so no one else reaches its socket.
                 std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
                     .map_err(|e| sock_err(e.to_string()))?;
             }
@@ -453,19 +462,31 @@ impl WorkerServer {
         self.shared.durable(role_id)
     }
 
-    /// Sends a message to the connected worker of `role_id`. False if it is not connected.
+    /// Sends a message to the connected worker of `role_id`. False if it is not connected, or
+    /// if its queue stayed full for [`SEND_TIMEOUT`]: that session is then dropped (the worker
+    /// reconnects and gets everything pending again).
     pub async fn send(&self, role_id: &str, body: AgentBody) -> bool {
         let outbox = lock(&self.shared.outboxes)
             .get(role_id)
-            .map(|(_, tx, _)| tx.clone());
-        let Some(tx) = outbox else {
+            .map(|(session, tx, fence)| (*session, tx.clone(), fence.clone()));
+        let Some((session, tx, fence)) = outbox else {
             return false;
         };
         let msg = AgentMessage {
             ack_seq: self.durable(role_id),
             body: Some(body),
         };
-        tx.send(Ok(msg)).await.is_ok()
+        match tokio::time::timeout(SEND_TIMEOUT, push(&tx, &fence, Ok(msg))).await {
+            Ok(sent) => sent,
+            Err(_) => {
+                let mut boxes = lock(&self.shared.outboxes);
+                if boxes.get(role_id).is_some_and(|(s, _, _)| *s == session) {
+                    boxes.remove(role_id);
+                }
+                fence.cancel();
+                false
+            }
+        }
     }
 
     /// Stops serving and removes the socket file.

@@ -845,6 +845,85 @@ async fn crash_and_readopt(test: &str, sandbox: &str, id: &str) {
     assert_eq!(ckpts, 6, "{test}: every checkpoint was committed");
 }
 
+/// Two `attempt run`s of one spec at once: the second refuses (the attempt is the first's)
+/// and the first finishes undisturbed.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs uv; runs in ci-attempts"]
+async fn a_second_cli_run_never_takes_over() {
+    if !ready("a_second_cli_run_never_takes_over") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let config = dir.path().join("agent.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "state_dir = {:?}\n[cache]\nmin_free_bytes = 0\n[sandbox]\nbackend = \"none\"\n",
+            state.display().to_string()
+        ),
+    )
+    .unwrap();
+    let out = dir.path().join("out");
+    let s = spec(
+        "att_two_cli",
+        serde_json::json!({"steps": 8, "checkpoint_every": 2, "step_seconds": 0.5}),
+        serde_json::json!({"upload_dir": out}),
+    );
+    let spec_file = dir.path().join("spec.json");
+    std::fs::write(&spec_file, serde_json::to_vec(&s).unwrap()).unwrap();
+    let agent = |log: &str| {
+        let log = std::fs::File::create(dir.path().join(log)).unwrap();
+        std::process::Command::new(env!("CARGO_BIN_EXE_mrl-agent"))
+            .args([
+                "--config",
+                &config.display().to_string(),
+                "attempt",
+                "run",
+                "--spec",
+            ])
+            .arg(&spec_file)
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap()
+    };
+    let job = state.join("jobs").join("att_two_cli");
+    let mut first = agent("first.log");
+    let deadline = std::time::Instant::now() + WAIT;
+    while !AttemptRecord::load(&job)
+        .ok()
+        .flatten()
+        .is_some_and(|r| !r.workers.is_empty())
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the first run never started"
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    let second = agent("second.log");
+    let status = tokio::task::spawn_blocking(move || second.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap()
+        .status;
+    let log = std::fs::read_to_string(dir.path().join("second.log")).unwrap();
+    assert!(!status.success(), "{log}");
+    assert!(log.contains("another mrl-agent"), "{log}");
+    let status = tokio::task::spawn_blocking(move || first.wait())
+        .await
+        .unwrap()
+        .unwrap();
+    let log = std::fs::read_to_string(dir.path().join("first.log")).unwrap();
+    assert!(status.success(), "{log}");
+    assert!(log.contains("Attempt ended: EXIT_KIND_COMPLETED"), "{log}");
+    assert_eq!(
+        std::fs::read_dir(out.join("checkpoints")).unwrap().count(),
+        4
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs uv; runs in ci-attempts"]
 async fn real_agent_crash_is_readopted() {

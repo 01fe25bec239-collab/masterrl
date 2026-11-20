@@ -272,7 +272,11 @@ pub fn purge(state_root: &Path, job_dir: &Path) -> Result<bool> {
         }
     }
     if let Some(name) = job_dir.file_name() {
-        let _ = std::fs::remove_file(socket_path(state_root, &name.to_string_lossy()));
+        let sock = socket_path(state_root, &name.to_string_lossy());
+        let _ = std::fs::remove_file(&sock);
+        if let Some(dir) = sock.parent() {
+            let _ = std::fs::remove_dir(dir); // the attempt's own folder, once empty
+        }
     }
     Ok(removed)
 }
@@ -330,6 +334,10 @@ pub struct SweepReport {
     pub evicted: usize,
     /// Environments removed.
     pub envs_removed: Vec<String>,
+    /// Space still short after everything unpinned that could go went (plain words); the
+    /// agent keeps running and tries again next sweep.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub short_on_space: Option<String>,
 }
 
 /// One janitor pass over the whole node. `live` are attempts running now (left alone).
@@ -369,10 +377,16 @@ pub async fn sweep(ctx: &AgentContext, envs: &Envs, live: &HashSet<String>) -> R
     report.incoming_removed = ctx
         .cache
         .expire_incoming(crate::state::cache::INCOMING_TTL)?;
-    report.evicted = ctx.cache.reserve(0)?.len();
+    // Unused environments go first (they are the big ones), then cache entries. A disk still
+    // below its floor is reported, never an error: pinned data can't go, and the agent must
+    // keep running to finish the attempts holding it.
     report.envs_removed = envs
         .evict_unused(ctx.config.cache.min_free_bytes)
         .map_err(|e| AgentError::exec("the environment cleanup", e.explain()))?;
+    match ctx.cache.reserve(0) {
+        Ok(evicted) => report.evicted = evicted.len(),
+        Err(e) => report.short_on_space = Some(e.explain()),
+    }
     Ok(report)
 }
 
@@ -395,8 +409,13 @@ impl crate::registry::AgentService for JanitorService {
                 () = shutdown.cancelled() => return Ok(()),
                 _ = tick.tick() => {
                     let live = running_attempts(ctx.state.root());
-                    let report = sweep(&ctx, &envs, &live).await?;
-                    let json = serde_json::to_vec_pretty(&report).unwrap_or_default();
+                    // A failed sweep is written down and retried next time; it never stops
+                    // the agent.
+                    let json = match sweep(&ctx, &envs, &live).await {
+                        Ok(report) => serde_json::to_vec_pretty(&report).unwrap_or_default(),
+                        Err(e) => serde_json::to_vec_pretty(&serde_json::json!({"error": e.explain()}))
+                            .unwrap_or_default(),
+                    };
                     ctx.state.write_atomic("janitor.json", &json)?;
                 }
             }
@@ -422,6 +441,35 @@ pub fn running_attempts(state_root: &Path) -> HashSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A disk below its floor with nothing left to evict: the sweep still removes unused
+    /// environments and reports the shortage instead of failing (which would stop the agent).
+    #[tokio::test]
+    async fn a_full_disk_never_fails_the_sweep() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::AgentConfig {
+            state_dir: dir.path().join("state"),
+            cache: crate::config::CacheConfig {
+                max_bytes: Some(1 << 30),
+                min_free_bytes: u64::MAX / 4,
+            },
+            ..crate::config::AgentConfig::default()
+        };
+        let ctx = AgentContext::with_hw(config, Vec::new()).unwrap();
+        std::fs::create_dir_all(ctx.state.root().join("jobs")).unwrap();
+        let envs = Envs::open(ctx.state.root(), Arc::clone(&ctx.cache)).unwrap();
+        let unused = ctx.state.root().join("envs").join("uv-old");
+        std::fs::create_dir_all(&unused).unwrap();
+        std::fs::write(
+            unused.join(crate::envs::MARKER),
+            br#"{"runtime_ref":"uv:sha256:old","last_used_unix":0}"#,
+        )
+        .unwrap();
+        let report = sweep(&ctx, &envs, &HashSet::new()).await.unwrap();
+        assert_eq!(report.envs_removed, ["uv:sha256:old"]);
+        assert!(!unused.exists());
+        assert!(report.short_on_space.is_some(), "{report:?}");
+    }
 
     #[test]
     fn purge_wipes_scratch_but_keeps_logs() {

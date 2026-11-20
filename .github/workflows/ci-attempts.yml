@@ -54,5 +54,10 @@ jobs:
           MRL_TEST_DOCKER_REQUIRED: "1"
         run: cargo test -p mrl-agent --locked --test attempts -- --include-ignored
 
+      - name: container watcher test (Docker)
+        env:
+          MRL_TEST_DOCKER_REQUIRED: "1"
+        run: cargo test -p mrl-agent --locked --lib docker_watcher -- --include-ignored
+
       - name: worker protocol tests (Rust client)
         run: cargo test -p mrl-testkit --locked agent::attempts

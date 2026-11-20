@@ -565,6 +565,44 @@ mod tests {
         assert_eq!(e.code(), tonic::Code::OutOfRange);
     }
 
+    /// A worker that stops reading can't hold up the agent: once its queue is full, a send
+    /// gives up within `SEND_TIMEOUT`, the session is dropped and later sends fail at once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_that_stops_reading_is_disconnected() {
+        use mrl_agent::worker_server::SEND_TIMEOUT;
+        let fx = ServerFixture::start("att_full", "n0nce").await;
+        let (_w, _) = FakeWorker::connect(fx.target(), hello("att_full", "n0nce", "trainer"))
+            .await
+            .unwrap();
+        let server = fx.server.as_ref().unwrap();
+        let big = || {
+            AgentBody::Prepare(mrl_proto::worker::v1::Prepare {
+                job_spec_json: "x".repeat(256 << 10),
+                ..Default::default()
+            })
+        };
+        let started = std::time::Instant::now();
+        let mut refused = false;
+        for _ in 0..400 {
+            if !server.send("trainer", big()).await {
+                refused = true;
+                break;
+            }
+        }
+        assert!(refused, "the full queue was noticed");
+        assert!(
+            started.elapsed() < SEND_TIMEOUT * 3,
+            "{:?}",
+            started.elapsed()
+        );
+        let at = std::time::Instant::now();
+        assert!(
+            !server.send("trainer", big()).await,
+            "the session was dropped"
+        );
+        assert!(at.elapsed() < Duration::from_secs(1));
+    }
+
     #[tokio::test]
     async fn a_replaced_session_handles_nothing_more() {
         let fx = ServerFixture::start("att_1", "n").await;
@@ -838,6 +876,7 @@ mod runner_tests {
                 "ckpt_1".into(),
                 UploadPlan {
                     command_id: "up-1".into(),
+                    answered: false,
                     targets: vec![target(&base, path, &sha, 7)],
                 },
             );
@@ -1177,6 +1216,7 @@ mod runner_tests {
                 "ckpt_1".into(),
                 UploadPlan {
                     command_id: "up-1".into(),
+                    answered: false,
                     // Expires while the outcome can't be saved.
                     targets: vec![UploadTarget {
                         expires_unix: time::OffsetDateTime::now_utc().unix_timestamp() + 2,
@@ -1220,6 +1260,59 @@ mod runner_tests {
         assert_eq!(r.command_id, "up-1");
         assert!(r.failure.is_none());
         assert_eq!(got.lock().unwrap().len(), 1, "uploaded exactly once");
+    }
+
+    /// An accepted upload command always ends with one result: when the worker commits a
+    /// changed manifest (CORRUPT), and when the attempt ends before the upload.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn accepted_upload_commands_end_with_one_result() {
+        let (base, got) = sink().await;
+        let path = "checkpoints/ckpt_1/w.bin";
+        let sha = sha_hex(b"weights");
+        let mut fx = RunnerFixture::readopt(spec("att_cr", serde_json::json!({})), |r| {
+            let mut ck = staged(path, &sha, 7, None);
+            ck.commit_requested = false;
+            r.checkpoints.insert("ckpt_1".into(), ck);
+            let mut other = staged("checkpoints/ckpt_2/w.bin", &sha, 7, None);
+            other.commit_requested = false;
+            other.is_final = false;
+            r.checkpoints.insert("ckpt_2".into(), other);
+        })
+        .await;
+        let (mut w, _) = fx.worker("trainer").await;
+        fx.control
+            .send(upload("up-corrupt", target(&base, path, &sha, 7)))
+            .await
+            .unwrap();
+        fx.control
+            .send(Control::Upload {
+                command_id: "up-late".into(),
+                checkpoint_id: "ckpt_2".into(),
+                targets: vec![target(&base, "checkpoints/ckpt_2/w.bin", &sha, 7)],
+            })
+            .await
+            .unwrap();
+        w.send(Body::CheckpointCommit(
+            mrl_proto::worker::v1::CheckpointCommitRequest {
+                checkpoint_id: "ckpt_1".into(),
+                manifest_sha256: "f".repeat(64),
+            },
+        ))
+        .await;
+        let first = done(&mut fx).await;
+        assert_eq!(first.command_id, "up-corrupt");
+        assert!(first.failure.is_some(), "the corrupt commit is reported");
+        // The worker exits without asking to commit ckpt_2: its command still gets a result.
+        fx.end_workers();
+        let second = done(&mut fx).await;
+        assert_eq!(second.command_id, "up-late");
+        assert!(second.failure.is_some());
+        let rec = fx.saved();
+        assert!(
+            rec.uploads.values().all(|p| p.answered),
+            "saved as answered"
+        );
+        assert!(got.lock().unwrap().is_empty(), "nothing was uploaded");
     }
 
     /// Two commands for one checkpoint before the worker asks to commit: the first is answered

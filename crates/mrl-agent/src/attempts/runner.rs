@@ -262,15 +262,18 @@ pub fn now_ms() -> i64 {
     (time::OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000) as i64
 }
 
-/// Socket path: `<state>/sock/<hash>.sock`, or `/tmp/mrl-<uid>/<hash>.sock` when the state
-/// folder is too deep for a Unix socket path.
+/// Socket path: `<state>/sock/<hash>/w.sock`, or `/tmp/mrl-<uid>/<hash>/w.sock` when the
+/// state folder is too deep for a Unix socket path. One folder per attempt, so a container
+/// gets only its own socket's folder (read-only) and no other attempt's.
 pub fn socket_path(state_root: &Path, attempt_id: &str) -> PathBuf {
     let key = format!("{}\0{attempt_id}", state_root.display());
-    let name = format!("{}.sock", &mrl_storage::sha256_hex(key.as_bytes())[..16]);
-    let p = state_root.join("sock").join(&name);
+    let name = &mrl_storage::sha256_hex(key.as_bytes())[..16];
+    let p = state_root.join("sock").join(name).join("w.sock");
     #[cfg(unix)]
     if p.as_os_str().len() > MAX_SOCKET_PATH {
-        return PathBuf::from(format!("/tmp/mrl-{}", nix::unistd::getuid())).join(name);
+        return PathBuf::from(format!("/tmp/mrl-{}", nix::unistd::getuid()))
+            .join(name)
+            .join("w.sock");
     }
     p
 }
@@ -765,7 +768,8 @@ impl Runner {
                 cgroup: None,
             });
         }
-        let stop = spawn_exec(role_id.to_owned(), exec, container, self.exits_tx.clone());
+        let watched = container.map(|name| (name, attempt_token(&self.rec.nonce)));
+        let stop = spawn_exec(role_id.to_owned(), exec, watched, self.exits_tx.clone());
         self.workers
             .insert(role_id.to_owned(), WorkerHandle { primary, stop });
         self.save();
@@ -1093,7 +1097,11 @@ impl Runner {
             .or_insert_with(|| UploadPlan {
                 command_id: command_id.clone(),
                 targets: Vec::new(),
+                answered: false,
             });
+        if plan.command_id != command_id {
+            plan.answered = false;
+        }
         plan.command_id = command_id;
         for t in targets {
             plan.targets.retain(|x| x.local_path != t.local_path);
@@ -1198,12 +1206,11 @@ impl Runner {
                     return false;
                 }
                 if corrupt {
-                    let ack = commit_ack(
-                        &c.checkpoint_id,
-                        CommitState::Corrupt,
-                        "the manifest changed after staging",
-                    );
+                    let why = "the manifest changed after staging";
+                    let ack = commit_ack(&c.checkpoint_id, CommitState::Corrupt, why);
                     self.send(role_id, ack).await;
+                    self.answer_plan(&c.checkpoint_id, Some(why.to_owned()))
+                        .await;
                 } else {
                     self.try_commit(&c.checkpoint_id).await;
                 }
@@ -1320,10 +1327,27 @@ impl Runner {
                 self.send(&role, commit_ack(id, state, &reason)).await;
             }
         }
-        if let Some(command_id) = u.command_id {
-            let failure = u.result.err().map(|(_, reason)| reason);
-            self.command_done(command_id, failure).await;
+        let failure = u.result.err().map(|(_, reason)| reason);
+        match (u.checkpoint_id, u.command_id) {
+            (Some(id), _) => self.answer_plan(&id, failure).await,
+            (None, Some(command_id)) => self.command_done(command_id, failure).await,
+            (None, None) => {}
         }
+    }
+
+    /// Gives the checkpoint's upload command its one result, unless it already has one. Saved
+    /// first, so a restart neither repeats nor loses it.
+    async fn answer_plan(&mut self, checkpoint_id: &str, failure: Option<String>) {
+        let Some(plan) = self.rec.uploads.get_mut(checkpoint_id) else {
+            return;
+        };
+        if plan.answered {
+            return;
+        }
+        plan.answered = true;
+        let command_id = plan.command_id.clone();
+        self.save();
+        self.command_done(command_id, failure).await;
     }
 
     /// Reports a finished upload command (`failure`: why it failed).
@@ -1517,6 +1541,10 @@ impl Runner {
                             if let Some(ck) = self.rec.checkpoints.get_mut(&checkpoint_id) {
                                 if ck.state == Some(CommitState::Rejected as i32) {
                                     ck.state = None;
+                                    // The retry is a new upload: its command gets a result.
+                                    if let Some(p) = self.rec.uploads.get_mut(&checkpoint_id) {
+                                        p.answered = false;
+                                    }
                                 }
                             }
                             self.save();
@@ -1594,6 +1622,32 @@ impl Runner {
     }
 
     async fn finish_with(&mut self, decision: ExitDecision) -> ExitDecision {
+        // Uploads still running get to finish (not after a self-fence), so their commands get
+        // their real result; every command still without one is then answered as failed.
+        let until = Instant::now() + UPLOAD_DRAIN;
+        while !self.in_flight.is_empty() && !self.self_fenced {
+            for (_, done) in std::mem::take(&mut self.unsaved) {
+                self.on_upload(done).await;
+            }
+            if self.in_flight.is_empty() {
+                break;
+            }
+            match tokio::time::timeout_at(until, self.uploads_rx.recv()).await {
+                Ok(Some(u)) => self.on_upload(u).await,
+                _ => break,
+            }
+        }
+        let waiting: Vec<String> = self
+            .rec
+            .uploads
+            .iter()
+            .filter(|(_, p)| !p.answered)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in waiting {
+            let why = format!("the attempt ended before checkpoint {id} was uploaded");
+            self.answer_plan(&id, Some(why)).await;
+        }
         if let Some(s) = self.server.take() {
             s.stop().await;
         }
@@ -1608,6 +1662,9 @@ impl Runner {
         decision
     }
 }
+
+/// How long an ending attempt waits for uploads still running.
+const UPLOAD_DRAIN: Duration = Duration::from_secs(60);
 
 /// Runs `spec` under [`KEEPER`] (see there).
 #[cfg(unix)]
@@ -1679,8 +1736,10 @@ pub fn docker_run_args<'a>(
         a.extend(["-v".into(), v]);
     }
     if let Some(dir) = socket_dir {
+        // Connecting needs no write access; read-only keeps the worker from removing or
+        // replacing the socket.
         let d = dir.display().to_string();
-        a.extend(["-v".into(), format!("{d}:{d}")]);
+        a.extend(["-v".into(), format!("{d}:{d}:ro")]);
     }
     a.extend(["-w".into(), work]);
     for n in env_names.chain(["MRL_STAGING_DIR", "TMPDIR"]) {
@@ -1746,26 +1805,54 @@ async fn docker(args: &[&str]) {
 }
 
 /// Watches a worker the agent started.
+///
+/// A container (`container`: its name and this launch's token) is stopped, killed and
+/// inspected only by its id, once `docker inspect` shows it carries the token; a container
+/// that took over the name is never touched. Until then, stopping the `docker run` client
+/// (which forwards signals) is all that is done.
 fn spawn_exec(
     role_id: String,
     mut exec: Box<dyn Execution>,
-    container: Option<String>,
+    container: Option<(String, String)>,
     exits: mpsc::Sender<WorkerExit>,
 ) -> mpsc::Sender<StopMsg> {
     let (tx, mut rx) = mpsc::channel(4);
     tokio::spawn(async move {
+        let mut id: Option<String> = None;
+        let resolve = |id: &mut Option<String>| {
+            let pending = container.clone().filter(|_| id.is_none());
+            async move {
+                let (name, token) = pending?;
+                tokio::task::spawn_blocking(move || super::record::owned_container(&name, &token))
+                    .await
+                    .ok()
+                    .flatten()
+            }
+        };
+        let mut tick = tokio::time::interval(Duration::from_secs(1));
         let report = loop {
             tokio::select! {
                 r = exec.wait() => break r,
+                _ = tick.tick(), if container.is_some() && id.is_none() => {
+                    if let Some(found) = resolve(&mut id).await {
+                        id = Some(found);
+                    }
+                }
                 msg = rx.recv() => match msg {
                     Some(StopMsg::Stop(grace)) => {
-                        if let Some(c) = &container {
+                        if let Some(found) = resolve(&mut id).await {
+                            id = Some(found);
+                        }
+                        if let Some(c) = &id {
                             docker(&["stop", "-t", &grace.as_secs().to_string(), c]).await;
                         }
                         break exec.stop(grace).await;
                     }
                     Some(StopMsg::Kill) => {
-                        if let Some(c) = &container {
+                        if let Some(found) = resolve(&mut id).await {
+                            id = Some(found);
+                        }
+                        if let Some(c) = &id {
                             docker(&["kill", c]).await;
                         }
                         let _ = exec.kill().await;
@@ -1783,7 +1870,10 @@ fn spawn_exec(
             Ok(r) => (r.code, r.signal, r.oom_killed),
             Err(_) => (None, None, false),
         };
-        if let Some(c) = &container {
+        if let Some(found) = resolve(&mut id).await {
+            id = Some(found);
+        }
+        if let Some(c) = &id {
             let (c_code, c_oom) = container_exit(c).await;
             code = c_code.or(code);
             oom |= c_oom;
@@ -1913,6 +2003,86 @@ fn spawn_watch(
 mod tests {
     use super::*;
 
+    /// A started program that never ends on its own (stands in for `docker run`).
+    struct Forever;
+
+    #[async_trait::async_trait]
+    impl Execution for Forever {
+        fn pid(&self) -> Option<u32> {
+            None
+        }
+        async fn wait(&mut self) -> crate::Result<crate::exec::ExitReport> {
+            std::future::pending().await
+        }
+        async fn kill(&mut self) -> crate::Result<()> {
+            Ok(())
+        }
+        async fn stop(&mut self, _: Duration) -> crate::Result<crate::exec::ExitReport> {
+            Ok(crate::exec::ExitReport {
+                code: Some(0),
+                signal: None,
+                oom_killed: false,
+                limits: crate::exec::LimitSupport::default(),
+                runtime_ms: 0,
+            })
+        }
+    }
+
+    /// The live watcher stops a container only after checking its launch token: one that
+    /// took over the name is left running; this launch's own is stopped by id.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs Docker; runs in ci-attempts"]
+    async fn docker_watcher_stops_only_its_own_container() {
+        let Some(docker) = crate::envs::which("docker") else {
+            assert!(
+                std::env::var("MRL_TEST_DOCKER_REQUIRED").is_err(),
+                "Docker is required"
+            );
+            return;
+        };
+        let name = format!("mrl-test-w{}", std::process::id());
+        let start = |token: &str| {
+            let _ = std::process::Command::new(&docker)
+                .args(["rm", "-f", &name])
+                .output();
+            let ok = std::process::Command::new(&docker)
+                .args(["run", "-d", "--name", &name, "-e"])
+                .arg(format!("{TOKEN_ENV}={token}"))
+                .args(["busybox:1.36", "sleep", "300"])
+                .stdout(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            assert!(ok.success());
+        };
+        let running = || crate::attempts::record::container_running(&name);
+        let watch = |token: String| {
+            let name = name.clone();
+            async move {
+                let (etx, mut erx) = mpsc::channel(1);
+                let stop = spawn_exec(
+                    "trainer".into(),
+                    Box::new(Forever),
+                    Some((name, token)),
+                    etx,
+                );
+                stop.send(StopMsg::Stop(Duration::from_secs(1)))
+                    .await
+                    .unwrap();
+                erx.recv().await.unwrap()
+            }
+        };
+        start(&attempt_token("newer"));
+        watch(attempt_token("older")).await;
+        assert!(running(), "another launch's container is left alone");
+        start(&attempt_token("mine"));
+        watch(attempt_token("mine")).await;
+        assert!(!running(), "its own container is stopped");
+        let _ = std::process::Command::new(&docker)
+            .args(["rm", "-f", &name])
+            .output();
+    }
+
     #[test]
     fn docker_args_keep_secrets_off_the_command_line() {
         let role = RoleSpec {
@@ -1944,6 +2114,11 @@ mod tests {
         assert!(s.contains("--network none"));
         assert!(s.contains("-e MRL_WORKER_NONCE -e MRL_CREDENTIAL_HF"));
         assert!(s.contains(&format!("-v {inputs}:{inputs}:ro")));
+        let sock = Path::new("/s").join("sock").display().to_string();
+        assert!(
+            s.contains(&format!("-v {sock}:{sock}:ro")),
+            "the socket folder is read-only"
+        );
         assert!(s.contains("--gpus \"device=0,1\""));
         assert!(s.contains("--cpus 1.500"));
         assert!(s.ends_with("x@sha256:aa mrl-worker --engine fake"));
@@ -1957,6 +2132,11 @@ mod tests {
         assert_ne!(
             p,
             socket_path(Path::new("/other"), "att_0123456789abcdef0123456789abcdef")
+        );
+        // Two attempts never share a socket folder (the one a container gets mounted).
+        assert_ne!(
+            p.parent(),
+            socket_path(Path::new("/s"), "att_other").parent()
         );
         let (a, b) = (new_nonce().unwrap(), new_nonce().unwrap());
         assert_eq!(a.len(), 64);

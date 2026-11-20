@@ -72,6 +72,9 @@ pub struct UploadPlan {
     pub command_id: String,
     /// One target per file.
     pub targets: Vec<UploadTarget>,
+    /// That command got its result (saved, so it is never answered twice or forgotten).
+    #[serde(default)]
+    pub answered: bool,
 }
 
 /// One authorized upload.

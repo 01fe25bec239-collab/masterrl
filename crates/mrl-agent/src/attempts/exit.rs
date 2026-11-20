@@ -178,11 +178,10 @@ pub fn decide(ev: &ExitEvidence) -> ExitDecision {
 }
 
 /// The process ended badly although the worker reported success (and the agent did not stop
-/// it itself). A re-adopted worker has no status to compare.
+/// it itself). Applies whenever a status is known: a re-adopted process has none, a re-adopted
+/// container's comes from `docker inspect`.
 fn abnormal_status(ev: &ExitEvidence) -> bool {
-    !ev.readopted
-        && !ev.agent_stopped
-        && (ev.signal.is_some() || ev.exit_code.is_some_and(|c| c != 0))
+    !ev.agent_stopped && (ev.signal.is_some() || ev.exit_code.is_some_and(|c| c != 0))
 }
 
 /// Out-of-band evidence, strongest first.
@@ -459,13 +458,20 @@ mod tests {
             ..completed.clone()
         });
         assert_eq!(d.class(), Some(FailureClass::Oom));
-        // Re-adopted: no status to compare, the report decides.
+        // Re-adopted process: no status to compare, the report decides.
         let d = decide(&ExitEvidence {
             readopted: true,
             exit_code: None,
-            ..completed
+            ..completed.clone()
         });
         assert!(d.failure.is_none());
+        // Re-adopted container: docker's exit code is compared.
+        let d = decide(&ExitEvidence {
+            readopted: true,
+            exit_code: Some(3),
+            ..completed
+        });
+        assert_eq!(d.failure.unwrap().sub_code, "EXIT_STATUS_MISMATCH");
     }
 
     #[test]

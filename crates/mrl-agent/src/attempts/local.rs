@@ -131,7 +131,8 @@ async fn run_cli(config: Option<&Path>, cmd: AttemptCommand) -> Result<ExitCode,
     let id = spec.attempt.attempt_id.clone();
     let job_dir = ctx.state.job_dir(&id);
 
-    let readopted = attempts.readopt().await;
+    // Only this attempt: other attempts on the same state folder belong to whoever runs them.
+    let readopted = attempts.readopt_where(|a| a == id).await;
     let mine = readopted
         .iter()
         .find(|s| s.attempt.as_ref().is_some_and(|a| a.attempt_id == id));
@@ -141,7 +142,13 @@ async fn run_cli(config: Option<&Path>, cmd: AttemptCommand) -> Result<ExitCode,
             return print_outcome(rec.exit.as_ref(), json);
         }
         (Some(_), Some(_)) => eprintln!("mrl-agent: re-adopted attempt {id}"),
-        _ => attempts.launch(spec)?,
+        (Some(_), None) => {
+            return Err(AttemptError::state(
+                &id,
+                "is run by another mrl-agent on this machine; stop that one first",
+            ))
+        }
+        (None, _) => attempts.launch(spec)?,
     }
 
     // No telemetry service in a local run: feed GPU events to the attempt from here.

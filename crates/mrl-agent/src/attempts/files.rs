@@ -30,6 +30,13 @@ pub async fn stage_inputs(
     holder: &str,
 ) -> Result<BTreeMap<String, String>, AttemptError> {
     std::fs::create_dir_all(inputs_dir).map_err(|e| AgentError::state(inputs_dir, e))?;
+    // A hard link shares bytes with the cache object, so it is safe only where the worker
+    // can't undo the read-only bit: every worker in a container, with inputs mounted `:ro`.
+    // A process-mode worker runs as the agent's user and could chmod and rewrite it.
+    let shared_ok = spec
+        .runtimes
+        .iter()
+        .all(|r| matches!(r.kind(), Ok(super::spec::RuntimeKind::Container { .. })));
     let mut staged = BTreeMap::new();
     for input in &spec.inputs {
         let dest = inputs_dir.join(safe_relative(&input.local_path)?);
@@ -80,7 +87,11 @@ pub async fn stage_inputs(
                 )));
             }
         } else {
-            link_or_copy(&object, &dest)?;
+            if shared_ok {
+                link_or_copy(&object, &dest)?;
+            } else {
+                copy_new(&object, &dest)?;
+            }
         }
         read_only(&dest)?;
         staged.insert(input.name.clone(), dest.display().to_string());
@@ -93,7 +104,8 @@ static FILLS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 > = std::sync::LazyLock::new(Default::default);
 
-/// Copies `from` to a new file `to` (fails if `to` exists).
+/// Copies `from` to a new file `to` (fails if `to` exists). On Linux the copy goes through
+/// `copy_file_range`, which shares blocks on filesystems that support it.
 fn copy_new(from: &Path, to: &Path) -> Result<(), AttemptError> {
     let mut src = std::fs::File::open(from).map_err(|e| AgentError::state(from, e))?;
     let mut dst = std::fs::OpenOptions::new()
@@ -105,7 +117,7 @@ fn copy_new(from: &Path, to: &Path) -> Result<(), AttemptError> {
     Ok(())
 }
 
-/// Unix: a hard link to the (read-only) cache object.
+/// Unix: a hard link to the (read-only) cache object (container workers only).
 #[cfg(unix)]
 fn link_or_copy(object: &Path, dest: &Path) -> Result<(), AttemptError> {
     match std::fs::hard_link(object, dest) {
@@ -247,15 +259,27 @@ pub async fn snapshot(
     ));
     let (staging_c, snap_c) = (staging.to_path_buf(), snap.clone());
     let copied = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        let mut src = open_beneath(&staging_c, &rel_path)?;
-        if !src.metadata()?.is_file() {
+        let src = open_beneath(&staging_c, &rel_path)?;
+        let meta = src.metadata()?;
+        if !meta.is_file() {
             return Err(std::io::Error::other("not a regular file"));
+        }
+        if meta.len() != size {
+            return Err(std::io::Error::other(format!(
+                "it holds {} bytes, not the {size} authorized",
+                meta.len()
+            )));
         }
         let mut dst = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&snap_c)?;
-        std::io::copy(&mut src, &mut dst)?;
+        // At most one byte past the authorized size: a file still growing is caught by the
+        // size check below without filling the disk.
+        std::io::copy(
+            &mut std::io::Read::take(src, size.saturating_add(1)),
+            &mut dst,
+        )?;
         dst.sync_all()
     })
     .await;
@@ -352,6 +376,16 @@ mod tests {
             .await
             .is_err());
         assert!(snapshot(&staging, "../etc/passwd", 7, &sha).await.is_err());
+        // A file bigger than authorized is refused without a snapshot left behind.
+        std::fs::write(staging.join("ckpt/big.bin"), vec![0u8; 4096]).unwrap();
+        assert!(snapshot(&staging, "ckpt/big.bin", 7, &sha).await.is_err());
+        assert_eq!(
+            std::fs::read_dir(dir.path().join("uploads"))
+                .unwrap()
+                .count(),
+            1,
+            "only the good snapshot"
+        );
         #[cfg(unix)]
         {
             // A link to a file outside staging, as the last part or in the middle.
