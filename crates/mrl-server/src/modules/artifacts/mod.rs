@@ -539,7 +539,8 @@ impl ArtifactStore {
     /// Copies `src` to `blobs/sha256/…` when its bytes match `f`. The copy is checked, not
     /// the source: the bytes are downloaded into a private folder, hashed there, and those
     /// same bytes are stored, so a source rewritten meanwhile can't slip in. Content already
-    /// stored is not written again; nothing under `blobs/` is ever deleted here. Returns
+    /// stored is reused only when it hashes right (else rewritten from the checked bytes);
+    /// nothing under `blobs/` is ever deleted here. Returns
     /// the problem when the source does not match.
     async fn snapshot_file(
         &self,
@@ -584,9 +585,7 @@ impl ArtifactStore {
             Err(e) => return Err(e.into()),
         }
         let blob = store.keys().blob(&f.sha256)?;
-        if !blob_stored(store, &blob, f.size).await? {
-            crate::modules::uploads::store_file(store, &local, &blob, f.size).await?;
-        }
+        crate::modules::uploads::store_blob(store, &local, &blob, f.size, &f.sha256).await?;
         scratch::close(dir)?;
         Ok(None)
     }

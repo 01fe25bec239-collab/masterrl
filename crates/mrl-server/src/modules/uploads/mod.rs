@@ -670,15 +670,33 @@ async fn join_and_store(st: &Store, row: &Row, tmp: &std::path::Path) -> Result<
         .into());
     }
     let blob = st.keys().blob(&actual)?;
-    let exists = match st.head(&blob).await {
-        Ok(info) => info.size == row.size(),
-        Err(StorageError::NotFound { .. }) => false,
+    store_blob(st, tmp, &blob, row.size(), &actual).await?;
+    Ok(blob)
+}
+
+/// Stores the checked local file `tmp` (`size` bytes hashing to `sha256`) at `blob`, its
+/// content address. An object already there is reused only when its bytes hash to
+/// `sha256`; one that is missing, another size or corrupted is rewritten from `tmp`.
+pub(crate) async fn store_blob(
+    st: &Store,
+    tmp: &std::path::Path,
+    blob: &str,
+    size: u64,
+    sha256: &str,
+) -> Result<(), Error> {
+    let intact = match st.head(blob).await {
+        Ok(info) if info.size == size => match st.sha256(blob).await {
+            Ok(have) => have == sha256,
+            Err(StorageError::NotFound { .. }) => false,
+            Err(e) => return Err(e.into()),
+        },
+        Ok(_) | Err(StorageError::NotFound { .. }) => false,
         Err(e) => return Err(e.into()),
     };
-    if !exists {
-        store_file(st, tmp, &blob, row.size()).await?;
+    if !intact {
+        store_file(st, tmp, blob, size).await?;
     }
-    Ok(blob)
+    Ok(())
 }
 
 /// Stores the local file `tmp` of `size` bytes at `key`: one put up to 16 MiB, else a

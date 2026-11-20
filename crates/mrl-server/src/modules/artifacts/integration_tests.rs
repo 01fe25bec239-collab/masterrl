@@ -1254,6 +1254,69 @@ async fn artifacts_register_and_download(kind: Kind) {
         )
         .await;
     assert_eq!(r.status, 201, "the name was freed: {}", r.text());
+    // A same-size corrupted object already at a content address is rewritten from the
+    // checked bytes, never reused: when an upload finishes, and when a module registers
+    // from a folder. Downloads return the right bytes.
+    let download = |art: String, path: &'static str| {
+        let e = &e;
+        async move {
+            let r = e
+                .call(
+                    Method::POST,
+                    &format!("/api/v1/artifacts/{art}:download"),
+                    A,
+                    Some(json!({ "path": path })),
+                )
+                .await;
+            assert_eq!(r.status, 200, "{}", r.text());
+            e.fetch(&r.json()).await
+        }
+    };
+    let good = format!("repair upload {}", uuid::Uuid::new_v4());
+    let blob = st.keys().blob(&sha256_hex(good.as_bytes())).unwrap();
+    st.put(&blob, good.to_uppercase().into_bytes().into())
+        .await
+        .unwrap();
+    let up = e.upload(A, good.as_bytes(), None).await;
+    assert_eq!(
+        st.get(&blob).await.unwrap(),
+        good.as_bytes(),
+        "repaired on complete"
+    );
+    let manifest = json!({"schema_version": "artifact-manifest/v1", "kind": "eval", "created_at": "2026-11-16T00:00:00Z",
+        "files": [{"path": "u.txt", "size": good.len(), "sha256": sha256_hex(good.as_bytes()), "role": "report"}]});
+    let r = e
+        .call(
+            Method::POST,
+            "/api/v1/artifacts",
+            A,
+            Some(
+                json!({"name": "repaired-upload", "manifest": manifest, "uploads": {"u.txt": up}}),
+            ),
+        )
+        .await;
+    assert_eq!(r.status, 201, "{}", r.text());
+    let art = r.json()["id"].as_str().unwrap().to_owned();
+    assert_eq!(download(art, "u.txt").await, good.as_bytes());
+    let good = format!("repair folder {}", uuid::Uuid::new_v4());
+    let blob = st.keys().blob(&sha256_hex(good.as_bytes())).unwrap();
+    st.put(&blob, good.to_uppercase().into_bytes().into())
+        .await
+        .unwrap();
+    let folder = put_files(&e, "evals/repair/", &[("f.txt", good.as_bytes())]).await;
+    let art = e
+        .register_from("repaired-folder", "evals/repair/", folder)
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        st.get(&blob).await.unwrap(),
+        good.as_bytes(),
+        "repaired on register"
+    );
+    assert_eq!(download(art, "f.txt").await, good.as_bytes());
     e.scratch_cleaned("registration").await;
     let r = e
         .call(
