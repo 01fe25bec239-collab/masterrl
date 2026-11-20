@@ -6,7 +6,9 @@
 //! With nothing registered (P17 on its own), a request acts in the caller's org.
 //!
 //! [`RehomeLocalRows`] runs at startup: rows stored under the nil org (by a solo build
-//! without a directory) move to their project's org once a directory can say which.
+//! without a directory) move to their project's org once a directory can say which. All of
+//! an org's projects move in one transaction (runs can link across projects), and an
+//! experiment the org already has under the same name absorbs the local one.
 
 use super::error::JobsError;
 use super::scope;
@@ -73,27 +75,39 @@ impl RehomeLocalRows {
         Self { db, projects }
     }
 
-    async fn rehome(&self, project: Uuid, org: Uuid) -> Result<(), sqlx::Error> {
+    /// Moves every nil-org row of `projects` to `org` in one transaction, so runs linked
+    /// across these projects (parent and child) move together.
+    async fn rehome(&self, org: Uuid, projects: &[Uuid]) -> Result<(), sqlx::Error> {
         let mut tx = self.db.pool().begin().await?;
         // The (org_id, id) foreign keys are checked at commit, when every row has moved.
         sqlx::query("SET CONSTRAINTS ALL DEFERRED")
             .execute(&mut *tx)
             .await?;
         for sql in [
-            "UPDATE experiments SET org_id = $1 WHERE org_id = $3 AND project_id = $2",
-            "UPDATE runs SET org_id = $1 WHERE org_id = $3 AND project_id = $2",
+            // An experiment the org already has under the same name (like `default`, made
+            // once per credential) absorbs the local one: its runs point at the org's copy.
+            // ponytail: the local copy's description and tags are dropped with it.
+            "UPDATE runs r SET experiment_id = keep.id FROM experiments dup \
+               JOIN experiments keep ON keep.org_id = $1 AND keep.project_id = dup.project_id \
+                AND keep.name = dup.name \
+             WHERE dup.org_id = $3 AND dup.project_id = ANY($2) AND r.experiment_id = dup.id",
+            "DELETE FROM experiments dup USING experiments keep \
+             WHERE dup.org_id = $3 AND dup.project_id = ANY($2) AND keep.org_id = $1 \
+               AND keep.project_id = dup.project_id AND keep.name = dup.name",
+            "UPDATE experiments SET org_id = $1 WHERE org_id = $3 AND project_id = ANY($2)",
+            "UPDATE runs SET org_id = $1 WHERE org_id = $3 AND project_id = ANY($2)",
             "UPDATE run_configs SET org_id = $1 WHERE org_id = $3 \
-               AND run_id IN (SELECT id FROM runs WHERE project_id = $2)",
-            "UPDATE jobs SET org_id = $1 WHERE org_id = $3 AND project_id = $2",
+               AND run_id IN (SELECT id FROM runs WHERE project_id = ANY($2))",
+            "UPDATE jobs SET org_id = $1 WHERE org_id = $3 AND project_id = ANY($2)",
             "UPDATE job_attempts SET org_id = $1 WHERE org_id = $3 \
-               AND job_id IN (SELECT id FROM jobs WHERE project_id = $2)",
+               AND job_id IN (SELECT id FROM jobs WHERE project_id = ANY($2))",
             "UPDATE attempt_placements SET org_id = $1 WHERE org_id = $3 AND attempt_id IN \
                (SELECT a.id FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
-                WHERE j.project_id = $2)",
+                WHERE j.project_id = ANY($2))",
         ] {
             sqlx::query(sql)
                 .bind(org)
-                .bind(project)
+                .bind(projects)
                 .bind(Uuid::nil())
                 .execute(&mut *tx)
                 .await?;
@@ -122,19 +136,22 @@ impl StartupStep for RehomeLocalRows {
         .fetch_all(self.db.pool())
         .await
         .map_err(fail)?;
+        let mut by_org: std::collections::BTreeMap<Uuid, Vec<Uuid>> = Default::default();
         for project in projects {
             let id = ProjectId::from_uuid(project);
             match directory.owner(id).await? {
-                Some(org) => {
-                    // A project that can't move (say, a request key reused under both orgs)
-                    // is logged and left as it is, rather than stopping the server.
-                    if let Err(e) = self.rehome(project, org.as_uuid()).await {
-                        tracing::error!(project = %id, error = %e, "could not move local runs to their project's org");
-                    }
-                }
+                Some(org) => by_org.entry(org.as_uuid()).or_default().push(project),
                 None => {
                     tracing::warn!(project = %id, "local runs name a project that no longer exists; left as they are")
                 }
+            }
+        }
+        for (org, projects) in by_org {
+            // An org whose rows can't move is logged and left as it is, rather than
+            // stopping the server; the next start tries again.
+            if let Err(e) = self.rehome(org, &projects).await {
+                let org = OrgId::from_uuid(org);
+                tracing::error!(%org, error = %e, "could not move local runs to their project's org");
             }
         }
         Ok(())

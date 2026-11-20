@@ -84,7 +84,13 @@ pub async fn list(
     // solo owner (one person, every local org); otherwise the caller's org. The authorizer
     // still decides row by row.
     let org = match project {
-        Some(p) => Some(projects.org_for(&ctx, p).await?),
+        Some(p) => {
+            // Authorize the project first: hidden and missing answer the same 404.
+            let org = projects.org_for(&ctx, p).await?;
+            let res = resource("project", Some(p.to_string()), org, p.as_uuid());
+            scope::authorize(&state, &ctx, "runs.read", &res).await?;
+            Some(org)
+        }
         None if ctx.principal.kind == crate::seams::PrincipalKind::LocalOwner => None,
         None => Some(scope::tenant(&ctx)?),
     };

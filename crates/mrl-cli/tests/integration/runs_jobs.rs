@@ -1468,10 +1468,37 @@ async fn foreign_and_missing_projects_are_404_with_no_writes() {
                 .unwrap();
         assert_eq!(n, 0, "{table} has rows");
     }
+    // GET /jobs?project=: a hidden project answers exactly like a foreign or missing one.
+    let hidden = ProjectId::new();
+    e.add_project(hidden);
+    e.rules
+        .lock()
+        .unwrap()
+        .hidden
+        .insert(("usr_owner".into(), hidden.to_string()));
+    let mut answers = Vec::new();
+    for project in [hidden, foreign, missing] {
+        let res = e
+            .get("owner", &format!("/api/v1/jobs?project={project}"))
+            .await;
+        assert_eq!(res.status, 404, "{project}: {}", res.text());
+        let p = res.json();
+        answers.push((p["code"].clone(), p["title"].clone(), p["detail"].clone()));
+    }
+    assert!(answers.windows(2).all(|w| w[0] == w[1]), "{answers:?}");
     // The org's own project still works.
     assert_eq!(
         e.submit("owner", "ok", &submission("mine")).await.status,
         201
+    );
+    let own = e
+        .get("owner", &format!("/api/v1/jobs?project={}", e.project))
+        .await;
+    assert_eq!(
+        own.json()["items"].as_array().unwrap().len(),
+        1,
+        "{}",
+        own.text()
     );
 }
 
@@ -1606,4 +1633,124 @@ async fn solo_runs_are_stored_under_the_project_org_for_every_credential() {
         .json();
     assert_eq!(mine["items"].as_array().unwrap().len(), 2, "{mine}");
     srv.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn legacy_duplicates_and_cross_project_lineage_move_together() {
+    use mrl_server::seams::{Principal, PrincipalKind};
+    let db = TestDb::new().await;
+    let org = OrgId::new();
+    let (p, q) = (ProjectId::new(), ProjectId::new());
+    let person = |token: &str, id: &str, kind, org: Option<String>, role| TestUser {
+        token: token.to_owned(),
+        principal: Principal {
+            id: id.to_owned(),
+            kind,
+            org,
+        },
+        role,
+    };
+    let people = vec![
+        person(
+            "solo",
+            "usr_local",
+            PrincipalKind::LocalOwner,
+            None,
+            Role::Owner,
+        ),
+        person(
+            "pat",
+            "tok_pat",
+            PrincipalKind::Service,
+            Some(org.to_string()),
+            Role::Researcher,
+        ),
+    ];
+    async fn post(
+        srv: &TestServer,
+        token: &str,
+        project: ProjectId,
+        key: &str,
+        body: &Value,
+    ) -> Value {
+        let path = format!("/api/v1/projects/{project}/runs");
+        let res = call(srv, Method::POST, &path, token, Some(key), Some(body)).await;
+        assert_eq!(res.status, 201, "{}", res.text());
+        res.json()
+    }
+
+    // Before the directory: the solo owner writes under the nil org, the token under its
+    // org, so project P gets a `default` experiment in each; a child in P has its parent in Q.
+    let old = runs_server_with(
+        db.db(),
+        accepting_chains(),
+        &people,
+        vec![],
+        &Harness::default(),
+    )
+    .await;
+    let solo_run = post(&old, "solo", p, "a", &submission("solo")).await;
+    let pat_run = post(&old, "pat", p, "b", &submission("pat")).await;
+    let parent = post(&old, "solo", q, "c", &submission("parent")).await;
+    let mut child = submission("child");
+    child["parent_run_id"] = parent["id"].clone();
+    let child = post(&old, "solo", p, "d", &child).await;
+    old.shutdown().await.unwrap();
+    assert_ne!(solo_run["experiment_id"], pat_run["experiment_id"]);
+
+    let harness = Harness::default();
+    *harness.rules.lock().unwrap() = AuthRules::with_projects(&[(p, org), (q, org)]);
+    for start in ["first start", "second start"] {
+        let srv = runs_server_with(db.db(), accepting_chains(), &people, vec![], &harness).await;
+        let nil: i64 = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM runs WHERE org_id = $1) \
+                  + (SELECT count(*) FROM experiments WHERE org_id = $1)",
+        )
+        .bind(uuid::Uuid::nil())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(nil, 0, "{start}: rows left under the nil org");
+        let get = |path: String| {
+            let srv = &srv;
+            async move {
+                let res = call(srv, Method::GET, &path, "pat", None, None).await;
+                assert_eq!(res.status, 200, "{path}: {}", res.text());
+                res.json()
+            }
+        };
+        let in_p = get(format!("/api/v1/projects/{p}/runs")).await;
+        let in_q = get(format!("/api/v1/projects/{q}/runs")).await;
+        let ids = |page: &Value| -> Vec<Value> {
+            page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|r| r["id"].clone())
+                .collect()
+        };
+        for run in [&solo_run, &pat_run, &child] {
+            assert!(
+                ids(&in_p).contains(&run["id"]),
+                "{start}: {} missing from P",
+                run["id"]
+            );
+        }
+        assert_eq!(ids(&in_q), vec![parent["id"].clone()], "{start}");
+        // One `default` experiment in P, holding every run.
+        let exps: Vec<Value> = in_p["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["experiment_id"].clone())
+            .collect();
+        assert!(exps.windows(2).all(|w| w[0] == w[1]), "{start}: {exps:?}");
+        let e = get(format!("/api/v1/projects/{p}/experiments")).await;
+        assert_eq!(e["items"].as_array().unwrap().len(), 1, "{start}: {e}");
+        // Lineage survives.
+        let got = get(format!("/api/v1/runs/{}", child["id"].as_str().unwrap())).await;
+        assert_eq!(got["parent_run_id"], parent["id"], "{start}");
+        srv.shutdown().await.unwrap();
+    }
 }
