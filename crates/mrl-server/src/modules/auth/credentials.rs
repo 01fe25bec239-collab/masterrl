@@ -443,7 +443,14 @@ impl Authenticator for CoreAuthenticator {
             };
         }
         match verify_session(&self.db, headers).await? {
-            Some(user) => Ok(Some(tenancy::principal_for(&self.db, user).await?)),
+            Some(user) => {
+                let mode = if self.solo.is_some() {
+                    crate::config::Mode::Solo
+                } else {
+                    crate::config::Mode::Team
+                };
+                Ok(Some(tenancy::principal_for(&self.db, mode, user).await?))
+            }
             None => Ok(None),
         }
     }

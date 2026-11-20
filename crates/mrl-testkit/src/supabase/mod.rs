@@ -201,8 +201,13 @@ impl MockSupabase {
 
     /// A JWT with exactly these claims, signed with the project key (for claim checks).
     pub fn sign(&self, claims: &Value) -> String {
+        self.sign_as(KID, claims)
+    }
+
+    /// Like [`MockSupabase::sign`], with header `kid` set to `kid` (the key is the same).
+    pub fn sign_as(&self, kid: &str, claims: &Value) -> String {
         let mut header = Header::new(Algorithm::ES256);
-        header.kid = Some(KID.to_owned());
+        header.kid = Some(kid.to_owned());
         match jsonwebtoken::encode(&header, claims, &self.mock.signing) {
             Ok(t) => t,
             Err(e) => panic!("mock supabase sign: {e}"),

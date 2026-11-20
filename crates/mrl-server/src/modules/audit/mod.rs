@@ -80,7 +80,12 @@ pub async fn write(
     Ok(())
 }
 
-/// The `AuditSink` seam over `audit_events` (one transaction per record).
+/// The `AuditSink` seam over `audit_events`, for records that stand alone: a refusal or a
+/// failed attempt, which no transaction of the caller's can undo.
+///
+/// The seam's `record` cannot join the caller's transaction (it takes no `Tx`), so a success
+/// written here could stay committed while the change it describes rolls back. Successes are
+/// therefore refused: write them with [`write`] inside the change's own transaction.
 pub struct PgAuditSink {
     db: Db,
 }
@@ -95,6 +100,15 @@ impl PgAuditSink {
 #[async_trait]
 impl AuditSink for PgAuditSink {
     async fn record(&self, e: AuditEvent) -> Result<(), SeamError> {
+        if e.outcome == AuditOutcome::Success {
+            return Err(SeamError::new(
+                "audit",
+                format!(
+                    "{}: record a successful change with audit::write in the transaction that makes it, so both commit or neither does",
+                    e.action
+                ),
+            ));
+        }
         let mut tx = self.db.begin().await?;
         write(&mut tx, &e, &serde_json::json!({})).await?;
         tx.commit().await.map_err(DbError::from)?;

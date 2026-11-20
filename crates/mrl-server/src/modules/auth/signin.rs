@@ -38,7 +38,18 @@ struct Stored {
     /// Supabase refused the refresh token: the user must sign in again.
     #[serde(default)]
     expired: bool,
+    /// The project that issued these tokens (`<supabase_url>/auth/v1`). A session from
+    /// another project (or from before this field) counts as signed out and is never sent.
+    #[serde(default)]
+    issuer: String,
 }
+
+/// Serializes every read-modify-write of the stored session (refresh, sign-in, sign-out), so
+/// two requests never refresh the same rotating token and a sign-out is never undone.
+///
+/// ponytail: one lock per process, since one process serves one install's keychain; per-store
+/// locks if a process ever holds several.
+static SESSION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// Where this install's sign-in stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
@@ -107,13 +118,15 @@ impl SignIn {
         }
     }
 
+    /// The stored session, if it belongs to the configured project.
     async fn load(&self) -> Result<Option<Stored>, SignInError> {
-        let (_, store) = self.parts()?;
+        let (supabase, store) = self.parts()?;
         let Some(raw) = store.get(SESSION_SECRET).await.map_err(store_err)? else {
             return Ok(None);
         };
         // A damaged entry is treated as signed out rather than blocking forever.
-        Ok(serde_json::from_str(raw.expose()).ok())
+        let stored: Option<Stored> = serde_json::from_str(raw.expose()).ok();
+        Ok(stored.filter(|s| s.issuer == supabase.issuer()))
     }
 
     async fn save(&self, s: &Stored) -> Result<(), SignInError> {
@@ -127,12 +140,19 @@ impl SignIn {
 
     /// Keeps the tokens of a finished sign-in.
     pub async fn keep(&self, t: &TokenSet) -> Result<(), SignInError> {
+        let _held = SESSION_LOCK.lock().await;
+        self.store_tokens(t).await
+    }
+
+    async fn store_tokens(&self, t: &TokenSet) -> Result<(), SignInError> {
+        let (supabase, _) = self.parts()?;
         self.save(&Stored {
             access_token: t.access_token.clone(),
             refresh_token: t.refresh_token.clone(),
             expires_at: t.expiry(),
             user: t.user.clone(),
             expired: false,
+            issuer: supabase.issuer(),
         })
         .await
     }
@@ -160,6 +180,7 @@ impl SignIn {
     /// A live access token, refreshed first when it is about to expire.
     pub async fn access(&self) -> Result<Access, SignInError> {
         let (supabase, _) = self.parts()?;
+        let _held = SESSION_LOCK.lock().await;
         let mut s = self.load().await?.ok_or(SignInError::SignedOut)?;
         if s.expired {
             return Err(SignInError::Expired);
@@ -167,7 +188,7 @@ impl SignIn {
         if s.expires_at - REFRESH_MARGIN <= OffsetDateTime::now_utc().unix_timestamp() {
             match supabase.refresh(&s.refresh_token).await {
                 Ok(t) => {
-                    self.keep(&t).await?;
+                    self.store_tokens(&t).await?;
                     s = self.load().await?.ok_or(SignInError::SignedOut)?;
                 }
                 // Only a definite "this refresh token is dead" ends the session; a rate limit
@@ -193,6 +214,8 @@ impl SignIn {
             Err(SignInError::NotConfigured) => return Ok(()),
             Err(e) => return Err(e),
         };
+        let _held = SESSION_LOCK.lock().await;
+        // Only a session of this project is ended there; another project's is just forgotten.
         if let Some(s) = self.load().await? {
             if let Err(e) = supabase.logout(&s.access_token).await {
                 tracing::info!(error = %e, "could not end the session at the sign-in service");

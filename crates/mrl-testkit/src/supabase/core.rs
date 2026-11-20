@@ -112,6 +112,18 @@ impl CoreServer {
         self.db.pool().close().await;
     }
 
+    /// Stops the server and starts it again with `config` on the same database and secret
+    /// store (a settings change, or a switch between solo and team mode).
+    pub async fn restart(self, config: Config) -> Self {
+        if let Err(e) = self.server.shutdown().await {
+            panic!("test core did not stop cleanly: {}", e.explain());
+        }
+        match Self::try_start(config, self.db, self.secrets).await {
+            Ok(c) => c,
+            Err(e) => panic!("test core did not restart: {}", e.explain()),
+        }
+    }
+
     /// Sends a JSON request (or none) with `auth`.
     pub async fn call(
         &self,

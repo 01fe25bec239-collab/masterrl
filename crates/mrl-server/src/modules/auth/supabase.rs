@@ -477,7 +477,9 @@ impl IdentityProvider for SupabaseIdentity {
                 if !tenancy::is_active(&self.db, user).await? {
                     return Ok(None);
                 }
-                Ok(Some(tenancy::principal_for(&self.db, user).await?))
+                Ok(Some(
+                    tenancy::principal_for(&self.db, Mode::Team, user).await?,
+                ))
             }
         }
     }

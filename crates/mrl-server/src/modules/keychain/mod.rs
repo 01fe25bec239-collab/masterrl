@@ -28,19 +28,51 @@ enum Backend {
 }
 
 impl KeychainStore {
-    /// The OS keychain when this computer has one; otherwise the encrypted file
-    /// `<fallback_dir>/<service>.vault`, after logging a warning.
+    /// The store this install used before; on first use, the OS keychain, or the encrypted
+    /// file `<fallback_dir>/<service>.vault` (after a warning) only when there is no keychain
+    /// service at all (a Linux box without Secret Service).
+    ///
+    /// The choice sticks: a keychain that is locked or fails for a while is reported
+    /// (MRL-ENV-161) and keeps being used, so saved secrets never seem to vanish and new ones
+    /// never go to a second store.
     pub async fn open(service: &str, fallback_dir: &Path) -> Self {
-        if os_keychain_works(service).await {
+        let marker = fallback_dir.join(format!("{service}.os-keychain"));
+        let file = Self::file(service, fallback_dir);
+        if marker.exists() {
             return Self::os(service);
         }
-        tracing::warn!(
-            code = NO_KEYCHAIN,
-            folder = %fallback_dir.display(),
-            "this computer has no keychain service; secrets are kept in an encrypted file \
-             that only this folder's permissions protect"
-        );
-        Self::file(service, fallback_dir)
+        if let Backend::File(v) = &file.backend {
+            if v.path.exists() || v.key_path.exists() {
+                return file;
+            }
+        }
+        match probe(service).await {
+            Ok(()) => {
+                let written = std::fs::create_dir_all(fallback_dir)
+                    .and_then(|()| std::fs::write(&marker, b"os keychain\n"));
+                if let Err(e) = written {
+                    tracing::warn!(error = %e, "could not note that this install uses the keychain");
+                }
+                Self::os(service)
+            }
+            Err(e) if no_keychain_service(&e) => {
+                tracing::warn!(
+                    code = NO_KEYCHAIN,
+                    folder = %fallback_dir.display(),
+                    "this computer has no keychain service; secrets are kept in an encrypted file \
+                     that only this folder's permissions protect"
+                );
+                file
+            }
+            Err(e) => {
+                tracing::error!(
+                    code = KEYCHAIN_FAILED,
+                    error = %keychain_error("read the keychain", &e),
+                    "the keychain did not answer; secrets stay in it, so unlock it and try again"
+                );
+                Self::os(service)
+            }
+        }
     }
 
     /// The OS keychain, with no fallback.
@@ -102,24 +134,26 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| SeamError::new("secrets", format!("keychain call stopped: {e}")))?
 }
 
-/// True when the OS keychain answers a read (a missing entry counts as an answer).
-async fn os_keychain_works(service: &str) -> bool {
+/// Reads a probe entry from the OS keychain (a missing entry counts as an answer).
+async fn probe(service: &str) -> Result<(), keyring::Error> {
     let service = service.to_owned();
-    let probe = blocking(move || {
-        let entry = keyring::Entry::new(&service, "keychain-probe")
-            .map_err(|e| keychain_error("open the keychain", &e))?;
-        match entry.get_password() {
+    let read = tokio::task::spawn_blocking(move || {
+        match keyring::Entry::new(&service, "keychain-probe")?.get_password() {
             Ok(_) | Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(keychain_error("read the keychain", &e)),
+            Err(e) => Err(e),
         }
     })
     .await;
-    match probe {
-        Ok(()) => true,
-        Err(e) => {
-            tracing::debug!(error = %e, "keychain probe failed");
-            false
-        }
+    read.unwrap_or_else(|e| Err(keyring::Error::NoStorageAccess(Box::new(e))))
+}
+
+/// True when there is no keychain service to use: no store for this platform, or (Linux and
+/// other Unix) Secret Service failing to answer at all. A locked store is not absent.
+fn no_keychain_service(e: &keyring::Error) -> bool {
+    match e {
+        keyring::Error::NoDefaultStore => true,
+        keyring::Error::PlatformFailure(_) => cfg!(not(any(target_os = "macos", windows))),
+        _ => false,
     }
 }
 
@@ -266,6 +300,37 @@ impl FileVault {
 mod tests {
     use super::*;
 
+    #[test]
+    fn only_a_missing_keychain_service_selects_the_file() {
+        let platform =
+            || -> Box<dyn std::error::Error + Send + Sync> { "dbus: no such service".into() };
+        assert!(no_keychain_service(&keyring::Error::NoDefaultStore));
+        assert!(!no_keychain_service(&keyring::Error::NoStorageAccess(
+            platform()
+        )));
+        assert_eq!(
+            no_keychain_service(&keyring::Error::PlatformFailure(platform())),
+            cfg!(not(any(target_os = "macos", windows)))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_store_chosen_first_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        // A vault from earlier stays in use even where a keychain now answers.
+        let first = KeychainStore::file("mrl-sticky", dir.path());
+        first.set("x", Secret::new("v")).await.unwrap();
+        let again = KeychainStore::open("mrl-sticky", dir.path()).await;
+        assert!(again.uses_fallback());
+        assert_eq!(again.get("x").await.unwrap().unwrap().expose(), "v");
+        // An install noted as using the keychain never moves to a file, whatever the probe says.
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join("mrl-sticky.os-keychain"), b"").unwrap();
+        assert!(!KeychainStore::open("mrl-sticky", other.path())
+            .await
+            .uses_fallback());
+    }
+
     async fn round_trip(store: &KeychainStore) {
         let name = format!("test.{}", uuid::Uuid::new_v4().simple());
         assert_eq!(store.get(&name).await.unwrap(), None);
@@ -340,9 +405,14 @@ mod tests {
             );
         }
         round_trip(&store).await;
+        let vault = dir.path().join(format!("{service}.vault"));
+        let key = dir.path().join(format!("{service}.vault-key"));
         assert!(
-            std::fs::read_dir(dir.path()).unwrap().next().is_none() || store.uses_fallback(),
+            store.uses_fallback() || !(vault.exists() || key.exists()),
             "the OS backend must not write the fallback file"
         );
+        // The choice is kept: opening again picks the same store.
+        let again = KeychainStore::open(&service, dir.path()).await;
+        assert_eq!(again.uses_fallback(), store.uses_fallback());
     }
 }

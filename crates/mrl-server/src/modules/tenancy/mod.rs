@@ -234,9 +234,10 @@ pub async fn primary_org(db: &Db, user: UserId) -> Result<Option<OrgId>, DbError
     Ok(org.map(OrgId::from_uuid))
 }
 
-/// The principal for `user`: the local owner in solo mode, else a team-mode user.
-pub async fn principal_for(db: &Db, user: UserId) -> Result<Principal, DbError> {
-    if local_owner(db).await?.is_some_and(|o| o.id == user) {
+/// The principal for `user`: the local owner in solo mode, else a team-mode user. A Team
+/// core on a former Solo database treats the former owner as an ordinary user.
+pub async fn principal_for(db: &Db, mode: Mode, user: UserId) -> Result<Principal, DbError> {
+    if mode == Mode::Solo && local_owner(db).await?.is_some_and(|o| o.id == user) {
         return Ok(Principal::local_owner());
     }
     Ok(Principal {
@@ -336,12 +337,13 @@ pub fn action_from_str(name: &str) -> Option<Action> {
 /// orgs' resources never show; `auth.session` needs no role.
 pub struct Rbac {
     db: Db,
+    mode: Mode,
 }
 
 impl Rbac {
-    /// RBAC over this database.
-    pub fn new(db: Db) -> Self {
-        Self { db }
+    /// RBAC over this database. The local owner's shortcuts apply in solo mode only.
+    pub fn new(db: Db, mode: Mode) -> Self {
+        Self { db, mode }
     }
 
     async fn decide(
@@ -356,7 +358,10 @@ impl Rbac {
             .or(ctx.project.as_deref())
             .and_then(|p| ProjectId::from_str(p).ok());
         let (user, token_org) = match ctx.principal.kind {
-            PrincipalKind::LocalOwner => return Ok(verdict(&[Role::Owner], action)),
+            PrincipalKind::LocalOwner if self.mode == Mode::Solo => {
+                return Ok(verdict(&[Role::Owner], action))
+            }
+            PrincipalKind::LocalOwner => return Ok(Decision::Deny),
             PrincipalKind::User => match UserId::from_str(&ctx.principal.id) {
                 Ok(u) => (u, None),
                 Err(_) => return Ok(Decision::Deny),
@@ -400,7 +405,12 @@ impl Rbac {
         if !is_active(&self.db, user).await? {
             return Ok(Decision::Deny);
         }
-        if let Some(owner) = local_owner(&self.db).await? {
+        // The local-owner flag stays in the database after a switch to team mode; it counts
+        // only in solo mode.
+        if let Some(owner) = local_owner(&self.db)
+            .await?
+            .filter(|_| self.mode == Mode::Solo)
+        {
             if owner.id == user {
                 return Ok(verdict(&[Role::Owner], action));
             }

@@ -65,19 +65,32 @@ impl Default for AuthConfig {
     }
 }
 
+/// True for `https://host[:port][/path]`, or `http://` to a loopback host with a port.
+fn supabase_url_ok(url: &str) -> bool {
+    let Ok(u) = reqwest::Url::parse(url) else {
+        return false;
+    };
+    let loopback = matches!(u.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
+    (u.scheme() == "https" || (u.scheme() == "http" && loopback && u.port().is_some()))
+        && u.host_str().is_some()
+        && u.username().is_empty()
+        && u.password().is_none()
+        && u.query().is_none()
+        && u.fragment().is_none()
+}
+
 impl AuthConfig {
     /// Problems with these settings, one line each (team mode also needs Supabase, checked at startup).
     pub fn problems(&self) -> Vec<String> {
         let mut out = Vec::new();
         match (&self.supabase_url, &self.supabase_anon_key) {
             (Some(url), Some(_)) => {
-                let local = ["http://127.0.0.1:", "http://localhost:"]
-                    .iter()
-                    .any(|p| url.starts_with(p));
-                if !(url.starts_with("https://") || local) || reqwest::Url::parse(url).is_err() {
-                    out.push(format!(
-                        "auth.supabase_url: {url:?} must be an https:// address, like https://abcd.supabase.co"
-                    ));
+                // The value is not echoed: a mistyped one may hold a password.
+                if !supabase_url_ok(url) {
+                    out.push(
+                        "auth.supabase_url must be an https:// address with no user name, password, query or fragment, like https://abcd.supabase.co (http:// only for a local test server on 127.0.0.1, localhost or [::1])"
+                            .to_owned(),
+                    );
                 }
             }
             (None, None) => {}
@@ -244,7 +257,7 @@ pub async fn production_seams(
             identity.clone(),
             solo,
         ))
-        .authorizer(tenancy::Rbac::new(db.clone()))
+        .authorizer(tenancy::Rbac::new(db.clone(), mode))
         .audit(audit::PgAuditSink::new(db.clone()))
         .identity_arc(identity)
         .secrets_arc(secrets))
@@ -913,23 +926,42 @@ pub struct TokenInfo {
     pub last_used_at: Option<OffsetDateTime>,
 }
 
-#[utoipa::path(get, path = "/auth/tokens", tag = "auth", responses((status = 200, description = "Your live tokens, newest first.", body = Page<TokenInfo>)))]
+#[utoipa::path(get, path = "/auth/tokens", tag = "auth", params(crate::http::pagination::PageQuery),
+    responses((status = 200, description = "Your live tokens, newest first, in cursor pages.", body = Page<TokenInfo>)))]
 async fn list_tokens(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
     Caller(ctx): Caller,
+    axum::extract::Query(q): axum::extract::Query<crate::http::pagination::PageQuery>,
 ) -> Result<Json<Page<TokenInfo>>, Fail> {
     let user = authorize_self_shared(&state, &shared, &ctx, "auth.manage_tokens").await?;
+    let page = q.resolve()?;
+    let bad_cursor = || {
+        ApiError::new(
+            ErrorCode::Pagination,
+            "cursor must be the next_cursor value from an earlier page, unchanged.",
+        )
+    };
+    let after = match page.after.as_deref() {
+        Some(a) => Some(Uuid::parse_str(a).map_err(|_| bad_cursor())?),
+        None => None,
+    };
+    // Token ids are UUIDv7, so id order is creation order.
     let rows: Vec<TokenRow> = sqlx::query_as(
         "SELECT id, name, token_prefix, scopes, expires_at, last_used_at FROM api_tokens \
-         WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now() ORDER BY created_at DESC LIMIT 200",
+         WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now() AND ($2::uuid IS NULL OR id < $2) \
+         ORDER BY id DESC LIMIT $3",
     )
     .bind(user.as_uuid())
+    .bind(after)
+    .bind(i64::try_from(page.fetch()).unwrap_or(201))
     .fetch_all(shared.db.pool())
     .await
     .map_err(|e| db_error(e.into()))?;
+    let page = Page::from_overfetch(rows, &page, |r| r.0.to_string());
     Ok(Json(Page {
-        items: rows
+        items: page
+            .items
             .into_iter()
             .map(
                 |(id, name, prefix, scopes, expires_at, last_used_at)| TokenInfo {
@@ -942,7 +974,7 @@ async fn list_tokens(
                 },
             )
             .collect(),
-        next_cursor: None,
+        next_cursor: page.next_cursor,
     }))
 }
 
@@ -1140,4 +1172,42 @@ async fn revoke_token(
     .map_err(db_error)?;
     commit(tx).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn supabase_url_is_checked_parsed_and_never_echoed() {
+        for ok in [
+            "https://abcd.supabase.co",
+            "http://127.0.0.1:54321",
+            "http://localhost:54321",
+            "http://[::1]:54321",
+        ] {
+            assert!(supabase_url_ok(ok), "{ok}");
+        }
+        for bad in [
+            "http://127.0.0.1:@evil.example",
+            "http://localhost:x@evil.example:80",
+            "http://evil.example",
+            "http://127.0.0.1",
+            "https://user:hunter2@abcd.supabase.co",
+            "https://abcd.supabase.co/?apikey=1",
+            "https://abcd.supabase.co/#x",
+            "ftp://abcd.supabase.co",
+            "abcd.supabase.co",
+        ] {
+            assert!(!supabase_url_ok(bad), "{bad}");
+        }
+        let config = AuthConfig {
+            supabase_url: Some("https://user:hunter2@abcd.supabase.co".into()),
+            supabase_anon_key: Some("k".into()),
+            ..AuthConfig::default()
+        };
+        let problems = config.problems();
+        assert_eq!(problems.len(), 1);
+        assert!(!problems[0].contains("hunter2"), "{}", problems[0]);
+    }
 }

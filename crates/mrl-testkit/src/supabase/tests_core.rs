@@ -1,7 +1,7 @@
 //! P16 integration tests: a production-wired core against the mock Supabase and a real
 //! PostgreSQL (`just test-integration`).
 
-use super::core::{Auth, CoreServer};
+use super::core::{config, Auth, CoreServer};
 use super::{MockSupabase, MockUser};
 use crate::pg::TestDb;
 use crate::seams::InMemorySecretStore;
@@ -223,23 +223,38 @@ async fn jwt_verification_uses_the_jwks_and_works_offline_from_the_cache() {
             .is_none(),
         "expired"
     );
+    // Claims this project would accept: only the key decides below.
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let good = json!({"iss": sb.issuer(), "aud": "authenticated", "sub": user.id.to_string(), "exp": now + 300});
+    assert!(v.verify(&sb.sign(&good)).await.unwrap().is_some());
     assert!(
-        v.verify(&other.access_token(&user, 300))
+        v.verify(&other.sign(&good)).await.unwrap().is_none(),
+        "same issuer, audience and kid, another key"
+    );
+    assert!(
+        v.verify(&sb.sign_as("unknown-kid", &good))
             .await
             .unwrap()
             .is_none(),
-        "other project's key and issuer"
+        "unknown kid"
     );
     assert!(v.verify("not.a.jwt").await.unwrap().is_none());
-    let mut parts: Vec<String> = sb
-        .access_token(&user, 300)
-        .split('.')
-        .map(str::to_owned)
-        .collect();
-    parts[1] = parts[1].chars().rev().collect();
+    // A valid payload for someone else under the original signature.
+    use base64::Engine as _;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let signed = sb.sign(&good);
+    let parts: Vec<&str> = signed.split('.').collect();
+    let mut forged = good.clone();
+    forged["sub"] = json!(uuid::Uuid::now_v7().to_string());
+    let swapped = format!(
+        "{}.{}.{}",
+        parts[0],
+        b64.encode(forged.to_string()),
+        parts[2]
+    );
     assert!(
-        v.verify(&parts.join(".")).await.unwrap().is_none(),
-        "tampered"
+        v.verify(&swapped).await.unwrap().is_none(),
+        "payload swapped under a valid signature"
     );
 
     // Offline: a new process (empty memory) still checks tokens with the keys in the database.
@@ -267,7 +282,7 @@ async fn rbac_matches_the_p06_matrix_for_every_role_and_action() {
         o = org.as_uuid(), o2 = other_org.as_uuid(), w = ws.as_uuid(), p = project.as_uuid(), p2 = other_project.as_uuid()
     ))
     .await;
-    let rbac = Rbac::new(db.db().clone());
+    let rbac = Rbac::new(db.db().clone(), Mode::Solo);
     let in_org = |org: OrgId| Resource {
         org: Some(org.to_string()),
         ..Resource::kind("thing")
@@ -1004,6 +1019,22 @@ async fn tokens_are_scoped_listed_and_revoked_and_the_audit_log_pages() {
 
     // Seam writes and handler writes both land; pages are newest first.
     let sink = mrl_server::modules::audit::PgAuditSink::new(core.db.db().clone());
+    // A success through the seam could outlive a rolled-back change, so it is refused and
+    // nothing is written.
+    let before = core.db.count("audit_events").await;
+    let success = sink
+        .record(mrl_server::modules::audit::event(
+            time::OffsetDateTime::now_utc(),
+            "local-owner",
+            None,
+            "runs.cancel_own",
+            "run_1",
+            mrl_server::seams::AuditOutcome::Success,
+            "trace",
+        ))
+        .await;
+    assert!(success.is_err());
+    assert_eq!(core.db.count("audit_events").await, before);
     sink.record(mrl_server::modules::audit::event(
         time::OffsetDateTime::now_utc(),
         "local-owner",
@@ -1696,7 +1727,7 @@ async fn a_one_project_token_acts_only_in_that_project() {
     let token_id = made["id"].as_str().unwrap().to_owned();
 
     // The owner's role does not lift the token's project limit.
-    let rbac = Rbac::new(core.db.db().clone());
+    let rbac = Rbac::new(core.db.db().clone(), Mode::Solo);
     let c = ctx(Principal {
         id: token_id.clone(),
         kind: PrincipalKind::Service,
@@ -2341,28 +2372,76 @@ async fn push(core: &CoreServer) -> TestResponse {
         .await
 }
 
+/// Applies this build's migrations below `before` (all of them with `None`).
+async fn migrate_to(db: &TestDb, before: Option<i64>) {
+    let mut m = mrl_server::db::migrate::migrator();
+    if let Some(v) = before {
+        m.migrations = m
+            .migrations
+            .iter()
+            .filter(|x| x.version < v)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into();
+    }
+    mrl_server::db::migrate::apply_with(db.db(), &m)
+        .await
+        .unwrap();
+}
+
+/// A completed replay record whose kept response is `body`.
+fn kept(key: &str, body: &str) -> String {
+    format!(
+        "INSERT INTO idempotency_keys (scope, key, request_sha256, state, response_status, response_body, expires_at) \
+         VALUES ('usr_1', '{key}', '\\x00', 'DONE', 201, convert_to('{body}', 'UTF8'), now() + interval '1 day');"
+    )
+}
+
+async fn keys(db: &TestDb) -> Vec<String> {
+    sqlx::query_scalar("SELECT key FROM idempotency_keys ORDER BY key")
+        .fetch_all(db.pool())
+        .await
+        .unwrap()
+}
+
 #[tokio::test]
 #[ignore = "needs DATABASE_URL"]
-async fn the_upgrade_clears_idempotency_entries_kept_by_earlier_revisions() {
-    let sb = MockSupabase::start().await;
-    let core = solo(&sb).await;
-    // What an earlier revision could have kept: a replayable new token and a fingerprint.
-    core.db
-        .seed(
-            "INSERT INTO idempotency_keys (scope, key, request_sha256, state, response_status, response_body, expires_at) VALUES \
-             ('usr_1', 'k1', '\\x00', 'DONE', 201, convert_to('{\"token\":\"mrl_pat_x\"}', 'UTF8'), now() + interval '1 day'), \
-             ('usr_1', 'k2', '\\x01', 'IN_PROGRESS', NULL, NULL, now() + interval '1 day');",
-        )
-        .await;
-    assert_eq!(core.db.count("idempotency_keys").await, 2);
-    sqlx::raw_sql(include_str!(
-        "../../../mrl-server/migrations/16007_clear_idempotency.sql"
+async fn the_upgrade_from_wave_03_keeps_every_replay_record() {
+    let db = TestDb::empty().await;
+    migrate_to(&db, Some(16001)).await;
+    db.seed(&kept(
+        "run-1",
+        r#"{"id":"run_1","token":"mrl_pat_lookalike"}"#,
     ))
-    .execute(core.db.pool())
-    .await
-    .unwrap();
-    assert_eq!(core.db.count("idempotency_keys").await, 0);
-    core.stop().await;
+    .await;
+    db.seed("INSERT INTO idempotency_keys (scope, key, request_sha256, state, owner, claim, expires_at) \
+             VALUES ('usr_1', 'run-2', '\\x01', 'IN_PROGRESS', 1, gen_random_uuid(), now() + interval '1 day');")
+        .await;
+    migrate_to(&db, None).await;
+    assert_eq!(keys(&db).await, vec!["run-1", "run-2"]);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn the_upgrade_clears_only_what_earlier_p16_revisions_kept() {
+    let db = TestDb::empty().await;
+    // A database that ran P16 before 16007 (like 3791ab7's parent).
+    migrate_to(&db, Some(16007)).await;
+    for (key, body) in [
+        ("token", r#"{"id":"tok_1","token":"mrl_pat_x"}"#),
+        ("session", r#"{"csrf_token":"c","expires_at":"x"}"#),
+        ("setup", r#"{"recovery_key":"abcd-ef01"}"#),
+        (
+            "restore",
+            r#"{"version":1,"profile":{"schema":"setup-profile/v1"}}"#,
+        ),
+        ("refused", r#"{"code":"MRL-IDEM-003"}"#),
+        ("org", r#"{"id":"org_1","slug":"lab"}"#),
+    ] {
+        db.seed(&kept(key, body)).await;
+    }
+    migrate_to(&db, None).await;
+    assert_eq!(keys(&db).await, vec!["org"]);
 }
 
 #[tokio::test]
@@ -2471,5 +2550,182 @@ async fn a_viewer_login_token_can_revoke_itself() {
         .call(Method::GET, "/api/v1/auth/me", &Auth::Bearer(token), None)
         .await;
     assert_eq!(after.status, 401, "{}", after.text());
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn every_live_token_is_reachable_through_the_list_pages() {
+    let sb = MockSupabase::start().await;
+    let core = solo(&sb).await;
+    let owner: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE is_local_owner")
+        .fetch_one(core.db.pool())
+        .await
+        .unwrap();
+    let ids: Vec<uuid::Uuid> = (0..205).map(|_| uuid::Uuid::now_v7()).collect();
+    let rows: Vec<String> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            format!(
+                "('{id}', '{owner}', 't{i}', 'mrl_pat_x{i}', decode(md5('{id}'), 'hex'), ARRAY['*'], now() + interval '1 day')"
+            )
+        })
+        .collect();
+    core.db
+        .seed(&format!(
+            "INSERT INTO api_tokens (id, user_id, name, token_prefix, token_hash, scopes, expires_at) VALUES {};",
+            rows.join(", ")
+        ))
+        .await;
+    let mut seen = Vec::new();
+    let mut path = "/api/v1/auth/tokens?limit=200".to_owned();
+    loop {
+        let page = core.call(Method::GET, &path, &Auth::Launch, None).await;
+        assert_eq!(page.status, 200, "{}", page.text());
+        let page = page.json();
+        seen.extend(
+            page["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["id"].as_str().unwrap().to_owned()),
+        );
+        match page["next_cursor"].as_str() {
+            Some(c) => path = format!("/api/v1/auth/tokens?limit=200&cursor={c}"),
+            None => break,
+        }
+    }
+    assert_eq!(seen.len(), 205);
+    let oldest = mrl_domain::ids::TokenId::from_uuid(ids[0]).to_string();
+    assert_eq!(
+        seen.last(),
+        Some(&oldest),
+        "token 205 (the oldest) is on the last page"
+    );
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_new_supabase_project_never_gets_the_old_projects_session() {
+    let sb = MockSupabase::start().await;
+    let core = solo(&sb).await;
+    assert_eq!(core.sign_in(&sb, &Auth::Launch, false).await.status, 200);
+    let state = |r: TestResponse| r.json()["sign_in"].as_str().unwrap_or_default().to_owned();
+    assert_eq!(
+        state(
+            core.call(Method::GET, "/api/v1/auth/me", &Auth::Launch, None)
+                .await
+        ),
+        "active"
+    );
+    // Same keychain, another project in the settings.
+    let next = MockSupabase::start().await;
+    let core = core.restart(config(Mode::Solo, &next)).await;
+    assert_eq!(
+        state(
+            core.call(Method::GET, "/api/v1/auth/me", &Auth::Launch, None)
+                .await
+        ),
+        "signed_out"
+    );
+    // Signing in to the new project works and replaces the old session.
+    assert_eq!(core.sign_in(&next, &Auth::Launch, false).await.status, 200);
+    assert_eq!(
+        state(
+            core.call(Method::GET, "/api/v1/auth/me", &Auth::Launch, None)
+                .await
+        ),
+        "active"
+    );
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn overlapping_requests_refresh_the_rotating_token_once_at_a_time() {
+    let sb = MockSupabase::start().await;
+    let core = solo(&sb).await;
+    sb.set_access_ttl(30); // inside the refresh margin: every use refreshes first
+    assert_eq!(core.sign_in(&sb, &Auth::Launch, false).await.status, 200);
+    assert_eq!(
+        core.call(
+            Method::POST,
+            "/api/v1/sync/setup",
+            &Auth::Launch,
+            Some(json!({"passphrase": PASSPHRASE}))
+        )
+        .await
+        .status,
+        200
+    );
+    let status = || core.call(Method::GET, "/api/v1/sync/status", &Auth::Launch, None);
+    let (a, b, c, d, e, f) = tokio::join!(
+        push(&core),
+        push(&core),
+        status(),
+        status(),
+        push(&core),
+        status()
+    );
+    for r in [a, b, c, d, e, f] {
+        assert_eq!(r.status, 200, "{}", r.text());
+        assert!(!r.text().contains("MRL-AUTH-160"), "{}", r.text());
+    }
+    assert_eq!(
+        core.call(Method::GET, "/api/v1/auth/me", &Auth::Launch, None)
+            .await
+            .json()["sign_in"],
+        "active"
+    );
+    // Sign-out is never undone by a refresh that was waiting.
+    let (out, late) = tokio::join!(
+        core.call(Method::POST, "/api/v1/auth/logout", &Auth::Launch, None),
+        push(&core)
+    );
+    assert_eq!(out.status, 204, "{}", out.text());
+    assert!(late.status == 200 || late.status == 401, "{}", late.text());
+    assert_eq!(
+        core.call(Method::GET, "/api/v1/auth/me", &Auth::Launch, None)
+            .await
+            .json()["sign_in"],
+        "signed_out"
+    );
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_team_core_on_a_former_solo_database_has_no_local_owner() {
+    let sb = MockSupabase::start().await;
+    let core = solo(&sb).await;
+    let done = core.sign_in(&sb, &Auth::Launch, true).await;
+    assert_eq!(done.status, 200, "{}", done.text());
+    let pat = done.json()["token"]["token"].as_str().unwrap().to_owned();
+    let core = core.restart(config(Mode::Team, &sb)).await;
+    let jwt = sb.access_token(&sb.user(), 600);
+    let me = core
+        .call(
+            Method::GET,
+            "/api/v1/auth/me",
+            &Auth::Bearer(jwt.clone()),
+            None,
+        )
+        .await;
+    assert_eq!(me.status, 200, "{}", me.text());
+    assert_eq!(me.json()["principal_kind"], "user", "{}", me.text());
+    // No owner shortcut and no implicit platform grant: neither credential creates orgs.
+    for auth in [Auth::Bearer(jwt), Auth::Bearer(pat)] {
+        let r = core
+            .call(
+                Method::POST,
+                "/api/v1/orgs",
+                &auth,
+                Some(json!({"slug": "new-lab", "name": "New lab"})),
+            )
+            .await;
+        assert_eq!(r.status, 403, "{}", r.text());
+    }
     core.stop().await;
 }
