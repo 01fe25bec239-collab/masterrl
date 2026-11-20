@@ -36,6 +36,9 @@ pub const BODY_LIMIT: usize = 2 * 1024 * 1024;
 /// `PUT` bodies under this path skip [`BODY_LIMIT`]: the transfer ticket carries its own size
 /// limit, and the endpoint enforces it (P19).
 pub const UNLIMITED_PUT_PREFIX: &str = "/api/v1/transfer/";
+/// How a transfer path appears in spans, logs and problem `instance`s: the path itself
+/// carries the ticket, which is a credential.
+pub const TRANSFER_ROUTE: &str = "/api/v1/transfer/{ticket}";
 /// Request id header (echoed on every response).
 pub const REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 /// W3C trace context header.
@@ -148,7 +151,8 @@ async fn metrics(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-/// Sets `RequestMeta` (request id, trace id), opens the request span and links the
+/// Sets `RequestMeta` (request id, trace id), opens the request span (its `path` is the
+/// matched route template, never a raw transfer path) and links the
 /// incoming W3C trace context so OTLP traces join the caller's trace.
 async fn request_meta(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
     let request_id = req
@@ -175,7 +179,10 @@ async fn request_meta(State(state): State<AppState>, mut req: Request, next: Nex
     let span = tracing::info_span!(
         "http.request",
         method = %req.method(),
-        path = %req.uri().path(),
+        path = %req
+            .extensions()
+            .get::<MatchedPath>()
+            .map_or_else(|| shown_path(req.uri().path()), |m| m.as_str()),
         trace_id = %trace_id,
         request_id = %request_id,
     );
@@ -191,6 +198,16 @@ async fn request_meta(State(state): State<AppState>, mut req: Request, next: Nex
         res.headers_mut().insert(REQUEST_ID, v);
     }
     res
+}
+
+/// `path` as spans, logs and problem `instance`s may show it: any transfer path (matched
+/// or not) becomes [`TRANSFER_ROUTE`], so its ticket is never recorded.
+pub fn shown_path(path: &str) -> &str {
+    if path.contains("/transfer/") {
+        TRANSFER_ROUTE
+    } else {
+        path
+    }
 }
 
 /// `00-<32 hex>-<16 hex>-<2 hex>` → (trace id, header). All-zero ids are not valid.
@@ -284,7 +301,7 @@ async fn limit_body(req: Request, next: Next) -> Response {
 /// `application/problem+json` with `instance` and `trace_id`.
 async fn render_problems(req: Request, next: Next) -> Response {
     let meta = meta_of(&req);
-    let instance = req.uri().path().to_owned();
+    let instance = shown_path(req.uri().path()).to_owned();
     let res = next.run(req).await;
     let status = res.status();
     if let Some(err) = res.extensions().get::<Arc<ApiError>>().cloned() {
@@ -601,5 +618,20 @@ pub(crate) mod tests {
         assert_eq!(headers[header::CONTENT_TYPE], PROBLEM_JSON);
         assert_eq!(json["code"], "MRL-VAL-007");
         assert_eq!(json["trace_id"].as_str().unwrap().len(), 32);
+    }
+
+    #[test]
+    fn transfer_paths_never_show_their_ticket() {
+        for p in [
+            "/api/v1/transfer/eyJrZXkiOi.sig",
+            "/api/v1/transfer/eyJrZXkiOi.sig/extra",
+            "/api/v1//transfer/eyJrZXkiOi.sig",
+        ] {
+            assert_eq!(shown_path(p), TRANSFER_ROUTE, "{p}");
+        }
+        assert_eq!(
+            shown_path("/api/v1/artifacts/art_1"),
+            "/api/v1/artifacts/art_1"
+        );
     }
 }

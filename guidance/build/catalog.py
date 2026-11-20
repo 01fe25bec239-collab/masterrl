@@ -1071,6 +1071,12 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': 'The upload was completed, cancelled, or it expired after 24 hours. It takes '
                     'no more changes.',
              'what_to_do': {'steps': ['Start a new upload for the file.']}},
+            {'code': 'MRL-CONFLICT-192',
+             'title': 'This secret is being deleted.',
+             'why': "Someone started deleting this secret, so its value can't be changed or read "
+                    'any more. A delete that stopped halfway leaves it in this state.',
+             'what_to_do': {'steps': ['Delete the secret again to finish.',
+                                      'Then create a new secret if you still need one.']}},
             {'code': 'MRL-DATA-001',
              'title': 'Your dataset did not pass its checks.',
              'why': "Some rows are empty, are missing fields, or don't match the chosen format.",
@@ -1230,10 +1236,14 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
             {'code': 'MRL-ENV-190',
              'title': 'This server has no place to keep secret values.',
              'why': "The server was started without a secret store, so it can't save or read "
-                    'secret values.',
+                    'secret values. A team server also needs it to sign download and upload links '
+                    'that every server copy accepts.',
              'what_to_do': {'steps': ['Start the server from the desktop app, which keeps secrets '
                                       "in your computer's keychain.",
-                                      'Or use a secret read from an environment variable.']}},
+                                      'On a solo server, you can also use a secret read from an '
+                                      'environment variable.',
+                                      'On a team server, ask your admin to set up the shared '
+                                      'secret store.']}},
             {'code': 'MRL-IDEM-001',
              'title': 'This request is already running.',
              'why': 'A request with the same request key started earlier and has not finished.',

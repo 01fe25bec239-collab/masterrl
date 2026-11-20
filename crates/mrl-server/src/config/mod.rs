@@ -256,7 +256,8 @@ impl Default for PgBundleConfig {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ObjectStoreConfig {
-    /// `s3://bucket/prefix` or `file:///absolute/path`.
+    /// `s3://bucket` (objects go under `orgs/` at the bucket root; a path after the bucket is
+    /// refused) or `file:///absolute/path`.
     pub url: Option<String>,
     /// Endpoint for S3-compatible stores, like `http://127.0.0.1:8333`.
     pub endpoint: Option<String>,
@@ -466,14 +467,21 @@ impl Config {
 
         // <mrl:validate P19> P19 checks (push to `problems`) go right below this line.
         if let Some(url) = &self.object_store.url {
-            let bucket = url
-                .strip_prefix("s3://")
-                .map(|r| r.split('/').next().unwrap_or_default());
-            if bucket == Some("") {
-                problems.push(
-                    "object_store.url: an s3:// address needs a bucket name, like s3://masterrl"
-                        .to_owned(),
-                );
+            if let Some(rest) = url.strip_prefix("s3://") {
+                let (bucket, path) = rest.split_once('/').unwrap_or((rest, ""));
+                if bucket.is_empty() {
+                    problems.push(
+                        "object_store.url: an s3:// address needs a bucket name, like s3://masterrl"
+                            .to_owned(),
+                    );
+                }
+                // Objects live under `orgs/` at the bucket root; a path would be silently
+                // ignored, so two deployments sharing a bucket would mix their data.
+                if !path.trim_matches('/').is_empty() {
+                    problems.push(format!(
+                        "object_store.url: {url:?} has a path after the bucket; MasterRL stores objects at the bucket root, so use s3://{bucket} (or a bucket of its own per deployment)"
+                    ));
+                }
             }
         }
         if problems.is_empty() {
@@ -893,8 +901,12 @@ mod tests {
     #[test]
     fn object_store_values() {
         assert!(
-            parse("[object_store]\nurl = \"s3://b/p\"\nendpoint = \"http://127.0.0.1:8333\"")
-                .is_ok()
+            parse("[object_store]\nurl = \"s3://b\"\nendpoint = \"http://127.0.0.1:8333\"").is_ok()
+        );
+        assert!(parse("[object_store]\nurl = \"s3://b/\"").is_ok());
+        assert_eq!(
+            code(parse("[object_store]\nurl = \"s3://b/p\"")),
+            ErrorCode::ConfigValue
         );
         assert!(parse("[object_store]\nurl = \"file:///var/mrl\"").is_ok());
         assert_eq!(

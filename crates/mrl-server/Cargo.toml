@@ -52,6 +52,7 @@ utoipa = { workspace = true, features = ["yaml"] }
 # <mrl:deps P19> P19 dependencies go right below this line.
 mrl-domain = { path = "../mrl-domain" }
 mrl-storage = { path = "../mrl-storage" }
+tempfile = "=3.27.0"
 
 [dev-dependencies]
 mrl-domain = { path = "../mrl-domain" }

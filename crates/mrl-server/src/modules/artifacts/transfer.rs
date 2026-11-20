@@ -1,12 +1,16 @@
 //! `PUT|GET /api/v1/transfer/{ticket}`: the server-proxied transfer endpoint. The ticket is
 //! the only credential (no sign-in); it allows one method on one key up to its size limit.
 //!
-//! - PUT: the body streams into a temporary file, counted against the ticket's size limit
+//! - PUT: the body streams into a file in a private scratch folder, counted against the ticket's size limit
 //!   (the API's 2 MiB limit does not apply here) and, when the client sends
 //!   `x-mrl-content-sha256`, checked against that hash; then it is stored at the ticket's key
-//!   (one put up to 16 MiB, multipart above).
+//!   (one put up to 16 MiB, multipart above). Tickets never allow writing under `blobs/`.
 //! - GET: the object must fit the ticket's size limit. `Range: bytes=N-` and `bytes=N-M`
 //!   resume a download (206); the body streams in 8 MiB pieces.
+//!
+//! The path carries the ticket, so spans, logs and problem `instance`s show
+//! `/api/v1/transfer/{ticket}` instead (`crate::http::shown_path`). In solo mode the
+//! launch-secret header is still needed, as on every path of a solo server.
 
 use super::{ArtifactStore, Error};
 use crate::app::AppState;
@@ -39,7 +43,15 @@ pub(super) async fn upload(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Json<serde_json::Value>, Error> {
-    let claims = store.verify(&s, &token, TicketMethod::Put).await?;
+    let claims = store
+        .verify(s.seams.secrets.as_ref(), &token, TicketMethod::Put)
+        .await?;
+    let st = store
+        .org_store(s.seams.secrets.as_ref(), claims.org_id())
+        .await?;
+    if super::is_immutable(&st, &claims.key) {
+        return Err(super::immutable());
+    }
     let declared = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
@@ -47,22 +59,19 @@ pub(super) async fn upload(
     if let Some(n) = declared {
         claims.check_size(n).map_err(|e| too_large(e.to_string()))?;
     }
-    // Streamed into a temporary file while counting and hashing, so the ticket's size limit
-    // holds even without a content-length and nothing large sits in memory.
-    let tmp = std::env::temp_dir().join(format!("mrl-transfer-{}", uuid::Uuid::new_v4().simple()));
-    let result = receive(&s, &store, &claims, &headers, body, &tmp).await;
-    for p in [tmp.clone(), crate::modules::uploads::ledger_of(&tmp)] {
-        let _ = tokio::fs::remove_file(p).await;
-    }
-    let (size, sha) = result?;
+    // Streamed into a private folder while counting and hashing, so the ticket's size limit
+    // holds even without a content-length and nothing large sits in memory. The folder (with
+    // the multipart ledger) goes when this returns or the request is cancelled.
+    let dir = store.scratch_dir()?;
+    let (size, sha) = receive(&st, &claims, &headers, body, &dir.path().join("body")).await?;
+    super::scratch::close(dir)?;
     Ok(Json(
         serde_json::json!({ "key": claims.key, "size": size, "sha256": sha }),
     ))
 }
 
 async fn receive(
-    s: &AppState,
-    store: &ArtifactStore,
+    st: &mrl_storage::Store,
     claims: &mrl_storage::TicketClaims,
     headers: &HeaderMap,
     body: Body,
@@ -108,8 +117,7 @@ async fn receive(
             .into());
         }
     }
-    let st = store.org_store(s, claims.org_id()).await?;
-    crate::modules::uploads::store_file(&st, tmp, &claims.key, size).await?;
+    crate::modules::uploads::store_file(st, tmp, &claims.key, size).await?;
     Ok((size, sha))
 }
 
@@ -124,8 +132,12 @@ pub(super) async fn download(
     Path(token): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, Error> {
-    let claims = store.verify(&s, &token, TicketMethod::Get).await?;
-    let org = store.org_store(&s, claims.org_id()).await?;
+    let claims = store
+        .verify(s.seams.secrets.as_ref(), &token, TicketMethod::Get)
+        .await?;
+    let org = store
+        .org_store(s.seams.secrets.as_ref(), claims.org_id())
+        .await?;
     let info = org.head(&claims.key).await?;
     claims.check_size(info.size)?;
     let size = info.size;

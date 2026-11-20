@@ -7,19 +7,29 @@
 //!   on a team server the environment holds the server's own credentials, so tenants may
 //!   never point at it.
 //! - `PUT /secrets/{sec}/value {value}`: write-only; the answer is `204` with no body.
-//! - `POST /secrets/{sec}/grants {run_id, mount}`: lets a run receive the secret (needs the
-//!   `run` use).
+//! - `DELETE /secrets/{sec}`: marks the secret as being deleted, removes the value from the
+//!   store, then the metadata and grants. A failure leaves it marked (rotation and resolution
+//!   refuse it, MRL-CONFLICT-192); deleting again finishes. Rotation holds the row lock while
+//!   it writes, so the two never interleave, even across server replicas.
+//! - [`SecretResolver::grant`]: lets a run receive the secret (needs the `run` use). There is
+//!   no public endpoint: the runs module (P17) calls it in the transaction where it checked
+//!   the run and the caller's permission, since only it knows whether a run id is real.
 //! - [`SecretResolver`]: the only way to read a value; it enforces `allowed_uses`.
 //!   P20 delivers granted secrets to agents with [`SecretResolver::resolve_for_run`].
+//!
+//! Reading one secret and listing secrets check the same resource: the secret with the
+//! project recorded on it.
 
 use crate::app::AppState;
 use crate::config::Mode;
-use crate::db::Db;
+use crate::db::{Db, Tx};
 use crate::error::{ApiError, ErrorCode, FieldError};
 use crate::modules::artifacts::{
-    check_name, codes, field, not_found, org_of, resource, ArtifactStore, Error,
+    check_name, codes, field, not_found, org_of, owned, resource, ArtifactStore, Error,
 };
-use crate::seams::{AuditEvent, AuditOutcome, RequestContext, Secret, SecretStore};
+use crate::seams::{
+    AuditEvent, AuditOutcome, Decision, RequestContext, Resource, Secret, SecretStore,
+};
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -36,6 +46,10 @@ pub const KINDS: [&str; 5] = ["hf_token", "cloud_credentials", "s3", "oidc", "ge
 pub const RUN_USE: &str = "run";
 /// Largest value, in bytes.
 pub const MAX_VALUE: usize = 64 * 1024;
+/// The action that reads secret metadata.
+const READ: &str = "tenancy.read";
+/// The action that changes secrets.
+const MANAGE: &str = "secrets.manage";
 
 /// `POST /secrets` body.
 #[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
@@ -84,16 +98,6 @@ pub struct SecretMeta {
     pub rotated_at: Option<OffsetDateTime>,
 }
 
-/// `POST /secrets/{sec}/grants` body.
-#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
-#[serde(deny_unknown_fields)]
-pub struct NewGrant {
-    /// `run_…`.
-    pub run_id: String,
-    /// `env` (an environment variable) or `file` (a file in the run's folder).
-    pub mount: String,
-}
-
 /// A secret a run may receive, with its value. `Debug` hides the value.
 #[derive(Debug, Clone)]
 pub struct GrantedSecret {
@@ -120,11 +124,24 @@ struct Row {
     created_by: String,
     created_at: OffsetDateTime,
     rotated_at: Option<OffsetDateTime>,
+    deleting: bool,
+}
+
+impl Row {
+    /// What every check of this secret is authorized against.
+    fn resource(&self, org: &str) -> Resource {
+        owned(
+            "secret",
+            org,
+            SecretId::from_uuid(self.id).to_string(),
+            self.project_id.clone(),
+        )
+    }
 }
 
 macro_rules! columns {
     () => {
-        "id, project_id, name, backend, ref, kind, allowed_uses, created_by, created_at, rotated_at"
+        "id, project_id, name, backend, ref, kind, allowed_uses, created_by, created_at, rotated_at, deleting"
     };
 }
 
@@ -160,7 +177,8 @@ impl SecretResolver {
         Self { db, mode }
     }
 
-    async fn row(&self, org: &str, id: Uuid) -> Result<Row, Error> {
+    /// The secret, also while it is being deleted.
+    async fn row_any(&self, org: &str, id: Uuid) -> Result<Row, Error> {
         sqlx::query_as(concat!(
             "SELECT ",
             columns!(),
@@ -171,6 +189,62 @@ impl SecretResolver {
         .fetch_optional(self.db.pool())
         .await?
         .ok_or_else(|| not_found("secret"))
+    }
+
+    /// The secret, unless it is being deleted.
+    async fn row(&self, org: &str, id: Uuid) -> Result<Row, Error> {
+        let row = self.row_any(org, id).await?;
+        if row.deleting {
+            return Err(deleting(&row));
+        }
+        Ok(row)
+    }
+
+    /// Lets `run` receive `secret` of `org`, mounted as `env` or `file`. Call it inside the
+    /// transaction where the run's owner checked that `run` is a real run of `org` and that
+    /// the caller may attach secrets to it. The secret must allow the `run` use and not be
+    /// being deleted (its row is locked until `tx` ends, so a delete waits).
+    pub async fn grant(
+        &self,
+        tx: &mut Tx,
+        org: &str,
+        secret: SecretId,
+        run: RunId,
+        mount: &str,
+    ) -> Result<(), Error> {
+        if !matches!(mount, "env" | "file") {
+            return Err(field("/mount", "Use env or file."));
+        }
+        let row: Row = sqlx::query_as(concat!(
+            "SELECT ",
+            columns!(),
+            " FROM secrets_metadata WHERE org_id = $1 AND id = $2 FOR SHARE"
+        ))
+        .bind(org)
+        .bind(secret.as_uuid())
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| not_found("secret"))?;
+        if row.deleting {
+            return Err(deleting(&row));
+        }
+        if !row.allowed_uses.iter().any(|u| u == RUN_USE) {
+            return Err(Error::coded(
+                codes::SECRET_USE,
+                StatusCode::FORBIDDEN,
+                format!("The secret {:?} does not allow the use \"run\".", row.name),
+            ));
+        }
+        sqlx::query(
+            "INSERT INTO run_secret_grants (run_id, secret_id, mount) VALUES ($1, $2, $3)
+             ON CONFLICT (run_id, secret_id) DO UPDATE SET mount = EXCLUDED.mount",
+        )
+        .bind(run.as_uuid())
+        .bind(secret.as_uuid())
+        .bind(mount)
+        .execute(&mut **tx)
+        .await?;
+        Ok(())
     }
 
     /// The value of `secret` in `org` for `use_` (MRL-PERM-190 when the secret does not allow it).
@@ -195,9 +269,9 @@ impl SecretResolver {
     ) -> Result<Vec<GrantedSecret>, Error> {
         let rows: Vec<(String, Row)> = sqlx::query_as::<_, GrantRow>(
             "SELECT g.mount, s.id, s.project_id, s.name, s.backend, s.ref, s.kind, s.allowed_uses,
-                    s.created_by, s.created_at, s.rotated_at
+                    s.created_by, s.created_at, s.rotated_at, s.deleting
              FROM run_secret_grants g JOIN secrets_metadata s ON s.id = g.secret_id
-             WHERE s.org_id = $1 AND g.run_id = $2 ORDER BY s.name",
+             WHERE s.org_id = $1 AND g.run_id = $2 AND NOT s.deleting ORDER BY s.name",
         )
         .bind(org)
         .bind(run.as_uuid())
@@ -258,6 +332,17 @@ async fn value(
         .get(&row.reference)
         .await?
         .ok_or_else(empty)
+}
+
+fn deleting(row: &Row) -> Error {
+    Error::coded(
+        codes::SECRET_DELETING,
+        StatusCode::CONFLICT,
+        format!(
+            "The secret {:?} is being deleted. Delete it again to finish.",
+            row.name
+        ),
+    )
 }
 
 fn env_refused() -> Error {
@@ -373,7 +458,7 @@ pub(crate) async fn create(
     ctx: RequestContext,
     Json(new): Json<NewSecret>,
 ) -> Result<(StatusCode, Json<SecretMeta>), Error> {
-    s.authorize(&ctx, "secrets.manage", &resource(&ctx, "secret", None))
+    s.authorize(&ctx, MANAGE, &resource(&ctx, "secret", None))
         .await?;
     let uses = check_new(&new)?;
     if new.env_var.is_some() && s.config.server.mode != Mode::Solo {
@@ -433,18 +518,30 @@ pub(crate) async fn list(
     Extension(store): Extension<Arc<ArtifactStore>>,
     ctx: RequestContext,
 ) -> Result<Json<serde_json::Value>, Error> {
-    s.authorize(&ctx, "tenancy.read", &resource(&ctx, "secret", None))
+    s.authorize(&ctx, READ, &resource(&ctx, "secret", None))
         .await?;
+    let org = org_of(&ctx)?;
     // ponytail: no paging; an org has few secrets. Add PageQuery when that changes.
     let rows: Vec<Row> = sqlx::query_as(concat!(
         "SELECT ",
         columns!(),
-        " FROM secrets_metadata WHERE org_id = $1 ORDER BY name, id"
+        " FROM secrets_metadata WHERE org_id = $1 AND NOT deleting ORDER BY name, id"
     ))
-    .bind(org_of(&ctx)?)
+    .bind(&org)
     .fetch_all(store.db().pool())
     .await?;
-    let items: Vec<SecretMeta> = rows.into_iter().map(SecretMeta::from).collect();
+    // Each entry is checked like a GET of it.
+    let mut items: Vec<SecretMeta> = Vec::with_capacity(rows.len());
+    for row in rows {
+        if s.seams
+            .authorizer
+            .authorize(&ctx, READ, &row.resource(&org))
+            .await?
+            == Decision::Allow
+        {
+            items.push(row.into());
+        }
+    }
     Ok(Json(serde_json::json!({ "items": items })))
 }
 
@@ -458,10 +555,15 @@ pub(crate) async fn get(
     Path(sec): Path<String>,
 ) -> Result<Json<SecretMeta>, Error> {
     let id = parse_id(&sec)?;
-    s.authorize(&ctx, "tenancy.read", &resource(&ctx, "secret", Some(sec)))
+    let org = org_of(&ctx)?;
+    let row = SecretResolver::new(store.db().clone(), s.config.server.mode)
+        .row_any(&org, id)
         .await?;
-    let r = SecretResolver::new(store.db().clone(), s.config.server.mode);
-    Ok(Json(r.row(&org_of(&ctx)?, id).await?.into()))
+    s.authorize(&ctx, READ, &row.resource(&org)).await?;
+    if row.deleting {
+        return Err(deleting(&row));
+    }
+    Ok(Json(row.into()))
 }
 
 /// Saves a secret's value. Write-only: the answer has no body.
@@ -476,12 +578,11 @@ pub(crate) async fn set_value(
     body: Bytes,
 ) -> Result<StatusCode, Error> {
     let id = parse_id(&sec)?;
-    s.authorize(
-        &ctx,
-        "secrets.manage",
-        &resource(&ctx, "secret", Some(sec.clone())),
-    )
-    .await?;
+    let org = org_of(&ctx)?;
+    let row = SecretResolver::new(store.db().clone(), s.config.server.mode)
+        .row_any(&org, id)
+        .await?;
+    s.authorize(&ctx, MANAGE, &row.resource(&org)).await?;
     // Parsed by hand so no error message can echo the value.
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
@@ -499,23 +600,32 @@ pub(crate) async fn set_value(
     if value.is_empty() || value.len() > MAX_VALUE {
         return Err(field("/value", "The value needs 1 byte to 64 KiB."));
     }
-    let org = org_of(&ctx)?;
-    let row = SecretResolver::new(store.db().clone(), s.config.server.mode)
-        .row(&org, id)
-        .await?;
     if row.backend == "env" {
         return Err(field(
             "/value",
             "This secret reads an environment variable; set that variable on the server instead.",
         ));
     }
-    store_of(s.seams.secrets.as_ref())?
-        .set(&row.reference, Secret::new(value))
-        .await?;
+    let secrets = store_of(s.seams.secrets.as_ref())?;
+    // The row stays locked while the value is written: a delete waits for it, and a
+    // rotation that starts after a delete began is refused.
+    let mut tx = store.db().pool().begin().await?;
+    let locked: Option<bool> =
+        sqlx::query_scalar("SELECT deleting FROM secrets_metadata WHERE id = $1 FOR UPDATE")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    match locked {
+        None => return Err(not_found("secret")),
+        Some(true) => return Err(deleting(&row)),
+        Some(false) => {}
+    }
+    secrets.set(&row.reference, Secret::new(value)).await?;
     sqlx::query("UPDATE secrets_metadata SET rotated_at = now() WHERE id = $1")
         .bind(id)
-        .execute(store.db().pool())
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
     audit(&s, &ctx, &org, "secrets.set_value", sec).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -530,21 +640,33 @@ pub(crate) async fn delete(
     Path(sec): Path<String>,
 ) -> Result<StatusCode, Error> {
     let id = parse_id(&sec)?;
-    s.authorize(
-        &ctx,
-        "secrets.manage",
-        &resource(&ctx, "secret", Some(sec.clone())),
-    )
-    .await?;
     let org = org_of(&ctx)?;
     let row = SecretResolver::new(store.db().clone(), s.config.server.mode)
-        .row(&org, id)
+        .row_any(&org, id)
         .await?;
+    s.authorize(&ctx, MANAGE, &row.resource(&org)).await?;
+    // 1. Mark it. This waits for a rotation in progress (it holds the row lock) and makes
+    //    later rotations, grants and resolutions refuse it.
+    sqlx::query("UPDATE secrets_metadata SET deleting = true WHERE org_id = $1 AND id = $2")
+        .bind(&org)
+        .bind(id)
+        .execute(store.db().pool())
+        .await?;
+    // 2. Remove the value and make sure it is gone. A store error keeps the marked row, so
+    //    the reference is not lost; deleting again carries on from here.
     if row.backend == "secret_store" {
         if let Some(st) = s.seams.secrets.as_ref() {
             st.delete(&row.reference).await?;
+            if st.get(&row.reference).await?.is_some() {
+                return Err(ApiError::new(
+                    ErrorCode::Unavailable,
+                    "The secret store still has the value. Delete the secret again.",
+                )
+                .into());
+            }
         }
     }
+    // 3. The metadata, and with it the grants.
     sqlx::query("DELETE FROM secrets_metadata WHERE org_id = $1 AND id = $2")
         .bind(&org)
         .bind(id)
@@ -554,59 +676,10 @@ pub(crate) async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// Lets a run receive the secret.
-#[utoipa::path(post, path = "/secrets/{sec}/grants", tag = "secrets", request_body = NewGrant,
-    params(("sec" = String, Path, description = "`sec_…`")),
-    responses((status = 204, description = "Granted."), (status = 403, body = crate::error::Problem)))]
-pub(crate) async fn grant(
-    State(s): State<AppState>,
-    Extension(store): Extension<Arc<ArtifactStore>>,
-    ctx: RequestContext,
-    Path(sec): Path<String>,
-    Json(g): Json<NewGrant>,
-) -> Result<StatusCode, Error> {
-    let id = parse_id(&sec)?;
-    s.authorize(
-        &ctx,
-        "secrets.manage",
-        &resource(&ctx, "secret", Some(sec.clone())),
-    )
-    .await?;
-    let run = g
-        .run_id
-        .parse::<RunId>()
-        .map_err(|_| field("/run_id", "This is not a run id."))?;
-    if !matches!(g.mount.as_str(), "env" | "file") {
-        return Err(field("/mount", "Use env or file."));
-    }
-    let org = org_of(&ctx)?;
-    let row = SecretResolver::new(store.db().clone(), s.config.server.mode)
-        .row(&org, id)
-        .await?;
-    if !row.allowed_uses.iter().any(|u| u == RUN_USE) {
-        return Err(Error::coded(
-            codes::SECRET_USE,
-            StatusCode::FORBIDDEN,
-            format!("The secret {:?} does not allow the use \"run\".", row.name),
-        ));
-    }
-    sqlx::query(
-        "INSERT INTO run_secret_grants (run_id, secret_id, mount) VALUES ($1, $2, $3)
-         ON CONFLICT (run_id, secret_id) DO UPDATE SET mount = EXCLUDED.mount",
-    )
-    .bind(run.as_uuid())
-    .bind(id)
-    .bind(&g.mount)
-    .execute(store.db().pool())
-    .await?;
-    audit(&s, &ctx, &org, "secrets.grant", format!("{sec}->{run}")).await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(create, list, get, set_value, delete, grant),
-    components(schemas(NewSecret, SecretMeta, NewGrant)),
+    paths(create, list, get, set_value, delete),
+    components(schemas(NewSecret, SecretMeta)),
     tags((name = "secrets", description = "Secret references. Values are write-only."))
 )]
 pub(crate) struct Doc;

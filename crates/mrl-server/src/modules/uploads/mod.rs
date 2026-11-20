@@ -3,20 +3,22 @@
 //! 1. `POST /uploads {filename, size, sha256, part_size?}` opens an upload (24 h to finish).
 //! 2. Send parts `0..part_count`: `PUT /uploads/{up}/parts/{n}` (signed in), or ask
 //!    `POST /uploads/{up}:presign {parts}` for PUT tickets to `/api/v1/transfer/{ticket}`.
-//!    Every part but the last has exactly `part_size` bytes.
+//!    Every part but the last has exactly `part_size` bytes. On every backend (S3 too) part
+//!    tickets go through the server's transfer endpoint, never straight to the bucket: a
+//!    presigned S3 PUT can't limit its size, and the endpoint enforces key, expiry and size.
 //! 3. `GET /uploads/{up}` lists the parts that arrived, so a client resumes after a crash.
 //! 4. `POST /uploads/{up}:complete` joins the parts, checks the sha256 of the whole file and
 //!    stores it as the blob `orgs/{org}/blobs/sha256/…` (once per content). `:abort` cancels.
 //!
 //! Parts are objects under `orgs/{org}/uploads/{id}/parts/`. The cleanup job expires open
 //! uploads after 24 hours and deletes anything under `uploads/` older than that which no
-//! open upload owns.
+//! open upload owns, plus scratch folders a killed process left behind.
 
 use crate::app::AppState;
 use crate::error::{ApiError, ErrorCode, FieldError};
 use crate::http::BODY_LIMIT;
 use crate::modules::artifacts::{
-    codes, field, not_found, org_of, resource, split_action, ArtifactStore, Error,
+    codes, field, not_found, org_of, owned, resource, scratch, split_action, ArtifactStore, Error,
 };
 use crate::seams::RequestContext;
 use axum::body::Bytes;
@@ -32,6 +34,9 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
+
+/// The action every upload endpoint checks.
+pub(crate) const ACTION: &str = "uploads.write";
 
 /// Smallest part size.
 pub const MIN_PART_SIZE: u64 = 1 << 20;
@@ -102,12 +107,21 @@ pub struct PresignRequest {
     pub parts: Option<Vec<u64>>,
 }
 
+/// `POST /uploads/{up}:presign` answer.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct PresignResponse {
+    /// One ticket per part asked for.
+    pub tickets: Vec<PartTicket>,
+}
+
 /// One PUT ticket per part.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct PartTicket {
     /// Part number.
     pub part: u64,
-    /// The ticket: `PUT` its `url` with the part's bytes.
+    /// The ticket: `PUT` its `url` (the server's `/api/v1/transfer/{ticket}`, so
+    /// `presigned` is false on every backend) with exactly the part's bytes. It expires after
+    /// 10 minutes and allows this one part's key and size.
     #[schema(value_type = Object)]
     pub ticket: TransferTicket,
 }
@@ -183,6 +197,25 @@ fn closed(row: &Row) -> Error {
         StatusCode::CONFLICT,
         format!("This upload is {state} and takes no more changes."),
     )
+}
+
+/// The upload `up` of the caller's org, if the caller may see it: the same check as
+/// lineage links to it (`ACTION` on the upload with its recorded project).
+async fn load_visible(
+    s: &AppState,
+    store: &ArtifactStore,
+    ctx: &RequestContext,
+    org: &str,
+    up: &str,
+) -> Result<Row, Error> {
+    let row = load(store, org, up).await?;
+    s.authorize(
+        ctx,
+        ACTION,
+        &owned("upload", org, row.key(), row.project_id.clone()),
+    )
+    .await?;
+    Ok(row)
 }
 
 async fn load(store: &ArtifactStore, org: &str, up: &str) -> Result<Row, Error> {
@@ -288,7 +321,7 @@ pub(crate) async fn create(
     ctx: RequestContext,
     Json(new): Json<NewUpload>,
 ) -> Result<(StatusCode, Json<Upload>), Error> {
-    s.authorize(&ctx, "uploads.write", &resource(&ctx, "upload", None))
+    s.authorize(&ctx, ACTION, &resource(&ctx, "upload", None))
         .await?;
     let part_size = check_new(&new)?;
     let org = org_of(&ctx)?;
@@ -322,16 +355,10 @@ pub(crate) async fn get(
     ctx: RequestContext,
     Path(up): Path<String>,
 ) -> Result<Json<Upload>, Error> {
-    s.authorize(
-        &ctx,
-        "uploads.write",
-        &resource(&ctx, "upload", Some(up.clone())),
-    )
-    .await?;
     let org = org_of(&ctx)?;
-    let row = load(&store, &org, &up).await?;
+    let row = load_visible(&s, &store, &ctx, &org, &up).await?;
     let parts = if row.state == "OPEN" {
-        let st = store.org_store(&s, &org).await?;
+        let st = store.org_store(s.seams.secrets.as_ref(), &org).await?;
         received(&st, &row)
             .await?
             .into_iter()
@@ -357,14 +384,8 @@ pub(crate) async fn put_part(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, Error> {
-    s.authorize(
-        &ctx,
-        "uploads.write",
-        &resource(&ctx, "upload", Some(up.clone())),
-    )
-    .await?;
     let org = org_of(&ctx)?;
-    let row = load(&store, &org, &up).await?;
+    let row = load_visible(&s, &store, &ctx, &org, &up).await?;
     if !row.is_open() {
         return Err(closed(&row));
     }
@@ -393,17 +414,15 @@ pub(crate) async fn put_part(
             .into());
         }
     }
-    let st = store.org_store(&s, &org).await?;
+    let st = store.org_store(s.seams.secrets.as_ref(), &org).await?;
     st.put(&part_key(&st, &row, n)?, body).await?;
     Ok(Json(
         serde_json::json!({ "part": n, "size": want, "sha256": sha }),
     ))
 }
 
-/// `POST /uploads/{up}:complete`, `:abort` or `:presign`.
-#[utoipa::path(post, path = "/uploads/{up}:complete", tag = "uploads",
-    params(("up" = String, Path, description = "`up_…`")),
-    responses((status = 200, body = Upload), (status = 409, body = crate::error::Problem), (status = 422, body = crate::error::Problem)))]
+/// `POST /uploads/{up}:complete`, `:abort` or `:presign` (one route; each is documented as
+/// its own operation below).
 pub(crate) async fn action(
     State(s): State<AppState>,
     Extension(store): Extension<Arc<ArtifactStore>>,
@@ -412,17 +431,9 @@ pub(crate) async fn action(
     body: Bytes,
 ) -> Result<Json<serde_json::Value>, Error> {
     let (up, act) = split_action(&segment);
-    s.authorize(
-        &ctx,
-        "uploads.write",
-        &resource(&ctx, "upload", Some(up.to_owned())),
-    )
-    .await?;
-    let org = org_of(&ctx)?;
-    let row = load(&store, &org, up).await?;
     match act {
-        Some("complete") => json(complete(&s, &store, &org, row).await?),
-        Some("abort") => json(abort(&s, &store, &org, row).await?),
+        Some("complete") => json(complete_upload(&s, &store, &ctx, up).await?),
+        Some("abort") => json(abort_upload(&s, &store, &ctx, up).await?),
         Some("presign") => {
             let req: PresignRequest = if body.is_empty() {
                 PresignRequest::default()
@@ -434,8 +445,7 @@ pub(crate) async fn action(
                     )
                 })?
             };
-            let tickets = presign(&s, &store, &ctx, &org, row, req).await?;
-            Ok(Json(serde_json::json!({ "tickets": tickets })))
+            json(presign_upload(&s, &store, &ctx, up, req).await?)
         }
         _ => Err(ApiError::new(ErrorCode::RouteNotFound, "No endpoint has this path.").into()),
     }
@@ -445,18 +455,24 @@ fn json(v: impl Serialize) -> Result<Json<serde_json::Value>, Error> {
     Ok(Json(serde_json::to_value(v).unwrap_or_default()))
 }
 
-async fn presign(
+/// Asks for PUT tickets for parts (default: every part not received yet, at most 1000).
+/// The tickets point at the server's transfer endpoint on every backend.
+#[utoipa::path(post, path = "/uploads/{up}:presign", tag = "uploads", request_body(content = PresignRequest, description = "Optional; an empty body asks for every missing part."),
+    params(("up" = String, Path, description = "`up_…`")),
+    responses((status = 200, body = PresignResponse), (status = 409, body = crate::error::Problem), (status = 422, body = crate::error::Problem)))]
+async fn presign_upload(
     s: &AppState,
     store: &ArtifactStore,
     ctx: &RequestContext,
-    org: &str,
-    row: Row,
+    up: &str,
     req: PresignRequest,
-) -> Result<Vec<PartTicket>, Error> {
+) -> Result<PresignResponse, Error> {
+    let org = org_of(ctx)?;
+    let row = load_visible(s, store, ctx, &org, up).await?;
     if !row.is_open() {
         return Err(closed(&row));
     }
-    let st = store.org_store(s, org).await?;
+    let st = store.org_store(s.seams.secrets.as_ref(), &org).await?;
     let parts = match req.parts {
         Some(p) => p,
         None => {
@@ -484,10 +500,21 @@ async fn presign(
             .await?;
         out.push(PartTicket { part: n, ticket });
     }
-    Ok(out)
+    Ok(PresignResponse { tickets: out })
 }
 
-async fn abort(s: &AppState, store: &ArtifactStore, org: &str, row: Row) -> Result<Upload, Error> {
+/// Cancels an open upload and deletes its parts.
+#[utoipa::path(post, path = "/uploads/{up}:abort", tag = "uploads",
+    params(("up" = String, Path, description = "`up_…`")),
+    responses((status = 200, body = Upload), (status = 404, body = crate::error::Problem), (status = 409, body = crate::error::Problem)))]
+async fn abort_upload(
+    s: &AppState,
+    store: &ArtifactStore,
+    ctx: &RequestContext,
+    up: &str,
+) -> Result<Upload, Error> {
+    let org = &org_of(ctx)?;
+    let row = load_visible(s, store, ctx, org, up).await?;
     let done = sqlx::query(
         "UPDATE uploads SET state = 'ABORTED', finished_at = now() WHERE id = $1 AND state = 'OPEN'",
     )
@@ -498,22 +525,32 @@ async fn abort(s: &AppState, store: &ArtifactStore, org: &str, row: Row) -> Resu
     if done == 0 {
         return Err(closed(&row));
     }
-    delete_parts(&store.org_store(s, org).await?, &row.key()).await?;
+    delete_parts(
+        &store.org_store(s.seams.secrets.as_ref(), org).await?,
+        &row.key(),
+    )
+    .await?;
     let row = load(store, org, &row.key()).await?;
     Ok(row.into_upload(Vec::new()))
 }
 
-/// Joins the parts into a temporary file while hashing, checks the sha256, stores the blob.
-async fn complete(
+/// Finishes an upload: joins the parts while hashing, checks the sha256 of the whole file
+/// and stores it as `blobs/sha256/…` (once per content).
+#[utoipa::path(post, path = "/uploads/{up}:complete", tag = "uploads",
+    params(("up" = String, Path, description = "`up_…`")),
+    responses((status = 200, body = Upload), (status = 409, body = crate::error::Problem), (status = 422, body = crate::error::Problem)))]
+async fn complete_upload(
     s: &AppState,
     store: &ArtifactStore,
-    org: &str,
-    row: Row,
+    ctx: &RequestContext,
+    up: &str,
 ) -> Result<Upload, Error> {
+    let org = &org_of(ctx)?;
+    let row = load_visible(s, store, ctx, org, up).await?;
     if !row.is_open() {
         return Err(closed(&row));
     }
-    let st = store.org_store(s, org).await?;
+    let st = store.org_store(s.seams.secrets.as_ref(), org).await?;
     let have = received(&st, &row).await?;
     let wrong: Vec<String> = (0..row.part_count())
         .filter_map(|n| match have.get(&n) {
@@ -534,16 +571,9 @@ async fn complete(
             ),
         ));
     }
-    let tmp = std::env::temp_dir().join(format!(
-        "mrl-upload-{}-{}",
-        row.key(),
-        Uuid::new_v4().simple()
-    ));
-    let result = join_and_store(&st, &row, &tmp).await;
-    for p in [tmp.clone(), ledger_of(&tmp)] {
-        let _ = tokio::fs::remove_file(p).await;
-    }
-    let blob = result?;
+    let dir = store.scratch_dir()?;
+    let blob = join_and_store(&st, &row, &dir.path().join("file")).await?;
+    scratch::close(dir)?;
     let done = sqlx::query(
         "UPDATE uploads SET state = 'COMPLETED', blob_key = $2, finished_at = now()
          WHERE id = $1 AND state = 'OPEN'",
@@ -558,13 +588,6 @@ async fn complete(
     }
     delete_parts(&st, &row.key()).await?;
     Ok(load(store, org, &row.key()).await?.into_upload(Vec::new()))
-}
-
-/// `upload_file` keeps its resume ledger next to the file.
-pub(crate) fn ledger_of(path: &std::path::Path) -> std::path::PathBuf {
-    let mut name = path.file_name().unwrap_or_default().to_owned();
-    name.push(".mrl-upload.json");
-    path.with_file_name(name)
 }
 
 async fn join_and_store(st: &Store, row: &Row, tmp: &std::path::Path) -> Result<String, Error> {
@@ -605,7 +628,8 @@ async fn join_and_store(st: &Store, row: &Row, tmp: &std::path::Path) -> Result<
 }
 
 /// Stores the local file `tmp` of `size` bytes at `key`: one put up to 16 MiB, else a
-/// parallel multipart transfer. The caller deletes `tmp` and its [`ledger_of`] file.
+/// parallel multipart transfer, whose ledger sits next to `tmp` (keep both in a scratch
+/// folder).
 pub(crate) async fn store_file(
     st: &Store,
     tmp: &std::path::Path,
@@ -634,11 +658,13 @@ pub struct Swept {
     pub objects: u64,
     /// Artifacts left PENDING for 24 hours, now FAILED.
     pub stale_artifacts: u64,
+    /// Scratch folders older than 24 hours (left by a killed process), deleted.
+    pub scratch: u64,
 }
 
 /// One cleanup pass: expires open uploads after 24 hours, deletes objects under each org's
 /// `uploads/` older than 24 hours that no open upload owns, and fails artifacts left
-/// PENDING for 24 hours.
+/// PENDING for 24 hours, and deletes scratch folders older than 24 hours.
 pub async fn sweep(store: &ArtifactStore) -> Result<Swept, Error> {
     let pool = store.db().pool();
     let expired = sqlx::query(
@@ -680,17 +706,50 @@ pub async fn sweep(store: &ArtifactStore) -> Result<Swept, Error> {
             }
         }
     }
+    let root = store.scratch_root().to_owned();
+    let scratch = tokio::task::spawn_blocking(move || scratch::sweep(&root))
+        .await
+        .unwrap_or(0);
     Ok(Swept {
         expired,
         objects,
         stale_artifacts,
+        scratch,
     })
 }
 
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(create, get, put_part, action),
-    components(schemas(NewUpload, Upload, PresignRequest, PartTicket)),
-    tags((name = "uploads", description = "Resumable uploads. Also `POST /uploads/{up}:abort` and `POST /uploads/{up}:presign` (body `PresignRequest`, answer `{tickets: [PartTicket]}`)."))
+    paths(create, get, put_part, complete_upload, abort_upload, presign_upload),
+    components(schemas(NewUpload, Upload, PresignRequest, PresignResponse, PartTicket)),
+    tags((name = "uploads", description = "Resumable uploads."))
 )]
 pub(crate) struct Doc;
+
+#[cfg(test)]
+mod tests {
+    use utoipa::OpenApi;
+
+    #[test]
+    fn each_upload_action_is_its_own_operation() {
+        let doc = super::Doc::openapi();
+        for (path, id) in [
+            ("/uploads/{up}:complete", "complete_upload"),
+            ("/uploads/{up}:abort", "abort_upload"),
+            ("/uploads/{up}:presign", "presign_upload"),
+        ] {
+            let post = doc
+                .paths
+                .paths
+                .get(path)
+                .and_then(|p| p.post.as_ref())
+                .unwrap_or_else(|| panic!("POST {path} is documented"));
+            assert_eq!(post.operation_id.as_deref(), Some(id), "{path}");
+        }
+        let presign = serde_json::to_string(&doc.paths.paths["/uploads/{up}:presign"]).unwrap();
+        assert!(presign.contains("PresignRequest") && presign.contains("PresignResponse"));
+        let tickets =
+            serde_json::to_string(&doc.components.unwrap().schemas["PartTicket"]).unwrap();
+        assert!(tickets.contains("/api/v1/transfer/{ticket}"), "{tickets}");
+    }
+}

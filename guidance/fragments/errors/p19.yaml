@@ -15,6 +15,14 @@ errors:
       steps:
         - Start a new upload for the file.
 
+  - code: MRL-CONFLICT-192
+    title: This secret is being deleted.
+    why: Someone started deleting this secret, so its value can't be changed or read any more. A delete that stopped halfway leaves it in this state.
+    what_to_do:
+      steps:
+        - Delete the secret again to finish.
+        - Then create a new secret if you still need one.
+
   - code: MRL-STORE-190
     title: Some parts of this upload are missing or the wrong size.
     why: The app can finish an upload only when every part has arrived at its full size. Details list the parts.
@@ -41,8 +49,9 @@ errors:
 
   - code: MRL-ENV-190
     title: This server has no place to keep secret values.
-    why: The server was started without a secret store, so it can't save or read secret values.
+    why: The server was started without a secret store, so it can't save or read secret values. A team server also needs it to sign download and upload links that every server copy accepts.
     what_to_do:
       steps:
         - Start the server from the desktop app, which keeps secrets in your computer's keychain.
-        - Or use a secret read from an environment variable.
+        - On a solo server, you can also use a secret read from an environment variable.
+        - On a team server, ask your admin to set up the shared secret store.

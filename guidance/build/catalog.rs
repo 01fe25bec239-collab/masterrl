@@ -2205,6 +2205,17 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-CONFLICT-192")),
+            ("title", Value::Str("This secret is being deleted.")),
+            ("why", Value::Str("Someone started deleting this secret, so its value can't be changed or read any more. A delete that stopped halfway leaves it in this state.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Delete the secret again to finish."),
+                    Value::Str("Then create a new secret if you still need one."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-DATA-001")),
             ("title", Value::Str("Your dataset did not pass its checks.")),
             ("why", Value::Str("Some rows are empty, are missing fields, or don't match the chosen format.")),
@@ -2491,11 +2502,12 @@ pub static CATALOG: Value = Value::Map(&[
         Value::Map(&[
             ("code", Value::Str("MRL-ENV-190")),
             ("title", Value::Str("This server has no place to keep secret values.")),
-            ("why", Value::Str("The server was started without a secret store, so it can't save or read secret values.")),
+            ("why", Value::Str("The server was started without a secret store, so it can't save or read secret values. A team server also needs it to sign download and upload links that every server copy accepts.")),
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Start the server from the desktop app, which keeps secrets in your computer's keychain."),
-                    Value::Str("Or use a secret read from an environment variable."),
+                    Value::Str("On a solo server, you can also use a secret read from an environment variable."),
+                    Value::Str("On a team server, ask your admin to set up the shared secret store."),
                 ])),
             ])),
         ]),

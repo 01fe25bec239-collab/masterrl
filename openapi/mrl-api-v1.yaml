@@ -95,7 +95,7 @@ paths:
       tags:
       - artifacts
       summary: '`POST /artifacts/{art}:download` → a GET ticket for one file of a committed artifact.'
-      operationId: action
+      operationId: download_artifact
       parameters:
       - name: art
         in: path
@@ -136,7 +136,9 @@ paths:
           type: string
       - name: direction
         in: query
-        description: '`upstream`, `downstream` or `both` (default).'
+        description: |-
+          `up` (what the node came from), `down` (what came from it) or `both` (default).
+          `upstream` and `downstream` work too.
         required: false
         schema:
           type: string
@@ -232,33 +234,6 @@ paths:
         '204':
           description: Deleted.
         '404':
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/Problem'
-  /api/v1/secrets/{sec}/grants:
-    post:
-      tags:
-      - secrets
-      summary: Lets a run receive the secret.
-      operationId: grant
-      parameters:
-      - name: sec
-        in: path
-        description: '`sec_…`'
-        required: true
-        schema:
-          type: string
-      requestBody:
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/NewGrant'
-        required: true
-      responses:
-        '204':
-          description: Granted.
-        '403':
           content:
             application/json:
               schema:
@@ -445,12 +420,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
-  /api/v1/uploads/{up}:complete:
+  /api/v1/uploads/{up}:abort:
     post:
       tags:
       - uploads
-      summary: '`POST /uploads/{up}:complete`, `:abort` or `:presign`.'
-      operationId: action
+      summary: Cancels an open upload and deletes its parts.
+      operationId: abort_upload
       parameters:
       - name: up
         in: path
@@ -464,6 +439,75 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Upload'
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/uploads/{up}:complete:
+    post:
+      tags:
+      - uploads
+      summary: |-
+        Finishes an upload: joins the parts while hashing, checks the sha256 of the whole file
+        and stores it as `blobs/sha256/…` (once per content).
+      operationId: complete_upload
+      parameters:
+      - name: up
+        in: path
+        description: '`up_…`'
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Upload'
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/uploads/{up}:presign:
+    post:
+      tags:
+      - uploads
+      summary: |-
+        Asks for PUT tickets for parts (default: every part not received yet, at most 1000).
+        The tickets point at the server's transfer endpoint on every backend.
+      operationId: presign_upload
+      parameters:
+      - name: up
+        in: path
+        description: '`up_…`'
+        required: true
+        schema:
+          type: string
+      requestBody:
+        description: Optional; an empty body asks for every missing part.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PresignRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PresignResponse'
         '409':
           content:
             application/json:
@@ -548,7 +592,9 @@ components:
           description: Name.
         prefix:
           type: string
-          description: Full key prefix of the files.
+          description: |-
+            Full key prefix the files were registered from. Downloads read the checked copies in
+            `blobs/sha256/…`, so later changes there do not matter.
         project_id:
           type:
           - string
@@ -692,20 +738,6 @@ components:
           - 'null'
           description: Project, if the artifact belongs to one.
       additionalProperties: false
-    NewGrant:
-      type: object
-      description: '`POST /secrets/{sec}/grants` body.'
-      required:
-      - run_id
-      - mount
-      properties:
-        mount:
-          type: string
-          description: '`env` (an environment variable) or `file` (a file in the run''s folder).'
-        run_id:
-          type: string
-          description: '`run_…`.'
-      additionalProperties: false
     NewLink:
       type: object
       description: |-
@@ -822,7 +854,10 @@ components:
           minimum: 0
         ticket:
           type: object
-          description: 'The ticket: `PUT` its `url` with the part''s bytes.'
+          description: |-
+            The ticket: `PUT` its `url` (the server's `/api/v1/transfer/{ticket}`, so
+            `presigned` is false on every backend) with exactly the part's bytes. It expires after
+            10 minutes and allows this one part's key and size.
     PresignRequest:
       type: object
       description: '`POST /uploads/{up}:presign` body.'
@@ -837,6 +872,17 @@ components:
             minimum: 0
           description: 'Part numbers; default: every part not received yet (at most 1000).'
       additionalProperties: false
+    PresignResponse:
+      type: object
+      description: '`POST /uploads/{up}:presign` answer.'
+      required:
+      - tickets
+      properties:
+        tickets:
+          type: array
+          items:
+            $ref: '#/components/schemas/PartTicket'
+          description: One ticket per part asked for.
     Problem:
       type: object
       description: RFC 9457 problem document.
@@ -1030,7 +1076,7 @@ tags:
 - name: artifacts
   description: Generic artifacts and the transfer endpoint.
 - name: uploads
-  description: 'Resumable uploads. Also `POST /uploads/{up}:abort` and `POST /uploads/{up}:presign` (body `PresignRequest`, answer `{tickets: [PartTicket]}`).'
+  description: Resumable uploads.
 - name: lineage
   description: Where entities came from and what came from them.
 - name: secrets

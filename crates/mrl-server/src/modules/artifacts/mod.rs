@@ -14,19 +14,20 @@
 //! ```
 
 mod error;
+pub(crate) mod scratch;
 mod transfer;
 
 pub use error::{codes, render, Error};
 pub use transfer::SHA256_HEADER;
 
 use crate::app::{AppState, ServerModule, Task};
-use crate::config::{Config, Role};
+use crate::config::{Config, Mode, Role};
 use crate::db::{Db, LeaderElection};
 use crate::error::{ApiError, ErrorCode, FieldError};
 use crate::http::pagination::{Page, PageQuery};
 use crate::modules::lineage::{LineageWriter, NodeRef, Relation};
 use crate::seams::{
-    AuditEvent, AuditOutcome, PrincipalKind, RequestContext, Resource, SecretStore,
+    AuditEvent, AuditOutcome, Decision, PrincipalKind, RequestContext, Resource, SecretStore,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -36,7 +37,7 @@ use axum::{Extension, Json, Router};
 use mrl_domain::ids::ArtifactId;
 use mrl_storage::{
     verify_ticket, ArtifactManifest, Backend, BackendConfig, S3Config, StorageError, Store,
-    TicketClaims, TicketKey, TicketMethod, TransferTicket,
+    TicketClaims, TicketKey, TicketMethod, TransferOptions, TransferTicket,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -58,23 +59,31 @@ const SWEEP_EVERY: Duration = Duration::from_secs(3600);
 /// The module: routes, the cleanup job and the shared [`ArtifactStore`].
 pub struct ArtifactsModule {
     store: Arc<ArtifactStore>,
-    mode: crate::config::Mode,
 }
 
 impl ArtifactsModule {
     /// The module for this database and these settings. Connects to storage on first use.
     pub fn new(db: Db, config: &Config) -> Self {
         Self {
-            store: Arc::new(ArtifactStore::new(db, backend_config(config))),
-            mode: config.server.mode,
+            store: Arc::new(ArtifactStore::new(
+                db,
+                backend_config(config),
+                config.server.mode,
+                scratch::default_root(),
+            )),
         }
     }
 
-    /// The module with an explicit backend, for a server in `mode` (tests and embedders).
-    pub fn with_backend(db: Db, backend: BackendConfig, mode: crate::config::Mode) -> Self {
+    /// The module with an explicit backend, for a server in `mode`, keeping request scratch
+    /// folders under `scratch_root` (tests and embedders).
+    pub fn with_backend(
+        db: Db,
+        backend: BackendConfig,
+        mode: Mode,
+        scratch_root: std::path::PathBuf,
+    ) -> Self {
         Self {
-            store: Arc::new(ArtifactStore::new(db, Ok(backend))),
-            mode,
+            store: Arc::new(ArtifactStore::new(db, Ok(backend), mode, scratch_root)),
         }
     }
 
@@ -85,7 +94,7 @@ impl ArtifactsModule {
 
     /// The secret resolver, for other modules (P20 delivers granted secrets with it).
     pub fn secrets(&self) -> crate::modules::secrets::SecretResolver {
-        crate::modules::secrets::SecretResolver::new(self.store.db.clone(), self.mode)
+        crate::modules::secrets::SecretResolver::new(self.store.db.clone(), self.store.mode)
     }
 }
 
@@ -106,7 +115,6 @@ impl ServerModule for ArtifactsModule {
             .route("/secrets", get(secrets::list).post(secrets::create))
             .route("/secrets/{sec}", get(secrets::get).delete(secrets::delete))
             .route("/secrets/{sec}/value", put(secrets::set_value))
-            .route("/secrets/{sec}/grants", post(secrets::grant))
             .route_layer(from_fn(render))
             .layer(Extension(self.store.clone()))
     }
@@ -114,7 +122,7 @@ impl ServerModule for ArtifactsModule {
     fn public_routes(&self) -> Router<AppState> {
         Router::new()
             .route(
-                "/transfer/{token}",
+                "/transfer/{ticket}",
                 get(transfer::download).put(transfer::upload),
             )
             .route_layer(from_fn(render))
@@ -171,13 +179,10 @@ fn backend_config(config: &Config) -> Result<BackendConfig, String> {
             root: url.trim_start_matches("file://").into(),
         }),
         Some(url) => {
+            // Config validation refuses a path after the bucket: objects live under `orgs/`
+            // at the bucket root.
             let rest = url.trim_start_matches("s3://");
-            let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
-            if !prefix.trim_matches('/').is_empty() {
-                // ponytail: keys always start at `orgs/` in the bucket; a path prefix needs
-                // mrl-storage support (object_store PrefixStore).
-                tracing::warn!(url, "object_store.url: the path after the bucket is not used; objects go under orgs/ at the bucket root");
-            }
+            let bucket = rest.split('/').next().unwrap_or(rest);
             Ok(BackendConfig::S3(S3Config {
                 bucket: bucket.to_owned(),
                 region: "us-east-1".to_owned(),
@@ -204,16 +209,35 @@ fn backend_config(config: &Config) -> Result<BackendConfig, String> {
 pub struct ArtifactStore {
     pub(crate) db: Db,
     config: Result<BackendConfig, String>,
+    mode: Mode,
+    scratch: std::path::PathBuf,
     backend: OnceCell<(Backend, TicketKey)>,
 }
 
 impl ArtifactStore {
-    fn new(db: Db, config: Result<BackendConfig, String>) -> Self {
+    fn new(
+        db: Db,
+        config: Result<BackendConfig, String>,
+        mode: Mode,
+        scratch: std::path::PathBuf,
+    ) -> Self {
         Self {
             db,
             config,
+            mode,
+            scratch,
             backend: OnceCell::new(),
         }
+    }
+
+    /// A new private scratch folder (see [`scratch`]).
+    pub(crate) fn scratch_dir(&self) -> Result<tempfile::TempDir, Error> {
+        scratch::dir(&self.scratch)
+    }
+
+    /// Where scratch folders live.
+    pub(crate) fn scratch_root(&self) -> &std::path::Path {
+        &self.scratch
     }
 
     /// The database.
@@ -232,8 +256,8 @@ impl ArtifactStore {
         Ok(Backend::connect(config)?)
     }
 
-    /// The backend with its ticket key. The key comes from the `SecretStore` (made once);
-    /// without one, each process makes its own.
+    /// The backend with its ticket key (see [`ticket_key`]). A failure is not kept: the next
+    /// call tries again.
     pub async fn backend(&self, secrets: Option<&Arc<dyn SecretStore>>) -> Result<&Backend, Error> {
         Ok(&self.keyed(secrets).await?.0)
     }
@@ -244,20 +268,21 @@ impl ArtifactStore {
     ) -> Result<&(Backend, TicketKey), Error> {
         self.backend
             .get_or_try_init(|| async {
-                let key = ticket_key(secrets).await?;
+                let key = ticket_key(&self.db, self.mode, secrets).await?;
                 Ok::<_, Error>((self.connect()?.with_ticket_key(key.clone()), key))
             })
             .await
     }
 
-    /// Checks a ticket token for `method` and returns what it allows.
+    /// Checks a ticket token for `method` and returns what it allows. `secrets` is the
+    /// server's `SecretStore` (`state.seams.secrets`), which holds the shared signing key.
     pub async fn verify(
         &self,
-        state: &AppState,
+        secrets: Option<&Arc<dyn SecretStore>>,
         token: &str,
         method: TicketMethod,
     ) -> Result<TicketClaims, Error> {
-        let (_, key) = self.keyed(state.seams.secrets.as_ref()).await?;
+        let (_, key) = self.keyed(secrets).await?;
         Ok(verify_ticket(
             key,
             token,
@@ -266,9 +291,14 @@ impl ArtifactStore {
         )?)
     }
 
-    /// A store for `org`.
-    pub async fn org_store(&self, state: &AppState, org: &str) -> Result<Store, Error> {
-        Ok(self.backend(state.seams.secrets.as_ref()).await?.org(org)?)
+    /// A store for `org`, signing tickets with the shared key. `secrets` is the server's
+    /// `SecretStore` (`state.seams.secrets`).
+    pub async fn org_store(
+        &self,
+        secrets: Option<&Arc<dyn SecretStore>>,
+        org: &str,
+    ) -> Result<Store, Error> {
+        Ok(self.backend(secrets).await?.org(org)?)
     }
 
     /// A backend without a ticket key, for the cleanup job.
@@ -277,6 +307,7 @@ impl ArtifactStore {
     }
 
     /// A transfer ticket for `key` in the caller's org. GET tickets (downloads) are audited.
+    /// PUT tickets never point into `blobs/`, where committed content lives.
     pub async fn ticket(
         &self,
         state: &AppState,
@@ -286,9 +317,11 @@ impl ArtifactStore {
         max_size: u64,
     ) -> Result<TransferTicket, Error> {
         let org = org_of(ctx)?;
-        let ticket = self
-            .org_store(state, &org)
-            .await?
+        let store = self.org_store(state.seams.secrets.as_ref(), &org).await?;
+        if method == TicketMethod::Put && is_immutable(&store, key) {
+            return Err(immutable());
+        }
+        let ticket = store
             .transfer_ticket(key, method, max_size, TICKET_TTL)
             .await?;
         if method == TicketMethod::Get {
@@ -310,9 +343,12 @@ impl ArtifactStore {
         Ok(ticket)
     }
 
-    /// Registers an artifact in two phases: a PENDING row reserves the name, every object
-    /// is checked against the manifest (size and sha256), then the row is COMMITTED with its
-    /// lineage links in one transaction. A mismatch marks it FAILED (MRL-STORE-011).
+    /// Registers an artifact in two phases: a PENDING row reserves the name; every file is
+    /// copied into content-addressed storage (`blobs/sha256/…`) and the copy is checked
+    /// against the manifest (size and sha256); then the row is COMMITTED with its lineage
+    /// links in one transaction. Any failure after the reservation marks it FAILED (a
+    /// mismatch is MRL-STORE-011) and frees the name. Downloads read the copies, so changing
+    /// the source files later can't change a committed artifact.
     pub async fn register(
         &self,
         state: &AppState,
@@ -329,6 +365,7 @@ impl ArtifactStore {
         })?;
         let manifest = ArtifactManifest::from_json(&manifest_json)?;
         let name = check_name(&new.name, "/name")?;
+        let size = total_size(&manifest)?;
         let links = new
             .links
             .iter()
@@ -336,18 +373,12 @@ impl ArtifactStore {
             .map(|(i, l)| l.parse(i))
             .collect::<Result<Vec<_>, _>>()?;
         for (i, (from, _, to)) in links.iter().enumerate() {
-            let other = from.or(*to).filter(|n| matches!(n.kind, "art" | "up"));
-            if let Some(n) = other {
-                if !crate::modules::lineage::belongs(&self.db, &org, n).await? {
-                    return Err(field(
-                        &format!("/links/{i}"),
-                        "No item with this id exists here.",
-                    ));
-                }
+            if let Some(n) = from.or(*to) {
+                self.check_link(state, ctx, &org, i, n).await?;
             }
         }
         let id = state.seams.ids.new_uuid();
-        let store = self.org_store(state, &org).await?;
+        let store = self.org_store(state.seams.secrets.as_ref(), &org).await?;
         let prefix = match &new.prefix {
             Some(p) => {
                 let full = format!("{}{}", store.keys().prefix(), p.trim_start_matches('/'));
@@ -366,8 +397,8 @@ impl ArtifactStore {
                 ArtifactId::from_uuid(id)
             ),
         };
-        // Staging areas are cleaned up or overwritten (upload parts, checkpoint attempts), so a
-        // committed artifact may never point into one.
+        // Staging areas are cleaned up or rewritten (upload parts, checkpoint attempts):
+        // register the finished upload or checkpoint instead.
         for f in &manifest.files {
             let key = store.keys().join(&prefix, &f.path)?;
             if is_staging(&key[store.keys().prefix().len()..]) {
@@ -377,7 +408,6 @@ impl ArtifactStore {
                 ));
             }
         }
-        let size: u64 = manifest.files.iter().map(|f| f.size).sum();
         let inserted = sqlx::query(
             "INSERT INTO artifacts (id, org_id, project_id, name, kind, prefix, manifest, size_bytes, state, created_by)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'PENDING', $9)",
@@ -389,7 +419,7 @@ impl ArtifactStore {
         .bind(kind_str(&manifest))
         .bind(&prefix)
         .bind(&new.manifest)
-        .bind(i64::try_from(size).unwrap_or(i64::MAX))
+        .bind(size)
         .bind(&ctx.principal.id)
         .execute(self.db.pool())
         .await;
@@ -403,42 +433,33 @@ impl ArtifactStore {
             }
             other => other?,
         };
-        let verified = manifest
-            .verify(&store, true, |f| store.keys().join(&prefix, &f.path))
-            .await;
-        if let Err(e) = verified {
+        let done = match snapshot(self, &store, &prefix, &manifest).await {
+            Ok(()) => self.commit(&org, id, &links).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = done {
             sqlx::query(
                 "UPDATE artifacts SET state = 'FAILED' WHERE id = $1 AND state = 'PENDING'",
             )
             .bind(id)
             .execute(self.db.pool())
             .await?;
-            return Err(match e {
-                StorageError::ManifestMismatch(problems) => {
-                    let list: Vec<String> = problems
-                        .iter()
-                        .take(20)
-                        .map(|p| serde_json::to_string(p).unwrap_or_default())
-                        .collect();
-                    Error::coded(
-                        "MRL-STORE-011",
-                        StatusCode::UNPROCESSABLE_ENTITY,
-                        format!(
-                            "{} file(s) do not match the manifest: {}",
-                            problems.len(),
-                            list.join(", ")
-                        ),
-                    )
-                }
-                other => other.into(),
-            });
+            return Err(e);
         }
+        self.get(&org, id)
+            .await?
+            .ok_or_else(|| not_found("artifact"))
+    }
+
+    /// PENDING → COMMITTED plus the lineage links, in one transaction. Nothing is linked
+    /// unless this call made the transition; a failed link rolls the transition back.
+    async fn commit(&self, org: &str, id: Uuid, links: &[ParsedLink]) -> Result<(), Error> {
         let me = NodeRef::new("art", id);
-        let (org_tx, links_tx) = (org.clone(), links.clone());
+        let (org, links) = (org.to_owned(), links.to_vec());
         let committed = self
             .db
             .transaction(|tx| {
-                let (org, links) = (org_tx.clone(), links_tx.clone());
+                let (org, links) = (org.clone(), links.clone());
                 Box::pin(async move {
                     let n = sqlx::query(
                         "UPDATE artifacts SET state = 'COMMITTED', committed_at = now()
@@ -448,24 +469,60 @@ impl ArtifactStore {
                     .execute(&mut **tx)
                     .await?
                     .rows_affected();
+                    if n != 1 {
+                        return Ok(false);
+                    }
                     for (from, rel, to) in &links {
                         let (from, to) = (from.unwrap_or(me), to.unwrap_or(me));
                         LineageWriter::link(tx, &org, from, *rel, to).await?;
                     }
-                    Ok(n == 1)
+                    Ok(true)
                 })
             })
             .await?;
-        if !committed {
-            return Err(Error::coded(
+        if committed {
+            Ok(())
+        } else {
+            Err(Error::coded(
                 codes::NAME_TAKEN,
                 StatusCode::CONFLICT,
                 "The registration took too long and was cancelled. Register the artifact again.",
+            ))
+        }
+    }
+
+    /// A link given by a caller may point only at an artifact or upload of the caller's org
+    /// that the caller may see. Other kinds are linked by the modules that own them (inside
+    /// the transaction that creates them), since only they can tell whether an id is real.
+    async fn check_link(
+        &self,
+        state: &AppState,
+        ctx: &RequestContext,
+        org: &str,
+        i: usize,
+        node: NodeRef,
+    ) -> Result<(), Error> {
+        let path = format!("/links/{i}");
+        if !crate::modules::lineage::has_table(node.kind) {
+            return Err(field(
+                &path,
+                &format!(
+                    "Links to {}_… ids can't be added here; the part of the app that makes them records their links.",
+                    node.kind
+                ),
             ));
         }
-        self.get(&org, id).await?.ok_or_else(|| {
-            ApiError::new(ErrorCode::NotFound, "No artifact with this id exists.").into()
-        })
+        let visible = match crate::modules::lineage::access(&self.db, org, node).await? {
+            Some((action, res)) => {
+                state.seams.authorizer.authorize(ctx, action, &res).await? == Decision::Allow
+            }
+            None => false,
+        };
+        if visible {
+            Ok(())
+        } else {
+            Err(field(&path, "No item with this id exists here."))
+        }
     }
 
     /// The artifact `id` in `org`, in any state.
@@ -482,29 +539,160 @@ impl ArtifactStore {
     }
 }
 
+/// The sum of the file sizes, which must fit PostgreSQL's `bigint`.
+fn total_size(m: &ArtifactManifest) -> Result<i64, Error> {
+    m.files
+        .iter()
+        .try_fold(0u64, |sum, f| sum.checked_add(f.size))
+        .and_then(|t| i64::try_from(t).ok())
+        .ok_or_else(|| {
+            field(
+                "/manifest/files",
+                "The files add up to more than 9223372036854775807 bytes, the most one artifact can hold.",
+            )
+        })
+}
+
+/// Copies each file of `manifest` (under `prefix`) to `blobs/sha256/…`. The copy is
+/// checked, not the source: the bytes are downloaded into a private folder, hashed there,
+/// and those same bytes are stored, so a source rewritten meanwhile can't slip in. Content
+/// already stored (by an upload or another artifact) is not written again; nothing under
+/// `blobs/` is ever deleted here.
+async fn snapshot(
+    this: &ArtifactStore,
+    store: &Store,
+    prefix: &str,
+    manifest: &ArtifactManifest,
+) -> Result<(), Error> {
+    // ponytail: one file at a time through local disk; copy server-side and hash in
+    // parallel when large artifacts make registration slow.
+    let mut problems = Vec::new();
+    for f in &manifest.files {
+        let src = store.keys().join(prefix, &f.path)?;
+        match store.head(&src).await {
+            Ok(info) if info.size == f.size => {}
+            Ok(info) => {
+                problems.push(format!(
+                    "{}: {} bytes, the manifest says {}",
+                    f.path, info.size, f.size
+                ));
+                continue;
+            }
+            Err(StorageError::NotFound { .. }) => {
+                problems.push(format!("{}: missing", f.path));
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let dir = this.scratch_dir()?;
+        let local = dir.path().join("file");
+        let opts = TransferOptions::default();
+        match store
+            .download_file(&src, &local, Some(&f.sha256), opts)
+            .await
+        {
+            Ok(got) if got.size == f.size => {}
+            Ok(got) => {
+                problems.push(format!(
+                    "{}: {} bytes, the manifest says {}",
+                    f.path, got.size, f.size
+                ));
+                continue;
+            }
+            Err(StorageError::ChecksumMismatch { .. }) => {
+                problems.push(format!("{}: its sha256 differs from the manifest", f.path));
+                continue;
+            }
+            Err(StorageError::NotFound { .. }) => {
+                problems.push(format!("{}: missing", f.path));
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        let blob = store.keys().blob(&f.sha256)?;
+        let stored = match store.head(&blob).await {
+            Ok(info) => info.size == f.size,
+            Err(StorageError::NotFound { .. }) => false,
+            Err(e) => return Err(e.into()),
+        };
+        if !stored {
+            crate::modules::uploads::store_file(store, &local, &blob, f.size).await?;
+        }
+        scratch::close(dir)?;
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        let shown: Vec<&str> = problems.iter().take(20).map(String::as_str).collect();
+        Err(Error::coded(
+            "MRL-STORE-011",
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!(
+                "{} file(s) do not match the manifest: {}",
+                problems.len(),
+                shown.join("; ")
+            ),
+        ))
+    }
+}
+
 /// True for keys (relative to the org) in an area that is cleaned up or rewritten.
 fn is_staging(relative: &str) -> bool {
     relative.starts_with("uploads/") || relative.split('/').any(|p| p == "_staging")
 }
 
-/// The ticket signing key: from the `SecretStore` (created the first time), else per process.
-async fn ticket_key(secrets: Option<&Arc<dyn SecretStore>>) -> Result<TicketKey, Error> {
+/// True for keys under the org's `blobs/`: content-addressed, written only after the server
+/// checked the bytes, and referenced by committed artifacts and finished uploads.
+fn is_immutable(store: &Store, key: &str) -> bool {
+    key.strip_prefix(store.keys().prefix())
+        .is_some_and(|k| k.starts_with("blobs/"))
+}
+
+fn immutable() -> Error {
+    ApiError::new(
+        ErrorCode::Forbidden,
+        "Stored files can't be overwritten; upload to a new place instead.",
+    )
+    .into()
+}
+
+/// The ticket signing key. With a `SecretStore` it is shared there: created once, under a
+/// PostgreSQL advisory lock, so servers starting together on one database agree on it. A
+/// team server without a store signs nothing (MRL-ENV-190), since its replicas could not
+/// verify each other's tickets; a solo server without one uses a key per process.
+async fn ticket_key(
+    db: &Db,
+    mode: Mode,
+    secrets: Option<&Arc<dyn SecretStore>>,
+) -> Result<TicketKey, Error> {
     let fresh = || format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple());
-    let value = match secrets {
-        Some(s) => match s.get(TICKET_KEY_NAME).await? {
-            Some(v) => v.expose().to_owned(),
-            None => {
-                // ponytail: two first-time servers sharing one store can race here and one
-                // set of tickets stops verifying; a create-if-absent seam call fixes it.
-                let v = fresh();
-                s.set(TICKET_KEY_NAME, crate::seams::Secret::new(v.clone()))
-                    .await?;
-                v
-            }
-        },
-        // ponytail: per-process key; tickets end with the process, and team replicas need a
-        // shared SecretStore (P16) to verify each other's tickets.
-        None => fresh(),
+    let value = match (secrets, mode) {
+        (Some(s), _) => {
+            let mut tx = db.pool().begin().await?;
+            sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+                .bind(TICKET_KEY_NAME)
+                .execute(&mut *tx)
+                .await?;
+            let value = match s.get(TICKET_KEY_NAME).await? {
+                Some(v) => v.expose().to_owned(),
+                None => {
+                    let v = fresh();
+                    s.set(TICKET_KEY_NAME, crate::seams::Secret::new(v.clone()))
+                        .await?;
+                    v
+                }
+            };
+            tx.commit().await?;
+            value
+        }
+        (None, Mode::Solo) => fresh(),
+        (None, _) => {
+            return Err(Error::coded(
+                codes::NO_SECRET_STORE,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "This team server has no secret store, so it can't sign upload and download links that every server copy accepts.",
+            ))
+        }
     };
     Ok(TicketKey::new(value.into_bytes())?)
 }
@@ -529,6 +717,27 @@ pub(crate) fn resource(ctx: &RequestContext, kind: &str, id: Option<String>) -> 
         id,
         org: org_of(ctx).ok(),
         project: ctx.project.clone(),
+    }
+}
+
+/// An existing item of `kind` in `org`, with the project recorded on it. Reading it, listing
+/// it and linking to it are all checked against this same resource.
+pub(crate) fn owned(kind: &str, org: &str, id: String, project: Option<String>) -> Resource {
+    Resource {
+        kind: kind.to_owned(),
+        id: Some(id),
+        org: Some(org.to_owned()),
+        project,
+    }
+}
+
+/// The action that reads artifacts (and the lineage graph).
+pub(crate) const READ: &str = "lineage.read";
+
+impl Artifact {
+    /// What reads of this artifact are authorized against.
+    pub(crate) fn resource(&self, org: &str) -> Resource {
+        owned("artifact", org, self.id.clone(), self.project_id.clone())
     }
 }
 
@@ -666,7 +875,8 @@ pub struct Artifact {
     pub name: String,
     /// `model`, `dataset`, `checkpoint`, `eval`, `export` or `other`.
     pub kind: String,
-    /// Full key prefix of the files.
+    /// Full key prefix the files were registered from. Downloads read the checked copies in
+    /// `blobs/sha256/…`, so later changes there do not matter.
     pub prefix: String,
     /// `PENDING`, `COMMITTED` or `FAILED`.
     pub state: String,
@@ -752,8 +962,12 @@ async fn register(
     ctx: RequestContext,
     Json(body): Json<NewArtifact>,
 ) -> Result<(StatusCode, Json<Artifact>), Error> {
-    s.authorize(&ctx, "uploads.write", &resource(&ctx, "artifact", None))
-        .await?;
+    s.authorize(
+        &ctx,
+        crate::modules::uploads::ACTION,
+        &resource(&ctx, "artifact", None),
+    )
+    .await?;
     Ok((
         StatusCode::CREATED,
         Json(store.register(&s, &ctx, body).await?),
@@ -771,18 +985,13 @@ async fn get_one(
     Path(art): Path<String>,
 ) -> Result<Json<Artifact>, Error> {
     let id = parse_artifact_id(&art)?;
-    s.authorize(
-        &ctx,
-        "lineage.read",
-        &resource(&ctx, "artifact", Some(art.clone())),
-    )
-    .await?;
     let org = org_of(&ctx)?;
-    store
+    let found = store
         .get(&org, id)
         .await?
-        .map(Json)
-        .ok_or_else(|| not_found("artifact"))
+        .ok_or_else(|| not_found("artifact"))?;
+    s.authorize(&ctx, READ, &found.resource(&org)).await?;
+    Ok(Json(found))
 }
 
 /// Lists committed artifacts, newest last.
@@ -794,14 +1003,15 @@ async fn list(
     ctx: RequestContext,
     Query(q): Query<ListQuery>,
 ) -> Result<Json<Page<Artifact>>, Error> {
-    s.authorize(&ctx, "lineage.read", &resource(&ctx, "artifact", None))
+    s.authorize(&ctx, READ, &resource(&ctx, "artifact", None))
         .await?;
+    let org = org_of(&ctx)?;
     let page = PageQuery {
         limit: q.limit.clone(),
         cursor: q.cursor.clone(),
     }
     .resolve()?;
-    let after = match page.after.as_deref() {
+    let mut after = match page.after.as_deref() {
         Some(c) => Some(Uuid::parse_str(c).map_err(|_| {
             ApiError::new(
                 ErrorCode::Pagination,
@@ -810,27 +1020,52 @@ async fn list(
         })?),
         None => None,
     };
-    let rows: Vec<ArtifactRow> = sqlx::query_as(
-        "SELECT id, project_id, name, kind, prefix, manifest, size_bytes, state, created_by, created_at, committed_at
-         FROM artifacts
-         WHERE org_id = $1 AND state = 'COMMITTED' AND ($2::text IS NULL OR kind = $2)
-           AND ($3::uuid IS NULL OR id > $3)
-         ORDER BY id LIMIT $4",
-    )
-    .bind(org_of(&ctx)?)
-    .bind(&q.kind)
-    .bind(after)
-    .bind(i64::try_from(page.fetch()).unwrap_or(201))
-    .fetch_all(store.db.pool())
-    .await?;
-    let items = rows.into_iter().map(Artifact::from).collect();
+    // Each row is checked like a GET of it; hidden rows are skipped and the scan goes on
+    // until the page is full, so cursors only ever hold ids the caller may see.
+    let want = page.fetch();
+    let batch = i64::try_from(want).unwrap_or(201);
+    let mut items = Vec::with_capacity(want);
+    'scan: loop {
+        let rows: Vec<ArtifactRow> = sqlx::query_as(
+            "SELECT id, project_id, name, kind, prefix, manifest, size_bytes, state, created_by, created_at, committed_at
+             FROM artifacts
+             WHERE org_id = $1 AND state = 'COMMITTED' AND ($2::text IS NULL OR kind = $2)
+               AND ($3::uuid IS NULL OR id > $3)
+             ORDER BY id LIMIT $4",
+        )
+        .bind(&org)
+        .bind(&q.kind)
+        .bind(after)
+        .bind(batch)
+        .fetch_all(store.db.pool())
+        .await?;
+        let last_batch = rows.len() < want;
+        for row in rows {
+            after = Some(row.id);
+            let a = Artifact::from(row);
+            if s.seams
+                .authorizer
+                .authorize(&ctx, READ, &a.resource(&org))
+                .await?
+                == Decision::Allow
+            {
+                items.push(a);
+                if items.len() == want {
+                    break 'scan;
+                }
+            }
+        }
+        if last_batch {
+            break;
+        }
+    }
     Ok(Json(Page::from_overfetch(items, &page, |a| {
         a.uuid.to_string()
     })))
 }
 
 /// `POST /artifacts/{art}:download` → a GET ticket for one file of a committed artifact.
-#[utoipa::path(post, path = "/artifacts/{art}:download", tag = "artifacts", request_body = DownloadRequest,
+#[utoipa::path(post, path = "/artifacts/{art}:download", tag = "artifacts", operation_id = "download_artifact", request_body = DownloadRequest,
     params(("art" = String, Path, description = "`art_…`")),
     responses((status = 200, body = Object, description = "A transfer ticket: `{method, key, max_size, expires_at, url, presigned, headers}`."),
         (status = 404, body = crate::error::Problem)))]
@@ -846,18 +1081,13 @@ async fn action(
         return Err(ApiError::new(ErrorCode::RouteNotFound, "No endpoint has this path.").into());
     }
     let id = parse_artifact_id(art)?;
-    s.authorize(
-        &ctx,
-        "lineage.read",
-        &resource(&ctx, "artifact", Some(art.to_owned())),
-    )
-    .await?;
     let org = org_of(&ctx)?;
     let found = store
         .get(&org, id)
         .await?
         .filter(|a| a.state == "COMMITTED")
         .ok_or_else(|| not_found("artifact"))?;
+    s.authorize(&ctx, READ, &found.resource(&org)).await?;
     let manifest =
         ArtifactManifest::from_json(&serde_json::to_vec(&found.manifest).unwrap_or_default())?;
     let file = manifest
@@ -865,8 +1095,9 @@ async fn action(
         .iter()
         .find(|f| f.path == body.path)
         .ok_or_else(|| field("/path", "This artifact has no file at this path."))?;
-    let keys = store.org_store(&s, &org).await?;
-    let key = keys.keys().join(&found.prefix, &file.path)?;
+    // Committed files are read from their checked copies, never from the source prefix.
+    let keys = store.org_store(s.seams.secrets.as_ref(), &org).await?;
+    let key = keys.keys().blob(&file.sha256)?;
     Ok(Json(
         store
             .ticket(&s, &ctx, &key, TicketMethod::Get, file.size)
@@ -884,7 +1115,38 @@ struct Doc;
 
 #[cfg(test)]
 mod tests {
-    use super::is_staging;
+    use super::{is_staging, total_size, ArtifactManifest};
+
+    fn manifest(sizes: &[u64]) -> ArtifactManifest {
+        let files: Vec<serde_json::Value> = sizes
+            .iter()
+            .enumerate()
+            .map(|(i, s)| serde_json::json!({"path": format!("f{i}"), "size": s, "sha256": "0".repeat(64), "role": "other"}))
+            .collect();
+        ArtifactManifest::from_json(
+            serde_json::json!({"schema_version": "artifact-manifest/v1", "kind": "other",
+                "created_at": "2026-11-16T00:00:00Z", "files": files})
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn sizes_must_fit_bigint() {
+        let max = i64::MAX as u64;
+        assert_eq!(total_size(&manifest(&[])).unwrap(), 0);
+        assert_eq!(total_size(&manifest(&[0])).unwrap(), 0);
+        assert_eq!(total_size(&manifest(&[10, 32])).unwrap(), 42);
+        assert_eq!(total_size(&manifest(&[max])).unwrap(), i64::MAX);
+        assert_eq!(total_size(&manifest(&[max - 1, 1])).unwrap(), i64::MAX);
+        assert!(total_size(&manifest(&[max + 1])).is_err());
+        assert!(total_size(&manifest(&[max, 1])).is_err());
+        assert!(
+            total_size(&manifest(&[u64::MAX, 1])).is_err(),
+            "u64 overflow"
+        );
+    }
 
     #[test]
     fn staging_areas_are_refused() {

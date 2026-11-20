@@ -21,6 +21,8 @@ pub mod codes {
     pub const NAME_TAKEN: &str = "MRL-CONFLICT-190";
     /// The upload is completed, aborted or expired.
     pub const UPLOAD_CLOSED: &str = "MRL-CONFLICT-191";
+    /// The secret is being deleted.
+    pub const SECRET_DELETING: &str = "MRL-CONFLICT-192";
     /// Parts are missing or have the wrong size.
     pub const PARTS_INCOMPLETE: &str = "MRL-STORE-190";
     /// The secret does not allow this use.
@@ -158,10 +160,10 @@ pub async fn render(req: Request, next: Next) -> Response {
         .get::<RequestMeta>()
         .map(|m| m.trace_id.clone())
         .unwrap_or_default();
-    let instance = req
-        .extensions()
-        .get::<OriginalUri>()
-        .map_or_else(|| req.uri().path().to_owned(), |u| u.path().to_owned());
+    let instance = req.extensions().get::<OriginalUri>().map_or_else(
+        || crate::http::shown_path(req.uri().path()).to_owned(),
+        |u| crate::http::shown_path(u.path()).to_owned(),
+    );
     let res = next.run(req).await;
     let Some(p) = res.extensions().get::<Arc<Pending>>().cloned() else {
         return res;
