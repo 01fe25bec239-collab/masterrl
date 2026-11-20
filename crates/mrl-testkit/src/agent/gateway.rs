@@ -526,6 +526,104 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn a_relaunch_at_a_newer_epoch_gets_a_lease_after_the_old_one_was_cancelled() {
+        let gw = GatewayHarness::start(TestDb::new().await).await;
+        let a = TestAgent::new(1, |_| {});
+        let node_s = a.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
+        let node = NodeId::from_str(&node_s).unwrap();
+        let attempt = mrl_domain::ids::AttemptId::new();
+        let s = CommandSender::new(
+            &gw.gw,
+            &[CommandKind::LaunchAttempt, CommandKind::CancelAttempt],
+        );
+        let launch = |epoch| {
+            NewCommand::new(Kind::LaunchAttempt(
+                mrl_proto::agent::v1::LaunchAttempt::default(),
+            ))
+            .attempt(attempt, epoch)
+        };
+        let l1 = s.send(node, launch(1)).await.unwrap();
+        let c1 = s
+            .send(
+                node,
+                NewCommand::new(Kind::CancelAttempt(Default::default())).attempt(attempt, 1),
+            )
+            .await
+            .unwrap();
+        let l2 = s.send(node, launch(2)).await.unwrap();
+        for (id, state) in [
+            (l1.id, "COMPLETED"),
+            (c1.id, "COMPLETED"),
+            (l2.id, "RECEIVED"),
+        ] {
+            sqlx::query("UPDATE agent_commands SET state = $2 WHERE id = $1")
+                .bind(id)
+                .bind(state)
+                .execute(gw.db.pool())
+                .await
+                .unwrap();
+        }
+        let running = |epoch| mrl_proto::common::v1::AttemptRef {
+            attempt_id: attempt.to_string(),
+            fencing_epoch: epoch,
+            ..Default::default()
+        };
+        let leases = mrl_server::modules::nodes::store::leases(
+            gw.db.db(),
+            uuid_of(&node_s),
+            &[running(1), running(2)],
+        )
+        .await
+        .unwrap();
+        let granted: Vec<u64> = leases
+            .iter()
+            .filter_map(|l| l.attempt.as_ref().map(|a| a.fencing_epoch))
+            .collect();
+        assert_eq!(granted, vec![2], "epoch 1 was cancelled, epoch 2 runs");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn a_launch_queued_while_offline_is_never_sent_after_a_drain() {
+        let gw = GatewayHarness::start(TestDb::new().await).await;
+        let a = TestAgent::new(1, |_| {});
+        let node_s = a.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
+        let node = NodeId::from_str(&node_s).unwrap();
+        let launches = CommandSender::new(&gw.gw, &[CommandKind::LaunchAttempt]);
+        let queued = launches
+            .send(
+                node,
+                NewCommand::new(Kind::LaunchAttempt(
+                    mrl_proto::agent::v1::LaunchAttempt::default(),
+                )),
+            )
+            .await
+            .unwrap();
+        let r = gw
+            .post(&format!("/api/v1/nodes/{node_s}:drain"), json!({}))
+            .await;
+        assert_eq!(r.json()["status"], "DRAINING", "{}", r.text());
+        let st = launches.status(queued.id).await.unwrap().unwrap();
+        assert_eq!(st.state, "FAILED");
+        assert_eq!(st.result.unwrap()["failure"]["sub_code"], "node_draining");
+        // Reconnecting: other commands still go, the launch never does.
+        let probes = CommandSender::new(&gw.gw, &[CommandKind::Probe]);
+        let p = probes.send(node, probe()).await.unwrap();
+        let link = a.run();
+        wait_state(&gw, p.id, "FAILED").await; // delivered (no Probe handler)
+        assert_eq!(state_of(&gw, queued.id).await, "FAILED");
+        let sent: Option<time::OffsetDateTime> =
+            sqlx::query_scalar("SELECT sent_at FROM agent_commands WHERE id = $1")
+                .bind(queued.id)
+                .fetch_one(gw.db.pool())
+                .await
+                .unwrap();
+        assert!(sent.is_none(), "the launch was never sent");
+        link.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
     async fn commands_without_a_handler_fail_and_senders_refuse_foreign_kinds() {
         let gw = GatewayHarness::start(TestDb::new().await).await;
         let a = TestAgent::new(1, |_| {});
@@ -542,6 +640,16 @@ mod tests {
             0,
             "nothing written for a refused kind"
         );
+        // A command too large to send is refused before it is stored.
+        let huge = NewCommand::new(Kind::Probe(Probe {
+            request_id: "x".repeat(5 << 20),
+            ..Probe::default()
+        }));
+        assert_eq!(
+            probes.send(node, huge).await.unwrap_err().code(),
+            "MRL-NODE-187"
+        );
+        assert_eq!(gw.db.count("agent_commands").await, 0, "nothing stored");
 
         let drains = CommandSender::new(&gw.gw, &[CommandKind::Drain]);
         let c = drains
@@ -1325,7 +1433,16 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs PostgreSQL (just test-integration)"]
     async fn after_a_takeover_on_another_replica_the_old_stream_sends_and_records_nothing() {
-        let gw = GatewayHarness::start(TestDb::new().await).await;
+        let router = LaneRouter::new();
+        let seen = Arc::new(Seen(std::sync::Mutex::new(Vec::new())));
+        router.register(seen.clone());
+        let gw = GatewayHarness::start_with(
+            TestDb::new().await,
+            fast_config(),
+            Arc::new(InMemorySecretStore::default()),
+            router,
+        )
+        .await;
         let (_replica, b) = gw.replica().await;
         let first = TestAgent::new(1, |_| {});
         let node_s = first.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
@@ -1364,11 +1481,17 @@ mod tests {
         let e1 = gw.wait_status(&node_s, "ONLINE").await["session_epoch"]
             .as_i64()
             .unwrap();
-        // An old BULK stream on replica A that stays open through the takeover.
+        // Old TELEMETRY and BULK streams on replica A, bound to the old session.
         let (old_bulk, mut old_bulk_in) = raw_stream(
             &gw.addr().to_string(),
             &id,
             mrl_proto::agent::v1::Lane::Bulk,
+        )
+        .await;
+        let (old_tel, mut old_tel_in) = raw_stream(
+            &gw.addr().to_string(),
+            &id,
+            mrl_proto::agent::v1::Lane::Telemetry,
         )
         .await;
         let new = {
@@ -1410,26 +1533,77 @@ mod tests {
             "the old stream never sent it"
         );
         assert!(Link::of(&second.ctx).unwrap().journal_seq() >= c.seq);
-        // A CONTROL-class message on the old data stream is refused, and recorded nowhere.
-        old_bulk
-            .send(mrl_proto::agent::v1::AgentMessage {
-                seq: 777_777,
-                body: Some(agent_message::Body::AttemptStatus(AttemptStatus::default())),
-                ..Default::default()
-            })
-            .await
-            .unwrap();
-        let refused = loop {
-            match tokio::time::timeout(Duration::from_secs(10), old_bulk_in.message())
-                .await
-                .expect("the old data stream answers")
-            {
-                Ok(Some(_ack)) => continue,
-                Ok(None) => panic!("closed without a status"),
-                Err(status) => break status,
+        // Whatever the old data streams send now is refused: no CONTROL-class record, no
+        // metrics to the sink, no telemetry (a far-future reading would win otherwise).
+        let send = |m: mrl_proto::agent::v1::AgentMessage| {
+            let (b, t) = (old_bulk.clone(), old_tel.clone());
+            async move {
+                let _ = b.send(m.clone()).await;
+                let _ = t.send(m).await;
             }
         };
-        assert_eq!(refused.code(), tonic::Code::Aborted, "{refused:?}");
+        send(mrl_proto::agent::v1::AgentMessage {
+            seq: 777_777,
+            body: Some(agent_message::Body::AttemptStatus(AttemptStatus::default())),
+            ..Default::default()
+        })
+        .await;
+        send(mrl_proto::agent::v1::AgentMessage {
+            seq: 777_778,
+            body: Some(agent_message::Body::Worker(
+                mrl_proto::agent::v1::WorkerRelay {
+                    message: Some(mrl_proto::worker::v1::WorkerMessage {
+                        body: Some(mrl_proto::worker::v1::worker_message::Body::Metrics(
+                            Default::default(),
+                        )),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        })
+        .await;
+        send(mrl_proto::agent::v1::AgentMessage {
+            seq: 777_779,
+            body: Some(agent_message::Body::Telemetry(
+                mrl_proto::agent::v1::NodeTelemetry {
+                    time: Some(prost_types::Timestamp {
+                        seconds: 4_000_000_000,
+                        nanos: 0,
+                    }),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        })
+        .await;
+        for inbound in [&mut old_bulk_in, &mut old_tel_in] {
+            let refused = loop {
+                match tokio::time::timeout(Duration::from_secs(10), inbound.message())
+                    .await
+                    .expect("the old data stream closes")
+                {
+                    Ok(Some(_ack)) => continue,
+                    Ok(None) => panic!("closed without a status"),
+                    Err(status) => break status,
+                }
+            };
+            assert_eq!(refused.code(), tonic::Code::Aborted, "{refused:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(
+            seen.0.lock().unwrap().iter().all(|(_, seq)| *seq < 777_777),
+            "no metrics from the old session reached the sink"
+        );
+        let future: bool = sqlx::query_scalar(
+            "SELECT COALESCE(telemetry_at > now() + interval '1 year', false) FROM compute_nodes WHERE id = $1",
+        )
+        .bind(uuid_of(&node_s))
+        .fetch_one(gw.db.pool())
+        .await
+        .unwrap();
+        assert!(!future, "the old session's telemetry was not saved");
         let kept: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM node_events WHERE node_id = $1 AND kind = 'control_unrouted'
                AND (details->>'seq')::bigint = 777777",
@@ -1473,6 +1647,75 @@ mod tests {
             self.seen.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    /// A CONTROL sink that needs a connection from `0` for every item.
+    struct UsesPool(mrl_server::db::Db, AtomicUsize);
+
+    #[async_trait::async_trait]
+    impl mrl_server::modules::nodes::lanes::LaneSink for UsesPool {
+        fn name(&self) -> &'static str {
+            "uses-pool"
+        }
+        fn lanes(&self) -> &'static [mrl_server::modules::nodes::lanes::LaneKind] {
+            &[mrl_server::modules::nodes::lanes::LaneKind::Control]
+        }
+        async fn deliver(
+            &self,
+            _: mrl_server::modules::nodes::lanes::LaneItem,
+        ) -> Result<(), mrl_server::modules::nodes::lanes::SinkError> {
+            sqlx::query("SELECT 1")
+                .execute(self.0.pool())
+                .await
+                .map_err(|e| mrl_server::modules::nodes::lanes::SinkError {
+                    sink: "uses-pool",
+                    detail: e.to_string(),
+                })?;
+            self.1.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn kept_control_messages_reach_a_sink_that_shares_a_one_connection_pool() {
+        use prost::Message;
+        let gw = GatewayHarness::start(TestDb::new().await).await;
+        let a = TestAgent::new(1, |_| {});
+        let node = uuid_of(&a.enroll(&gw, &gw.token(json!({})).await).await.unwrap());
+        for seq in [1i64, 2] {
+            let msg = mrl_proto::agent::v1::AgentMessage {
+                seq: seq as u64,
+                body: Some(agent_message::Body::AttemptStatus(AttemptStatus::default())),
+                ..Default::default()
+            };
+            sqlx::query(
+                "INSERT INTO node_control_inbox (node_id, stream, seq, session_epoch, message)
+                 VALUES ($1, 1, $2, 1, $3)",
+            )
+            .bind(node)
+            .bind(seq)
+            .bind(msg.encode_to_vec())
+            .execute(gw.db.pool())
+            .await
+            .unwrap();
+        }
+        let one = gw.db.replica_with(&mrl_server::config::DatabaseConfig {
+            max_connections: 1,
+            min_connections: 0,
+            acquire_timeout_seconds: 5,
+            ..crate::pg::test_config()
+        });
+        let sink = UsesPool(one.clone(), AtomicUsize::new(0));
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            mrl_server::modules::nodes::store::dispatch(&one, &sink, node),
+        )
+        .await
+        .expect("the dispatcher never waits for its own connection")
+        .unwrap();
+        assert_eq!(sink.1.load(Ordering::SeqCst), 2);
+        assert_eq!(gw.db.count("node_control_inbox").await, 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1626,12 +1869,30 @@ mod tests {
             ..Default::default()
         };
         let id = uuid_of(&node);
-        store::telemetry(gw.db.db(), id, &reading(ts(now, 500_000_000), 51, 2), 90)
-            .await
-            .unwrap();
-        store::telemetry(gw.db.db(), id, &reading(ts(now, 100_000_000), 77, 1), 90)
-            .await
-            .unwrap();
+        let epoch: i64 =
+            sqlx::query_scalar("SELECT session_epoch FROM compute_nodes WHERE id = $1")
+                .bind(id)
+                .fetch_one(gw.db.pool())
+                .await
+                .unwrap();
+        store::telemetry(
+            gw.db.db(),
+            id,
+            epoch,
+            &reading(ts(now, 500_000_000), 51, 2),
+            90,
+        )
+        .await
+        .unwrap();
+        store::telemetry(
+            gw.db.db(),
+            id,
+            epoch,
+            &reading(ts(now, 100_000_000), 77, 1),
+            90,
+        )
+        .await
+        .unwrap();
         let n = gw.node(&node).await;
         assert_eq!(n["gpus"][0]["temperature_c"], 51);
         assert_eq!(n["telemetry"]["ram_used_bytes"], 2);

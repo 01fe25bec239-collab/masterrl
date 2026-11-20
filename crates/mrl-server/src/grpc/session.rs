@@ -304,19 +304,31 @@ struct Lossy {
 }
 
 impl Lossy {
-    fn start(gw: &Arc<Gateway>, node: Uuid, epoch: i64, stream: Lane) -> Self {
+    /// Lanes of one stream bound to the CONTROL session `epoch`; `session` is cancelled when
+    /// that session ends or is taken over, and then nothing more is written or delivered.
+    fn start(
+        gw: &Arc<Gateway>,
+        node: Uuid,
+        epoch: i64,
+        stream: Lane,
+        session: &CancellationToken,
+    ) -> Self {
         let (tx, mut rx) = watch::channel::<Option<AgentMessage>>(None);
         let gw2 = gw.clone();
+        let s = session.clone();
         tokio::spawn(async move {
-            while rx.changed().await.is_ok() {
+            while rx.changed().await.is_ok() && !s.is_cancelled() {
                 let msg = rx.borrow_and_update().clone();
                 let Some(msg) = msg else { continue };
                 if let Some(agent_message::Body::Telemetry(t)) = &msg.body {
                     if let Err(e) =
-                        store::telemetry(&gw2.db, node, t, gw2.config.gpu_hot_celsius).await
+                        store::telemetry(&gw2.db, node, epoch, t, gw2.config.gpu_hot_celsius).await
                     {
                         tracing::debug!(code = e.code(), error = %e, "telemetry not saved");
                     }
+                }
+                if s.is_cancelled() {
+                    return;
                 }
                 if let Some(sink) = gw2.lanes.sink_for(LaneKind::Telemetry) {
                     let item = LaneItem {
@@ -335,8 +347,18 @@ impl Lossy {
             }
         });
         Self {
-            metrics: LossyLane::start(&gw.lanes, LaneKind::Metrics, gw.config.lane_buffer),
-            logs: LossyLane::start(&gw.lanes, LaneKind::Logs, gw.config.lane_buffer),
+            metrics: LossyLane::start(
+                &gw.lanes,
+                LaneKind::Metrics,
+                gw.config.lane_buffer,
+                session.clone(),
+            ),
+            logs: LossyLane::start(
+                &gw.lanes,
+                LaneKind::Logs,
+                gw.config.lane_buffer,
+                session.clone(),
+            ),
             telemetry: tx,
         }
     }
@@ -456,15 +478,19 @@ async fn record_on_data(
     Ok(true)
 }
 
-/// Hands the node's kept CONTROL messages to the sink. A sink error is logged; the messages stay
-/// kept and are retried (next message, or the health pass).
-pub async fn deliver_kept(gw: &Gateway, node: Uuid) {
+/// Starts handing the node's kept CONTROL messages to the sink, in a task of its own: the stream
+/// (or health pass) that kept them never waits for the sink. A sink error is logged; the messages
+/// stay kept and are retried (next message, or the health pass).
+pub fn deliver_kept(gw: &Gateway, node: Uuid) {
     let Some(sink) = gw.lanes.sink_for(LaneKind::Control) else {
         return;
     };
-    if let Err(e) = store::dispatch(&gw.db, sink.as_ref(), node).await {
-        tracing::warn!(code = e.code(), error = %e, node = %NodeId::from_uuid(node), "CONTROL messages not delivered yet");
-    }
+    let db = gw.db.clone();
+    tokio::spawn(async move {
+        if let Err(e) = store::dispatch(&db, sink.as_ref(), node).await {
+            tracing::warn!(code = e.code(), error = %e, node = %NodeId::from_uuid(node), "CONTROL messages not delivered yet");
+        }
+    });
 }
 
 /// True for messages the gateway handles itself (never routed to a sink).
@@ -563,7 +589,7 @@ async fn control(
         }
         let mut sent_upto = resume - 1;
         let mut acked = 0u64;
-        let lossy = Lossy::start(gw, node, epoch, Lane::Control);
+        let lossy = Lossy::start(gw, node, epoch, Lane::Control, &superseded);
         let mut poll = tokio::time::interval(COMMAND_POLL);
         let mut recheck = tokio::time::interval(Duration::from_secs(gw.config.revocation_check_seconds));
         recheck.tick().await;
@@ -603,7 +629,7 @@ async fn control(
                     }
                     rx_seq = m.seq;
                     if route == Route::Inbox {
-                        deliver_kept(gw, node).await;
+                        deliver_kept(gw, node);
                     }
                     if accepted == Accept::New {
                         if lane != LaneKind::Control {
@@ -630,6 +656,33 @@ async fn control(
     }
     tracing::info!(node = %NodeId::from_uuid(node), epoch, "machine disconnected");
     result
+}
+
+/// The CONTROL session a data stream belongs to: the one this replica holds for `node`, when it
+/// is also the node's current session in the database. A data stream may open just before its
+/// CONTROL stream, so this waits up to 5 s.
+async fn bind_to_control(gw: &Gateway, node: Uuid) -> Result<(i64, CancellationToken), Status> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let current = store::session_epoch(&gw.db, node)
+            .await
+            .map_err(unavailable)?;
+        if let Some((epoch, token)) = gw.sessions.control_of(node) {
+            if epoch == current {
+                return Ok((epoch, token));
+            }
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(Status::failed_precondition(
+                NodesError::Protocol(
+                    "this connection has no CONTROL session for the machine; reconnect all streams"
+                        .into(),
+                )
+                .explain(),
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// The status that closes a stream a newer session replaced.
@@ -679,11 +732,10 @@ async fn data(
     let lane = Lane::try_from(h.lane).unwrap_or(Lane::Telemetry);
     let revoked = gw.sessions.revoked_token(node);
     send(out, hello(gw, lane, 0), 0, 0).await?;
-    // The node's current session epoch (data streams don't open sessions of their own).
-    let epoch = store::session_epoch(&gw.db, node)
-        .await
-        .map_err(unavailable)?;
-    let lossy = Lossy::start(gw, node, epoch, lane);
+    // Bound to the CONTROL session of the same connection (on this replica, current in the
+    // database): when it ends or is taken over, this stream closes too.
+    let (epoch, session) = bind_to_control(gw, node).await?;
+    let lossy = Lossy::start(gw, node, epoch, lane, &session);
     let mut recheck =
         tokio::time::interval(Duration::from_secs(gw.config.revocation_check_seconds));
     recheck.tick().await;
@@ -694,6 +746,7 @@ async fn data(
             () = revoked.cancelled() => {
                 return Err(denied(NodesError::Certificate("this machine's certificates were revoked".into())));
             }
+            () = session.cancelled() => return Err(taken_over()),
             _ = recheck.tick() => still_valid(gw, sha).await?,
             m = inbound.next() => {
                 let Some(Ok(m)) = m else { return Ok(()) };
@@ -708,7 +761,7 @@ async fn data(
                             return Err(taken_over());
                         }
                         if route == Route::Inbox {
-                            deliver_kept(gw, node).await;
+                            deliver_kept(gw, node);
                         }
                     }
                 } else {

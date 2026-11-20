@@ -234,6 +234,7 @@ pub(crate) struct LossyLane {
     lane: LaneKind,
     cap: usize,
     shared: Option<Arc<Shared>>,
+    session: tokio_util::sync::CancellationToken,
 }
 
 struct Shared {
@@ -270,17 +271,27 @@ impl Queue {
 }
 
 impl LossyLane {
-    /// A queue of `capacity` items feeding `router`'s sink for `lane` (none: discard).
-    pub fn start(router: &LaneRouter, lane: LaneKind, capacity: usize) -> Self {
+    /// A queue of `capacity` items feeding `router`'s sink for `lane` (none: discard), for one
+    /// CONTROL session: once `session` is cancelled (it ended or was taken over) nothing more
+    /// is queued or delivered.
+    // ponytail: items still queued when their session ends are dropped (lossy lanes, D-04-05).
+    pub fn start(
+        router: &LaneRouter,
+        lane: LaneKind,
+        capacity: usize,
+        session: tokio_util::sync::CancellationToken,
+    ) -> Self {
         let shared = router.sink_for(lane).map(|sink| {
             let shared = Arc::new(Shared {
                 q: std::sync::Mutex::new(Queue::default()),
                 notify: tokio::sync::Notify::new(),
             });
             let s = shared.clone();
+            let session = session.clone();
             tokio::spawn(async move {
                 loop {
                     let next = match s.q.lock() {
+                        Ok(_) if session.is_cancelled() => return,
                         Ok(mut q) => match q.items.pop_front() {
                             Some(i) => Some(i),
                             None if q.closed => return,
@@ -294,7 +305,10 @@ impl LossyLane {
                                 tracing::warn!(lane = lane.as_str(), error = %e, "lane sink failed; item dropped");
                             }
                         }
-                        None => s.notify.notified().await,
+                        None => tokio::select! {
+                            () = s.notify.notified() => {}
+                            () = session.cancelled() => return,
+                        },
                     }
                 }
             });
@@ -304,12 +318,17 @@ impl LossyLane {
             lane,
             cap: capacity.max(2),
             shared,
+            session,
         }
     }
 
     /// Queues `item` under the lane's overflow rule. Never waits.
     pub fn offer(&self, mut item: LaneItem) {
         let m = LaneMetrics::get();
+        if self.session.is_cancelled() {
+            m.discarded(self.lane);
+            return;
+        }
         let Some(shared) = &self.shared else {
             m.discarded(self.lane);
             return;
@@ -465,7 +484,12 @@ mod tests {
     #[tokio::test]
     async fn metrics_overflow_decimates_and_marks_the_gaps() {
         let (router, gate) = gate();
-        let lane = LossyLane::start(&router, LaneKind::Metrics, 4);
+        let lane = LossyLane::start(
+            &router,
+            LaneKind::Metrics,
+            4,
+            tokio_util::sync::CancellationToken::new(),
+        );
         lane.offer(item(1, LaneKind::Metrics)); // taken by the sink task, held at the gate
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         for s in 2..=7 {
@@ -481,7 +505,12 @@ mod tests {
     #[tokio::test]
     async fn logs_overflow_drops_new_chunks_and_marks_the_first_after_the_gap() {
         let (router, gate) = gate();
-        let lane = LossyLane::start(&router, LaneKind::Logs, 2);
+        let lane = LossyLane::start(
+            &router,
+            LaneKind::Logs,
+            2,
+            tokio_util::sync::CancellationToken::new(),
+        );
         lane.offer(item(1, LaneKind::Logs));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         for s in 2..=5 {
@@ -496,7 +525,12 @@ mod tests {
     #[tokio::test]
     async fn without_a_sink_items_are_discarded_and_counted() {
         let router = LaneRouter::new();
-        let lane = LossyLane::start(&router, LaneKind::Logs, 4);
+        let lane = LossyLane::start(
+            &router,
+            LaneKind::Logs,
+            4,
+            tokio_util::sync::CancellationToken::new(),
+        );
         let before = LaneMetrics::get().discarded_count(LaneKind::Logs);
         lane.offer(item(1, LaneKind::Logs));
         lane.offer(item(2, LaneKind::Logs));

@@ -150,6 +150,16 @@ pub enum LinkError {
     /// The core broke the protocol.
     #[error("the connection broke the protocol: {0}")]
     Protocol(String),
+    /// A CONTROL message is too large to send; it was not spooled.
+    #[error(
+        "the message is {bytes} bytes on the wire; the limit is {max} bytes, so it was not sent"
+    )]
+    TooLarge {
+        /// Its size when sent.
+        bytes: usize,
+        /// The limit.
+        max: usize,
+    },
     /// A local agent error (files, settings).
     #[error(transparent)]
     Agent(#[from] AgentError),
@@ -165,7 +175,7 @@ impl LinkError {
             Self::NotEnrolled(_) => codes::NOT_ENROLLED.into(),
             Self::Unreachable(_) => codes::UNREACHABLE.into(),
             Self::SpoolFull(_) => codes::SPOOL_FULL.into(),
-            Self::Protocol(_) => codes::PROTOCOL.into(),
+            Self::Protocol(_) | Self::TooLarge { .. } => codes::PROTOCOL.into(),
             Self::Agent(e) => e.code().into(),
         }
     }
@@ -283,6 +293,19 @@ impl Queue {
         }
         self.items.drain(..).collect()
     }
+}
+
+/// The largest `body` can be when sent (every envelope field at its widest).
+fn envelope_len(body: &agent_message::Body) -> usize {
+    prost::Message::encoded_len(&AgentMessage {
+        seq: u64::MAX,
+        ack_seq: u64::MAX,
+        sent_at: Some(prost_types::Timestamp {
+            seconds: i64::MIN,
+            nanos: i32::MIN,
+        }),
+        body: Some(body.clone()),
+    })
 }
 
 /// One agent's link state, shared by the session and other agent services.
@@ -479,7 +502,16 @@ impl Link {
     }
 
     /// Sends a CONTROL message durably (spooled until the core acks it). Returns its seq.
+    /// A message that could not be sent within [`MAX_MESSAGE_BYTES`] is refused before it is
+    /// spooled ([`LinkError::TooLarge`]), so it never blocks the messages after it.
     pub fn send_control(&self, body: agent_message::Body) -> Result<u64, LinkError> {
+        let size = envelope_len(&body);
+        if size > MAX_MESSAGE_BYTES {
+            return Err(LinkError::TooLarge {
+                bytes: size,
+                max: MAX_MESSAGE_BYTES,
+            });
+        }
         let seq = self
             .spool
             .lock()
@@ -581,7 +613,25 @@ impl Link {
                 accepted: u.outcome.is_ok(),
                 failure: u.outcome.err(),
             });
-            match self.send_control(body) {
+            let sent = match self.send_control(body) {
+                // A failure too large to send is reported without its details.
+                Err(LinkError::TooLarge { bytes, max }) => {
+                    self.send_control(agent_message::Body::CommandResult(CommandResult {
+                        command_id: u.command_id.clone(),
+                        accepted: false,
+                        failure: Some(Failure {
+                            class: FailureClass::EngineError as i32,
+                            sub_code: "result_too_large".into(),
+                            message: format!(
+                                "the command's result was {bytes} bytes, over the {max}-byte limit; its details were dropped"
+                            ),
+                            ..Failure::default()
+                        }),
+                    }))
+                }
+                other => other,
+            };
+            match sent {
                 Ok(_) => {}
                 Err(LinkError::SpoolFull(_)) => return Ok(()),
                 Err(e) => return Err(e),
@@ -592,6 +642,26 @@ impl Link {
                 .reported(u.seq)?;
         }
         Ok(())
+    }
+
+    /// Journals the outcome of `seq` unless the link was bound to another node since
+    /// `generation` (then the outcome belongs to nobody and is dropped).
+    fn save_outcome(
+        &self,
+        generation: u64,
+        seq: u64,
+        id: &str,
+        outcome: &std::result::Result<(), Failure>,
+    ) -> Result<(), LinkError> {
+        let mut j = self
+            .journal
+            .lock()
+            .map_err(|_| LinkError::Protocol("journal lock poisoned".into()))?;
+        // `bind` swaps the journal under this lock, so the check and the write see one node.
+        if self.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
+            return Ok(());
+        }
+        j.complete(seq, id, outcome).map_err(LinkError::from)
     }
 
     /// Journals and runs a delivered command (once).
@@ -619,22 +689,23 @@ impl Link {
                     ..Failure::default()
                 }),
             };
-            let saved = link
-                .journal
-                .lock()
-                .map_err(|_| LinkError::Protocol("journal lock poisoned".into()))
-                .and_then(|mut j| {
-                    // `bind` swaps the journal under this lock, so the check and the write
-                    // see the same node.
-                    if link.generation.load(std::sync::atomic::Ordering::SeqCst) != generation {
-                        return Ok(());
-                    }
-                    j.complete(seq, &id, &outcome).map_err(LinkError::from)
-                });
-            let reported = saved.and_then(|()| link.report_results());
-            if let Err(e) = reported {
+            // The outcome is kept here until the journal has it: a failed write is retried, the
+            // handler never runs again.
+            let mut failures = 0u32;
+            while let Err(e) = link.save_outcome(generation, seq, &id, &outcome) {
+                failures = failures.saturating_add(1);
+                if failures == 1 || failures.is_multiple_of(20) {
+                    eprintln!(
+                        "mrl-agent: the result of command {id} is not saved yet (trying again): {}",
+                        e.explain()
+                    );
+                }
+                tokio::time::sleep(backoff(failures)).await;
+            }
+            if let Err(e) = link.report_results() {
+                // Saved in the journal: the next heartbeat or ack spools it.
                 eprintln!(
-                    "mrl-agent: the result of command {id} is not recorded yet: {}",
+                    "mrl-agent: the result of command {id} is not sent yet: {}",
                     e.explain()
                 );
             }
@@ -1395,9 +1466,17 @@ impl crate::registry::AgentService for GatewayService {
                     reason: e.explain(),
                 });
             }
+            // Before the first connection (no command runs yet): commands a restart cut off are
+            // reported. Until that succeeds the agent does not connect, so a running command is
+            // never mistaken for an interrupted one.
             if !reported {
                 if let Err(e) = link.report_interrupted() {
                     eprintln!("mrl-agent: {}", e.explain());
+                    failures = failures.saturating_add(1);
+                    tokio::select! {
+                        () = shutdown.cancelled() => break,
+                        () = tokio::time::sleep(backoff(failures)) => continue,
+                    }
                 }
                 reported = true;
             }
@@ -1663,6 +1742,47 @@ mod tests {
         assert!(!link.bind("node_b").unwrap());
     }
 
+    #[test]
+    fn a_message_too_large_to_send_is_never_spooled_and_the_next_one_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = Link::open(dir.path(), &GatewaySettings::default()).unwrap();
+        let huge = agent_message::Body::CommandResult(CommandResult {
+            command_id: "big".into(),
+            accepted: false,
+            failure: Some(Failure {
+                message: "x".repeat(MAX_MESSAGE_BYTES),
+                ..Failure::default()
+            }),
+        });
+        assert!(matches!(
+            link.send_control(huge),
+            Err(LinkError::TooLarge { .. })
+        ));
+        assert_eq!(link.spooled(), 0);
+        link.send_control(agent_message::Body::AttemptStatus(Default::default()))
+            .unwrap();
+        assert_eq!(link.spooled(), 1, "the next message is not blocked");
+
+        // A result whose failure is too large is reported without its details.
+        link.journal.lock().unwrap().receive(1, "c1").unwrap();
+        let big = Failure {
+            message: "y".repeat(MAX_MESSAGE_BYTES),
+            ..Failure::default()
+        };
+        link.journal
+            .lock()
+            .unwrap()
+            .complete(1, "c1", &Err(big))
+            .unwrap();
+        link.report_results().unwrap();
+        let (msgs, _) = link.spool.lock().unwrap().pending(0, false).unwrap();
+        assert!(matches!(
+            &msgs[1].body,
+            Some(agent_message::Body::CommandResult(r))
+                if r.command_id == "c1" && r.failure.as_ref().is_some_and(|f| f.sub_code == "result_too_large")
+        ));
+    }
+
     /// Runs until `go` is notified.
     struct Gate(tokio::sync::Notify);
 
@@ -1672,6 +1792,48 @@ mod tests {
             self.0.notified().await;
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn a_failed_journal_write_keeps_the_outcome_and_retries_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = Arc::new(Link::open(dir.path(), &GatewaySettings::default()).unwrap());
+        let gate = Arc::new(Gate(tokio::sync::Notify::new()));
+        link.register("Probe", gate.clone());
+        link.deliver(
+            1,
+            Command {
+                command_id: "c1".into(),
+                kind: Some(command::Kind::Probe(Default::default())),
+            },
+        )
+        .unwrap();
+        // The state folder goes away while the command runs: saving its outcome fails.
+        let state = dir.path().join("gateway");
+        std::fs::remove_dir_all(&state).unwrap();
+        gate.0.notify_one();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            link.journal.lock().unwrap().interrupted(),
+            vec![(1, "c1".to_owned())],
+            "not saved yet"
+        );
+        std::fs::create_dir_all(state.join("spool")).unwrap();
+        for _ in 0..100 {
+            if link.spooled() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let (msgs, _) = link.spool.lock().unwrap().pending(0, false).unwrap();
+        assert!(
+            matches!(
+                &msgs[..],
+                [AgentMessage { body: Some(agent_message::Body::CommandResult(r)), .. }] if r.command_id == "c1" && r.accepted
+            ),
+            "the kept outcome is saved and reported once the write works"
+        );
+        assert!(link.journal.lock().unwrap().interrupted().is_empty());
     }
 
     #[tokio::test]

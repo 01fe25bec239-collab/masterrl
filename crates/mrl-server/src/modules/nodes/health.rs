@@ -95,7 +95,7 @@ pub async fn check_once(gw: &Gateway) -> Result<(), NodesError> {
         settle(gw, node).await?;
     }
     for node in store::inbox_nodes(&gw.db).await? {
-        crate::grpc::session::deliver_kept(gw, node).await;
+        crate::grpc::session::deliver_kept(gw, node);
     }
     sqlx::query(
         "UPDATE agent_commands SET state = 'EXPIRED', updated_at = now()

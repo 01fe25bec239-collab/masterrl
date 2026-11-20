@@ -524,7 +524,11 @@ async fn node_action(
                         return Ok(Ok(false));
                     }
                     return Ok(match store::transition(tx, node, NodeEvent::Drain, Some("operator")).await.map_err(to_db)? {
-                        Some(_) => Ok(false),
+                        Some(_) => {
+                            // Launches queued for this machine are resolved with the drain.
+                            store::refuse_new_work(tx, node).await.map_err(to_db)?;
+                            Ok(false)
+                        }
                         None => Err(field("/status", "This machine was removed; it can't be drained.")),
                     });
                 }

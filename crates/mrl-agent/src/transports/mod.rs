@@ -337,6 +337,28 @@ impl Transport for Tailscale {
     }
 }
 
+/// A complete TLS record holding an empty ClientHello, which no TLS server accepts: every TLS
+/// server answers it (an alert), while a tunnel whose far end is down closes or stays silent.
+const PROBE: &[u8] = &[0x16, 0x03, 0x01, 0x00, 0x04, 0x01, 0x00, 0x00, 0x00];
+
+/// Ok when something behind `io` answers: the gateway and the agent are TLS servers, so a reply
+/// to [`PROBE`] proves the tunnel reaches one.
+pub async fn answers(mut io: BoxIo, wait: Duration) -> Result<(), String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let talk = async {
+        io.write_all(PROBE).await?;
+        io.flush().await?;
+        let mut b = [0u8; 1];
+        io.read(&mut b).await
+    };
+    match tokio::time::timeout(wait, talk).await {
+        Ok(Ok(n)) if n > 0 => Ok(()),
+        Ok(Ok(_)) => Err("the tunnel closed without an answer".to_owned()),
+        Ok(Err(e)) => Err(format!("the tunnel failed: {e}")),
+        Err(_) => Err(format!("no answer within {} s", wait.as_secs())),
+    }
+}
+
 /// Through `cloudflared access tcp --hostname <hostname>`.
 pub struct CloudflareTunnel {
     hostname: String,
@@ -438,11 +460,21 @@ impl Transport for CloudflareTunnel {
             }
         }
         match self.open().await {
-            Ok(_) => r.pass(
-                "tunnel",
-                format!("cloudflared opened the tunnel to {}", self.hostname),
-            ),
             Err(e) => r.fail("tunnel", UNREACHABLE, e.to_string()),
+            Ok(io) => match answers(io, Duration::from_secs(10)).await {
+                Ok(()) => r.pass(
+                    "tunnel",
+                    format!("the core answered through the tunnel to {}", self.hostname),
+                ),
+                Err(why) => r.fail(
+                    "tunnel",
+                    UNREACHABLE,
+                    format!(
+                        "cloudflared runs, but nothing answered behind {} ({why}); check that the core's tunnel is running and points at its gateway port",
+                        self.hostname
+                    ),
+                ),
+            },
         }
         r
     }
@@ -575,6 +607,61 @@ mod tests {
             .connection_test()
             .await;
         assert!(r.problem().unwrap().contains("could not find"));
+    }
+
+    async fn probe_against(
+        serve: impl FnOnce(
+                tokio::net::TcpStream,
+            ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            + Send
+            + 'static,
+    ) -> Result<(), String> {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (s, _) = l.accept().await.unwrap();
+            serve(s).await;
+        });
+        let io = tokio::net::TcpStream::connect(addr).await.unwrap();
+        answers(Box::new(io), Duration::from_secs(2)).await
+    }
+
+    #[tokio::test]
+    async fn the_tunnel_test_needs_an_answer_from_behind_the_tunnel() {
+        // A TLS server behind the tunnel answers the probe.
+        let cert = rcgen::generate_simple_self_signed(vec!["x".to_owned()]).unwrap();
+        let config = tokio_rustls::rustls::ServerConfig::builder_with_provider(
+            std::sync::Arc::new(tokio_rustls::rustls::crypto::ring::default_provider()),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.cert.der().clone()],
+            tokio_rustls::rustls::pki_types::PrivateKeyDer::Pkcs8(
+                cert.signing_key.serialize_der().into(),
+            ),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+        let tls = probe_against(move |s| {
+            Box::pin(async move {
+                let _ = acceptor.accept(s).await;
+            })
+        })
+        .await;
+        assert_eq!(tls, Ok(()));
+        // The origin is down: cloudflared accepts locally, then closes (or never answers).
+        let closed = probe_against(|s| Box::pin(async move { drop(s) })).await;
+        assert!(closed.is_err(), "{closed:?}");
+        let silent = probe_against(|s| {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                drop(s);
+            })
+        })
+        .await;
+        assert!(silent.unwrap_err().contains("no answer"));
     }
 
     #[tokio::test]

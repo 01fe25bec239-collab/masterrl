@@ -2521,6 +2521,7 @@ dependencies = [
  "mrl-domain",
  "mrl-proto",
  "mrl-server",
+ "prost",
  "prost-types",
  "rcgen",
  "serde_json",

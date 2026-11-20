@@ -97,12 +97,12 @@ impl CommandKind {
     }
 
     fn starts_work(self) -> bool {
-        matches!(
-            self,
-            Self::LaunchAttempt | Self::StartAttempt | Self::LaunchDeployment
-        )
+        STARTS_WORK.contains(&self.as_str())
     }
 }
+
+/// Kinds that start new work: refused, and not sent, while a node drains.
+pub const STARTS_WORK: [&str; 3] = ["LaunchAttempt", "StartAttempt", "LaunchDeployment"];
 
 /// A command to write.
 #[derive(Debug, Clone)]
@@ -199,11 +199,18 @@ impl CommandSender {
             None => (None, None),
         };
         let id = Uuid::now_v7();
-        let payload = Command {
+        let command = Command {
             command_id: id.to_string(),
             kind: Some(cmd.kind.clone()),
+        };
+        let size = envelope_len(&command);
+        if size > crate::grpc::MAX_MESSAGE_BYTES {
+            return Err(NodesError::CommandRefused(format!(
+                "the command is {size} bytes on the wire; the limit is {} bytes",
+                crate::grpc::MAX_MESSAGE_BYTES
+            )));
         }
-        .encode_to_vec();
+        let payload = command.encode_to_vec();
         let supersede = cmd.supersede;
         let out = self
             .db
@@ -288,6 +295,23 @@ impl CommandSender {
         .transpose()
         .map_err(|e: sqlx::Error| e.into())
     }
+}
+
+/// The largest the command's `CoreMessage` can be when sent (every envelope field at its
+/// widest), so a command that is stored can always be sent.
+pub fn envelope_len(command: &Command) -> usize {
+    mrl_proto::agent::v1::CoreMessage {
+        seq: u64::MAX,
+        ack_seq: u64::MAX,
+        sent_at: Some(prost_types::Timestamp {
+            seconds: i64::MIN,
+            nanos: i32::MIN,
+        }),
+        body: Some(mrl_proto::agent::v1::core_message::Body::Command(
+            command.clone(),
+        )),
+    }
+    .encoded_len()
 }
 
 /// Wakes local CONTROL streams when any replica writes a command (LISTEN on [`WAKE_CHANNEL`]).

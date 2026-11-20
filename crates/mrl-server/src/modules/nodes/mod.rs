@@ -377,13 +377,25 @@ impl Sessions {
             .clone()
     }
 
-    /// Forgets the CONTROL session `epoch` (when it is still the current one).
+    /// Ends the CONTROL session `epoch` (when it is still the current one): its token is
+    /// cancelled, so the data streams bound to it close.
     pub fn close_control(&self, node: Uuid, epoch: i64) {
         if let Ok(mut map) = self.0.lock() {
             if map.get(&node).is_some_and(|e| e.epoch == epoch) {
-                map.remove(&node);
+                if let Some(e) = map.remove(&node) {
+                    e.control.cancel();
+                }
             }
         }
+    }
+
+    /// The CONTROL session this replica holds for `node`: its epoch and the token cancelled
+    /// when it ends or is taken over.
+    pub fn control_of(&self, node: Uuid) -> Option<(i64, CancellationToken)> {
+        let map = self.0.lock().ok()?;
+        map.get(&node)
+            .filter(|e| e.epoch > 0 && !e.control.is_cancelled())
+            .map(|e| (e.epoch, e.control.clone()))
     }
 
     /// True when this replica holds a CONTROL session for `node`.
