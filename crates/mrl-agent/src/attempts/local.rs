@@ -115,6 +115,8 @@ async fn run_cli(config: Option<&Path>, cmd: AttemptCommand) -> Result<ExitCode,
     let AttemptCommand::Run { spec, keep, json } = cmd;
     let spec = read_spec(&spec)?;
     let (cfg, _) = AgentConfig::load(config)?;
+    // One agent process per state folder, claimed before the node cache is opened.
+    let _writer = crate::envs::lock_state(&cfg.state_dir)?;
     let ctx = Arc::new(AgentContext::from_config(cfg)?);
     let (tx, mut rx) = super::attempt_events(256);
     let printer = tokio::spawn(async move {

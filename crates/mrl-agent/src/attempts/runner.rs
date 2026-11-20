@@ -219,6 +219,9 @@ pub struct Runner {
     /// Finished uploads whose outcome could not be saved: saved again on the retry tick,
     /// never uploaded twice.
     unsaved: HashMap<String, UploadDone>,
+    /// Uploads of files outside a checkpoint (`UploadArtifacts` without a checkpoint id),
+    /// running now, by command id.
+    adhoc: HashMap<String, tokio::task::JoinHandle<()>>,
 }
 
 /// Folders of an attempt.
@@ -332,6 +335,7 @@ impl Runner {
             last_seen: Instant::now(),
             in_flight: HashSet::new(),
             unsaved: HashMap::new(),
+            adhoc: HashMap::new(),
         }
     }
 
@@ -857,17 +861,35 @@ impl Runner {
         self.save();
     }
 
-    async fn send(&self, role_id: &str, body: AgentBody) -> bool {
-        match &self.server {
-            Some(s) => s.send(role_id, body).await,
-            None => false,
+    /// The earliest deadline in force (lease, cancel/pause stop), if any.
+    fn next_deadline(&self) -> Option<Instant> {
+        match (self.lease, self.stop_at) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
         }
     }
 
-    async fn send_all(&self, body: AgentBody) {
-        for role in self.workers.keys() {
-            self.send(role, body.clone()).await;
+    /// Sends to one worker. Never waits past the next deadline (nor the server's own
+    /// `SEND_TIMEOUT`), so the main loop gets back to lease expiry and stop deadlines on time.
+    async fn send(&self, role_id: &str, body: AgentBody) -> bool {
+        let Some(s) = &self.server else {
+            return false;
+        };
+        match self.next_deadline() {
+            Some(at) => tokio::time::timeout_at(at, s.send(role_id, body))
+                .await
+                .unwrap_or(false),
+            None => s.send(role_id, body).await,
         }
+    }
+
+    /// Sends to every worker at once, so blocked workers cost one wait, not one each.
+    async fn send_all(&self, body: AgentBody) {
+        let sends = self
+            .workers
+            .keys()
+            .map(|role| self.send(role, body.clone()));
+        futures::future::join_all(sends).await;
     }
 
     fn primary_role(&self) -> Option<String> {
@@ -1330,7 +1352,10 @@ impl Runner {
         let failure = u.result.err().map(|(_, reason)| reason);
         match (u.checkpoint_id, u.command_id) {
             (Some(id), _) => self.answer_plan(&id, failure).await,
-            (None, Some(command_id)) => self.command_done(command_id, failure).await,
+            (None, Some(command_id)) => {
+                self.adhoc.remove(&command_id);
+                self.command_done(command_id, failure).await;
+            }
             (None, None) => {}
         }
     }
@@ -1346,29 +1371,47 @@ impl Runner {
         }
         plan.answered = true;
         let command_id = plan.command_id.clone();
-        self.save();
         self.command_done(command_id, failure).await;
     }
 
-    /// Reports a finished upload command (`failure`: why it failed).
-    async fn command_done(&self, command_id: String, failure: Option<String>) {
-        let result = CommandResult {
-            command_id,
-            accepted: true,
-            failure: failure.map(|reason| mrl_proto::common::v1::Failure {
-                class: mrl_proto::common::v1::FailureClass::InfraTransient as i32,
-                sub_code: "UPLOAD_FAILED".into(),
-                message: reason,
-                retryable_hint: true,
-                classified_by: mrl_proto::common::v1::ClassifiedBy::Agent as i32,
-                ..Default::default()
-            }),
-        };
-        let _ = self.emit(AttemptEvent::CommandDone(result)).await;
+    /// Reports a finished upload command (`failure`: why it failed): saved with the record
+    /// first (in `results`), then sent; see [`Self::deliver_results`].
+    async fn command_done(&mut self, command_id: String, failure: Option<String>) {
+        self.rec.results.insert(command_id, failure);
+        self.save();
+        self.deliver_results().await;
     }
 
-    /// Retries commits whose outcome could not be saved (and any that now have tickets).
+    /// Sends every saved upload result not sent yet, removing each once the gateway's channel
+    /// took it. Stops at the first that can't be sent (closed channel, lease over); the retry
+    /// tick, a restart or the next agent sends it again.
+    async fn deliver_results(&mut self) {
+        let pending: Vec<(String, Option<String>)> = self
+            .rec
+            .results
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut sent = false;
+        for (command_id, failure) in pending {
+            let ev = AttemptEvent::CommandDone(upload_result(command_id.clone(), failure));
+            if !matches!(self.emit(ev).await, Delivery::Sent) {
+                break;
+            }
+            self.rec.results.remove(&command_id);
+            sent = true;
+        }
+        if sent {
+            self.save();
+        }
+    }
+
+    /// Retries commits whose outcome could not be saved (and any that now have tickets), and
+    /// results not sent yet.
     async fn retry_commits(&mut self) {
+        if !self.rec.results.is_empty() {
+            self.deliver_results().await;
+        }
         for (_, done) in std::mem::take(&mut self.unsaved) {
             self.on_upload(done).await;
         }
@@ -1428,8 +1471,10 @@ impl Runner {
                     reason,
                 });
                 self.remember(&body);
-                self.send_all(body).await;
+                // Armed on receipt: the grace period runs from now, however long the workers
+                // take to accept the request.
                 self.set_stop_deadline(Duration::from_secs(grace_s.into()) + DEADLINE_MARGIN);
+                self.send_all(body).await;
                 self.set_phase(AttemptPhase::Stopping).await;
             }
             Control::Pause {
@@ -1469,10 +1514,14 @@ impl Runner {
                 targets,
             } => {
                 if checkpoint_id.is_empty() {
+                    if self.adhoc.contains_key(&command_id) {
+                        return; // a replay of a running upload: answered when it ends
+                    }
                     let ctx = Arc::clone(&self.sh.ctx);
                     let staging = self.staging();
                     let tx = self.uploads_tx.clone();
-                    tokio::spawn(async move {
+                    let id = command_id.clone();
+                    let task = tokio::spawn(async move {
                         let mut result = Ok(());
                         for t in targets {
                             let sent = match t.ticket() {
@@ -1497,11 +1546,12 @@ impl Runner {
                         let _ = tx
                             .send(UploadDone {
                                 checkpoint_id: None,
-                                command_id: Some(command_id),
+                                command_id: Some(id),
                                 result,
                             })
                             .await;
                     });
+                    self.adhoc.insert(command_id, task);
                 } else {
                     let active = self
                         .rec
@@ -1625,11 +1675,11 @@ impl Runner {
         // Uploads still running get to finish (not after a self-fence), so their commands get
         // their real result; every command still without one is then answered as failed.
         let until = Instant::now() + UPLOAD_DRAIN;
-        while !self.in_flight.is_empty() && !self.self_fenced {
+        while !(self.in_flight.is_empty() && self.adhoc.is_empty()) && !self.self_fenced {
             for (_, done) in std::mem::take(&mut self.unsaved) {
                 self.on_upload(done).await;
             }
-            if self.in_flight.is_empty() {
+            if self.in_flight.is_empty() && self.adhoc.is_empty() {
                 break;
             }
             match tokio::time::timeout_at(until, self.uploads_rx.recv()).await {
@@ -1648,6 +1698,13 @@ impl Runner {
             let why = format!("the attempt ended before checkpoint {id} was uploaded");
             self.answer_plan(&id, Some(why)).await;
         }
+        // Uploads of other files still running are stopped, so no transfer outlives the
+        // attempt, and their commands fail.
+        for (command_id, task) in std::mem::take(&mut self.adhoc) {
+            task.abort();
+            let why = "the attempt ended before the upload finished".to_owned();
+            self.command_done(command_id, Some(why)).await;
+        }
         if let Some(s) = self.server.take() {
             s.stop().await;
         }
@@ -1660,6 +1717,22 @@ impl Runner {
         let line = serde_json::to_string(&report).unwrap_or_default();
         let _ = std::fs::write(self.job_dir.join("cleanup.json"), line);
         decision
+    }
+}
+
+/// The `CommandResult` for a finished upload command (`failure`: why it failed).
+pub fn upload_result(command_id: String, failure: Option<String>) -> CommandResult {
+    CommandResult {
+        command_id,
+        accepted: true,
+        failure: failure.map(|reason| mrl_proto::common::v1::Failure {
+            class: mrl_proto::common::v1::FailureClass::InfraTransient as i32,
+            sub_code: "UPLOAD_FAILED".into(),
+            message: reason,
+            retryable_hint: true,
+            classified_by: mrl_proto::common::v1::ClassifiedBy::Agent as i32,
+            ..Default::default()
+        }),
     }
 }
 
@@ -1770,7 +1843,7 @@ pub fn docker_run_args<'a>(
 }
 
 /// Container exit code and OOM flag (`docker inspect`).
-async fn container_exit(name: &str) -> (Option<i32>, bool) {
+pub(crate) async fn container_exit(name: &str) -> (Option<i32>, bool) {
     let Some(docker) = crate::envs::which("docker") else {
         return (None, false);
     };

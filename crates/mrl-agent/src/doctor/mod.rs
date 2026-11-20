@@ -913,8 +913,8 @@ pub async fn cli(config: Option<&Path>, args: DoctorArgs) -> std::process::ExitC
     let result = async {
         let (cfg, _) = crate::config::AgentConfig::load(config)?;
         let ctx = Arc::new(AgentContext::from_config(cfg)?);
-        let envs = Envs::open(ctx.state.root(), Arc::clone(&ctx.cache))
-            .map_err(|e| crate::AgentError::exec("the environment doctor", e.explain()))?;
+        // Read only: the doctor may run next to an agent that owns the state folder.
+        let envs = Envs::open_read_only(ctx.state.root(), Arc::clone(&ctx.cache));
         let facts = Facts::gather(&ctx, &envs).await;
         let report = run(&facts);
         ctx.state

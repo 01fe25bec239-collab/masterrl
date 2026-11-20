@@ -58,6 +58,10 @@ async fn channel(target: &str) -> Result<tonic::transport::Channel, Status> {
     if !target.contains(':') {
         let path = PathBuf::from(target);
         return tonic::transport::Endpoint::from_static("http://localhost")
+            // HTTP/2's standard windows: a worker that stops reading backs up the agent at
+            // once instead of buffering megabytes.
+            .initial_stream_window_size(Some(65_535))
+            .initial_connection_window_size(Some(65_535))
             .connect_with_connector(tower::service_fn(move |_: tonic::transport::Uri| {
                 let path = path.clone();
                 async move {
@@ -70,6 +74,8 @@ async fn channel(target: &str) -> Result<tonic::transport::Channel, Status> {
     }
     tonic::transport::Endpoint::from_shared(format!("http://{target}"))
         .map_err(unavailable)?
+        .initial_stream_window_size(Some(65_535))
+        .initial_connection_window_size(Some(65_535))
         .connect()
         .await
         .map_err(unavailable)
@@ -333,6 +339,7 @@ impl RunnerFixture {
             exit_report: None,
             requests: Vec::new(),
             uploads: Default::default(),
+            results: Default::default(),
         };
         edit(&mut record);
         let job = agent.ctx.state.job_dir(&id);
@@ -1121,6 +1128,57 @@ mod runner_tests {
         }
     }
 
+    /// Two connected workers that stop reading can't hold the attempt past its lease: sends
+    /// are bounded by the deadline and go to both workers at once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn blocked_workers_do_not_delay_the_lease() {
+        let rt = format!("uv:sha256:{SHA}");
+        let extra = serde_json::json!({
+            "roles": [{"role_id": "trainer", "primary": true, "count": 2, "runtime_ref": rt}],
+            // A big Prepare fills each worker's connection at once.
+            "job_spec": {"job_kind": "EXPORT", "blob": "x".repeat(300 << 10)},
+        });
+        let mut fx = RunnerFixture::readopt(spec("att_bl", extra), |r| {
+            r.lease_deadline_unix_ms = Some(now_ms() + 60_000);
+        })
+        .await;
+        let (_a, _) = fx.worker("trainer.0").await;
+        let (_b, _) = fx.worker("trainer.1").await;
+        let started = std::time::Instant::now();
+        // Each renewal goes to both workers and sets the lease to 3 s from now; the queues
+        // fill after a few dozen.
+        let control = fx.control.clone();
+        tokio::spawn(async move {
+            for _ in 0..200 {
+                let lease = Control::Lease {
+                    duration_s: 3,
+                    kill_budget_s: 0,
+                };
+                if control.send(lease).await.is_err() {
+                    return;
+                }
+            }
+            let _ = control
+                .send(Control::Cancel {
+                    request_id: "c".into(),
+                    grace_s: 60,
+                    reason: "test".into(),
+                })
+                .await;
+        });
+        let d = tokio::time::timeout(Duration::from_secs(60), &mut fx.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.phase, AttemptPhase::SelfFenced as i32, "{d:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(8),
+            "fenced late: {:?}",
+            started.elapsed()
+        );
+    }
+
     /// A PUT sink that answers after `delay`.
     async fn slow_sink(delay: Duration) -> (String, Arc<Mutex<Vec<Vec<u8>>>>) {
         use axum::routing::put;
@@ -1313,6 +1371,73 @@ mod runner_tests {
             "saved as answered"
         );
         assert!(got.lock().unwrap().is_empty(), "nothing was uploaded");
+    }
+
+    /// A result saved but not sent before a crash is sent after the restart: by the re-adopted
+    /// runner, and for an attempt that had ended, by the next manager.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn saved_results_are_sent_after_a_restart() {
+        let mut fx = RunnerFixture::readopt(spec("att_rs", serde_json::json!({})), |r| {
+            r.results.insert("up-9".into(), None);
+        })
+        .await;
+        let r = done(&mut fx).await;
+        assert_eq!(r.command_id, "up-9");
+        assert!(r.failure.is_none());
+        fx.end_workers();
+        let _ = tokio::time::timeout(Duration::from_secs(30), &mut fx.task).await;
+        let mut ended = fx.saved();
+        assert!(ended.results.is_empty(), "removed once sent");
+        // Ended, with a result still unsent (the agent died right after saving it).
+        ended.results.insert("up-10".into(), Some("late".into()));
+        let job = fx.staging().parent().unwrap().to_path_buf();
+        ended.save(&job).unwrap();
+        let (etx, mut erx) = mrl_agent::attempts::attempt_events(16);
+        let next =
+            mrl_agent::attempts::Attempts::new(Arc::clone(&fx.agent.ctx), etx, None).unwrap();
+        next.readopt().await;
+        let mut got = None;
+        while let Ok(e) = erx.try_recv() {
+            if let AttemptEvent::CommandDone(r) = e {
+                got = Some(r);
+            }
+        }
+        assert_eq!(got.unwrap().command_id, "up-10");
+        assert!(fx.saved().results.is_empty());
+    }
+
+    /// The worker exits while an upload of other files (no checkpoint) is still sending: the
+    /// attempt waits for it and its command gets exactly one result.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_upload_running_at_exit_gets_one_result() {
+        let (base, got) = slow_sink(Duration::from_millis(2500)).await;
+        let path = "logs/run.txt";
+        let sha = sha_hex(b"log lines");
+        let mut fx = RunnerFixture::readopt(spec("att_ad", serde_json::json!({})), |_| {}).await;
+        let file = fx.staging().join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"log lines").unwrap();
+        let (_w, _) = fx.worker("trainer").await;
+        fx.control
+            .send(Control::Upload {
+                command_id: "up-log".into(),
+                checkpoint_id: String::new(),
+                targets: vec![target(&base, path, &sha, 9)],
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        fx.end_workers();
+        let r = done(&mut fx).await;
+        assert_eq!(r.command_id, "up-log");
+        assert!(r.failure.is_none(), "{r:?}");
+        let _ = tokio::time::timeout(Duration::from_secs(30), &mut fx.task).await;
+        let mut more = 0;
+        while let Ok(e) = fx.events.try_recv() {
+            more += usize::from(matches!(e, AttemptEvent::CommandDone(_)));
+        }
+        assert_eq!(more, 0, "one result only");
+        assert_eq!(got.lock().unwrap().len(), 1);
     }
 
     /// Two commands for one checkpoint before the worker asks to commit: the first is answered

@@ -230,6 +230,20 @@ async fn a_second_manager_leaves_a_running_attempt_alone() {
         rec.exit.is_none(),
         "still the first manager's, not declared lost"
     );
+    // A targeted Cleanup from the second manager is refused and touches nothing.
+    let cleanup = Command {
+        command_id: "clean".into(),
+        kind: Some(Kind::Cleanup(Cleanup {
+            attempt: attempt_ref("job_o", "att_own"),
+            purge_scratch: true,
+            ..Default::default()
+        })),
+    };
+    assert!(!second.handle(&cleanup).await.unwrap().accepted);
+    let after = mrl_agent::attempts::record::AttemptRecord::load(&ctx.state.job_dir("att_own"))
+        .unwrap()
+        .unwrap();
+    assert!(after.exit.is_none(), "nothing released or decided");
     assert_eq!(first.running().len(), 1);
     first.handle(&cancel_cmd("job_o", "att_own")).await.unwrap();
     tokio::time::timeout(WAIT, first.wait("att_own"))
@@ -262,6 +276,28 @@ async fn pre_launch_data_must_match_the_launch() {
         )),
     };
     assert!(attempts.handle(&cred("job_m", 2)).await.unwrap().accepted);
+    // A newer epoch whose batch has a bad entry changes nothing: neither the epoch nor what
+    // was already there.
+    let mut bad = cred("job_m", 9);
+    if let Some(Kind::UpdateCredentials(u)) = &mut bad.kind {
+        u.credentials.push(mrl_proto::agent::v1::Credential {
+            name: "broken".into(),
+            value: vec![0xff, 0xfe],
+            expires_at: None,
+        });
+        u.credentials[0].name = "first_ok".into();
+    }
+    assert!(!attempts.handle(&bad).await.unwrap().accepted);
+    let check = bad_lock_spec(dir.path(), "att_m", "job_m", 2, serde_json::json!({}));
+    let env = attempts.secrets_for(&check).unwrap();
+    assert!(
+        env.iter().any(|(n, _)| n == "MRL_CREDENTIAL_HF_HUB"),
+        "kept"
+    );
+    assert!(
+        env.iter().all(|(n, _)| n != "MRL_CREDENTIAL_FIRST_OK"),
+        "nothing half-applied"
+    );
     assert!(
         !attempts
             .handle(&cred("job_other", 2))
@@ -832,6 +868,7 @@ async fn windows_reports_a_surviving_worker_lost() {
         exit_report: None,
         requests: Vec::new(),
         uploads: Default::default(),
+        results: Default::default(),
     };
     let job = ctx.state.job_dir("att_win");
     std::fs::create_dir_all(&job).unwrap();

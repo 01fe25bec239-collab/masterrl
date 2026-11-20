@@ -675,6 +675,7 @@ async fn orphaned_job(
         exit_report: None,
         requests: Vec::new(),
         uploads: Default::default(),
+        results: Default::default(),
     };
     (rec, orphan)
 }
@@ -845,8 +846,9 @@ async fn crash_and_readopt(test: &str, sandbox: &str, id: &str) {
     assert_eq!(ckpts, 6, "{test}: every checkpoint was committed");
 }
 
-/// Two `attempt run`s of one spec at once: the second refuses (the attempt is the first's)
-/// and the first finishes undisturbed.
+/// Two `attempt run`s on one state folder at once, for the same attempt and for another one:
+/// the second process refuses to start (one agent process per state folder) and the first
+/// finishes undisturbed.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs uv; runs in ci-attempts"]
 async fn a_second_cli_run_never_takes_over() {
@@ -872,7 +874,11 @@ async fn a_second_cli_run_never_takes_over() {
     );
     let spec_file = dir.path().join("spec.json");
     std::fs::write(&spec_file, serde_json::to_vec(&s).unwrap()).unwrap();
-    let agent = |log: &str| {
+    let mut other = s.clone();
+    other.attempt.attempt_id = "att_other_cli".into();
+    let other_file = dir.path().join("other.json");
+    std::fs::write(&other_file, serde_json::to_vec(&other).unwrap()).unwrap();
+    let agent = |log: &str, spec: &Path| {
         let log = std::fs::File::create(dir.path().join(log)).unwrap();
         std::process::Command::new(env!("CARGO_BIN_EXE_mrl-agent"))
             .args([
@@ -882,14 +888,14 @@ async fn a_second_cli_run_never_takes_over() {
                 "run",
                 "--spec",
             ])
-            .arg(&spec_file)
+            .arg(spec)
             .stdout(log.try_clone().unwrap())
             .stderr(log)
             .spawn()
             .unwrap()
     };
     let job = state.join("jobs").join("att_two_cli");
-    let mut first = agent("first.log");
+    let mut first = agent("first.log", &spec_file);
     let deadline = std::time::Instant::now() + WAIT;
     while !AttemptRecord::load(&job)
         .ok()
@@ -902,15 +908,21 @@ async fn a_second_cli_run_never_takes_over() {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    let second = agent("second.log");
-    let status = tokio::task::spawn_blocking(move || second.wait_with_output())
-        .await
-        .unwrap()
-        .unwrap()
-        .status;
-    let log = std::fs::read_to_string(dir.path().join("second.log")).unwrap();
-    assert!(!status.success(), "{log}");
-    assert!(log.contains("another mrl-agent"), "{log}");
+    for (log, spec) in [("same.log", &spec_file), ("other.log", &other_file)] {
+        let second = agent(log, spec);
+        let status = tokio::task::spawn_blocking(move || second.wait_with_output())
+            .await
+            .unwrap()
+            .unwrap()
+            .status;
+        let text = std::fs::read_to_string(dir.path().join(log)).unwrap();
+        assert!(!status.success(), "{log}: {text}");
+        assert!(text.contains("another mrl-agent"), "{log}: {text}");
+    }
+    assert!(
+        !state.join("jobs").join("att_other_cli").exists(),
+        "the refused run touched nothing"
+    );
     let status = tokio::task::spawn_blocking(move || first.wait())
         .await
         .unwrap()
@@ -992,6 +1004,7 @@ fn old_record(
         exit_report: None,
         requests: Vec::new(),
         uploads: Default::default(),
+        results: Default::default(),
     }
 }
 
@@ -1180,6 +1193,67 @@ async fn a_restart_never_adopts_a_newer_container() {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert!(!identity.alive(), "its own launch stopped it");
+}
+
+/// A container that ended while the agent was down: its saved report says it was cancelled
+/// cleanly, Docker says exit code 3. Recovery reads Docker's status and reports the mismatch.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs Docker; runs in ci-attempts"]
+async fn a_container_that_exited_while_the_agent_was_down_is_checked() {
+    use mrl_agent::attempts::runner::{attempt_token, TOKEN_ENV};
+    if !docker_ready("a_container_that_exited_while_the_agent_was_down_is_checked") {
+        return;
+    }
+    let docker = mrl_agent::envs::which("docker").unwrap();
+    let name = format!("mrl-test-x{}", std::process::id());
+    let _ = std::process::Command::new(&docker)
+        .args(["rm", "-f", &name])
+        .output();
+    let ran = std::process::Command::new(&docker)
+        .args(["run", "--name", &name, "-e"])
+        .arg(format!("{TOKEN_ENV}={}", attempt_token("down-launch")))
+        .args(["busybox:1.36", "sh", "-c", "exit 3"])
+        .stdout(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(ran.code(), Some(3));
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), None);
+    let identity = ProcIdentity::Container {
+        name: name.clone(),
+        id: None,
+    };
+    let mut rec = old_record(ctx.state.root(), "att_down", "down-launch", identity, None);
+    rec.phase = AttemptPhase::Running as i32;
+    rec.socket = mrl_agent::attempts::runner::socket_path(ctx.state.root(), "att_down");
+    rec.cancel_requested = true;
+    rec.exit_report = Some(prost::Message::encode_to_vec(
+        &mrl_proto::worker::v1::ExitReport {
+            kind: ExitKind::Cancelled as i32,
+            ..Default::default()
+        },
+    ));
+    let job = ctx.state.job_dir("att_down");
+    std::fs::create_dir_all(&job).unwrap();
+    rec.save(&job).unwrap();
+    let (attempts, _seen) = manager(&ctx);
+    let statuses = attempts.readopt().await;
+    let s = statuses
+        .iter()
+        .find(|s| {
+            s.attempt
+                .as_ref()
+                .is_some_and(|a| a.attempt_id == "att_down")
+        })
+        .unwrap();
+    assert_eq!(
+        s.failure.as_ref().map(|f| f.sub_code.as_str()),
+        Some("EXIT_STATUS_MISMATCH"),
+        "{s:?}"
+    );
+    let _ = std::process::Command::new(&docker)
+        .args(["rm", "-f", &name])
+        .output();
 }
 
 /// The lease runs out while the event reader is stuck: the launch ends fenced and no worker

@@ -63,6 +63,11 @@ pub struct AttemptRecord {
     /// Upload tickets per checkpoint id, from `UploadArtifacts`.
     #[serde(default)]
     pub uploads: BTreeMap<String, UploadPlan>,
+    /// Upload command results not yet handed to the gateway: command id -> failure (`None`:
+    /// succeeded). Saved before they are sent and removed once sent, so a crash in between
+    /// sends them again (at least once; the core dedups by command id).
+    #[serde(default)]
+    pub results: BTreeMap<String, Option<String>>,
 }
 
 /// The tickets for one checkpoint.

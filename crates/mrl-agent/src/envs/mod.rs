@@ -101,6 +101,8 @@ pub struct Envs {
     root: PathBuf,
     cache: Arc<NodeCache>,
     free_space: Arc<FreeSpaceFn>,
+    /// The state folder's writer lock (see [`lock_state`]); `None` for a read-only view.
+    _writer: Option<Arc<std::fs::File>>,
 }
 
 /// Free bytes on the disk holding a path (replaceable in tests).
@@ -119,8 +121,10 @@ const SNAPSHOT_SKIP: [&str; 8] = [
 ];
 
 impl Envs {
-    /// Opens `<state>/envs`.
+    /// Opens `<state>/envs` to install, pin and evict. Takes the state folder's writer lock
+    /// ([`lock_state`]): one agent process per state folder.
     pub fn open(state_root: &Path, cache: Arc<NodeCache>) -> Result<Self, AttemptError> {
+        let writer = lock_state(state_root)?;
         let root = state_root.join("envs");
         std::fs::create_dir_all(&root).map_err(|e| AgentError::state(&root, e))?;
         reclaim_snapshots(&root);
@@ -128,7 +132,19 @@ impl Envs {
             root,
             cache,
             free_space: Arc::new(disk_free),
+            _writer: Some(writer),
         })
+    }
+
+    /// A view for listing only (`mrl-agent doctor` next to a running agent): no lock taken,
+    /// nothing reclaimed. Never install or evict through it.
+    pub fn open_read_only(state_root: &Path, cache: Arc<NodeCache>) -> Self {
+        Self {
+            root: state_root.join("envs"),
+            cache,
+            free_space: Arc::new(disk_free),
+            _writer: None,
+        }
     }
 
     /// Uses `f` to read free disk space (tests).
@@ -235,6 +251,12 @@ impl Envs {
             }
             n = lo + (hi - lo) / 2;
         }
+    }
+
+    /// The install snapshot for the environment in `env_dir`.
+    fn snapshot_dir(&self, env_dir: &Path) -> PathBuf {
+        let name = env_dir.file_name().unwrap_or_default().to_string_lossy();
+        self.root.join(format!(".src-{name}-{}", snapshot_owner()))
     }
 
     /// The folder for a runtime.
@@ -355,11 +377,9 @@ impl Envs {
             // Install from an agent-owned copy holding the verified lock, never the live
             // project folder. The copy is removed however the install ends (error, cancel);
             // one left by a dead agent is reclaimed by `Envs::open`.
-            let snap = ScopedDir(self.root.join(format!(
-                ".src-{}-{}",
-                rt.dir_name(),
-                snapshot_owner()
-            )));
+            // Named after the environment folder (runtime and package), so two packages of
+            // one lock installing at once never share a copy.
+            let snap = ScopedDir(self.snapshot_dir(dir));
             let dirs: Vec<PathBuf> = plan.local.iter().map(|p| p.dir.clone()).collect();
             let copy = snapshot_project(project, &dirs, &lock, &snap.0, &self.root)
                 .map_err(|e| install_err(format!("the project could not be copied ({e})")))?;
@@ -460,6 +480,44 @@ impl Envs {
         }
         Ok(removed)
     }
+}
+
+/// The writer lock of a state folder (`<state>/agent.lock`, exclusive), shared by everything in
+/// this process that uses the folder and released when the last user drops it. Environments,
+/// pins and the node cache index are only safe with one writing process, so a second process
+/// (an `attempt run` next to the agent, or a second agent) is refused.
+pub fn lock_state(state_root: &Path) -> Result<Arc<std::fs::File>, AttemptError> {
+    static HELD: std::sync::LazyLock<
+        std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<std::fs::File>>>,
+    > = std::sync::LazyLock::new(Default::default);
+    let mut held = HELD.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(f) = held.get(state_root).and_then(std::sync::Weak::upgrade) {
+        return Ok(f);
+    }
+    std::fs::create_dir_all(state_root).map_err(|e| AgentError::state(state_root, e))?;
+    let path = state_root.join("agent.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .map_err(|e| AgentError::state(&path, e))?;
+    match file.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(AgentError::state(
+                &path,
+                std::io::Error::other(
+                    "another mrl-agent is using this state folder; stop it first or use another state_dir",
+                ),
+            )
+            .into());
+        }
+        Err(std::fs::TryLockError::Error(e)) => return Err(AgentError::state(&path, e).into()),
+    }
+    let file = Arc::new(file);
+    held.insert(state_root.to_path_buf(), Arc::downgrade(&file));
+    Ok(file)
 }
 
 /// One lock per environment folder for the whole agent process: materializing (up to the pin)
@@ -1401,6 +1459,25 @@ source = { virtual = "." }
         drop(held);
         assert!(!remove_env(&stale).unwrap());
         assert!(d.exists());
+    }
+
+    #[test]
+    fn packages_of_one_lock_get_their_own_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let e = envs(dir.path());
+        let rt = |p: &str| RuntimeSpec {
+            runtime_ref: format!("uv:sha256:{}", "7".repeat(64)),
+            project: None,
+            package: Some(p.into()),
+        };
+        let (a, b) = (e.dir_for(&rt("mrl-a")), e.dir_for(&rt("mrl-b")));
+        assert_ne!(e.snapshot_dir(&a), e.snapshot_dir(&b));
+        assert!(e
+            .snapshot_dir(&a)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with(".src-"));
     }
 
     #[test]

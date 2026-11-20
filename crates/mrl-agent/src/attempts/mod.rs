@@ -113,7 +113,7 @@ pub struct Attempts {
 /// What the core sent for an attempt before launching it (`StageArtifacts`,
 /// `UpdateCredentials`), for the job and epoch it named. Used by the launch with that same job
 /// and epoch, then dropped.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct Pending {
     /// The attempt as those commands named it (`None`: local runs, [`Attempts::set_credential`]).
     attempt: Option<AttemptRef>,
@@ -191,7 +191,12 @@ impl Attempts {
             ));
         }
         let job_dir = self.shared.ctx.state.job_dir(&id);
-        if lock(&self.live).contains_key(&id) || AttemptRecord::load(&job_dir)?.is_some() {
+        if lock(&self.live).contains_key(&id) {
+            return Err(AttemptError::state(&id, "already exists on this machine"));
+        }
+        // Claimed first, so the "no record yet" decision can't race another manager.
+        let claim = self.claim(&id)?;
+        if AttemptRecord::load(&job_dir)?.is_some() {
             return Err(AttemptError::state(&id, "already exists on this machine"));
         }
         if let Some(a) = lock(&self.pending).get(&id).and_then(|p| p.attempt.clone()) {
@@ -206,7 +211,6 @@ impl Attempts {
             }
         }
         let secrets = self.secrets_for(&spec)?;
-        let claim = self.claim(&id)?;
         // Every check passed: from now on this job's older epochs are refused.
         lock(&self.epochs)
             .entry(spec.attempt.job_id.clone())
@@ -233,6 +237,7 @@ impl Attempts {
             exit_report: None,
             requests: Vec::new(),
             uploads: BTreeMap::new(),
+            results: BTreeMap::new(),
         };
         record::private_dir(&job_dir).map_err(|e| crate::AgentError::state(&job_dir, e))?;
         rec.save(&job_dir)?;
@@ -447,12 +452,32 @@ impl Attempts {
             if let Some(d) = rec.exit.clone() {
                 // Ended before the restart: reported again, in case its status never got out.
                 out.push(status_of(&rec, Some(&d)));
+                // Only once nobody else holds it (its runner may still be finishing).
+                if !rec.results.is_empty() {
+                    if let Ok(_claim) = self.claim(&id) {
+                        if let Ok(Some(mut fresh)) = AttemptRecord::load(&dir) {
+                            self.replay_results(&dir, &mut fresh).await;
+                        }
+                    }
+                }
                 continue;
             }
             // Still managed by another agent process: not ours to adopt or declare lost.
             let Ok(claim) = self.claim(&id) else {
                 continue;
             };
+            // Decided from the record as it is now that it is ours: the owner may have
+            // finished in between.
+            let Ok(Some(fresh)) = AttemptRecord::load(&dir) else {
+                continue;
+            };
+            rec = fresh;
+            if let Some(d) = rec.exit.clone() {
+                out.push(status_of(&rec, Some(&d)));
+                self.replay_results(&dir, &mut rec).await;
+                drop(claim);
+                continue;
+            }
             // A container is adopted only when it carries this launch's token, and from then on
             // by its id; one that is gone or took over the name is dropped from the record, so
             // nothing here ever stops it.
@@ -483,18 +508,32 @@ impl Attempts {
             // agent can't get back, so a surviving worker could never reconnect. It is stopped
             // (by the release below) and reported lost instead of re-adopted.
             let readoptable = primary_alive && cfg!(unix);
+            // A container that ended while the agent was down still has its exit code and
+            // OOM flag (read by its verified id, before cleanup removes it).
+            let (exit_code, oom_killed) = match rec.workers.iter().find(|w| w.primary) {
+                Some(w) if !readoptable => match &w.identity {
+                    record::ProcIdentity::Container { id: Some(cid), .. } => {
+                        runner::container_exit(cid).await
+                    }
+                    _ => (None, false),
+                },
+                _ => (None, false),
+            };
+            let report = rec
+                .exit_report
+                .as_deref()
+                .and_then(|b| <ExitReport as prost::Message>::decode(b).ok());
             let status = if readoptable {
                 let runner = Runner::new(Arc::clone(&self.shared), rec.clone(), Vec::new());
                 self.spawn(&rec, true, runner, claim);
                 status_of(&rec, None)
-            } else if let Some(report) = rec
-                .exit_report
-                .as_deref()
-                .and_then(|b| <ExitReport as prost::Message>::decode(b).ok())
-            {
-                // The worker ended after its report was saved: the report decides.
+            } else if report.is_some() || oom_killed {
+                // The worker ended after its report was saved (or was OOM-killed): the report
+                // and the container's own status decide.
                 let d = exit::decide(&exit::ExitEvidence {
-                    report: Some(report),
+                    report,
+                    exit_code,
+                    oom_killed,
                     readopted: true,
                     cancel_requested: rec.cancel_requested,
                     final_committed: rec.final_committed(),
@@ -551,6 +590,27 @@ impl Attempts {
             out.push(status);
         }
         out
+    }
+
+    /// Sends the upload results an ended attempt saved but never got out (its agent stopped
+    /// in between), then forgets them.
+    async fn replay_results(&self, dir: &std::path::Path, rec: &mut AttemptRecord) {
+        if rec.results.is_empty() {
+            return;
+        }
+        for (command_id, failure) in std::mem::take(&mut rec.results) {
+            let r = runner::upload_result(command_id.clone(), failure.clone());
+            if self
+                .shared
+                .events
+                .send(AttemptEvent::CommandDone(r))
+                .await
+                .is_err()
+            {
+                rec.results.insert(command_id, failure);
+            }
+        }
+        let _ = rec.save(dir);
     }
 
     /// Handles an attempt command. `None` for commands this runtime does not own (deployments).
@@ -734,8 +794,11 @@ impl Attempts {
                         .ok()
                         .flatten()
                         .is_some_and(|r| r.exit.is_some());
+                    // Only attempts nobody runs (claimable) are purged.
                     if ended && !live.contains(&name) {
-                        crate::janitor::purge(ctx.state.root(), &dir)?;
+                        if let Ok(_claim) = self.claim(&name) {
+                            crate::janitor::purge(ctx.state.root(), &dir)?;
+                        }
                     }
                 }
             }
@@ -746,6 +809,14 @@ impl Attempts {
                     "is still running; cancel it first",
                 ));
             }
+            // Held for the whole cleanup: an attempt another manager runs is refused, and the
+            // record is read only once it can no longer change.
+            let _claim = self.claim(&id).map_err(|_| {
+                AttemptError::state(
+                    &id,
+                    "is still running (in another mrl-agent); cancel it first",
+                )
+            })?;
             let dir = ctx.state.job_dir(&id);
             if let Some(rec) = AttemptRecord::load(&dir)? {
                 crate::janitor::release(ctx, &self.shared.envs, &rec, &HashSet::new()).await;
@@ -816,8 +887,10 @@ impl Attempts {
             return Err(stale(seen));
         }
         let mut pending = lock(&self.pending);
-        let p = pending.entry(id.to_owned()).or_default();
-        match &p.attempt {
+        let current = pending.get(id).cloned().unwrap_or_default();
+        // The change is made on a copy and kept only if all of it is valid: a rejected
+        // command leaves what was there (and its epoch) untouched.
+        let mut next = match &current.attempt {
             Some(a) if a.job_id != r.job_id => {
                 return Err(AttemptError::state(
                     id,
@@ -825,11 +898,13 @@ impl Attempts {
                 ));
             }
             Some(a) if r.fencing_epoch < a.fencing_epoch => return Err(stale(a.fencing_epoch)),
-            Some(a) if r.fencing_epoch > a.fencing_epoch => *p = Pending::default(),
-            _ => {}
-        }
-        p.attempt = Some(r.clone());
-        add(p)
+            Some(a) if r.fencing_epoch > a.fencing_epoch => Pending::default(),
+            _ => current,
+        };
+        next.attempt = Some(r.clone());
+        add(&mut next)?;
+        pending.insert(id.to_owned(), next);
+        Ok(())
     }
 }
 
