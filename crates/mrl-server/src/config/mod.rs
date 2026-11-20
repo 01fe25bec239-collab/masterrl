@@ -8,13 +8,14 @@ use std::path::{Path, PathBuf};
 
 /// Environment variables with this prefix and a `__` override settings.
 pub const ENV_PREFIX: &str = "MRL_";
-const SECTIONS: [&str; 5] = [
-    "server",
-    "database",
-    "pgbundle",
-    "object_store",
-    "telemetry",
-];
+
+/// Top-level settings sections: read from [`Config`] itself, so every part's section
+/// (added below its `<mrl:config>` marker) can be set from the environment too.
+fn sections() -> Vec<String> {
+    toml::Table::try_from(Config::default())
+        .map(|t| t.keys().cloned().collect())
+        .unwrap_or_default()
+}
 
 /// How the server runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, clap::ValueEnum)]
@@ -540,11 +541,12 @@ fn set_path(table: &mut toml::Table, name: &str, rest: &str, raw: &str) -> Resul
             "use MRL_SECTION__KEY, with two underscores between parts",
         ));
     }
-    if !SECTIONS.contains(&parts[0].as_str()) {
+    let sections = sections();
+    if !sections.contains(&parts[0]) {
         return Err(env_err(&format!(
             "{:?} is not a settings section; use one of {}",
             parts[0],
-            SECTIONS.join(", ")
+            sections.join(", ")
         )));
     }
     let (last, path) = parts.split_last().ok_or_else(|| env_err("empty name"))?;
@@ -944,6 +946,23 @@ mod tests {
             let r = Config::from_toml_with_env("[server]\nmode = \"solo\"", env(&[(k, v)]));
             assert_eq!(code(r), ErrorCode::ConfigEnv, "{k}");
         }
+    }
+
+    #[test]
+    fn every_settings_section_takes_env_overrides() {
+        // Parts add sections below their markers, so check a superset.
+        let found = sections();
+        for s in [
+            "server",
+            "database",
+            "pgbundle",
+            "object_store",
+            "telemetry",
+        ] {
+            assert!(found.iter().any(|f| f == s), "{s} missing from {found:?}");
+        }
+        let c = Config::from_toml_with_env("", env(&[("MRL_TELEMETRY__LOG_LEVEL", "debug")]));
+        assert!(c.is_ok(), "{c:?}");
     }
 
     #[test]
