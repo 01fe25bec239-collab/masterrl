@@ -544,11 +544,15 @@ mod tests {
             2,
             "each command ran exactly once"
         );
-        assert_eq!(
-            Link::of(&a.ctx).unwrap().spooled(),
-            0,
-            "every result was acked"
-        );
+        // The ack follows the COMPLETED write; give it a moment to arrive.
+        let link_state = Link::of(&a.ctx).unwrap();
+        for _ in 0..100 {
+            if link_state.spooled() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(link_state.spooled(), 0, "every result was acked");
         link.stop().await;
     }
 
