@@ -182,6 +182,7 @@ mod tests {
             "MRL-RES-160",
             "MRL-ENV-160",
             "MRL-ENV-161",
+            "MRL-ENV-162",
             "MRL-CONFLICT-160",
         ] {
             let c = Coded::new(code, StatusCode::CONFLICT, "x");

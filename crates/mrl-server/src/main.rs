@@ -148,7 +148,7 @@ async fn run(cli: Cli) -> Result<(), Failure> {
         _ => {
             let service = &config.auth.keychain_service;
             let secrets: Arc<dyn SecretStore> =
-                Arc::new(KeychainStore::open(service, &secrets_dir).await);
+                Arc::new(KeychainStore::open(service, &secrets_dir, config.keychain.backend).await);
             serve(config, &env, cli.headless, db, bundle.as_ref(), secrets).await
         }
     };
@@ -258,6 +258,7 @@ async fn open_database(
     };
     let secrets = bundle_secrets(
         &config.auth.keychain_service,
+        config.keychain.backend,
         &pgbundle::data_dir(p)?,
         secrets_dir,
     )
@@ -274,12 +275,13 @@ async fn open_database(
 /// `<data>/secrets/` moves to the keychain once.
 async fn bundle_secrets(
     service: &str,
+    backend: mrl_server::modules::keychain::KeychainBackend,
     data_dir: &std::path::Path,
     secrets_dir: &std::path::Path,
 ) -> Result<Arc<dyn SecretStore>, Failure> {
     let digest = Sha256::digest(data_dir.to_string_lossy().as_bytes());
     let tag: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
-    let store = KeychainStore::open(&format!("{service}-db-{tag}"), secrets_dir).await;
+    let store = KeychainStore::open(&format!("{service}-db-{tag}"), secrets_dir, backend).await;
     let fail = |e: mrl_server::seams::SeamError| {
         ServerError::new(ErrorCode::StartupStep, format!("database password: {e}"))
     };

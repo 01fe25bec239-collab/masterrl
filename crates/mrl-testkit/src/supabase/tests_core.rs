@@ -2729,3 +2729,70 @@ async fn a_team_core_on_a_former_solo_database_has_no_local_owner() {
     }
     core.stop().await;
 }
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_named_project_must_exist_in_the_named_org() {
+    let db = TestDb::new().await;
+    let (a, b, ws_a, ws_b) = (
+        OrgId::new(),
+        OrgId::new(),
+        WorkspaceId::new(),
+        WorkspaceId::new(),
+    );
+    let (pa, pb) = (ProjectId::new(), ProjectId::new());
+    let owner = UserId::new();
+    db.seed(&format!(
+        "INSERT INTO organizations (id, slug, name, kind) VALUES ('{a}', 'a', 'A', 'team'), ('{b}', 'b', 'B', 'team');
+         INSERT INTO workspaces (id, org_id, slug, name) VALUES ('{wa}', '{a}', 'main', 'Main'), ('{wb}', '{b}', 'main', 'Main');
+         INSERT INTO projects (id, org_id, workspace_id, slug, name) VALUES ('{pa}', '{a}', '{wa}', 'p', 'P'), ('{pb}', '{b}', '{wb}', 'p', 'P');
+         INSERT INTO users (id, display_name) VALUES ('{u}', 'o');",
+        a = a.as_uuid(), b = b.as_uuid(), wa = ws_a.as_uuid(), wb = ws_b.as_uuid(),
+        pa = pa.as_uuid(), pb = pb.as_uuid(), u = owner.as_uuid()
+    ))
+    .await;
+    let mut tx = db.db().begin().await.unwrap();
+    tenancy::bind_role(&mut tx, a, owner, Role::Owner, Scope::Org)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let on = |p: String| Resource {
+        org: Some(a.to_string()),
+        project: Some(p),
+        ..Resource::kind("run")
+    };
+    let cases = [
+        (pb.to_string(), Decision::Hide), // another org's project
+        (ProjectId::new().to_string(), Decision::Hide), // no such project
+        ("prj_not-an-id".to_owned(), Decision::Hide),
+        (pa.to_string(), Decision::Allow), // same org
+    ];
+    let org_owner = ctx(Principal {
+        id: owner.to_string(),
+        kind: PrincipalKind::User,
+        org: Some(a.to_string()),
+    });
+    let team = Rbac::new(db.db().clone(), Mode::Team);
+    let solo = Rbac::new(db.db().clone(), Mode::Solo);
+    for (project, want) in &cases {
+        assert_eq!(
+            team.authorize(&org_owner, "runs.submit", &on(project.clone()))
+                .await
+                .unwrap(),
+            *want,
+            "org owner, {project}"
+        );
+        assert_eq!(
+            solo.authorize(
+                &ctx(Principal::local_owner()),
+                "runs.submit",
+                &on(project.clone())
+            )
+            .await
+            .unwrap(),
+            *want,
+            "solo owner, {project}"
+        );
+    }
+    db.pool().close().await;
+}

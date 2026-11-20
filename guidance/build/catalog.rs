@@ -2554,6 +2554,18 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-ENV-162")),
+            ("title", Value::Str("The keychain request was cancelled.")),
+            ("why", Value::Str("The keychain asked to let MasterRL use its secrets, and that request was cancelled.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Start the app again and choose Allow (or Always Allow) when the keychain asks."),
+                    Value::Str("On a development machine, set `backend = \"file\"` under `[keychain]` in the settings file. Secrets then stay in an encrypted file."),
+                    Value::Str("Secrets do not move between the two places, so sign in again after the change."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-IDEM-001")),
             ("title", Value::Str("This request is already running.")),
             ("why", Value::Str("A request with the same request key started earlier and has not finished.")),

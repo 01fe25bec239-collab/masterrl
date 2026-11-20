@@ -352,11 +352,33 @@ impl Rbac {
         action: Action,
         resource: &Resource,
     ) -> Result<Decision, DbError> {
-        let project = resource
-            .project
+        let named_org = resource
+            .org
             .as_deref()
-            .or(ctx.project.as_deref())
-            .and_then(|p| ProjectId::from_str(p).ok());
+            .or(ctx.org.as_deref())
+            .and_then(|o| OrgId::from_str(o).ok());
+        // A named project must exist and sit in the named org, before any Allow path (the
+        // solo owner's included); otherwise it looks missing, like another org's.
+        let (project, project_org) = match resource.project.as_deref().or(ctx.project.as_deref()) {
+            None => (None, None),
+            Some(raw) => {
+                let Ok(p) = ProjectId::from_str(raw) else {
+                    return Ok(Decision::Hide);
+                };
+                let org: Option<Uuid> =
+                    sqlx::query_scalar("SELECT org_id FROM projects WHERE id = $1")
+                        .bind(p.as_uuid())
+                        .fetch_optional(self.db.pool())
+                        .await?;
+                let Some(org) = org.map(OrgId::from_uuid) else {
+                    return Ok(Decision::Hide);
+                };
+                if named_org.is_some_and(|n| n != org) {
+                    return Ok(Decision::Hide);
+                }
+                (Some(p), Some(org))
+            }
+        };
         let (user, token_org) = match ctx.principal.kind {
             PrincipalKind::LocalOwner if self.mode == Mode::Solo => {
                 return Ok(verdict(&[Role::Owner], action))
@@ -370,6 +392,11 @@ impl Rbac {
                 let Some(g) = credentials::token_grant(&self.db, &ctx.principal.id).await? else {
                     return Ok(Decision::Deny);
                 };
+                if let (Some(t), Some(p)) = (g.org, project_org) {
+                    if t != p {
+                        return Ok(Decision::Hide);
+                    }
+                }
                 // Token limits apply before any role, the solo owner's included.
                 if !credentials::scopes_allow(&g.scopes, action) {
                     return Ok(Decision::Deny);
@@ -393,12 +420,7 @@ impl Rbac {
             if resource.kind == PLATFORM {
                 return Ok(Decision::Deny);
             }
-            let named = resource
-                .org
-                .as_deref()
-                .or(ctx.org.as_deref())
-                .and_then(|o| OrgId::from_str(o).ok());
-            if named.is_some_and(|o| o != bound) {
+            if named_org.is_some_and(|o| o != bound) {
                 return Ok(Decision::Hide);
             }
         }
@@ -427,12 +449,7 @@ impl Rbac {
         if action == Action::AuthSession {
             return Ok(Decision::Allow);
         }
-        let org = resource
-            .org
-            .as_deref()
-            .or(ctx.org.as_deref())
-            .and_then(|o| OrgId::from_str(o).ok())
-            .or(token_org);
+        let org = named_org.or(project_org).or(token_org);
         let Some(org) = org else {
             return Ok(Decision::Deny);
         };

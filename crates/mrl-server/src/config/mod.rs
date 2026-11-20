@@ -75,6 +75,8 @@ pub struct Config {
     // <mrl:config P16> P16 settings fields go right below this line.
     /// Sign-in (Supabase) and access tokens.
     pub auth: crate::modules::auth::AuthConfig,
+    /// Where secrets are kept (`backend = "auto" | "file"`).
+    pub keychain: crate::modules::keychain::KeychainConfig,
     // <mrl:config P17> P17 settings fields go right below this line.
 
     // <mrl:config P18> P18 settings fields go right below this line.

@@ -150,9 +150,22 @@ paths:
       tags:
       - auth
       operationId: list_tokens
+      parameters:
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
       responses:
         '200':
-          description: Your live tokens, newest first.
+          description: Your live tokens, newest first, in cursor pages.
           content:
             application/json:
               schema:

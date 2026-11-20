@@ -2506,6 +2506,18 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-ENV-162",
+      "title": "The keychain request was cancelled.",
+      "why": "The keychain asked to let MasterRL use its secrets, and that request was cancelled.",
+      "what_to_do": {
+        "steps": [
+          "Start the app again and choose Allow (or Always Allow) when the keychain asks.",
+          "On a development machine, set `backend = \"file\"` under `[keychain]` in the settings file. Secrets then stay in an encrypted file.",
+          "Secrets do not move between the two places, so sign in again after the change."
+        ]
+      }
+    },
+    {
       "code": "MRL-IDEM-001",
       "title": "This request is already running.",
       "why": "A request with the same request key started earlier and has not finished.",

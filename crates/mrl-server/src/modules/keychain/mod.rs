@@ -15,6 +15,28 @@ use std::path::{Path, PathBuf};
 pub const NO_KEYCHAIN: &str = "MRL-ENV-160";
 /// Code for a keychain that exists but refused a read or write.
 pub const KEYCHAIN_FAILED: &str = "MRL-ENV-161";
+/// Code for a keychain prompt that was cancelled.
+pub const KEYCHAIN_CANCELLED: &str = "MRL-ENV-162";
+
+/// Where secrets are kept.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum KeychainBackend {
+    /// The OS keychain; the encrypted file only where there is no keychain service.
+    #[default]
+    Auto,
+    /// Always the encrypted file (development machines, CI).
+    File,
+}
+
+/// `[keychain]` settings.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct KeychainConfig {
+    /// `auto` (default) or `file`. Secrets do not move between the two: choose before
+    /// first use, or sign in and set up sync again after a change.
+    pub backend: KeychainBackend,
+}
 
 /// Secrets in the OS keychain under one service name, or in the fallback file.
 pub struct KeychainStore {
@@ -35,9 +57,18 @@ impl KeychainStore {
     /// The choice sticks: a keychain that is locked or fails for a while is reported
     /// (MRL-ENV-161) and keeps being used, so saved secrets never seem to vanish and new ones
     /// never go to a second store.
-    pub async fn open(service: &str, fallback_dir: &Path) -> Self {
+    ///
+    /// With [`KeychainBackend::File`], always the encrypted file.
+    pub async fn open(service: &str, fallback_dir: &Path, backend: KeychainBackend) -> Self {
         let marker = fallback_dir.join(format!("{service}.os-keychain"));
         let file = Self::file(service, fallback_dir);
+        if backend == KeychainBackend::File {
+            tracing::info!(
+                folder = %fallback_dir.display(),
+                "secrets are kept in an encrypted file (keychain.backend = \"file\")"
+            );
+            return file;
+        }
         if marker.exists() {
             return Self::os(service);
         }
@@ -120,9 +151,21 @@ fn check_name(name: &str) -> Result<(), SeamError> {
 
 fn keychain_error(what: &str, e: &keyring::Error) -> SeamError {
     // keyring errors name the platform failure, never the value.
+    let text = e.to_string();
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("cancel") || lower.contains("dismissed") {
+        return SeamError::new(
+            "secrets",
+            format!(
+                "{KEYCHAIN_CANCELLED}: the keychain request was cancelled, so the app could not {what}. \
+                 Start it again and choose Allow when the keychain asks, or set backend = \"file\" \
+                 under [keychain] in the settings file to keep secrets in an encrypted file"
+            ),
+        );
+    }
     SeamError::new(
         "secrets",
-        format!("{KEYCHAIN_FAILED}: could not {what}: {e}"),
+        format!("{KEYCHAIN_FAILED}: could not {what}: {text}"),
     )
 }
 
@@ -150,11 +193,9 @@ async fn probe(service: &str) -> Result<(), keyring::Error> {
 /// True when there is no keychain service to use: no store for this platform, or (Linux and
 /// other Unix) Secret Service failing to answer at all. A locked store is not absent.
 fn no_keychain_service(e: &keyring::Error) -> bool {
-    match e {
-        keyring::Error::NoDefaultStore => true,
-        keyring::Error::PlatformFailure(_) => cfg!(not(any(target_os = "macos", windows))),
-        _ => false,
-    }
+    let secret_service = cfg!(not(any(target_os = "macos", windows)));
+    matches!(e, keyring::Error::NoDefaultStore)
+        || (secret_service && matches!(e, keyring::Error::PlatformFailure(_)))
 }
 
 #[async_trait]
@@ -301,6 +342,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_cancelled_prompt_is_a_plain_error_with_a_way_out() {
+        let cancelled = keyring::Error::PlatformFailure("User canceled the operation.".into());
+        let e = keychain_error("read the keychain", &cancelled);
+        assert!(e.detail.starts_with(KEYCHAIN_CANCELLED), "{e}");
+        assert!(e.detail.contains("backend = \"file\""), "{e}");
+        let locked = keyring::Error::NoStorageAccess("locked".into());
+        assert!(keychain_error("read", &locked)
+            .detail
+            .starts_with(KEYCHAIN_FAILED));
+        let settings: KeychainConfig = toml::from_str("backend = \"file\"").unwrap();
+        assert_eq!(settings.backend, KeychainBackend::File);
+        assert!(toml::from_str::<KeychainConfig>("backend = \"cloud\"").is_err());
+    }
+
+    #[tokio::test]
+    async fn the_file_backend_is_used_when_chosen() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("mrl-pick.os-keychain"), b"").unwrap();
+        let store = KeychainStore::open("mrl-pick", dir.path(), KeychainBackend::File).await;
+        assert!(store.uses_fallback());
+        round_trip(&store).await;
+    }
+
+    #[test]
     fn only_a_missing_keychain_service_selects_the_file() {
         let platform =
             || -> Box<dyn std::error::Error + Send + Sync> { "dbus: no such service".into() };
@@ -320,15 +385,17 @@ mod tests {
         // A vault from earlier stays in use even where a keychain now answers.
         let first = KeychainStore::file("mrl-sticky", dir.path());
         first.set("x", Secret::new("v")).await.unwrap();
-        let again = KeychainStore::open("mrl-sticky", dir.path()).await;
+        let again = KeychainStore::open("mrl-sticky", dir.path(), KeychainBackend::Auto).await;
         assert!(again.uses_fallback());
         assert_eq!(again.get("x").await.unwrap().unwrap().expose(), "v");
         // An install noted as using the keychain never moves to a file, whatever the probe says.
         let other = tempfile::tempdir().unwrap();
         std::fs::write(other.path().join("mrl-sticky.os-keychain"), b"").unwrap();
-        assert!(!KeychainStore::open("mrl-sticky", other.path())
-            .await
-            .uses_fallback());
+        assert!(
+            !KeychainStore::open("mrl-sticky", other.path(), KeychainBackend::Auto)
+                .await
+                .uses_fallback()
+        );
     }
 
     async fn round_trip(store: &KeychainStore) {
@@ -391,7 +458,7 @@ mod tests {
     async fn os_keychain_round_trips() {
         let service = format!("masterrl-test-{}", uuid::Uuid::new_v4().simple());
         let dir = tempfile::tempdir().unwrap();
-        let store = KeychainStore::open(&service, dir.path()).await;
+        let store = KeychainStore::open(&service, dir.path(), KeychainBackend::Auto).await;
         if std::env::var_os("MRL_EXPECT_KEYCHAIN").is_some() {
             assert!(
                 !store.uses_fallback(),
@@ -412,7 +479,7 @@ mod tests {
             "the OS backend must not write the fallback file"
         );
         // The choice is kept: opening again picks the same store.
-        let again = KeychainStore::open(&service, dir.path()).await;
+        let again = KeychainStore::open(&service, dir.path(), KeychainBackend::Auto).await;
         assert_eq!(again.uses_fallback(), store.uses_fallback());
     }
 }
