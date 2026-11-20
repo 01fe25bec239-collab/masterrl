@@ -295,6 +295,22 @@ impl Queue {
     }
 }
 
+/// A FAILED result for `command_id` whose real result (`bytes` long) was too large to send.
+fn too_large_result(command_id: &str, bytes: usize) -> agent_message::Body {
+    agent_message::Body::CommandResult(CommandResult {
+        command_id: command_id.to_owned(),
+        accepted: false,
+        failure: Some(Failure {
+            class: FailureClass::EngineError as i32,
+            sub_code: "result_too_large".into(),
+            message: format!(
+                "the command's result was {bytes} bytes, over the {MAX_MESSAGE_BYTES}-byte limit; its details were dropped"
+            ),
+            ..Failure::default()
+        }),
+    })
+}
+
 /// The largest `body` can be when sent (every envelope field at its widest).
 fn envelope_len(body: &agent_message::Body) -> usize {
     prost::Message::encoded_len(&AgentMessage {
@@ -615,19 +631,8 @@ impl Link {
             });
             let sent = match self.send_control(body) {
                 // A failure too large to send is reported without its details.
-                Err(LinkError::TooLarge { bytes, max }) => {
-                    self.send_control(agent_message::Body::CommandResult(CommandResult {
-                        command_id: u.command_id.clone(),
-                        accepted: false,
-                        failure: Some(Failure {
-                            class: FailureClass::EngineError as i32,
-                            sub_code: "result_too_large".into(),
-                            message: format!(
-                                "the command's result was {bytes} bytes, over the {max}-byte limit; its details were dropped"
-                            ),
-                            ..Failure::default()
-                        }),
-                    }))
+                Err(LinkError::TooLarge { bytes, .. }) => {
+                    self.send_control(too_large_result(&u.command_id, bytes))
                 }
                 other => other,
             };
@@ -640,6 +645,40 @@ impl Link {
                 .lock()
                 .map_err(|_| LinkError::Protocol("journal lock poisoned".into()))?
                 .reported(u.seq)?;
+        }
+        Ok(())
+    }
+
+    /// The spooled `msgs` that can be sent. One too large to send (spooled before sizes were
+    /// checked) would fail on every replay and block the rest, so it is set aside instead.
+    fn sendable(&self, msgs: Vec<AgentMessage>) -> Result<Vec<AgentMessage>, LinkError> {
+        let mut out = Vec::with_capacity(msgs.len());
+        for m in msgs {
+            match &m.body {
+                Some(body) if envelope_len(body) > MAX_MESSAGE_BYTES => {
+                    self.set_aside(m.seq, body)?
+                }
+                _ => out.push(m),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Moves spooled message `seq` (too large to send) out of the way, keeping it on disk for
+    /// diagnosis; a command result is replaced by a small FAILED `result_too_large` one.
+    fn set_aside(&self, seq: u64, body: &agent_message::Body) -> Result<(), LinkError> {
+        let kept = self
+            .spool
+            .lock()
+            .map_err(|_| LinkError::Protocol("spool lock poisoned".into()))?
+            .set_aside(seq)?;
+        eprintln!(
+            "mrl-agent: CONTROL message {seq} is {} bytes, over the {MAX_MESSAGE_BYTES}-byte limit; it was not sent and is kept at {}",
+            envelope_len(body),
+            kept.display()
+        );
+        if let agent_message::Body::CommandResult(r) = body {
+            self.send_control(too_large_result(&r.command_id, envelope_len(body)))?;
         }
         Ok(())
     }
@@ -980,7 +1019,7 @@ async fn flush(
         .map_err(|_| LinkError::Protocol("spool lock poisoned".into()))?
         .pending(*last, volatile.is_some())?;
     let ack = l.link.journal_seq();
-    for mut m in msgs {
+    for mut m in l.link.sendable(msgs)? {
         m.ack_seq = ack;
         m.sent_at = now_ts();
         *last = m.seq;
@@ -1781,6 +1820,46 @@ mod tests {
             Some(agent_message::Body::CommandResult(r))
                 if r.command_id == "c1" && r.failure.as_ref().is_some_and(|f| f.sub_code == "result_too_large")
         ));
+    }
+
+    #[test]
+    fn a_message_spooled_too_large_is_set_aside_and_the_next_one_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = Link::open(dir.path(), &GatewaySettings::default()).unwrap();
+        // Spooled by an older agent, before sizes were checked.
+        let big = link
+            .spool
+            .lock()
+            .unwrap()
+            .push(agent_message::Body::CommandResult(CommandResult {
+                command_id: "big".into(),
+                accepted: false,
+                failure: Some(Failure {
+                    message: "x".repeat(MAX_MESSAGE_BYTES),
+                    ..Failure::default()
+                }),
+            }))
+            .unwrap()
+            .unwrap();
+        link.send_control(agent_message::Body::AttemptStatus(Default::default()))
+            .unwrap();
+        let (msgs, _) = link.spool.lock().unwrap().pending(0, false).unwrap();
+        let sent = link.sendable(msgs).unwrap();
+        assert_eq!(sent.len(), 1);
+        assert!(matches!(
+            sent[0].body,
+            Some(agent_message::Body::AttemptStatus(_))
+        ));
+        let kept = dir
+            .path()
+            .join(format!("gateway/spool/oversized/{big:020}.pb"));
+        assert!(kept.exists(), "kept for diagnosis");
+        // Never again, and the command still gets a (small) result.
+        let (msgs, _) = link.spool.lock().unwrap().pending(0, false).unwrap();
+        assert!(msgs.iter().all(|m| m.seq != big));
+        assert!(msgs.iter().any(|m| matches!(&m.body,
+            Some(agent_message::Body::CommandResult(r)) if r.command_id == "big"
+                && r.failure.as_ref().is_some_and(|f| f.sub_code == "result_too_large"))));
     }
 
     /// Runs until `go` is notified.

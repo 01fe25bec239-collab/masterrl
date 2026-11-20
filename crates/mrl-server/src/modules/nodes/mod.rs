@@ -318,6 +318,8 @@ pub struct Pki {
 pub(crate) struct NodeSessions {
     /// Epoch of the CONTROL session this replica holds.
     pub epoch: i64,
+    /// The connection that CONTROL session came on ([`crate::grpc::PeerInfo::connection`]).
+    pub connection: u64,
     /// Cancelled when a newer CONTROL session for the node starts here.
     pub control: CancellationToken,
     /// Cancelled when the node's certificates are revoked (all streams close).
@@ -336,6 +338,7 @@ impl Sessions {
         &self,
         node: Uuid,
         epoch: i64,
+        connection: u64,
     ) -> (CancellationToken, CancellationToken, Arc<Notify>) {
         let Ok(mut map) = self.0.lock() else {
             let t = CancellationToken::new();
@@ -344,6 +347,7 @@ impl Sessions {
         };
         let entry = map.entry(node).or_insert_with(|| NodeSessions {
             epoch: 0,
+            connection: 0,
             control: CancellationToken::new(),
             revoked: CancellationToken::new(),
             wake: Arc::new(Notify::new()),
@@ -354,6 +358,7 @@ impl Sessions {
         entry.control.cancel();
         entry.control = CancellationToken::new();
         entry.epoch = epoch;
+        entry.connection = connection;
         (
             entry.control.clone(),
             entry.revoked.clone(),
@@ -369,6 +374,7 @@ impl Sessions {
         map.entry(node)
             .or_insert_with(|| NodeSessions {
                 epoch: 0,
+                connection: 0,
                 control: CancellationToken::new(),
                 revoked: CancellationToken::new(),
                 wake: Arc::new(Notify::new()),
@@ -389,12 +395,17 @@ impl Sessions {
         }
     }
 
-    /// The CONTROL session this replica holds for `node`: its epoch and the token cancelled
-    /// when it ends or is taken over.
-    pub fn control_of(&self, node: Uuid) -> Option<(i64, CancellationToken)> {
+    /// The CONTROL session this replica holds for `node` when it came on `connection`: its epoch
+    /// and the token cancelled when it ends or is taken over.
+    pub fn control_of(&self, node: Uuid, connection: u64) -> Option<(i64, CancellationToken)> {
         let map = self.0.lock().ok()?;
         map.get(&node)
-            .filter(|e| e.epoch > 0 && !e.control.is_cancelled())
+            .filter(|e| {
+                e.epoch > 0
+                    && connection != 0
+                    && e.connection == connection
+                    && !e.control.is_cancelled()
+            })
             .map(|e| (e.epoch, e.control.clone()))
     }
 
@@ -806,10 +817,16 @@ mod tests {
     fn sessions_supersede_and_revoke() {
         let s = Sessions::default();
         let node = Uuid::now_v7();
-        let (c1, r1, _) = s.open_control(node, 1);
-        let (c2, _, _) = s.open_control(node, 2);
+        let (c1, r1, _) = s.open_control(node, 1, 7);
+        let (c2, _, _) = s.open_control(node, 2, 8);
         assert!(c1.is_cancelled() && !c2.is_cancelled());
         assert!(s.has_control(node));
+        assert_eq!(s.control_of(node, 8).map(|c| c.0), Some(2));
+        assert!(
+            s.control_of(node, 7).is_none(),
+            "another connection never borrows it"
+        );
+        assert!(s.control_of(node, 0).is_none());
         s.close_control(node, 1); // stale epoch: ignored
         assert!(s.has_control(node));
         s.revoke(node);

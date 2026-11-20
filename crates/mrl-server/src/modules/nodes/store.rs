@@ -954,33 +954,51 @@ pub async fn inbox(
     Ok(())
 }
 
-/// How long a dispatcher owns the oldest kept message of a node while the sink runs.
-const INBOX_LEASE_SECONDS: f64 = 60.0;
+/// How long a dispatcher's lease on the oldest kept message of a node lasts; it is renewed
+/// every third of that while the sink runs.
+pub const INBOX_LEASE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Delivers `node`'s kept CONTROL messages to `sink` in arrival order, deleting each one the sink
 /// took; stops at the first sink error (that message and later ones stay for the next try).
-///
-/// No connection is held while the sink runs (it may send commands to the same node, even with a
-/// one-connection pool): the dispatcher leases the node's oldest row in one short statement,
-/// calls the sink, then deletes the row. Only the oldest row can be leased, so one dispatcher per
-/// node runs at a time (on any replica) and order is kept. A dispatcher that dies leaves its lease
-/// to expire after [`INBOX_LEASE_SECONDS`]; delivery is at-least-once.
+/// [`dispatch_with_lease`] with [`INBOX_LEASE`].
 pub async fn dispatch(
     db: &Db,
     sink: &dyn super::lanes::LaneSink,
     node: Uuid,
 ) -> Result<(), NodesError> {
+    dispatch_with_lease(db, sink, node, INBOX_LEASE).await
+}
+
+/// [`dispatch`] with a lease of `lease`.
+///
+/// No connection is held while the sink runs (it may send commands to the same node, even with a
+/// one-connection pool): the dispatcher leases the node's oldest row in one short statement under
+/// a token of its own, renews the lease while the sink runs, then deletes the row. Only the
+/// oldest row can be leased, so one dispatcher per node runs at a time (on any replica) and order
+/// is kept. Renewal, release and delete all require the token, so a dispatcher whose lease was
+/// lost (it stalled past expiry and another took over) never touches the other's row. Delivery
+/// is at-least-once.
+pub async fn dispatch_with_lease(
+    db: &Db,
+    sink: &dyn super::lanes::LaneSink,
+    node: Uuid,
+    lease: std::time::Duration,
+) -> Result<(), NodesError> {
     use prost::Message;
+    let secs = lease.as_secs_f64();
     loop {
+        let token = Uuid::new_v4();
         let row: Option<(i64, i16, i64, i64, Vec<u8>)> = sqlx::query_as(
-            "UPDATE node_control_inbox SET leased_until = now() + make_interval(secs => $2)
+            "UPDATE node_control_inbox
+                SET leased_until = now() + make_interval(secs => $2), lease_token = $3
              WHERE id = (SELECT id FROM node_control_inbox WHERE node_id = $1
                          ORDER BY id LIMIT 1 FOR UPDATE)
                AND (leased_until IS NULL OR leased_until < now())
              RETURNING id, stream, seq, session_epoch, message",
         )
         .bind(node)
-        .bind(INBOX_LEASE_SECONDS)
+        .bind(secs)
+        .bind(token)
         .fetch_optional(db.pool())
         .await?;
         // Empty, or another dispatcher holds the oldest row (it continues with the rest).
@@ -998,19 +1016,51 @@ pub async fn dispatch(
             dropped_before: 0,
             message,
         };
-        if let Err(e) = sink.deliver(item).await {
-            sqlx::query("UPDATE node_control_inbox SET leased_until = NULL WHERE id = $1")
-                .bind(id)
-                .execute(db.pool())
-                .await?;
+        let deliver = sink.deliver(item);
+        tokio::pin!(deliver);
+        let mut renew = tokio::time::interval(lease / 3);
+        renew.tick().await;
+        let delivered = loop {
+            tokio::select! {
+                r = &mut deliver => break r,
+                _ = renew.tick() => {
+                    let kept = sqlx::query(
+                        "UPDATE node_control_inbox SET leased_until = now() + make_interval(secs => $3)
+                         WHERE id = $1 AND lease_token = $2",
+                    )
+                    .bind(id)
+                    .bind(token)
+                    .bind(secs)
+                    .execute(db.pool())
+                    .await;
+                    if !matches!(kept, Ok(ref r) if r.rows_affected() == 1) {
+                        tracing::warn!(node = %node, "a CONTROL inbox lease was lost while its sink ran; another dispatcher may deliver it again");
+                    }
+                }
+            }
+        };
+        if let Err(e) = delivered {
+            sqlx::query(
+                "UPDATE node_control_inbox SET leased_until = NULL, lease_token = NULL
+                 WHERE id = $1 AND lease_token = $2",
+            )
+            .bind(id)
+            .bind(token)
+            .execute(db.pool())
+            .await?;
             return Err(NodesError::Protocol(format!(
                 "the CONTROL sink did not take a message; it is kept and retried: {e}"
             )));
         }
-        sqlx::query("DELETE FROM node_control_inbox WHERE id = $1")
+        let done = sqlx::query("DELETE FROM node_control_inbox WHERE id = $1 AND lease_token = $2")
             .bind(id)
+            .bind(token)
             .execute(db.pool())
             .await?;
+        if done.rows_affected() == 0 {
+            // Another dispatcher holds it now and delivers it again (at-least-once).
+            return Ok(());
+        }
     }
 }
 
@@ -1072,21 +1122,33 @@ pub async fn claim_commands(
     if !holds(&mut tx, node, epoch).await? {
         return Ok(Claim::Stale);
     }
-    // While the node drains (or is gone), work-starting commands are not sent; `holds` keeps the
-    // node row share-locked, so a drain commits before or after this claim, never during it.
+    // While the node drains (or is gone), work-starting commands above `after` are failed, not
+    // sent: the agent has not got them (`after` starts at its journal position), and leaving them
+    // SENT would let an ack of a later command mark them RECEIVED. `holds` keeps the node row
+    // share-locked, so a drain commits before or after this claim, never during it.
+    sqlx::query(
+        "UPDATE agent_commands c SET state = 'FAILED', result = $4, updated_at = now()
+         FROM compute_nodes n
+         WHERE n.id = c.node_id AND c.node_id = $1 AND c.state IN ('PENDING','SENT')
+           AND c.seq > $2 AND c.kind = ANY($3) AND n.status IN ('DRAINING','DECOMMISSIONED')",
+    )
+    .bind(node)
+    .bind(i64::try_from(after).unwrap_or(i64::MAX))
+    .bind(&super::commands::STARTS_WORK[..])
+    .bind(draining_failure())
+    .execute(&mut *tx)
+    .await?;
     let rows = sqlx::query(
         "UPDATE agent_commands SET state = 'SENT', sent_at = now(), updated_at = now()
-         WHERE id IN (SELECT c.id FROM agent_commands c JOIN compute_nodes n ON n.id = c.node_id
-                      WHERE c.node_id = $1 AND c.state IN ('PENDING','SENT') AND c.seq > $2
-                        AND c.deadline_at > now()
-                        AND NOT (c.kind = ANY($3) AND n.status IN ('DRAINING','DECOMMISSIONED'))
-                      ORDER BY c.seq LIMIT 64)
+         WHERE id IN (SELECT id FROM agent_commands
+                      WHERE node_id = $1 AND state IN ('PENDING','SENT') AND seq > $2
+                        AND deadline_at > now()
+                      ORDER BY seq LIMIT 64)
            AND state IN ('PENDING','SENT') AND deadline_at > now()
          RETURNING id, seq, payload",
     )
     .bind(node)
     .bind(i64::try_from(after).unwrap_or(i64::MAX))
-    .bind(&super::commands::STARTS_WORK[..])
     .fetch_all(&mut *tx)
     .await?;
     tx.commit().await?;
@@ -1104,12 +1166,33 @@ pub async fn claim_commands(
     Ok(Claim::Send(out))
 }
 
+/// Fails command `id`, which is `size` bytes on the wire and so can never be sent.
+pub async fn fail_unsendable(db: &Db, id: Uuid, size: usize) -> Result<(), NodesError> {
+    let failure = json!({ "accepted": false, "failure": {
+        "class": "FAILURE_CLASS_USER_CONFIG", "sub_code": "command_too_large",
+        "message": format!("the command is {size} bytes on the wire, over the {}-byte limit; it was not sent", crate::grpc::MAX_MESSAGE_BYTES) } });
+    sqlx::query(
+        "UPDATE agent_commands SET state = 'FAILED', result = $2, updated_at = now()
+         WHERE id = $1 AND state IN ('PENDING','SENT')",
+    )
+    .bind(id)
+    .bind(failure)
+    .execute(db.pool())
+    .await?;
+    Ok(())
+}
+
+/// The result of a work-starting command the agent never got because the node drains.
+fn draining_failure() -> Value {
+    json!({ "accepted": false, "failure": {
+        "class": "FAILURE_CLASS_INFRA_TRANSIENT", "sub_code": "node_draining",
+        "message": "the machine started draining before this command reached it; it takes no new work" } })
+}
+
 /// Fails the node's work-starting commands that were not sent yet (drain: no new work). Their
 /// senders see FAILED `node_draining` and can place the work elsewhere.
 pub async fn refuse_new_work(tx: &mut Tx, node: Uuid) -> Result<u64, NodesError> {
-    let failure = json!({ "accepted": false, "failure": {
-        "class": "FAILURE_CLASS_INFRA_TRANSIENT", "sub_code": "node_draining",
-        "message": "the machine started draining before this command was sent; it takes no new work" } });
+    let failure = draining_failure();
     Ok(sqlx::query(
         "UPDATE agent_commands SET state = 'FAILED', result = $3, updated_at = now()
          WHERE node_id = $1 AND state = 'PENDING' AND kind = ANY($2)",

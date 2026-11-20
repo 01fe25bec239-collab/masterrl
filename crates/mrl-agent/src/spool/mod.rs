@@ -132,6 +132,20 @@ impl Spool {
         Ok((out, seq))
     }
 
+    /// Moves the message `seq` out of the spool into `<dir>/oversized/` (kept for diagnosis, never
+    /// sent): it can't be sent at all, so it must not block the messages after it.
+    pub fn set_aside(&mut self, seq: u64) -> Result<PathBuf> {
+        let aside = self.dir.join("oversized");
+        std::fs::create_dir_all(&aside).map_err(|e| AgentError::state(&aside, e))?;
+        let to = aside.join(format!("{seq:020}.pb"));
+        let from = self.file(seq);
+        std::fs::rename(&from, &to).map_err(|e| AgentError::state(&from, e))?;
+        if let Some(len) = self.entries.remove(&seq) {
+            self.bytes -= len;
+        }
+        Ok(to)
+    }
+
     /// The core durably accepted everything up to `upto`: delete those files.
     pub fn ack(&mut self, upto: u64) -> Result<()> {
         let done: Vec<u64> = self.entries.range(..=upto).map(|(s, _)| *s).collect();

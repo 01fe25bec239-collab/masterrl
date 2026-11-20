@@ -54,6 +54,17 @@ pub struct PeerInfo {
     pub transport: Option<TransportKind>,
     /// The node the core meant to reach, when the core dialed.
     pub dialed_node: Option<Uuid>,
+    /// This connection's id in this process ([`PeerInfo::new_connection`]): the streams of one
+    /// connection share it, so data streams bind to the CONTROL stream of their own connection.
+    pub connection: u64,
+}
+
+impl PeerInfo {
+    /// A fresh connection id (never 0).
+    pub fn new_connection() -> u64 {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 /// A TLS connection plus who is on the other end.
@@ -164,6 +175,7 @@ pub async fn serve(gw: Arc<Gateway>, cancel: CancellationToken) -> Result<(), No
                         let peer = PeerInfo {
                             cert_sha256: tls::peer_sha256(io.get_ref().1.peer_certificates()),
                             remote: Some(remote),
+                            connection: PeerInfo::new_connection(),
                             ..PeerInfo::default()
                         };
                         let _ = tx.send(Ok(Conn { io, peer })).await;

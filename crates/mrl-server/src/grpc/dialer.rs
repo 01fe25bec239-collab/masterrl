@@ -251,6 +251,7 @@ async fn dial_node(
         remote: None,
         transport: Some(endpoint.kind()),
         dialed_node: Some(node),
+        connection: PeerInfo::new_connection(),
     };
     let channel = channel_over(tls).await?;
     let client = AgentEndpointServiceClient::new(channel)

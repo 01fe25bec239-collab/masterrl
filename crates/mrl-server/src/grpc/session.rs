@@ -149,8 +149,8 @@ async fn drive(
             let ident = check_identity(gw, peer, sha, &hello).await?;
             let transport = peer.transport.or_else(|| TransportKind::from_proto(hello.transport));
             match Lane::try_from(hello.lane) {
-                Ok(Lane::Control) => control(gw, sha, ident, &hello, transport, inbound, out, shutdown).await,
-                Ok(Lane::Telemetry | Lane::Bulk) => data(gw, sha, ident, &hello, inbound, out, shutdown).await,
+                Ok(Lane::Control) => control(gw, sha, ident, &hello, transport, peer.connection, inbound, out, shutdown).await,
+                Ok(Lane::Telemetry | Lane::Bulk) => data(gw, sha, ident, &hello, peer.connection, inbound, out, shutdown).await,
                 _ => Err(protocol("AgentHello.lane must be CONTROL, TELEMETRY or BULK")),
             }
         }
@@ -558,6 +558,7 @@ async fn control(
     ident: CertIdentity,
     h: &AgentHello,
     transport: Option<TransportKind>,
+    connection: u64,
     inbound: &mut Inbound,
     out: &Outbound,
     shutdown: &CancellationToken,
@@ -572,7 +573,7 @@ async fn control(
     )
     .await
     .map_err(unavailable)?;
-    let (superseded, revoked, wake) = gw.sessions.open_control(node, epoch);
+    let (superseded, revoked, wake) = gw.sessions.open_control(node, epoch, connection);
     // This certificate authenticated: certificates issued before it are retired now (rotation
     // keeps the old one valid until the new one is proven to work).
     let retired = store::retire_older(&gw.db, node, sha)
@@ -658,16 +659,21 @@ async fn control(
     result
 }
 
-/// The CONTROL session a data stream belongs to: the one this replica holds for `node`, when it
-/// is also the node's current session in the database. A data stream may open just before its
+/// The CONTROL session a data stream belongs to: the one that came on the same `connection`,
+/// when it is also the node's current session in the database. A stream from any other
+/// connection (an older one, say) never borrows it. A data stream may open just before its
 /// CONTROL stream, so this waits up to 5 s.
-async fn bind_to_control(gw: &Gateway, node: Uuid) -> Result<(i64, CancellationToken), Status> {
+async fn bind_to_control(
+    gw: &Gateway,
+    node: Uuid,
+    connection: u64,
+) -> Result<(i64, CancellationToken), Status> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let current = store::session_epoch(&gw.db, node)
             .await
             .map_err(unavailable)?;
-        if let Some((epoch, token)) = gw.sessions.control_of(node) {
+        if let Some((epoch, token)) = gw.sessions.control_of(node, connection) {
             if epoch == current {
                 return Ok((epoch, token));
             }
@@ -711,19 +717,31 @@ async fn send_commands(
         store::Claim::Send(rows) => rows,
     };
     let mut last = after;
-    for (_, seq, payload) in claimed {
+    for (id, seq, payload) in claimed {
         let cmd = commands::decode(&payload).map_err(unavailable)?;
+        let size = commands::envelope_len(&cmd);
+        if size > super::MAX_MESSAGE_BYTES {
+            // Stored before sizes were checked: it can never be sent, so it must not stall the
+            // commands after it. The row (and its payload) stays, FAILED, for diagnosis.
+            tracing::warn!(node = %NodeId::from_uuid(node), command = %id, size, "a stored command is too large to send; failed");
+            store::fail_unsendable(&gw.db, id, size)
+                .await
+                .map_err(unavailable)?;
+            continue;
+        }
         send(out, core_message::Body::Command(cmd), seq, rx_seq).await?;
         last = seq;
     }
     Ok(last)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn data(
     gw: &Arc<Gateway>,
     sha: &str,
     ident: CertIdentity,
     h: &AgentHello,
+    connection: u64,
     inbound: &mut Inbound,
     out: &Outbound,
     shutdown: &CancellationToken,
@@ -734,7 +752,7 @@ async fn data(
     send(out, hello(gw, lane, 0), 0, 0).await?;
     // Bound to the CONTROL session of the same connection (on this replica, current in the
     // database): when it ends or is taken over, this stream closes too.
-    let (epoch, session) = bind_to_control(gw, node).await?;
+    let (epoch, session) = bind_to_control(gw, node, connection).await?;
     let lossy = Lossy::start(gw, node, epoch, lane, &session);
     let mut recheck =
         tokio::time::interval(Duration::from_secs(gw.config.revocation_check_seconds));
