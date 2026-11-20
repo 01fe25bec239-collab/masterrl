@@ -219,6 +219,39 @@ impl axum::extract::FromRequestParts<AppState> for Caller {
     }
 }
 
+/// SHA-384 that `3791ab7`'s migration 16007 (which cleared every replay record) left in
+/// `_sqlx_migrations`. Its text was narrowed later; those databases already ran the wider
+/// cleanup, so only the recorded checksum is out of date.
+const OLD_16007_CHECKSUM: &str = "1d60f7824cb6fd11da14c37b45e470fdc7c76a701ac3046ad6e89fc51b60523d5bdda95b26d1e1e37e94ccd72103ba0c";
+
+/// Brings a database that ran the earlier 16007 in line with this build, so later migrations
+/// pass SQLx's checksum check. Changes nothing else, and nothing on any other database. Run
+/// it before migrations.
+pub async fn repair_migration_checksums(db: &Db) -> Result<(), DbError> {
+    let exists: bool = sqlx::query_scalar("SELECT to_regclass('_sqlx_migrations') IS NOT NULL")
+        .fetch_one(db.pool())
+        .await?;
+    let current = crate::db::migrate::migrator()
+        .iter()
+        .find(|m| m.version == 16007)
+        .map(|m| m.checksum.to_vec());
+    let (true, Some(current)) = (exists, current) else {
+        return Ok(());
+    };
+    let n = sqlx::query(
+        "UPDATE _sqlx_migrations SET checksum = $1 WHERE version = 16007 AND checksum = decode($2, 'hex')",
+    )
+    .bind(current)
+    .bind(OLD_16007_CHECKSUM)
+    .execute(db.pool())
+    .await?
+    .rows_affected();
+    if n > 0 {
+        tracing::info!("updated the recorded checksum of database update 16007");
+    }
+    Ok(())
+}
+
 /// A database error as an API error (503, details only in the log).
 pub fn db_error(e: DbError) -> ApiError {
     ApiError::from(SeamError::from(e))
@@ -507,6 +540,12 @@ async fn callback(
         })?;
     let profile = claims.profile();
     let db = &shared.db;
+    // Solo: one sign-in at a time from the account check to the keychain write, so two
+    // accounts finishing at once cannot both pass the check.
+    let held = match shared.mode {
+        Mode::Solo => Some(signin::hold_session().await),
+        Mode::Team => None,
+    };
     let user = match shared.mode {
         Mode::Solo => {
             let owner = tenancy::ensure_local_owner(db).await.map_err(db_error)?;
@@ -582,9 +621,10 @@ async fn callback(
         .map_err(db_error)?;
     commit(tx).await?;
     // The keychain is not transactional: keep the Supabase session once the link is saved.
-    if shared.mode == Mode::Solo {
-        shared.sign_in(&state).keep(&tokens).await?;
+    if let Some(held) = &held {
+        shared.sign_in(&state).keep(held, &tokens).await?;
     }
+    drop(held);
     Ok(Json(SignedIn {
         user: UserInfo {
             id: user.to_string(),

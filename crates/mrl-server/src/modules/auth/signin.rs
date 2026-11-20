@@ -51,6 +51,19 @@ struct Stored {
 /// locks if a process ever holds several.
 static SESSION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+/// Exclusive use of the stored session for one whole solo sign-in: the account check, the
+/// owner link, the token and the keychain write, so two sign-ins never interleave.
+pub struct SessionHeld {
+    _guard: tokio::sync::MutexGuard<'static, ()>,
+}
+
+/// Waits for, then holds, the stored session (see [`SessionHeld`]).
+pub async fn hold_session() -> SessionHeld {
+    SessionHeld {
+        _guard: SESSION_LOCK.lock().await,
+    }
+}
+
 /// Where this install's sign-in stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "snake_case")]
@@ -138,9 +151,9 @@ impl SignIn {
             .map_err(store_err)
     }
 
-    /// Keeps the tokens of a finished sign-in.
-    pub async fn keep(&self, t: &TokenSet) -> Result<(), SignInError> {
-        let _held = SESSION_LOCK.lock().await;
+    /// Keeps the tokens of a finished sign-in, while `held` covers the whole sign-in.
+    pub async fn keep(&self, held: &SessionHeld, t: &TokenSet) -> Result<(), SignInError> {
+        let _ = held;
         self.store_tokens(t).await
     }
 

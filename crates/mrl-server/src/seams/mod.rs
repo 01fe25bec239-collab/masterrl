@@ -228,8 +228,16 @@ pub struct AuditEvent {
 /// Where audit records go.
 #[async_trait]
 pub trait AuditSink: Send + Sync {
-    /// Stores one record.
+    /// Stores one record that stands alone (a refusal, a failed attempt).
     async fn record(&self, event: AuditEvent) -> Result<(), SeamError>;
+
+    /// Stores one record inside the caller's transaction `tx`, so it commits or rolls back
+    /// with the change it describes. Use this for successful changes. Sinks without a
+    /// database (logs, tests) record it as [`AuditSink::record`] does.
+    async fn record_in(&self, tx: &mut crate::db::Tx, event: AuditEvent) -> Result<(), SeamError> {
+        let _ = tx;
+        self.record(event).await
+    }
 }
 
 /// A response kept for idempotent replay.

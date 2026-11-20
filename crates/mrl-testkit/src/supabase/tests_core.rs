@@ -2796,3 +2796,284 @@ async fn a_named_project_must_exist_in_the_named_org() {
     }
     db.pool().close().await;
 }
+
+/// Starts a sign-in and approves it in the mock as its current user; returns the callback
+/// body (with a CLI token requested).
+async fn approved(core: &CoreServer, sb: &MockSupabase) -> Value {
+    let started = core
+        .call(
+            Method::POST,
+            "/api/v1/auth/login",
+            &Auth::Launch,
+            Some(
+                json!({ "provider": "github", "redirect_uri": "http://127.0.0.1:53111/callback" }),
+            ),
+        )
+        .await
+        .json();
+    let back = sb
+        .approve(started["authorize_url"].as_str().unwrap())
+        .unwrap();
+    let q: std::collections::HashMap<String, String> = reqwest::Url::parse(&back)
+        .unwrap()
+        .query_pairs()
+        .into_owned()
+        .collect();
+    json!({ "flow_id": q["flow"], "code": q["code"], "issue_token": true, "token_name": "race" })
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn two_accounts_finishing_sign_in_at_once_link_only_one() {
+    let sb = MockSupabase::start().await;
+    let core = solo(&sb).await;
+    let first = approved(&core, &sb).await;
+    sb.set_user(MockUser::new("bob@example.com", "Bob"));
+    let second = approved(&core, &sb).await;
+    let finish = |body: Value| {
+        let core = &core;
+        async move {
+            core.call(
+                Method::POST,
+                "/api/v1/auth/callback",
+                &Auth::Launch,
+                Some(body),
+            )
+            .await
+        }
+    };
+    let (a, b) = tokio::join!(finish(first), finish(second));
+    let mut statuses = [a.status, b.status];
+    statuses.sort_unstable();
+    assert_eq!(statuses, [200, 409], "{} / {}", a.text(), b.text());
+    let winner = if a.status == 200 { a.json() } else { b.json() };
+    assert!(winner["token"]["token"].as_str().is_some());
+    assert_eq!(
+        core.db.count("api_tokens").await,
+        1,
+        "only one account got a token"
+    );
+    // The owner link and the keychain session name the same account.
+    let linked: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT supabase_user_id FROM users WHERE is_local_owner")
+            .fetch_one(core.db.pool())
+            .await
+            .unwrap();
+    let me = core
+        .call(Method::GET, "/api/v1/auth/me", &Auth::Launch, None)
+        .await
+        .json();
+    assert_eq!(me["sign_in"], "active");
+    assert_eq!(me["user"]["email"], winner["user"]["email"]);
+    let stored = core
+        .secrets
+        .get("auth.supabase_session")
+        .await
+        .unwrap()
+        .unwrap();
+    let stored: Value = serde_json::from_str(stored.expose()).unwrap();
+    assert_eq!(
+        stored["user"]["id"].as_str().map(str::to_owned),
+        linked.map(|l| l.to_string())
+    );
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_team_core_never_syncs_with_the_former_solo_owners_session() {
+    let sb = MockSupabase::start().await;
+    let core = solo(&sb).await;
+    assert_eq!(core.sign_in(&sb, &Auth::Launch, false).await.status, 200);
+    let setup = |auth: Auth| {
+        let core = &core;
+        async move {
+            core.call(
+                Method::POST,
+                "/api/v1/sync/setup",
+                &auth,
+                Some(json!({"passphrase": PASSPHRASE})),
+            )
+            .await
+        }
+    };
+    assert_eq!(setup(Auth::Launch).await.status, 200);
+    assert_eq!(push(&core).await.status, 200);
+    let history = sb.stored_rows();
+    let core = core.restart(config(Mode::Team, &sb)).await;
+    let (bob, _) = member(&core, &sb, "bob").await;
+    let set_up = core
+        .call(
+            Method::POST,
+            "/api/v1/sync/setup",
+            &Auth::Bearer(bob.clone()),
+            Some(json!({"passphrase": PASSPHRASE})),
+        )
+        .await;
+    assert_eq!(set_up.status, 200, "{}", set_up.text());
+    for (method, path) in [
+        (Method::POST, "/api/v1/sync/push"),
+        (Method::POST, "/api/v1/sync/restore"),
+    ] {
+        let body = (path.ends_with("restore")).then(|| json!({"passphrase": PASSPHRASE}));
+        let r = core
+            .call(method, path, &Auth::Bearer(bob.clone()), body)
+            .await;
+        assert_eq!(r.status, 409, "{path}: {}", r.text());
+        assert_eq!(r.json()["code"], "MRL-AUTH-163");
+    }
+    let status = core
+        .call(Method::GET, "/api/v1/sync/status", &Auth::Bearer(bob), None)
+        .await;
+    assert_eq!(status.status, 200, "{}", status.text());
+    assert!(status.json()["copies"].is_null(), "{}", status.text());
+    assert_eq!(
+        sb.stored_rows(),
+        history,
+        "the former owner's history is unchanged"
+    );
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn the_audit_seam_commits_and_rolls_back_with_the_callers_transaction() {
+    let sb = MockSupabase::start().await;
+    let core = solo(&sb).await;
+    // The production seam, as any module gets it from `state.seams.audit`.
+    let store: Arc<dyn SecretStore> = core.secrets.clone();
+    let sink: Arc<dyn AuditSink> = mrl_server::modules::auth::production_seams(
+        &core.config,
+        core.db.db(),
+        store,
+        crate::server::TEST_SECRET,
+    )
+    .await
+    .unwrap()
+    .build(Mode::Solo)
+    .unwrap()
+    .audit;
+    let success = |target: &str| {
+        mrl_server::modules::audit::event(
+            time::OffsetDateTime::now_utc(),
+            "local-owner",
+            None,
+            "runs.submit",
+            target,
+            mrl_server::seams::AuditOutcome::Success,
+            "trace",
+        )
+    };
+    let count = |target: &'static str| {
+        let core = &core;
+        async move {
+            let n: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events WHERE target = $1")
+                .bind(target)
+                .fetch_one(core.db.pool())
+                .await
+                .unwrap();
+            n
+        }
+    };
+    let mut tx = core.db.db().begin().await.unwrap();
+    sink.record_in(&mut tx, success("kept")).await.unwrap();
+    tx.commit().await.unwrap();
+    let mut tx = core.db.db().begin().await.unwrap();
+    sink.record_in(&mut tx, success("undone")).await.unwrap();
+    tx.rollback().await.unwrap();
+    assert_eq!(count("kept").await, 1);
+    assert_eq!(count("undone").await, 0);
+    // On its own, the seam still refuses a success.
+    assert!(sink.record(success("alone")).await.is_err());
+    assert_eq!(count("alone").await, 0);
+    core.stop().await;
+}
+
+/// Migration 16007 exactly as `3791ab7` shipped it.
+const OLD_16007: &str =
+    "-- Earlier P16 revisions let keyed requests to the secret-bearing endpoints (tokens, sessions,
+-- sync setup and restore) reach the idempotency store, which keeps a SHA-256 of the body (a
+-- fast check of a sync passphrase) and the response (a new token or recovery key). Those
+-- endpoints now bypass the store; this clears what was kept. Rows only live 24 hours, so the
+-- cost is that a retry in flight during the upgrade runs again instead of replaying.
+DELETE FROM idempotency_keys;
+";
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_database_made_by_3791ab7_takes_later_migrations_and_keeps_its_data() {
+    use sqlx::migrate::{Migration, MigrationType};
+    use sqlx::SqlSafeStr;
+    let db = TestDb::empty().await;
+    // What 3791ab7 applied: this build's migrations, with its own 16007 text.
+    let mut old = mrl_server::db::migrate::migrator();
+    old.migrations = old
+        .migrations
+        .iter()
+        .map(|m| {
+            if m.version == 16007 {
+                Migration::new(
+                    16007,
+                    m.description.clone(),
+                    MigrationType::Simple,
+                    sqlx::AssertSqlSafe(OLD_16007.to_owned()).into_sql_str(),
+                    false,
+                )
+            } else {
+                m.clone()
+            }
+        })
+        .collect::<Vec<_>>()
+        .into();
+    mrl_server::db::migrate::apply_with(db.db(), &old)
+        .await
+        .unwrap();
+    db.seed(&kept("org", r#"{"id":"org_1","slug":"lab"}"#))
+        .await;
+    db.seed("INSERT INTO users (id, display_name) VALUES (gen_random_uuid(), 'kept');")
+        .await;
+    // A later build: this build's migrations plus one more.
+    let mut later = mrl_server::db::migrate::migrator();
+    let mut list = later.migrations.to_vec();
+    list.push(Migration::new(
+        99_001,
+        "later".into(),
+        MigrationType::Simple,
+        sqlx::AssertSqlSafe("SELECT 1;".to_owned()).into_sql_str(),
+        false,
+    ));
+    later.migrations = list.into();
+    let refused = mrl_server::db::migrate::apply_with(db.db(), &later).await;
+    assert!(
+        refused.is_err(),
+        "without the repair SQLx refuses the changed checksum"
+    );
+    mrl_server::modules::auth::repair_migration_checksums(db.db())
+        .await
+        .unwrap();
+    assert_eq!(
+        mrl_server::db::migrate::apply_with(db.db(), &later)
+            .await
+            .unwrap(),
+        vec![99_001]
+    );
+    assert_eq!(keys(&db).await, vec!["org"], "replay records kept");
+    let users: i64 = sqlx::query_scalar("SELECT count(*) FROM users WHERE display_name = 'kept'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(users, 1);
+    // A database made by this build is left as it is.
+    let fresh = TestDb::new().await;
+    mrl_server::modules::auth::repair_migration_checksums(fresh.db())
+        .await
+        .unwrap();
+    assert!(
+        mrl_server::db::migrate::pending(fresh.db(), &mrl_server::db::migrate::migrator())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    fresh.pool().close().await;
+    db.pool().close().await;
+}

@@ -77,7 +77,18 @@ impl KeychainStore {
                 return file;
             }
         }
-        match probe(service).await {
+        Self::after_probe(service, fallback_dir, file, probe(service).await)
+    }
+
+    /// The store for a first use, from the probe's answer.
+    fn after_probe(
+        service: &str,
+        fallback_dir: &Path,
+        file: Self,
+        probe: Result<(), keyring::Error>,
+    ) -> Self {
+        let marker = fallback_dir.join(format!("{service}.os-keychain"));
+        match probe {
             Ok(()) => {
                 let written = std::fs::create_dir_all(fallback_dir)
                     .and_then(|()| std::fs::write(&marker, b"os keychain\n"));
@@ -190,12 +201,26 @@ async fn probe(service: &str) -> Result<(), keyring::Error> {
     read.unwrap_or_else(|e| Err(keyring::Error::NoStorageAccess(Box::new(e))))
 }
 
-/// True when there is no keychain service to use: no store for this platform, or (Linux and
-/// other Unix) Secret Service failing to answer at all. A locked store is not absent.
+/// What the Linux Secret Service driver reports when there is no provider or no D-Bus
+/// session (`secret_service::Error::Unavailable`, and D-Bus finding no provider to start).
+const NO_SECRET_SERVICE: [&str; 2] = [
+    "no secret service provider or dbus session found",
+    "org.freedesktop.DBus.Error.ServiceUnknown",
+];
+
+/// True only for a confirmed absence: no store for this platform, or (Linux and other Unix)
+/// Secret Service saying there is no provider or session. A locked store, a timeout or any
+/// other failure is not absence.
 fn no_keychain_service(e: &keyring::Error) -> bool {
-    let secret_service = cfg!(not(any(target_os = "macos", windows)));
-    matches!(e, keyring::Error::NoDefaultStore)
-        || (secret_service && matches!(e, keyring::Error::PlatformFailure(_)))
+    match e {
+        keyring::Error::NoDefaultStore => true,
+        keyring::Error::PlatformFailure(p) => {
+            let text = p.to_string();
+            cfg!(not(any(target_os = "macos", windows)))
+                && NO_SECRET_SERVICE.iter().any(|m| text.contains(m))
+        }
+        _ => false,
+    }
 }
 
 #[async_trait]
@@ -373,10 +398,27 @@ mod tests {
         assert!(!no_keychain_service(&keyring::Error::NoStorageAccess(
             platform()
         )));
+        let absent = || -> Box<dyn std::error::Error + Send + Sync> {
+            "no secret service provider or dbus session found".into()
+        };
         assert_eq!(
-            no_keychain_service(&keyring::Error::PlatformFailure(platform())),
+            no_keychain_service(&keyring::Error::PlatformFailure(absent())),
             cfg!(not(any(target_os = "macos", windows)))
         );
+        // A transient failure (like a D-Bus timeout) is never absence.
+        assert!(!no_keychain_service(&keyring::Error::PlatformFailure(
+            platform()
+        )));
+    }
+
+    #[test]
+    fn a_transient_failure_on_a_new_install_keeps_the_keychain() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = KeychainStore::file("mrl-new", dir.path());
+        let timeout = keyring::Error::PlatformFailure("D-Bus method call timed out".into());
+        let store = KeychainStore::after_probe("mrl-new", dir.path(), file, Err(timeout));
+        assert!(!store.uses_fallback(), "reported, not swapped for the file");
+        assert!(!dir.path().join("mrl-new.vault").exists());
     }
 
     #[tokio::test]

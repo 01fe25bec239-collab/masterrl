@@ -143,9 +143,14 @@ async fn run(cli: Cli) -> Result<(), Failure> {
     let telemetry = telemetry::init(&config.telemetry)?;
     let secrets_dir = pgbundle::data_dir(&config.pgbundle)?.join("secrets");
     let (db, bundle) = open_database(&config, &env, &secrets_dir).await?;
-    let result = match cli.command {
-        Some(Command::Migrate { dry_run }) => migrate(&db, dry_run).await,
-        _ => {
+    // Before any migration runs, so SQLx's checksum check passes (see the function).
+    let repaired = mrl_server::modules::auth::repair_migration_checksums(&db)
+        .await
+        .map_err(Failure::from);
+    let result = match (repaired, cli.command) {
+        (Err(e), _) => Err(e),
+        (Ok(()), Some(Command::Migrate { dry_run })) => migrate(&db, dry_run).await,
+        (Ok(()), _) => {
             let service = &config.auth.keychain_service;
             let secrets: Arc<dyn SecretStore> =
                 Arc::new(KeychainStore::open(service, &secrets_dir, config.keychain.backend).await);

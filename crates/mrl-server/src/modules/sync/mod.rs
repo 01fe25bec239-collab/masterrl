@@ -531,6 +531,34 @@ fn sign_in(state: &AppState, shared: &Shared) -> SignIn {
     SignIn::new(shared.supabase.clone(), state.seams.secrets.clone())
 }
 
+/// The stored sign-in, only when it is the caller's own account: the Supabase user linked to
+/// the caller, or in solo mode the not-yet-linked local owner (restore links them). A team
+/// core opened on a former solo keychain never lends that owner's session to anyone.
+async fn own_access(state: &AppState, shared: &Shared, c: &Caller) -> Result<Access, Fail> {
+    let access = sign_in(state, shared).access().await?;
+    let row: Option<(Option<uuid::Uuid>, bool)> =
+        sqlx::query_as("SELECT supabase_user_id, is_local_owner FROM users WHERE id = $1")
+            .bind(c.user.as_uuid())
+            .fetch_optional(shared.db.pool())
+            .await
+            .map_err(|e| db_error(e.into()))?;
+    let solo = state.config.server.mode == Mode::Solo;
+    let mine = match row {
+        Some((Some(linked), _)) => linked == access.user.id,
+        Some((None, owner)) => solo && owner,
+        None => false,
+    };
+    if !mine {
+        return Err(Coded::new(
+            crate::modules::auth::signin::OTHER_ACCOUNT,
+            StatusCode::CONFLICT,
+            "The MasterRL account signed in on this computer is not yours, so setup sync cannot use it.",
+        )
+        .into());
+    }
+    Ok(access)
+}
+
 fn online(shared: &Shared) -> Result<&Supabase, Fail> {
     shared
         .supabase
@@ -777,7 +805,7 @@ async fn push(
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
     let profile = load_profile(&shared.db, c.user).await?;
     check(&profile)?;
-    let access = sign_in(&state, &shared).access().await?;
+    let access = own_access(&state, &shared, &c).await?;
     let plain = serde_json::to_vec(&profile)
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
     let sealed = crypto::seal(&key, &aad(access.user.id), &plain)
@@ -868,7 +896,7 @@ async fn restore(
 ) -> Result<Json<Restored>, Fail> {
     let c = caller(&state, &shared, &ctx).await?;
     let sb = online(&shared)?;
-    let access = sign_in(&state, &shared).access().await?;
+    let access = own_access(&state, &shared, &c).await?;
     let copies = remote_copies(sb, &access).await.map_err(remote_error)?;
     let copy = match req.version {
         Some(v) => copies.into_iter().find(|c| c.version == v),
@@ -1042,7 +1070,7 @@ async fn status(
     let si = sign_in(&state, &shared);
     let sign_in_state = si.state().await?;
     let (copies, copies_unavailable) = match (&shared.supabase, sign_in_state) {
-        (Some(sb), SignInState::Active) => match si.access().await {
+        (Some(sb), SignInState::Active) => match own_access(&state, &shared, &c).await {
             Ok(access) => match remote_copies(sb, &access).await {
                 Ok(cs) => (
                     Some(
@@ -1057,7 +1085,7 @@ async fn status(
                 ),
                 Err(e) => (None, Some(fail_text(remote_error(e)))),
             },
-            Err(e) => (None, Some(fail_text(Fail::from(e)))),
+            Err(e) => (None, Some(fail_text(e))),
         },
         _ => (None, Some("Sign in to see your saved copies.".to_owned())),
     };
