@@ -1258,6 +1258,58 @@ async fn a_container_that_exited_while_the_agent_was_down_is_checked() {
         .output();
 }
 
+/// `attempt stop-all` (what `service uninstall` runs once the service is down) ends the
+/// workers the stopped service left running and records how their attempts ended.
+#[tokio::test(flavor = "multi_thread")]
+async fn stop_all_ends_workers_the_service_left_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), None);
+    let mut worker = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .unwrap();
+    let identity = ProcIdentity::of_pid(worker.id()).unwrap();
+    let mut rec = old_record(ctx.state.root(), "att_left", "left-launch", identity, None);
+    rec.phase = AttemptPhase::Running as i32;
+    rec.socket = mrl_agent::attempts::runner::socket_path(ctx.state.root(), "att_left");
+    let job = ctx.state.job_dir("att_left");
+    std::fs::create_dir_all(&job).unwrap();
+    rec.save(&job).unwrap();
+    let config = dir.path().join("agent.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "state_dir = {:?}\n[cache]\nmin_free_bytes = 0\n",
+            ctx.state.root().display().to_string()
+        ),
+    )
+    .unwrap();
+    // This test's own manager must not hold the state folder.
+    drop(ctx);
+    let out = tokio::task::spawn_blocking(move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_mrl-agent"))
+            .args([
+                "--config",
+                &config.display().to_string(),
+                "attempt",
+                "stop-all",
+            ])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("stopped 1 running attempt"), "{err}");
+    assert!(
+        worker.try_wait().unwrap().is_some(),
+        "the worker was stopped"
+    );
+    let rec = AttemptRecord::load(&job).unwrap().unwrap();
+    assert!(rec.exit.is_some(), "its outcome is recorded");
+}
+
 /// The lease runs out while the event reader is stuck: the launch ends fenced and no worker
 /// is ever started.
 #[tokio::test(flavor = "multi_thread")]

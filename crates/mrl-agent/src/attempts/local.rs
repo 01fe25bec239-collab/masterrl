@@ -34,6 +34,10 @@ pub enum AttemptCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Stop every attempt still running from this state folder: re-adopt each, cancel it
+    /// (its workers get their grace period) and clean up. `service uninstall` runs it once the
+    /// service has stopped: stopping the service leaves workers running for the next agent.
+    StopAll,
 }
 
 /// Runs an `attempt` subcommand; errors are printed with their code.
@@ -112,7 +116,10 @@ fn describe(e: &AttemptEvent) -> Option<String> {
 }
 
 async fn run_cli(config: Option<&Path>, cmd: AttemptCommand) -> Result<ExitCode, AttemptError> {
-    let AttemptCommand::Run { spec, keep, json } = cmd;
+    let (spec, keep, json) = match cmd {
+        AttemptCommand::Run { spec, keep, json } => (spec, keep, json),
+        AttemptCommand::StopAll => return stop_all(config).await,
+    };
     let spec = read_spec(&spec)?;
     let (cfg, _) = AgentConfig::load(config)?;
     // One agent process per state folder, claimed before the node cache is opened.
@@ -184,6 +191,43 @@ async fn run_cli(config: Option<&Path>, cmd: AttemptCommand) -> Result<ExitCode,
         crate::janitor::purge(ctx.state.root(), &job_dir)?;
     }
     print_outcome(outcome.as_ref(), json)
+}
+
+/// Grace period a stopped attempt's workers get.
+const STOP_ALL_GRACE_S: u32 = 10;
+
+/// `attempt stop-all`: re-adopts every attempt still running here and cancels it.
+async fn stop_all(config: Option<&Path>) -> Result<ExitCode, AttemptError> {
+    let (cfg, _) = AgentConfig::load(config)?;
+    let _writer = crate::envs::lock_state(&cfg.state_dir)?;
+    let ctx = Arc::new(AgentContext::from_config(cfg)?);
+    let (tx, mut rx) = super::attempt_events(256);
+    // Nobody to tell: events are dropped as they come.
+    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let attempts = Attempts::new(ctx, tx, None)?;
+    attempts.readopt().await;
+    let running = attempts.running();
+    for a in &running {
+        let cancel = mrl_proto::agent::v1::Command {
+            command_id: format!("stop-all-{}", a.attempt_id),
+            kind: Some(mrl_proto::agent::v1::command::Kind::CancelAttempt(
+                mrl_proto::agent::v1::CancelAttempt {
+                    attempt: Some(a.clone()),
+                    request_id: "stop-all".into(),
+                    grace_s: STOP_ALL_GRACE_S,
+                    reason: "the agent service was removed".into(),
+                },
+            )),
+        };
+        attempts.handle(&cancel).await;
+    }
+    for a in &running {
+        attempts.wait(&a.attempt_id).await;
+    }
+    eprintln!("mrl-agent: stopped {} running attempt(s)", running.len());
+    drop(attempts);
+    drain.abort();
+    Ok(ExitCode::SUCCESS)
 }
 
 /// Waits for Ctrl-C (cancel, then keep waiting) or SIGTERM (returns true: detach).

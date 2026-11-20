@@ -492,7 +492,7 @@ pub fn installed_in(envs_root: &Path) -> Vec<InstalledEnv> {
 /// this process that uses the folder and released when the last user drops it. Environments,
 /// pins and the node cache index are only safe with one writing process, so a second process
 /// (an `attempt run` next to the agent, or a second agent) is refused.
-pub fn lock_state(state_root: &Path) -> Result<Arc<std::fs::File>, AttemptError> {
+pub fn lock_state(state_root: &Path) -> crate::Result<Arc<std::fs::File>> {
     static HELD: std::sync::LazyLock<
         std::sync::Mutex<std::collections::HashMap<PathBuf, std::sync::Weak<std::fs::File>>>,
     > = std::sync::LazyLock::new(Default::default);
@@ -516,10 +516,9 @@ pub fn lock_state(state_root: &Path) -> Result<Arc<std::fs::File>, AttemptError>
                 std::io::Error::other(
                     "another mrl-agent is using this state folder; stop it first or use another state_dir",
                 ),
-            )
-            .into());
+            ));
         }
-        Err(std::fs::TryLockError::Error(e)) => return Err(AgentError::state(&path, e).into()),
+        Err(std::fs::TryLockError::Error(e)) => return Err(AgentError::state(&path, e)),
     }
     let file = Arc::new(file);
     held.insert(state_root.to_path_buf(), Arc::downgrade(&file));

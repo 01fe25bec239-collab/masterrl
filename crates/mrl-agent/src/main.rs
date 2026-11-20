@@ -161,6 +161,9 @@ async fn dispatch(config: Option<PathBuf>, command: Command) -> Result<ExitCode,
         }
         Command::Run => {
             let (cfg, _) = AgentConfig::load(config.as_deref())?;
+            // One agent per state folder, claimed before the cache opens or the PID file is
+            // written, and held until the agent stops.
+            let _writer = mrl_agent::envs::lock_state(&cfg.state_dir)?;
             let ctx = Arc::new(AgentContext::from_config(cfg)?);
             let shutdown = CancellationToken::new();
             let stop = shutdown.clone();

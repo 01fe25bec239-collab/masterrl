@@ -946,3 +946,60 @@ async fn doctor_leaves_the_node_cache_untouched() {
     assert!(stray.exists(), "nothing in the cache folder was reconciled");
     assert!(ctx.cache.get(&sha).unwrap().is_some());
 }
+
+/// A second `mrl-agent run` on a state folder a running agent owns stops before it opens the
+/// cache or writes `agent.pid`: it fails with a plain message and the first agent's PID file
+/// stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_daemon_leaves_the_first_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = dir.path().join("state");
+    let config = dir.path().join("agent.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "state_dir = {:?}\n[cache]\nmin_free_bytes = 0\n",
+            state.display().to_string()
+        ),
+    )
+    .unwrap();
+    let agent = move || {
+        std::process::Command::new(env!("CARGO_BIN_EXE_mrl-agent"))
+            .args(["--config", &config.display().to_string(), "run"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let mut first = agent();
+    let pid_file = state.join(mrl_agent::PID_FILE);
+    let deadline = std::time::Instant::now() + WAIT;
+    while !pid_file.exists() {
+        assert!(
+            first.try_wait().unwrap().is_none(),
+            "the first agent stopped"
+        );
+        assert!(std::time::Instant::now() < deadline, "no agent.pid");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let pid = std::fs::read_to_string(&pid_file).unwrap();
+    assert_eq!(pid.trim(), first.id().to_string());
+    let second = tokio::task::spawn_blocking(move || agent().wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    let err = String::from_utf8_lossy(&second.stderr);
+    assert!(!second.status.success());
+    assert!(err.contains("another mrl-agent"), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(&pid_file).unwrap(),
+        pid,
+        "the first agent's PID file is untouched"
+    );
+    assert!(
+        first.try_wait().unwrap().is_none(),
+        "the first agent runs on"
+    );
+    first.kill().unwrap();
+    first.wait().unwrap();
+}
