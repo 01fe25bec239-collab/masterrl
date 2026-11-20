@@ -91,8 +91,11 @@ impl SecretStore for Shared {
 /// The project whose items `usr-viewer` may not see.
 const PRIVATE: &str = "private";
 
-/// `usr-viewer` may not read runs, nor anything recorded in project [`PRIVATE`] (Hide);
-/// everyone else may do everything.
+/// The project for which the authorizer fails when `usr-viewer` asks.
+const BROKEN: &str = "broken";
+
+/// `usr-viewer` may not read runs, nor anything recorded in project [`PRIVATE`] (Hide), and
+/// its checks on project [`BROKEN`] fail; everyone else may do everything.
 struct ViewerRules;
 
 #[async_trait]
@@ -104,6 +107,9 @@ impl Authorizer for ViewerRules {
         res: &Resource,
     ) -> Result<Decision, SeamError> {
         let viewer = ctx.principal.id == "usr-viewer";
+        if viewer && res.project.as_deref() == Some(BROKEN) {
+            return Err(SeamError::new("authorizer", "the test authorizer is down"));
+        }
         Ok(
             if viewer && (action == "runs.read" || res.project.as_deref() == Some(PRIVATE)) {
                 Decision::Hide
@@ -1168,7 +1174,12 @@ async fn artifacts_register_and_download(kind: Kind) {
     // An artifact committed before files were copied (only its folder has them) gets its
     // checked copy on the first download.
     let legacy = uuid::Uuid::now_v7();
-    let legacy_bytes = b"legacy bytes";
+    // Unique bytes: the S3 test bucket outlives runs, so fixed content may already be stored.
+    let legacy_owned = format!("legacy {}", uuid::Uuid::new_v4());
+    let legacy_bytes = legacy_owned.as_bytes();
+    let st = e.backend.org("org-a").unwrap();
+    let legacy_blob = st.keys().blob(&sha256_hex(legacy_bytes)).unwrap();
+    assert!(st.head(&legacy_blob).await.is_err(), "no copy yet");
     let legacy_manifest = put_files(&e, "old/l1/", &[("l.bin", legacy_bytes)]).await;
     e.db.seed(&format!(
         "INSERT INTO artifacts (id, org_id, name, kind, prefix, manifest, size_bytes, state, created_by, committed_at)
@@ -1187,11 +1198,62 @@ async fn artifacts_register_and_download(kind: Kind) {
         .await;
     assert_eq!(r.status, 200, "{}", r.text());
     assert_eq!(e.fetch(&r.json()).await, legacy_bytes);
-    let st = e.backend.org("org-a").unwrap();
-    assert!(st
-        .head(&st.keys().blob(&sha256_hex(legacy_bytes)).unwrap())
-        .await
-        .is_ok());
+    assert!(st.head(&legacy_blob).await.is_ok(), "the copy was made");
+    // A finished upload's stored file that is gone, or changed with the same size, is
+    // caught when registering; the name stays free.
+    for case in ["missing", "corrupted"] {
+        let bytes = format!("{case} {}", uuid::Uuid::new_v4());
+        let up = e.upload(A, bytes.as_bytes(), None).await;
+        let blob = e
+            .call(Method::GET, &format!("/api/v1/uploads/{up}"), A, None)
+            .await
+            .json()["blob_key"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        if case == "missing" {
+            st.delete(&blob).await.unwrap();
+        } else {
+            st.put(&blob, bytes.to_uppercase().into_bytes().into())
+                .await
+                .unwrap();
+        }
+        let manifest = json!({"schema_version": "artifact-manifest/v1", "kind": "eval", "created_at": "2026-11-16T00:00:00Z",
+            "files": [{"path": "b.txt", "size": bytes.len(), "sha256": sha256_hex(bytes.as_bytes()), "role": "report"}]});
+        let r = e
+            .call(
+                Method::POST,
+                "/api/v1/artifacts",
+                A,
+                Some(json!({"name": "from-blob", "manifest": manifest, "uploads": {"b.txt": up}})),
+            )
+            .await;
+        assert_eq!(
+            (r.status, code(&r).as_str()),
+            (422, "MRL-STORE-011"),
+            "{case}: {}",
+            r.text()
+        );
+        let detail = r.json()["detail"].as_str().unwrap().to_owned();
+        assert!(
+            detail.contains(if case == "missing" {
+                "missing"
+            } else {
+                "changed"
+            }),
+            "{detail}"
+        );
+    }
+    let (fine, fine_up) = e.upload_files(&[("b.txt", b"fine")]).await;
+    let r = e
+        .call(
+            Method::POST,
+            "/api/v1/artifacts",
+            A,
+            Some(json!({"name": "from-blob", "manifest": fine, "uploads": fine_up})),
+        )
+        .await;
+    assert_eq!(r.status, 201, "the name was freed: {}", r.text());
     e.scratch_cleaned("registration").await;
     let r = e
         .call(
@@ -2735,6 +2797,22 @@ async fn creating_needs_the_destination_and_a_visible_source() {
         .call(Method::POST, "/api/v1/artifacts", A, Some(body))
         .await;
     assert_eq!(r.status, 201, "its owner can: {}", r.text());
+    // An authorizer that fails is an outage (503), not a missing upload.
+    let up = e.upload(A, bytes, Some(BROKEN)).await;
+    let r = e
+        .call(
+            Method::POST,
+            "/api/v1/artifacts",
+            VIEWER,
+            Some(json!({"name": "outage", "manifest": manifest, "uploads": {"w.bin": up}})),
+        )
+        .await;
+    assert_eq!(
+        (r.status, code(&r).as_str()),
+        (503, "MRL-INTERNAL-002"),
+        "{}",
+        r.text()
+    );
 }
 
 #[tokio::test]

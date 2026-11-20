@@ -513,7 +513,8 @@ impl ArtifactStore {
     }
 
     /// Makes every file a checked copy in `blobs/sha256/…` (see [`snapshot_file`]). A
-    /// finished upload already is one; only its size and hash are compared.
+    /// finished upload's stored file already is one; it is re-read and hashed
+    /// ([`check_blob`]) so a lost or changed object is caught before commit.
     async fn snapshot(
         &self,
         store: &Store,
@@ -524,8 +525,7 @@ impl ArtifactStore {
         for (f, src) in manifest.files.iter().zip(sources) {
             let problem = match src {
                 Source::Key(key) => self.snapshot_file(store, &key, f).await?,
-                Source::Upload(up, b) => (b.size != f.size || b.sha256 != f.sha256)
-                    .then(|| format!("{}: upload {up} has other content", f.path)),
+                Source::Upload(up, b) => check_blob(store, &up, &b, f).await?,
             };
             problems.extend(problem);
         }
@@ -688,10 +688,54 @@ pub trait NodeLookup: Send + Sync {
     async fn find(&self, org: &str, id: Uuid) -> Result<Option<(&'static str, Resource)>, Error>;
 }
 
-/// A checked blob of a finished upload.
+/// The stored file of a finished upload, as its row records it.
 pub(crate) struct UploadBlob {
+    /// Its key, under `blobs/sha256/`.
+    pub(crate) key: String,
     pub(crate) size: u64,
     pub(crate) sha256: String,
+}
+
+/// Compares a finished upload's stored file with manifest entry `f`: first the row, then
+/// the object itself (it must exist with that size, and its bytes must hash to that
+/// sha256), since storage can lose or change what the row describes. Returns the problem.
+async fn check_blob(
+    store: &Store,
+    up: &str,
+    b: &UploadBlob,
+    f: &mrl_storage::ManifestFile,
+) -> Result<Option<String>, Error> {
+    if b.size != f.size || b.sha256 != f.sha256 {
+        return Ok(Some(format!("{}: upload {up} has other content", f.path)));
+    }
+    match store.head(&b.key).await {
+        Ok(info) if info.size == f.size => {}
+        Ok(info) => {
+            return Ok(Some(format!(
+                "{}: the stored file of upload {up} has {} bytes, the manifest says {}",
+                f.path, info.size, f.size
+            )))
+        }
+        Err(StorageError::NotFound { .. }) => {
+            return Ok(Some(format!(
+                "{}: the stored file of upload {up} is missing",
+                f.path
+            )))
+        }
+        Err(e) => return Err(e.into()),
+    }
+    match store.sha256(&b.key).await {
+        Ok(sha) if sha == f.sha256 => Ok(None),
+        Ok(_) => Ok(Some(format!(
+            "{}: the stored file of upload {up} has changed",
+            f.path
+        ))),
+        Err(StorageError::NotFound { .. }) => Ok(Some(format!(
+            "{}: the stored file of upload {up} is missing",
+            f.path
+        ))),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Where a manifest file comes from.

@@ -18,10 +18,10 @@ use crate::app::AppState;
 use crate::error::{ApiError, ErrorCode, FieldError};
 use crate::http::BODY_LIMIT;
 use crate::modules::artifacts::{
-    allow, codes, destination, field, not_found, org_of, owned, scratch, split_action,
-    ArtifactStore, Error, UploadBlob,
+    codes, destination, field, not_found, org_of, owned, scratch, split_action, ArtifactStore,
+    Error, UploadBlob,
 };
-use crate::seams::RequestContext;
+use crate::seams::{Decision, RequestContext};
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -229,21 +229,23 @@ pub(crate) async fn finished(
     up: &str,
 ) -> Result<UploadBlob, Error> {
     let row = load(store, org, up).await?;
-    allow(
-        seams,
-        ctx,
-        ACTION,
-        &owned("upload", org, row.key(), row.project_id.clone()),
-    )
-    .await
-    .map_err(|_| not_found("upload"))?;
-    if row.state != "COMPLETED" {
-        return Err(field(
-            &format!("/uploads/{up}"),
-            "This upload is not finished; complete it first.",
-        ));
+    // Denied and hidden both look like a missing upload; an authorizer that fails is
+    // reported as such (503), not as "not found".
+    let res = owned("upload", org, row.key(), row.project_id.clone());
+    if seams.authorizer.authorize(ctx, ACTION, &res).await? != Decision::Allow {
+        return Err(not_found("upload"));
     }
+    let key = match (&row.blob_key, row.state.as_str()) {
+        (Some(k), "COMPLETED") => k.clone(),
+        _ => {
+            return Err(field(
+                &format!("/uploads/{up}"),
+                "This upload is not finished; complete it first.",
+            ))
+        }
+    };
     Ok(UploadBlob {
+        key,
         size: row.size(),
         sha256: row.sha256,
     })
@@ -630,13 +632,34 @@ async fn join_and_store(st: &Store, row: &Row, tmp: &std::path::Path) -> Result<
     };
     let mut file = tokio::fs::File::create(tmp).await.map_err(io)?;
     let mut hash = Sha256::new();
+    let mut total = 0u64;
+    // Each part is checked as read, not as listed: a ticket PUT may have replaced it since.
     for n in 0..row.part_count() {
         let bytes = st.get(&part_key(st, row, n)?).await?;
+        let (got, want) = (bytes.len() as u64, row.part_len(n));
+        if got != want {
+            return Err(Error::coded(
+                codes::PARTS_INCOMPLETE,
+                StatusCode::CONFLICT,
+                format!("Part {n} changed while finishing: it has {got} bytes, not {want}. Send it again."),
+            ));
+        }
+        total += got;
         hash.update(&bytes);
         file.write_all(&bytes).await.map_err(io)?;
     }
     file.flush().await.map_err(io)?;
     drop(file);
+    if total != row.size() {
+        return Err(Error::coded(
+            codes::PARTS_INCOMPLETE,
+            StatusCode::CONFLICT,
+            format!(
+                "The parts add up to {total} bytes, not {}. Send them again.",
+                row.size()
+            ),
+        ));
+    }
     let actual: String = hash.finalize().iter().map(|b| format!("{b:02x}")).collect();
     if actual != row.sha256 {
         return Err(StorageError::ChecksumMismatch {
@@ -760,6 +783,47 @@ pub(crate) struct Doc;
 #[cfg(test)]
 mod tests {
     use utoipa::OpenApi;
+
+    /// A part replaced by a shorter body after it was listed: the bytes read are checked,
+    /// even when they hash to the declared sha256.
+    #[tokio::test]
+    async fn parts_are_checked_as_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = mrl_storage::Backend::connect(&mrl_storage::BackendConfig::Local {
+            root: dir.path().join("objects"),
+        })
+        .unwrap()
+        .org("org-a")
+        .unwrap();
+        let short = b"short".to_vec();
+        let row = super::Row {
+            id: uuid::Uuid::now_v7(),
+            project_id: None,
+            filename: "f".into(),
+            // Declared: 10 bytes whose hash is the 5-byte body's (what an attacker chose).
+            size: 10,
+            sha256: mrl_storage::sha256_hex(&short),
+            part_size: 1 << 20,
+            state: "OPEN".into(),
+            blob_key: None,
+            created_at: time::OffsetDateTime::now_utc(),
+            expires_at: time::OffsetDateTime::now_utc(),
+        };
+        st.put(&super::part_key(&st, &row, 0).unwrap(), short.into())
+            .await
+            .unwrap();
+        let err = super::join_and_store(&st, &row, &dir.path().join("file"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), super::codes::PARTS_INCOMPLETE);
+        assert!(
+            st.list(&format!("{}blobs/", st.keys().prefix()))
+                .await
+                .unwrap_or_default()
+                .is_empty(),
+            "nothing was stored"
+        );
+    }
 
     #[test]
     fn each_upload_action_is_its_own_operation() {
