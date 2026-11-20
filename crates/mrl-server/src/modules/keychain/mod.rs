@@ -144,6 +144,37 @@ impl KeychainStore {
     }
 }
 
+/// Copies secret `name` into `to` from the first of `from` that has it, when `to` lacks it.
+/// Returns where it came from. A cancelled keychain prompt on a source is returned (the
+/// secret is still there; allowing access once moves it); other source failures are logged
+/// and that source skipped.
+///
+/// Used for the bundled database's password when `keychain.backend` changes: without it the
+/// existing database could not be opened.
+pub async fn carry_secret(
+    name: &str,
+    to: &dyn SecretStore,
+    from: &[(&str, &dyn SecretStore)],
+) -> Result<Option<String>, SeamError> {
+    if to.get(name).await?.is_some() {
+        return Ok(None);
+    }
+    for (label, source) in from {
+        match source.get(name).await {
+            Ok(Some(v)) => {
+                to.set(name, v).await?;
+                return Ok(Some((*label).to_owned()));
+            }
+            Ok(None) => {}
+            Err(e) if e.detail.starts_with(KEYCHAIN_CANCELLED) => return Err(e),
+            Err(e) => {
+                tracing::warn!(source = label, error = %e, "could not look for a secret there")
+            }
+        }
+    }
+    Ok(None)
+}
+
 fn check_name(name: &str) -> Result<(), SeamError> {
     let ok = !name.is_empty()
         && name.len() <= 128
@@ -365,6 +396,108 @@ impl FileVault {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A store switch on an existing install: the bundled database still opens and keeps its
+    /// data. The "before" store stands in for the OS keychain.
+    #[tokio::test]
+    #[ignore = "needs PostgreSQL programs"]
+    async fn the_database_survives_a_switch_to_the_file_backend() {
+        use crate::pgbundle::{BundleOptions, PgBinaries, PgBundle, PASSWORD_SECRET};
+        use std::sync::Arc;
+        let configured = std::env::var_os("MRL_TEST_PG_BIN").map(std::path::PathBuf::from);
+        let bins = match PgBinaries::locate(configured.as_deref()).await {
+            Ok(b) => b,
+            Err(e) if std::env::var_os("CI").is_some() => {
+                panic!("CI needs PostgreSQL programs: {e}")
+            }
+            Err(e) => return eprintln!("skipped: {e}"),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let options = |secrets: Arc<dyn SecretStore>| BundleOptions {
+            data_dir: dir.path().join("data"),
+            binaries: bins.clone(),
+            previous: None,
+            backups_keep: 2,
+            secrets,
+        };
+        let connect = |b: &PgBundle| {
+            crate::db::Db::connect_lazy(
+                &crate::config::DatabaseConfig::default(),
+                b.connect_options(),
+            )
+        };
+        let before: Arc<dyn SecretStore> =
+            Arc::new(KeychainStore::file("mrl-db", &dir.path().join("os")));
+        let b = PgBundle::start(options(before.clone())).await.unwrap();
+        let db = connect(&b);
+        sqlx::raw_sql("CREATE TABLE kept (v int); INSERT INTO kept VALUES (42);")
+            .execute(db.pool())
+            .await
+            .unwrap();
+        db.pool().close().await;
+        b.stop().await.unwrap();
+
+        let after: Arc<dyn SecretStore> =
+            Arc::new(KeychainStore::file("mrl-db", &dir.path().join("file")));
+        assert!(
+            PgBundle::start(options(after.clone())).await.is_err(),
+            "no password, no database"
+        );
+        let from: [(&str, &dyn SecretStore); 1] = [("OS keychain", before.as_ref())];
+        let carried = carry_secret(PASSWORD_SECRET, after.as_ref(), &from)
+            .await
+            .unwrap();
+        assert_eq!(carried.as_deref(), Some("OS keychain"));
+        let b = PgBundle::start(options(after)).await.unwrap();
+        let db = connect(&b);
+        let v: i32 = sqlx::query_scalar("SELECT v FROM kept")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        assert_eq!(v, 42);
+        db.pool().close().await;
+        b.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn carrying_a_secret_copies_once_and_stops_at_a_cancelled_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let to = KeychainStore::file("mrl-to", dir.path());
+        let from = KeychainStore::file("mrl-from", dir.path());
+        from.set("pw", Secret::new("p1")).await.unwrap();
+        let sources: [(&str, &dyn SecretStore); 1] = [("from", &from)];
+        assert_eq!(
+            carry_secret("pw", &to, &sources).await.unwrap().as_deref(),
+            Some("from")
+        );
+        assert_eq!(to.get("pw").await.unwrap().unwrap().expose(), "p1");
+        from.set("pw", Secret::new("p2")).await.unwrap();
+        assert_eq!(
+            carry_secret("pw", &to, &sources).await.unwrap(),
+            None,
+            "kept, not overwritten"
+        );
+        struct Cancelled;
+        #[async_trait]
+        impl SecretStore for Cancelled {
+            async fn get(&self, _: &str) -> Result<Option<Secret>, SeamError> {
+                Err(keychain_error(
+                    "read the keychain",
+                    &keyring::Error::PlatformFailure("User canceled the operation.".into()),
+                ))
+            }
+            async fn set(&self, _: &str, _: Secret) -> Result<(), SeamError> {
+                Ok(())
+            }
+            async fn delete(&self, _: &str) -> Result<(), SeamError> {
+                Ok(())
+            }
+        }
+        let empty = KeychainStore::file("mrl-empty", dir.path());
+        let cancelled: [(&str, &dyn SecretStore); 1] = [("os", &Cancelled)];
+        let e = carry_secret("pw", &empty, &cancelled).await.unwrap_err();
+        assert!(e.detail.starts_with(KEYCHAIN_CANCELLED), "{e}");
+    }
 
     #[test]
     fn a_cancelled_prompt_is_a_plain_error_with_a_way_out() {

@@ -3043,6 +3043,24 @@ async fn a_database_made_by_3791ab7_takes_later_migrations_and_keeps_its_data() 
         false,
     ));
     later.migrations = list.into();
+    // What `migrate --dry-run` reads leaves the recorded checksum as it was.
+    let recorded = || async {
+        let c: Vec<u8> =
+            sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 16007")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        c
+    };
+    let before = recorded().await;
+    let listed = mrl_server::db::migrate::pending(db.db(), &later)
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.iter().map(|m| m.version).collect::<Vec<_>>(),
+        vec![99_001]
+    );
+    assert_eq!(recorded().await, before);
     let refused = mrl_server::db::migrate::apply_with(db.db(), &later).await;
     assert!(
         refused.is_err(),

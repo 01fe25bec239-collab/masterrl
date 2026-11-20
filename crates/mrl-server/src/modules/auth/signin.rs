@@ -114,7 +114,8 @@ pub struct SignIn {
 }
 
 fn store_err(e: SeamError) -> SignInError {
-    SignInError::Store(e.to_string())
+    // The detail keeps the keychain's own code (like MRL-ENV-162) at its start.
+    SignInError::Store(e.detail)
 }
 
 impl SignIn {

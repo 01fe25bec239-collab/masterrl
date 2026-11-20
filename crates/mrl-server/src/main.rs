@@ -143,10 +143,15 @@ async fn run(cli: Cli) -> Result<(), Failure> {
     let telemetry = telemetry::init(&config.telemetry)?;
     let secrets_dir = pgbundle::data_dir(&config.pgbundle)?.join("secrets");
     let (db, bundle) = open_database(&config, &env, &secrets_dir).await?;
-    // Before any migration runs, so SQLx's checksum check passes (see the function).
-    let repaired = mrl_server::modules::auth::repair_migration_checksums(&db)
-        .await
-        .map_err(Failure::from);
+    // Before any migration runs, so SQLx's checksum check passes (see the function); only on
+    // runs that may write migration metadata.
+    let repaired = if writes_migrations(cli.command.as_ref(), db.auto_migrate()) {
+        mrl_server::modules::auth::repair_migration_checksums(&db)
+            .await
+            .map_err(Failure::from)
+    } else {
+        Ok(())
+    };
     let result = match (repaired, cli.command) {
         (Err(e), _) => Err(e),
         (Ok(()), Some(Command::Migrate { dry_run })) => migrate(&db, dry_run).await,
@@ -275,9 +280,19 @@ async fn open_database(
     Ok((db, Some(bundle)))
 }
 
+/// True when this run may write migration metadata: `migrate` without `--dry-run`, or
+/// serving with `database.auto_migrate`.
+fn writes_migrations(command: Option<&Command>, auto_migrate: bool) -> bool {
+    match command {
+        Some(Command::Migrate { dry_run }) => !dry_run,
+        _ => auto_migrate,
+    }
+}
+
 /// The bundled database's password lives in the keychain under a service named after the
 /// data folder, so two data folders never share one. A password an older build kept in
-/// `<data>/secrets/` moves to the keychain once.
+/// `<data>/secrets/` moves to the keychain once. After a switch to `keychain.backend = "file"`
+/// the password is copied once from the OS keychain, so the existing database still opens.
 async fn bundle_secrets(
     service: &str,
     backend: mrl_server::modules::keychain::KeychainBackend,
@@ -286,17 +301,27 @@ async fn bundle_secrets(
 ) -> Result<Arc<dyn SecretStore>, Failure> {
     let digest = Sha256::digest(data_dir.to_string_lossy().as_bytes());
     let tag: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
-    let store = KeychainStore::open(&format!("{service}-db-{tag}"), secrets_dir, backend).await;
+    let name = format!("{service}-db-{tag}");
+    let store = KeychainStore::open(&name, secrets_dir, backend).await;
     let fail = |e: mrl_server::seams::SeamError| {
         ServerError::new(ErrorCode::StartupStep, format!("database password: {e}"))
     };
     let old = FileSecretStore::new(secrets_dir);
-    if store.get(PASSWORD_SECRET).await.map_err(fail)?.is_none() {
-        if let Some(p) = old.get(PASSWORD_SECRET).await.map_err(fail)? {
-            store.set(PASSWORD_SECRET, p).await.map_err(fail)?;
+    let os = KeychainStore::os(&name);
+    let mut from: Vec<(&str, &dyn SecretStore)> = vec![("old secrets folder", &old)];
+    if backend == mrl_server::modules::keychain::KeychainBackend::File {
+        from.push(("OS keychain", &os));
+    }
+    let carried = mrl_server::modules::keychain::carry_secret(PASSWORD_SECRET, &store, &from)
+        .await
+        .map_err(fail)?;
+    match carried.as_deref() {
+        Some("old secrets folder") => {
             old.delete(PASSWORD_SECRET).await.map_err(fail)?;
             tracing::info!("moved the database password into the keychain");
         }
+        Some(source) => tracing::info!(source, "copied the database password to the chosen store"),
+        None => {}
     }
     Ok(Arc::new(store))
 }
@@ -335,6 +360,25 @@ fn listening_line(running: &mrl_server::Running, secret: Option<&str>) -> String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_runs_that_migrate_repair_migration_metadata() {
+        let dry = Command::Migrate { dry_run: true };
+        let real = Command::Migrate { dry_run: false };
+        assert!(
+            !writes_migrations(Some(&dry), true),
+            "a dry run never writes"
+        );
+        assert!(
+            writes_migrations(Some(&real), false),
+            "an explicit migrate does"
+        );
+        assert!(writes_migrations(None, true));
+        assert!(
+            !writes_migrations(None, false),
+            "no auto_migrate, no writes at startup"
+        );
+    }
 
     #[test]
     fn version_shows_name_version_and_sha() {

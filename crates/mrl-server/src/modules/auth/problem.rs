@@ -84,8 +84,23 @@ impl From<Coded> for Fail {
 
 impl From<SeamError> for Fail {
     fn from(e: SeamError) -> Self {
-        Fail::Api(ApiError::from(e))
+        match keychain_coded(&e.detail) {
+            Some(c) => Fail::Coded(c),
+            None => Fail::Api(ApiError::from(e)),
+        }
     }
+}
+
+/// A keychain failure (`MRL-ENV-161: …`, `MRL-ENV-162: …`) as its own code, so clients
+/// show the right guidance (a cancelled prompt is not a locked keychain).
+fn keychain_coded(detail: &str) -> Option<Coded> {
+    use crate::modules::keychain::{KEYCHAIN_CANCELLED, KEYCHAIN_FAILED};
+    [KEYCHAIN_CANCELLED, KEYCHAIN_FAILED]
+        .into_iter()
+        .find_map(|code| {
+            let rest = detail.strip_prefix(code)?.strip_prefix(": ")?;
+            Some(Coded::new(code, StatusCode::SERVICE_UNAVAILABLE, rest))
+        })
 }
 
 impl From<super::signin::SignInError> for Fail {
@@ -112,12 +127,15 @@ impl From<super::signin::SignInError> for Fail {
             E::Offline(d) => {
                 Coded::new(super::supabase::OFFLINE, StatusCode::SERVICE_UNAVAILABLE, d).into()
             }
-            E::Store(d) => Coded::new(
-                crate::modules::keychain::KEYCHAIN_FAILED,
-                StatusCode::SERVICE_UNAVAILABLE,
-                d,
-            )
-            .into(),
+            E::Store(d) => keychain_coded(&d)
+                .unwrap_or_else(|| {
+                    Coded::new(
+                        crate::modules::keychain::KEYCHAIN_FAILED,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        d,
+                    )
+                })
+                .into(),
         }
     }
 }
@@ -168,6 +186,58 @@ pub async fn render(req: Request, next: Next) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower::ServiceExt;
+
+    /// The problem document a handler failing with `fail` answers.
+    async fn problem_for(fail: Fail) -> serde_json::Value {
+        let app = axum::Router::new()
+            .route(
+                "/x",
+                axum::routing::get(move || {
+                    let fail = fail.clone();
+                    async move { Err::<(), Fail>(fail) }
+                }),
+            )
+            .layer(axum::middleware::from_fn(render));
+        let res = app
+            .oneshot(
+                axum::http::Request::get("/x")
+                    .body(axum::body::Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(res.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_keychain_prompt_keeps_its_code_over_http() {
+        use crate::modules::auth::signin::SignInError;
+        let cancelled = format!(
+            "{}: the keychain request was cancelled",
+            crate::modules::keychain::KEYCHAIN_CANCELLED
+        );
+        // Sign-in's storage error, and a plain seam error from the secret store.
+        for fail in [
+            Fail::from(SignInError::Store(cancelled.clone())),
+            Fail::from(SeamError::new("secrets", cancelled.clone())),
+        ] {
+            let p = problem_for(fail).await;
+            assert_eq!(p["code"], "MRL-ENV-162", "{p}");
+            assert_eq!(p["title"], "The keychain request was cancelled.");
+            assert_eq!(p["detail"], "the keychain request was cancelled");
+        }
+        let locked = Fail::from(SignInError::Store(
+            "MRL-ENV-161: could not read: locked".into(),
+        ));
+        assert_eq!(problem_for(locked).await["code"], "MRL-ENV-161");
+        let other = Fail::from(SignInError::Store("the vault is damaged".into()));
+        assert_eq!(problem_for(other).await["code"], "MRL-ENV-161");
+    }
 
     #[test]
     fn every_p16_code_has_a_registered_title() {
