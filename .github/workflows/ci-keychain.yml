@@ -35,7 +35,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
       - name: OS keychain round trip
-        run: cargo test --locked -p mrl-server --lib modules::keychain -- --ignored --test-threads=1
+        run: cargo test --locked -p mrl-server --lib modules::keychain::tests::os_keychain_round_trips -- --ignored --exact --test-threads=1
         env:
           MRL_EXPECT_KEYCHAIN: "1"
 
@@ -58,7 +58,7 @@ jobs:
         run: |
           dbus-run-session -- bash -euo pipefail -c '
             echo -n "ci-only-keyring-password" | gnome-keyring-daemon --unlock --components=secrets >/dev/null
-            cargo test --locked -p mrl-server --lib modules::keychain -- --ignored --test-threads=1
+            cargo test --locked -p mrl-server --lib modules::keychain::tests::os_keychain_round_trips -- --ignored --exact --test-threads=1
           '
 
   fallback:
@@ -72,4 +72,4 @@ jobs:
         env:
           MRL_EXPECT_NO_KEYCHAIN: "1"
           DBUS_SESSION_BUS_ADDRESS: "unix:path=/nonexistent"
-        run: cargo test --locked -p mrl-server --lib modules::keychain -- --ignored --test-threads=1
+        run: cargo test --locked -p mrl-server --lib modules::keychain::tests::os_keychain_round_trips -- --ignored --exact --test-threads=1
