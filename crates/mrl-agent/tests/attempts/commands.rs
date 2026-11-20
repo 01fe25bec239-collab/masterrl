@@ -869,6 +869,7 @@ async fn windows_reports_a_surviving_worker_lost() {
         requests: Vec::new(),
         uploads: Default::default(),
         results: Default::default(),
+        adhoc_uploads: Default::default(),
     };
     let job = ctx.state.job_dir("att_win");
     std::fs::create_dir_all(&job).unwrap();
@@ -895,4 +896,53 @@ async fn windows_reports_a_surviving_worker_lost() {
     assert!(!identity.alive(), "the worker was stopped");
     let _ = worker.kill();
     let _ = worker.wait();
+}
+
+/// `mrl-agent doctor` next to a running agent reads only: the node cache index and its
+/// objects stay byte for byte the same (it never opens the cache).
+#[tokio::test(flavor = "multi_thread")]
+async fn doctor_leaves_the_node_cache_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, _attempts, _rx) = manager(dir.path());
+    let tmp = ctx.cache.incoming_dir().join("obj");
+    std::fs::write(&tmp, b"cached bytes").unwrap();
+    let sha = mrl_storage::sha256_hex(b"cached bytes");
+    ctx.cache.insert_file(&tmp, &sha).await.unwrap();
+    // A stray file the cache would remove (and re-index) if it were opened again.
+    let shard = ctx.state.cache_dir().join("objects").join("zz");
+    std::fs::create_dir_all(&shard).unwrap();
+    let stray = shard.join("unlisted-left-by-a-crash");
+    std::fs::write(&stray, b"x").unwrap();
+    let index = ctx.state.cache_dir().join("index.json");
+    let before = (
+        std::fs::read(&index).unwrap(),
+        std::fs::metadata(&index).unwrap().modified().unwrap(),
+    );
+    let config = dir.path().join("agent.toml");
+    std::fs::write(
+        &config,
+        format!("state_dir = {:?}\n", ctx.state.root().display().to_string()),
+    )
+    .unwrap();
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_mrl-agent"))
+        .args([
+            "--config",
+            &config.display().to_string(),
+            "doctor",
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("\"checks\""),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let after = (
+        std::fs::read(&index).unwrap(),
+        std::fs::metadata(&index).unwrap().modified().unwrap(),
+    );
+    assert_eq!(before, after, "the index was not rewritten");
+    assert!(stray.exists(), "nothing in the cache folder was reconciled");
+    assert!(ctx.cache.get(&sha).unwrap().is_some());
 }

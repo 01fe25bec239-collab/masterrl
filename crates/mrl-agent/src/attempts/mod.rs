@@ -238,6 +238,7 @@ impl Attempts {
             requests: Vec::new(),
             uploads: BTreeMap::new(),
             results: BTreeMap::new(),
+            adhoc_uploads: BTreeMap::new(),
         };
         record::private_dir(&job_dir).map_err(|e| crate::AgentError::state(&job_dir, e))?;
         rec.save(&job_dir)?;
@@ -453,7 +454,7 @@ impl Attempts {
                 // Ended before the restart: reported again, in case its status never got out.
                 out.push(status_of(&rec, Some(&d)));
                 // Only once nobody else holds it (its runner may still be finishing).
-                if !rec.results.is_empty() {
+                if !rec.results.is_empty() || !rec.adhoc_uploads.is_empty() {
                     if let Ok(_claim) = self.claim(&id) {
                         if let Ok(Some(mut fresh)) = AttemptRecord::load(&dir) {
                             self.replay_results(&dir, &mut fresh).await;
@@ -595,6 +596,13 @@ impl Attempts {
     /// Sends the upload results an ended attempt saved but never got out (its agent stopped
     /// in between), then forgets them.
     async fn replay_results(&self, dir: &std::path::Path, rec: &mut AttemptRecord) {
+        // Uploads still saved as running when it ended can't be resumed any more: they fail.
+        for (command_id, _) in std::mem::take(&mut rec.adhoc_uploads) {
+            rec.results.insert(
+                command_id,
+                Some("the agent stopped during the upload".into()),
+            );
+        }
         if rec.results.is_empty() {
             return;
         }

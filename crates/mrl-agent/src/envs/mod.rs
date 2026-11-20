@@ -101,8 +101,8 @@ pub struct Envs {
     root: PathBuf,
     cache: Arc<NodeCache>,
     free_space: Arc<FreeSpaceFn>,
-    /// The state folder's writer lock (see [`lock_state`]); `None` for a read-only view.
-    _writer: Option<Arc<std::fs::File>>,
+    /// The state folder's writer lock (see [`lock_state`]).
+    _writer: Arc<std::fs::File>,
 }
 
 /// Free bytes on the disk holding a path (replaceable in tests).
@@ -132,19 +132,8 @@ impl Envs {
             root,
             cache,
             free_space: Arc::new(disk_free),
-            _writer: Some(writer),
+            _writer: writer,
         })
-    }
-
-    /// A view for listing only (`mrl-agent doctor` next to a running agent): no lock taken,
-    /// nothing reclaimed. Never install or evict through it.
-    pub fn open_read_only(state_root: &Path, cache: Arc<NodeCache>) -> Self {
-        Self {
-            root: state_root.join("envs"),
-            cache,
-            free_space: Arc::new(disk_free),
-            _writer: None,
-        }
     }
 
     /// Uses `f` to read free disk space (tests).
@@ -362,14 +351,25 @@ impl Envs {
         }
         // The verified lock is kept in the node cache, pinned while the attempt runs.
         if !lock_cached {
+            // A file of its own per insert: two packages of one lock install under different
+            // environment locks and may both fill the cache at once.
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let tmp = self
                 .cache
                 .incoming_dir()
-                .join(format!("{lock_sha256}.lock"));
-            tokio::fs::write(&tmp, &lock)
-                .await
-                .map_err(|e| AgentError::state(&tmp, e))?;
-            self.cache.insert_file(&tmp, lock_sha256).await?;
+                .join(format!("{lock_sha256}.{}-{n}.lock", std::process::id()));
+            let inserted = async {
+                tokio::fs::write(&tmp, &lock)
+                    .await
+                    .map_err(|e| AgentError::state(&tmp, e))?;
+                self.cache.insert_file(&tmp, lock_sha256).await
+            }
+            .await;
+            if inserted.is_err() {
+                let _ = std::fs::remove_file(&tmp);
+            }
+            inserted?;
         }
         self.cache.pin(lock_sha256, holder)?;
 
@@ -438,29 +438,7 @@ impl Envs {
 
     /// Every environment with a marker.
     pub fn installed(&self) -> Vec<InstalledEnv> {
-        let Ok(rd) = std::fs::read_dir(&self.root) else {
-            return Vec::new();
-        };
-        let mut out: Vec<InstalledEnv> = rd
-            .filter_map(|e| e.ok())
-            .filter_map(|e| {
-                let dir = e.path();
-                let mut env: InstalledEnv =
-                    serde_json::from_slice(&std::fs::read(dir.join(MARKER)).ok()?).ok()?;
-                env.pinned_by = std::fs::read_dir(dir.join(PINS))
-                    .map(|rd| {
-                        rd.filter_map(|p| p.ok())
-                            .map(|p| p.file_name().to_string_lossy().into_owned())
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                env.healthy = env.runtime_ref.starts_with("oci:") || worker_program(&dir).is_file();
-                env.dir = dir;
-                Some(env)
-            })
-            .collect();
-        out.sort_by_key(|e| e.last_used_unix);
-        out
+        installed_in(&self.root)
     }
 
     /// Removes unpinned environments, least recently used first, until `min_free_bytes` are
@@ -480,6 +458,34 @@ impl Envs {
         }
         Ok(removed)
     }
+}
+
+/// Every environment with a marker in `envs_root` (`<state>/envs`), least recently used
+/// first. Reads only; the doctor lists environments this way next to a running agent.
+pub fn installed_in(envs_root: &Path) -> Vec<InstalledEnv> {
+    let Ok(rd) = std::fs::read_dir(envs_root) else {
+        return Vec::new();
+    };
+    let mut out: Vec<InstalledEnv> = rd
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let dir = e.path();
+            let mut env: InstalledEnv =
+                serde_json::from_slice(&std::fs::read(dir.join(MARKER)).ok()?).ok()?;
+            env.pinned_by = std::fs::read_dir(dir.join(PINS))
+                .map(|rd| {
+                    rd.filter_map(|p| p.ok())
+                        .map(|p| p.file_name().to_string_lossy().into_owned())
+                        .collect()
+                })
+                .unwrap_or_default();
+            env.healthy = env.runtime_ref.starts_with("oci:") || worker_program(&dir).is_file();
+            env.dir = dir;
+            Some(env)
+        })
+        .collect();
+    out.sort_by_key(|e| e.last_used_unix);
+    out
 }
 
 /// The writer lock of a state folder (`<state>/agent.lock`, exclusive), shared by everything in
@@ -1459,6 +1465,43 @@ source = { virtual = "." }
         drop(held);
         assert!(!remove_env(&stale).unwrap());
         assert!(d.exists());
+    }
+
+    /// Two packages of one workspace lock installing at once, cold: both fill the lock into
+    /// the cache without tripping over each other (each then fails in uv on this empty
+    /// project, which is fine here).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_cold_installs_from_one_lock() {
+        if which("uv").is_none() {
+            return;
+        }
+        for round in 0..5 {
+            let dir = tempfile::tempdir().unwrap();
+            let project = dir.path().join("proj");
+            std::fs::create_dir_all(&project).unwrap();
+            let lock = format!("version = 1\n# round {round}\n");
+            std::fs::write(project.join("uv.lock"), &lock).unwrap();
+            let e = Arc::new(envs(dir.path()));
+            let rt = |p: &str| RuntimeSpec {
+                runtime_ref: format!("uv:sha256:{}", mrl_storage::sha256_hex(lock.as_bytes())),
+                project: Some(project.clone()),
+                package: Some(p.into()),
+            };
+            let (a, b) = (rt("pkg-a"), rt("pkg-b"));
+            let (ea, eb) = (Arc::clone(&e), Arc::clone(&e));
+            let ta = tokio::spawn(async move { ea.materialize(&a, "att_a", &|_| {}).await });
+            let tb = tokio::spawn(async move { eb.materialize(&b, "att_b", &|_| {}).await });
+            for r in [ta.await.unwrap(), tb.await.unwrap()] {
+                let err = r.unwrap_err();
+                assert!(
+                    err.explain().contains("installer"),
+                    "only uv failed: {}",
+                    err.explain()
+                );
+            }
+            let sha = mrl_storage::sha256_hex(lock.as_bytes());
+            assert!(e.cache.get(&sha).unwrap().is_some(), "the lock is cached");
+        }
     }
 
     #[test]

@@ -68,6 +68,10 @@ pub struct AttemptRecord {
     /// sends them again (at least once; the core dedups by command id).
     #[serde(default)]
     pub results: BTreeMap<String, Option<String>>,
+    /// Accepted uploads of files outside a checkpoint, by command id, saved before they start:
+    /// a restarted agent sends them again (or fails them once the attempt has ended).
+    #[serde(default)]
+    pub adhoc_uploads: BTreeMap<String, Vec<UploadTarget>>,
 }
 
 /// The tickets for one checkpoint.

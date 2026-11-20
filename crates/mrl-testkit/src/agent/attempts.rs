@@ -340,6 +340,7 @@ impl RunnerFixture {
             requests: Vec::new(),
             uploads: Default::default(),
             results: Default::default(),
+            adhoc_uploads: Default::default(),
         };
         edit(&mut record);
         let job = agent.ctx.state.job_dir(&id);
@@ -368,6 +369,33 @@ impl RunnerFixture {
             record,
             stand_ins,
         }
+    }
+
+    /// An agent crash and restart: the runner task is dropped mid-flight and a new runner
+    /// re-adopts the record as saved on disk (same agent, stand-ins still running).
+    pub async fn restart(&mut self) {
+        use mrl_agent::attempts::runner::{Runner, Shared};
+        self.task.abort();
+        let _ = (&mut self.task).await;
+        let record = self.saved();
+        let (tx, events) = mrl_agent::attempts::attempt_events(256);
+        let envs = mrl_agent::envs::Envs::open(
+            self.agent.ctx.state.root(),
+            Arc::clone(&self.agent.ctx.cache),
+        )
+        .unwrap_or_else(|e| panic!("{}", e.explain()));
+        let shared = Arc::new(Shared {
+            ctx: Arc::clone(&self.agent.ctx),
+            envs: Arc::new(envs),
+            events: tx,
+            progress: None,
+        });
+        let (control, rx) = mpsc::channel(16);
+        let runner = Runner::new(shared, record.clone(), Vec::new());
+        self.task = tokio::spawn(runner.readopt(rx));
+        self.events = events;
+        self.control = control;
+        self.record = record;
     }
 
     /// Connects a worker for `role_id` (retrying until the runner's server is up).
@@ -1179,6 +1207,83 @@ mod runner_tests {
         );
     }
 
+    /// A slow checkpoint upload still running when the lease expires is stopped before the
+    /// attempt is cleaned up: the PUT never completes afterwards, and its command fails once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_upload_crossing_lease_expiry_is_stopped() {
+        let (base, got) = slow_sink(Duration::from_secs(6)).await;
+        let path = "checkpoints/ckpt_1/w.bin";
+        let sha = sha_hex(b"weights");
+        let mut fx = RunnerFixture::readopt(spec("att_lx", serde_json::json!({})), |r| {
+            r.lease_deadline_unix_ms = Some(now_ms() + 2500);
+            r.checkpoints
+                .insert("ckpt_1".into(), staged(path, &sha, 7, None));
+            r.uploads.insert(
+                "ckpt_1".into(),
+                UploadPlan {
+                    command_id: "up-lx".into(),
+                    answered: false,
+                    targets: vec![target(&base, path, &sha, 7)],
+                },
+            );
+        })
+        .await;
+        let file = fx.staging().join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"weights").unwrap();
+        let (_w, _) = fx.worker("trainer").await;
+        let d = tokio::time::timeout(Duration::from_secs(60), &mut fx.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.phase, AttemptPhase::SelfFenced as i32);
+        let r = done(&mut fx).await;
+        assert_eq!(r.command_id, "up-lx");
+        assert!(r.failure.is_some());
+        // Past the sink's 6 s: the stopped PUT never lands.
+        tokio::time::sleep(Duration::from_secs(7)).await;
+        assert!(
+            got.lock().unwrap().is_empty(),
+            "no PUT outlived the attempt"
+        );
+    }
+
+    /// No lease and nobody reading events: a cancel still ends the attempt at its deadline
+    /// (publishing STOPPING waits only until then).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancel_ends_on_time_with_a_full_event_channel() {
+        let mut fx =
+            RunnerFixture::readopt_with(spec("att_fe", serde_json::json!({})), 1, |_| {}).await;
+        let (mut w, _) = fx.worker("trainer").await;
+        // One relayed message fills the channel (capacity 1); its ack says it was relayed.
+        let seq = w
+            .send(Body::Progress(mrl_proto::worker::v1::Progress {
+                step: 1,
+                ..Default::default()
+            }))
+            .await;
+        w.wait_ack(seq).await.unwrap();
+        let started = std::time::Instant::now();
+        fx.control
+            .send(Control::Cancel {
+                request_id: "c".into(),
+                grace_s: 1,
+                reason: "test".into(),
+            })
+            .await
+            .unwrap();
+        let d = tokio::time::timeout(Duration::from_secs(60), &mut fx.task)
+            .await
+            .expect("the cancel deadline was enforced")
+            .unwrap();
+        assert!(d.is_some());
+        // Grace 1 s + 5 s margin, then the stand-in gets the kill grace (it can't be reaped
+        // here, so it stays a zombie until then).
+        let bound = Duration::from_secs(6 + fx.agent.ctx.config.exec.kill_grace_secs + 8);
+        assert!(started.elapsed() < bound, "{:?}", started.elapsed());
+    }
+
     /// A PUT sink that answers after `delay`.
     async fn slow_sink(delay: Duration) -> (String, Arc<Mutex<Vec<Vec<u8>>>>) {
         use axum::routing::put;
@@ -1404,6 +1509,80 @@ mod runner_tests {
         }
         assert_eq!(got.unwrap().command_id, "up-10");
         assert!(fx.saved().results.is_empty());
+    }
+
+    /// The agent stopped right after saving a committed upload (outcome and result in one
+    /// save, before either was sent): after the restart the worker gets COMMITTED and the
+    /// command gets success, and teardown never reports that upload as failed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_restart_after_a_commit_tells_both_sides_success() {
+        let path = "checkpoints/ckpt_1/w.bin";
+        let sha = sha_hex(b"weights");
+        let mut fx = RunnerFixture::readopt(spec("att_bd", serde_json::json!({})), |r| {
+            r.checkpoints.insert(
+                "ckpt_1".into(),
+                staged(path, &sha, 7, Some(CommitState::Committed as i32)),
+            );
+            r.uploads.insert(
+                "ckpt_1".into(),
+                UploadPlan {
+                    command_id: "up-1".into(),
+                    answered: true,
+                    targets: Vec::new(),
+                },
+            );
+            r.results.insert("up-1".into(), None);
+        })
+        .await;
+        let (mut w, _) = fx.worker("trainer").await;
+        let acks = read_until(&mut w, |b| matches!(b, AgentBody::CheckpointCommitAck(_)))
+            .await
+            .unwrap();
+        assert!(matches!(acks.last(),
+            Some(AgentBody::CheckpointCommitAck(a)) if a.state == CommitState::Committed as i32));
+        let r = done(&mut fx).await;
+        assert_eq!(r.command_id, "up-1");
+        assert!(r.failure.is_none());
+        fx.end_workers();
+        let _ = tokio::time::timeout(Duration::from_secs(30), &mut fx.task).await;
+        while let Ok(e) = fx.events.try_recv() {
+            if let AttemptEvent::CommandDone(r) = e {
+                panic!("a second result: {r:?}");
+            }
+        }
+    }
+
+    /// An upload of other files is saved before its PUT starts; after an agent crash during
+    /// the PUT, the restarted runner sends it again and the command gets its result.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_upload_survives_an_agent_crash() {
+        let (base, got) = slow_sink(Duration::from_millis(1500)).await;
+        let path = "logs/run.txt";
+        let sha = sha_hex(b"log lines");
+        let mut fx = RunnerFixture::readopt(spec("att_ac", serde_json::json!({})), |_| {}).await;
+        let file = fx.staging().join(path);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, b"log lines").unwrap();
+        fx.control
+            .send(Control::Upload {
+                command_id: "up-log".into(),
+                checkpoint_id: String::new(),
+                targets: vec![target(&base, path, &sha, 9)],
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            fx.saved().adhoc_uploads.contains_key("up-log"),
+            "saved before the PUT"
+        );
+        // The crash, mid-PUT: the next runner has only what was saved.
+        fx.restart().await;
+        let r = done(&mut fx).await;
+        assert_eq!(r.command_id, "up-log");
+        assert!(r.failure.is_none(), "{r:?}");
+        assert!(fx.saved().adhoc_uploads.is_empty());
+        assert!(!got.lock().unwrap().is_empty());
     }
 
     /// The worker exits while an upload of other files (no checkpoint) is still sending: the

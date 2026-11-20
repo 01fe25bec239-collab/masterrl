@@ -676,6 +676,7 @@ async fn orphaned_job(
         requests: Vec::new(),
         uploads: Default::default(),
         results: Default::default(),
+        adhoc_uploads: Default::default(),
     };
     (rec, orphan)
 }
@@ -1005,6 +1006,7 @@ fn old_record(
         requests: Vec::new(),
         uploads: Default::default(),
         results: Default::default(),
+        adhoc_uploads: Default::default(),
     }
 }
 

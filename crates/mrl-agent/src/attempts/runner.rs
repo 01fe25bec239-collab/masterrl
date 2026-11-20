@@ -106,7 +106,8 @@ enum Early {
 enum Delivery {
     Sent,
     Closed,
-    LeaseOver,
+    /// The lease or the stop deadline came first.
+    DeadlinePassed,
 }
 
 /// The monotonic instant for a wall-clock time (Unix ms); now if it has passed.
@@ -213,6 +214,9 @@ pub struct Runner {
     pause_requested: bool,
     lease: Option<Instant>,
     stop_at: Option<Instant>,
+    /// When a stop deadline fired: from then on nothing waits (sends and events give up at
+    /// once), so stopping and finishing can't hang on a stuck reader.
+    stop_passed: Option<Instant>,
     last_seen: Instant,
     /// Checkpoints uploading now, or uploaded with an outcome not saved yet.
     in_flight: HashSet<String>,
@@ -222,6 +226,8 @@ pub struct Runner {
     /// Uploads of files outside a checkpoint (`UploadArtifacts` without a checkpoint id),
     /// running now, by command id.
     adhoc: HashMap<String, tokio::task::JoinHandle<()>>,
+    /// Checkpoint uploads running now, by checkpoint id.
+    ck_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
 }
 
 /// Folders of an attempt.
@@ -332,10 +338,12 @@ impl Runner {
             pause_requested: false,
             lease: None,
             stop_at: None,
+            stop_passed: None,
             last_seen: Instant::now(),
             in_flight: HashSet::new(),
             unsaved: HashMap::new(),
             adhoc: HashMap::new(),
+            ck_tasks: HashMap::new(),
         }
     }
 
@@ -410,6 +418,10 @@ impl Runner {
             .exit_report
             .as_deref()
             .and_then(|b| ExitReport::decode(b).ok());
+        // Uploads accepted before the restart start again (a PUT can be repeated).
+        for (command_id, targets) in self.rec.adhoc_uploads.clone() {
+            self.start_adhoc(command_id, targets);
+        }
         // The saved deadline, never a fresh one: an expired lease fences at once.
         if let Some(at) = self.rec.lease_deadline_unix_ms {
             self.arm_lease(at);
@@ -431,14 +443,20 @@ impl Runner {
         self.lease.is_some_and(|at| Instant::now() >= at)
     }
 
-    /// Sends an event. Waits while the channel is full, but never past the lease deadline, so
-    /// a slow reader can't keep the attempt running without a lease.
+    /// Sends an event. Waits while the channel is full, but never past the next deadline
+    /// (lease, cancel/pause stop), so a slow reader can't keep the attempt running past either.
     async fn emit(&self, ev: AttemptEvent) -> Delivery {
-        let far = Instant::now() + Duration::from_secs(365 * 24 * 3600);
+        let Some(at) = self.next_deadline() else {
+            // Nothing to enforce: wait for the reader.
+            return match self.sh.events.send(ev).await {
+                Ok(()) => Delivery::Sent,
+                Err(_) => Delivery::Closed,
+            };
+        };
         tokio::select! {
             biased;
             r = self.sh.events.send(ev) => if r.is_ok() { Delivery::Sent } else { Delivery::Closed },
-            () = tokio::time::sleep_until(self.lease.unwrap_or(far)) => Delivery::LeaseOver,
+            () = tokio::time::sleep_until(at) => Delivery::DeadlinePassed,
         }
     }
 
@@ -804,7 +822,7 @@ impl Runner {
                     self.stop_all().await;
                 }
                 () = tokio::time::sleep_until(stop_at), if self.stop_at.is_some() => {
-                    self.stop_at = None;
+                    self.stop_passed = self.stop_at.take();
                     self.stop_all().await;
                 }
                 Some(inb) = self.inbound_rx.recv() => self.on_inbound(inb).await,
@@ -861,12 +879,13 @@ impl Runner {
         self.save();
     }
 
-    /// The earliest deadline in force (lease, cancel/pause stop), if any.
+    /// The earliest deadline in force (lease, cancel/pause stop, or a stop deadline that has
+    /// already passed), if any.
     fn next_deadline(&self) -> Option<Instant> {
-        match (self.lease, self.stop_at) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        }
+        [self.lease, self.stop_at, self.stop_passed]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     /// Sends to one worker. Never waits past the next deadline (nor the server's own
@@ -1305,7 +1324,7 @@ impl Runner {
             command_id: self.rec.uploads.get(id).map(|p| p.command_id.clone()),
             result: Ok(()),
         };
-        tokio::spawn(async move {
+        let task = tokio::spawn(async move {
             let mut result = Ok(());
             for (f, d) in dests {
                 if let Err(e) = files::send(&ctx, &staging, &f.path, f.size, &f.sha256, &d).await {
@@ -1321,11 +1340,14 @@ impl Runner {
             }
             let _ = tx.send(UploadDone { result, ..done }).await;
         });
+        self.ck_tasks.insert(id.to_owned(), task);
     }
 
     async fn on_upload(&mut self, u: UploadDone) {
+        let failure = u.result.as_ref().err().map(|(_, reason)| reason.clone());
         if let Some(id) = &u.checkpoint_id {
             self.in_flight.remove(id);
+            self.ck_tasks.remove(id);
             let (state, reason) = match &u.result {
                 Ok(()) => (CommitState::Committed, String::new()),
                 Err((s, r)) => (*s, r.clone()),
@@ -1335,11 +1357,20 @@ impl Runner {
                 ck.state = Some(state as i32);
                 prev
             });
+            // The checkpoint's outcome and its command's result go into one save: after a
+            // crash both say the same, never COMMITTED with a failed or missing result.
+            let answered = self.record_answer(id, failure);
             if !self.save() {
                 // Not durable yet: nobody hears the outcome. The result is kept and the retry
                 // tick saves it again (no second upload), then reports it.
                 if let (Some(ck), Some(prev)) = (self.rec.checkpoints.get_mut(id), prev) {
                     ck.state = prev;
+                }
+                if let Some(command_id) = answered {
+                    self.rec.results.remove(&command_id);
+                    if let Some(plan) = self.rec.uploads.get_mut(id) {
+                        plan.answered = false;
+                    }
                 }
                 self.in_flight.insert(id.clone());
                 self.unsaved.insert(id.clone(), u);
@@ -1348,30 +1379,76 @@ impl Runner {
             if let Some(role) = self.primary_role() {
                 self.send(&role, commit_ack(id, state, &reason)).await;
             }
+            self.deliver_results().await;
+            return;
         }
-        let failure = u.result.err().map(|(_, reason)| reason);
-        match (u.checkpoint_id, u.command_id) {
-            (Some(id), _) => self.answer_plan(&id, failure).await,
-            (None, Some(command_id)) => {
-                self.adhoc.remove(&command_id);
-                self.command_done(command_id, failure).await;
-            }
-            (None, None) => {}
+        if let Some(command_id) = u.command_id {
+            self.adhoc.remove(&command_id);
+            // Saved together with its result (in `command_done`).
+            self.rec.adhoc_uploads.remove(&command_id);
+            self.command_done(command_id, failure).await;
         }
+    }
+
+    /// Notes the result of the checkpoint's upload command in the record (not saved yet),
+    /// unless it already has one. Returns the command id when it was noted now.
+    fn record_answer(&mut self, checkpoint_id: &str, failure: Option<String>) -> Option<String> {
+        let plan = self.rec.uploads.get_mut(checkpoint_id)?;
+        if plan.answered {
+            return None;
+        }
+        plan.answered = true;
+        let command_id = plan.command_id.clone();
+        self.rec.results.insert(command_id.clone(), failure);
+        Some(command_id)
     }
 
     /// Gives the checkpoint's upload command its one result, unless it already has one. Saved
     /// first, so a restart neither repeats nor loses it.
     async fn answer_plan(&mut self, checkpoint_id: &str, failure: Option<String>) {
-        let Some(plan) = self.rec.uploads.get_mut(checkpoint_id) else {
-            return;
-        };
-        if plan.answered {
-            return;
+        if self.record_answer(checkpoint_id, failure).is_some() {
+            self.save();
+            self.deliver_results().await;
         }
-        plan.answered = true;
-        let command_id = plan.command_id.clone();
-        self.command_done(command_id, failure).await;
+    }
+
+    /// Starts sending files outside a checkpoint for `command_id` (in the background).
+    fn start_adhoc(&mut self, command_id: String, targets: Vec<UploadTarget>) {
+        let ctx = Arc::clone(&self.sh.ctx);
+        let staging = self.staging();
+        let tx = self.uploads_tx.clone();
+        let id = command_id.clone();
+        let task = tokio::spawn(async move {
+            let mut result = Ok(());
+            for t in targets {
+                let sent = match t.ticket() {
+                    Ok(ticket) => {
+                        files::send(
+                            &ctx,
+                            &staging,
+                            &t.local_path,
+                            t.size,
+                            &t.sha256,
+                            &Destination::Ticket(ticket),
+                        )
+                        .await
+                    }
+                    Err(e) => Err(e),
+                };
+                if let Err(e) = sent {
+                    result = Err((CommitState::Rejected, e.explain()));
+                    break;
+                }
+            }
+            let _ = tx
+                .send(UploadDone {
+                    checkpoint_id: None,
+                    command_id: Some(id),
+                    result,
+                })
+                .await;
+        });
+        self.adhoc.insert(command_id, task);
     }
 
     /// Reports a finished upload command (`failure`: why it failed): saved with the record
@@ -1517,41 +1594,12 @@ impl Runner {
                     if self.adhoc.contains_key(&command_id) {
                         return; // a replay of a running upload: answered when it ends
                     }
-                    let ctx = Arc::clone(&self.sh.ctx);
-                    let staging = self.staging();
-                    let tx = self.uploads_tx.clone();
-                    let id = command_id.clone();
-                    let task = tokio::spawn(async move {
-                        let mut result = Ok(());
-                        for t in targets {
-                            let sent = match t.ticket() {
-                                Ok(ticket) => {
-                                    files::send(
-                                        &ctx,
-                                        &staging,
-                                        &t.local_path,
-                                        t.size,
-                                        &t.sha256,
-                                        &Destination::Ticket(ticket),
-                                    )
-                                    .await
-                                }
-                                Err(e) => Err(e),
-                            };
-                            if let Err(e) = sent {
-                                result = Err((CommitState::Rejected, e.explain()));
-                                break;
-                            }
-                        }
-                        let _ = tx
-                            .send(UploadDone {
-                                checkpoint_id: None,
-                                command_id: Some(id),
-                                result,
-                            })
-                            .await;
-                    });
-                    self.adhoc.insert(command_id, task);
+                    // Saved before it starts, so a restarted agent knows about it.
+                    self.rec
+                        .adhoc_uploads
+                        .insert(command_id.clone(), targets.clone());
+                    self.save();
+                    self.start_adhoc(command_id, targets);
                 } else {
                     let active = self
                         .rec
@@ -1687,6 +1735,25 @@ impl Runner {
                 _ => break,
             }
         }
+        // Transfers still running are stopped and joined before anything is reported or
+        // cleaned up: no PUT outlives the attempt.
+        for (_, t) in self.ck_tasks.drain() {
+            t.abort();
+            let _ = t.await;
+        }
+        for t in self.adhoc.values_mut() {
+            t.abort();
+            let _ = t.await;
+        }
+        // Results that made it before the stop keep their real outcome (and an unsaved one
+        // gets one more save).
+        while let Ok(u) = self.uploads_rx.try_recv() {
+            self.on_upload(u).await;
+        }
+        for (_, done) in std::mem::take(&mut self.unsaved) {
+            self.on_upload(done).await;
+        }
+        self.in_flight.clear();
         let waiting: Vec<String> = self
             .rec
             .uploads
@@ -1700,8 +1767,8 @@ impl Runner {
         }
         // Uploads of other files still running are stopped, so no transfer outlives the
         // attempt, and their commands fail.
-        for (command_id, task) in std::mem::take(&mut self.adhoc) {
-            task.abort();
+        for (command_id, _) in std::mem::take(&mut self.adhoc) {
+            self.rec.adhoc_uploads.remove(&command_id);
             let why = "the attempt ended before the upload finished".to_owned();
             self.command_done(command_id, Some(why)).await;
         }

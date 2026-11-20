@@ -178,11 +178,21 @@ async fn version(program: &str, args: &[&str]) -> Option<String> {
 impl Facts {
     /// Reads the facts of this machine.
     pub async fn gather(ctx: &Arc<AgentContext>, envs: &Envs) -> Self {
-        let c = Arc::clone(ctx);
-        let inventory = match tokio::task::spawn_blocking(move || c.inventory()).await {
-            Ok(inv) => inv,
-            Err(_) => crate::hw::collect_inventory(&[]),
-        };
+        Self::gather_from(ctx.hw.clone(), ctx.state.root(), envs.installed()).await
+    }
+
+    /// Reads the facts from hardware backends, the state folder and its environments. Opens
+    /// nothing writable (no node cache), so it is safe next to a running agent.
+    pub async fn gather_from(
+        hw: Vec<Arc<dyn crate::hw::HwBackend>>,
+        state_root: &Path,
+        envs: Vec<crate::envs::InstalledEnv>,
+    ) -> Self {
+        let inventory =
+            match tokio::task::spawn_blocking(move || crate::hw::collect_inventory(&hw)).await {
+                Ok(inv) => inv,
+                Err(_) => crate::hw::collect_inventory(&[]),
+            };
         let python = match version("python3", &["--version"]).await {
             Some(v) => Some(v),
             None => version("python", &["--version"]).await,
@@ -194,8 +204,8 @@ impl Facts {
                 python,
                 docker: version("docker", &["version", "--format", "{{.Server.Version}}"]).await,
             },
-            envs: envs.installed(),
-            state_disk_free: crate::envs::disk_free(ctx.state.root()),
+            envs,
+            state_disk_free: crate::envs::disk_free(state_root),
         }
     }
 }
@@ -912,13 +922,13 @@ pub struct DoctorArgs {
 pub async fn cli(config: Option<&Path>, args: DoctorArgs) -> std::process::ExitCode {
     let result = async {
         let (cfg, _) = crate::config::AgentConfig::load(config)?;
-        let ctx = Arc::new(AgentContext::from_config(cfg)?);
-        // Read only: the doctor may run next to an agent that owns the state folder.
-        let envs = Envs::open_read_only(ctx.state.root(), Arc::clone(&ctx.cache));
-        let facts = Facts::gather(&ctx, &envs).await;
+        // No AgentContext: it would open (and reconcile) the node cache, which a running
+        // agent may be writing. The doctor only reads.
+        let state = crate::state::StateDir::open(&cfg.state_dir)?;
+        let envs = crate::envs::installed_in(&state.root().join("envs"));
+        let facts = Facts::gather_from(crate::hw::registry::backends(), state.root(), envs).await;
         let report = run(&facts);
-        ctx.state
-            .write_atomic(REPORT_FILE, pretty(&report).as_bytes())?;
+        state.write_atomic(REPORT_FILE, pretty(&report).as_bytes())?;
         if let Some(task) = &args.plan {
             let Some(p) = plan(task, &facts) else {
                 return Err(crate::AgentError::UnknownName {
