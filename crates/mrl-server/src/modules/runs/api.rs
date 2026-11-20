@@ -10,7 +10,7 @@ use crate::modules::jobs::scope::{self, resource};
 use crate::modules::jobs::transitions::attempt_cols;
 use crate::modules::jobs::{
     codes, Attempt, AttemptRow, Chains, JobChange, JobSpec, JobTransitions, JobsError, NewJob,
-    ResolveError, RetryRules, Validation,
+    Projects, ResolveError, RetryRules, Validation,
 };
 use crate::seams::RequestContext;
 use crate::Db;
@@ -388,15 +388,15 @@ fn check_submission(s: &RunSubmission) -> Result<(), JobsError> {
     }
 }
 
-/// Fetches run `id` in `org` with its job.
-pub async fn find_run(db: &Db, org: Uuid, id: Uuid) -> Result<Option<RunRow>, JobsError> {
+/// Fetches run `id` with its job. Callers authorize it: the authorizer decides who may see
+/// it, so other orgs get 404.
+pub async fn find_run(db: &Db, id: Uuid) -> Result<Option<RunRow>, JobsError> {
     Ok(sqlx::query_as::<_, RunRow>(concat!(
         "SELECT ",
         run_cols!(),
-        " FROM runs r JOIN jobs j ON j.run_id = r.id WHERE r.id = $1 AND r.org_id = $2"
+        " FROM runs r JOIN jobs j ON j.run_id = r.id WHERE r.id = $1"
     ))
     .bind(id)
-    .bind(org)
     .fetch_optional(db.pool())
     .await?)
 }
@@ -427,9 +427,8 @@ async fn read_run(
     ctx: &RequestContext,
     run: &str,
 ) -> Result<RunRow, JobsError> {
-    let org = scope::tenant(ctx)?;
     let id: RunId = scope::parse_id(run, "run")?;
-    let row = find_run(db, org, id.as_uuid())
+    let row = find_run(db, id.as_uuid())
         .await?
         .ok_or_else(|| JobsError::not_found("run"))?;
     scope::authorize(state, ctx, "runs.read", &row.resource()).await?;
@@ -469,10 +468,13 @@ fn replay(row: &RunRow, fingerprint: &[u8]) -> Result<Response, JobsError> {
     responses((status = 201, description = "The run, QUEUED or REJECTED.", body = Run),
               (status = 400, description = "No `Idempotency-Key` (MRL-IDEM-170) or an unreadable body.", body = crate::error::Problem),
               (status = 422, description = "Fields need a change, or the key was used for another run.", body = crate::error::Problem)))]
+// Axum extractors, one per input.
+#[allow(clippy::too_many_arguments)]
 pub async fn submit(
     State(state): State<AppState>,
     Extension(db): Extension<Db>,
     Extension(chains): Extension<Chains>,
+    Extension(projects): Extension<Projects>,
     ctx: RequestContext,
     Path(prj): Path<String>,
     headers: HeaderMap,
@@ -489,7 +491,7 @@ pub async fn submit(
                 "Send an Idempotency-Key header with a new random value for this run.",
             )
         })?;
-    let (org, project) = project_scope(&state, &ctx, &prj, "runs.submit").await?;
+    let (org, project) = project_scope(&state, &ctx, &projects, &prj, "runs.submit").await?;
     let submitted: Value = serde_json::from_slice(&body)
         .map_err(|e| bad_body(format!("The body is not JSON: {e}.")))?;
     let sub: RunSubmission = serde_json::from_value(submitted.clone())
@@ -676,7 +678,7 @@ pub async fn submit(
         }
     };
     tx.commit().await?;
-    let row = find_run(&db, org, run_id)
+    let row = find_run(&db, run_id)
         .await?
         .ok_or_else(|| JobsError::not_found("run"))?;
     scope::audit(
@@ -697,12 +699,13 @@ pub async fn submit(
 pub async fn list(
     State(state): State<AppState>,
     Extension(db): Extension<Db>,
+    Extension(projects): Extension<Projects>,
     ctx: RequestContext,
     Path(prj): Path<String>,
     Query(q): Query<PageQuery>,
     Query(f): Query<RunFilter>,
 ) -> Result<Json<Page<Run>>, JobsError> {
-    let (org, project) = project_scope(&state, &ctx, &prj, "runs.read").await?;
+    let (org, project) = project_scope(&state, &ctx, &projects, &prj, "runs.read").await?;
     let page = q.resolve()?;
     let after = scope::after::<RunId>(&page, |r| r.as_uuid())?;
     let experiment = f
@@ -780,7 +783,7 @@ pub async fn action(
     let row = read_run(&state, &db, &ctx, run).await?;
     let job = JobId::from_uuid(row.job_id).to_string();
     crate::modules::jobs::api::cancel(&state, &db, &ctx, &job).await?;
-    let row = find_run(&db, row.org_id, row.id)
+    let row = find_run(&db, row.id)
         .await?
         .ok_or_else(|| JobsError::not_found("run"))?;
     Ok(Json(row.view()))
@@ -913,13 +916,12 @@ pub async fn timeline(
     type Event = (i64, String, String, Uuid, i64, Value, OffsetDateTime);
     let rows = sqlx::query_as::<_, Event>(
         "SELECT id, type, aggregate_kind, aggregate_id, aggregate_seq, payload, created_at \
-         FROM outbox_events WHERE org_id = $1 AND ($2::bigint IS NULL OR id > $2) AND ( \
-           (aggregate_kind = 'job' AND aggregate_id = $3) OR \
+         FROM outbox_events WHERE ($1::bigint IS NULL OR id > $1) AND ( \
+           (aggregate_kind = 'job' AND aggregate_id = $2) OR \
            (aggregate_kind = 'attempt' AND aggregate_id IN \
-              (SELECT id FROM job_attempts WHERE job_id = $3))) \
-         ORDER BY id LIMIT $4",
+              (SELECT id FROM job_attempts WHERE job_id = $2))) \
+         ORDER BY id LIMIT $3",
     )
-    .bind(row.org_id)
     .bind(after)
     .bind(row.job_id)
     .bind(i64::try_from(page.fetch()).unwrap_or(i64::MAX))

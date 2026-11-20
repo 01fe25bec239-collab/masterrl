@@ -53,11 +53,11 @@ pub fn with_etag<T: serde::Serialize>(version: i64, body: T) -> Response {
 pub async fn list(
     State(state): State<AppState>,
     Extension(db): Extension<crate::Db>,
+    Extension(projects): Extension<super::Projects>,
     ctx: RequestContext,
     Query(q): Query<PageQuery>,
     Query(f): Query<JobFilter>,
 ) -> Result<Json<Page<Job>>, JobsError> {
-    let org = scope::tenant(&ctx)?;
     let page = q.resolve()?;
     let after = scope::after::<JobId>(&page, |j| j.as_uuid())?;
     if let Some(s) = &f.state {
@@ -72,7 +72,7 @@ pub async fn list(
         .project
         .as_deref()
         .map(|p| {
-            p.parse::<ProjectId>().map(|p| p.as_uuid()).map_err(|_| {
+            p.parse::<ProjectId>().map_err(|_| {
                 ApiError::new(
                     ErrorCode::Filter,
                     format!("project `{p}` is not a project id."),
@@ -80,6 +80,15 @@ pub async fn list(
             })
         })
         .transpose()?;
+    // Which org to scan: the project's owner when filtering by project; every org for the
+    // solo owner (one person, every local org); otherwise the caller's org. The authorizer
+    // still decides row by row.
+    let org = match project {
+        Some(p) => Some(projects.org_for(&ctx, p).await?),
+        None if ctx.principal.kind == crate::seams::PrincipalKind::LocalOwner => None,
+        None => Some(scope::tenant(&ctx)?),
+    };
+    let project = project.map(|p| p.as_uuid());
     // Scan in id order, keeping only jobs the caller may read, until the page is full. The
     // cursor is the last *visible* job, so hidden jobs never show up in it.
     // ponytail: one authorizer call per row; add a bulk "visible projects" seam call if pages get slow.
@@ -92,7 +101,7 @@ pub async fn list(
         let rows = sqlx::query_as::<_, JobRow>(concat!(
             "SELECT ",
             job_cols!(),
-            " FROM jobs WHERE org_id = $1 AND ($2::text IS NULL OR state = $2) \
+            " FROM jobs WHERE ($1::uuid IS NULL OR org_id = $1) AND ($2::text IS NULL OR state = $2) \
                AND ($3::text IS NULL OR kind = $3) AND ($4::uuid IS NULL OR project_id = $4) \
                AND ($5::uuid IS NULL OR id < $5) ORDER BY id DESC LIMIT $6"
         ))
@@ -139,18 +148,14 @@ pub async fn read_job(
     ctx: &RequestContext,
     id: &str,
 ) -> Result<JobRow, JobsError> {
-    let org = scope::tenant(ctx)?;
+    // By id alone: the authorizer decides who may see it (other orgs get 404).
     let id: JobId = scope::parse_id(id, "job")?;
-    let row = sqlx::query_as::<_, JobRow>(concat!(
-        "SELECT ",
-        job_cols!(),
-        " FROM jobs WHERE id = $1 AND org_id = $2"
-    ))
-    .bind(id.as_uuid())
-    .bind(org)
-    .fetch_optional(db.pool())
-    .await?
-    .ok_or_else(|| JobsError::not_found("job"))?;
+    let row =
+        sqlx::query_as::<_, JobRow>(concat!("SELECT ", job_cols!(), " FROM jobs WHERE id = $1"))
+            .bind(id.as_uuid())
+            .fetch_optional(db.pool())
+            .await?
+            .ok_or_else(|| JobsError::not_found("job"))?;
     let res = resource("job", Some(id.to_string()), row.org_id, row.project_id);
     scope::authorize(state, ctx, "runs.read", &res).await?;
     Ok(row)

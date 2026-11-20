@@ -12,10 +12,13 @@ use mrl_domain::ids::{DatasetVersionId, ModelVersionId, OrgId, ProjectId, Worksp
 use mrl_domain::rbac::{allowed, Action, Role};
 use mrl_server::config::{BucketConfig, Config, Mode};
 use mrl_server::modules::jobs::{
-    Chains, CompletionVerifier, JobRow, JobSpec, JobValidator, SchemaChecks, Verdict, Verification,
+    Chains, CompletionVerifier, JobRow, JobSpec, JobValidator, ProjectDirectory, Projects,
+    SchemaChecks, Verdict, Verification,
 };
 use mrl_server::modules::runs::RunsModule;
-use mrl_server::seams::{Authorizer, Decision, Principal, RequestContext, Resource, SeamError};
+use mrl_server::seams::{
+    Authorizer, Decision, Principal, PrincipalKind, RequestContext, Resource, SeamError,
+};
 use mrl_server::{AppState, Db, ServerModule};
 use mrl_testkit::pg::TestDb;
 use mrl_testkit::seams as ts;
@@ -56,8 +59,9 @@ pub struct AuthRules {
     pub pool: Option<Db>,
     /// Which org owns each project (`prj_…` → `org_…`). Like P16's Rbac (A1 decision): a
     /// project that is missing here, or in another org than the one named, is hidden (404)
-    /// for every principal. `None` skips the check, for servers whose projects come from
-    /// [`TenancyDouble`].
+    /// for every principal. The server's project directory answers from this map too.
+    /// `None` skips both (no directory), for servers whose projects come from
+    /// [`TenancyDouble`] or that stand in for a build without P16.
     pub projects: Option<HashMap<String, String>>,
 }
 
@@ -128,6 +132,10 @@ impl Authorizer for RoleAuthorizer {
                 .await
                 .map_err(|e| SeamError::new("authorizer", e.to_string()))?;
         }
+        // Like P16: the solo owner may do everything once the project checks pass.
+        if ctx.principal.kind == PrincipalKind::LocalOwner {
+            return Ok(Decision::Allow);
+        }
         if resource.org.is_some() && resource.org != ctx.principal.org {
             return Ok(Decision::Hide);
         }
@@ -139,6 +147,22 @@ impl Authorizer for RoleAuthorizer {
             Some(a) if allowed(*role, a) => Decision::Allow,
             _ => Decision::Deny,
         })
+    }
+}
+
+/// A project directory answering from [`AuthRules::projects`] (P16 registers the real one).
+pub struct RulesDirectory(Arc<Mutex<AuthRules>>);
+
+#[async_trait]
+impl ProjectDirectory for RulesDirectory {
+    async fn owner(&self, project: ProjectId) -> Result<Option<OrgId>, SeamError> {
+        let rules = self.0.lock().unwrap();
+        let owner = rules
+            .projects
+            .as_ref()
+            .and_then(|m| m.get(&project.to_string()))
+            .and_then(|o| o.parse().ok());
+        Ok(owner)
     }
 }
 
@@ -196,8 +220,12 @@ pub async fn runs_server_with(
         .authorizer(authz)
         .audit_arc(harness.audit.clone());
     let seams = ts::build(seams, Mode::Team);
-    let mut modules: Vec<Box<dyn ServerModule>> =
-        vec![Box::new(RunsModule::with_chains(db.clone(), chains))];
+    let mut runs = RunsModule::with_chains(db.clone(), chains);
+    if harness.rules.lock().unwrap().projects.is_some() {
+        let directory = RulesDirectory(harness.rules.clone());
+        runs = runs.with_projects(Projects::with(Arc::new(directory)));
+    }
+    let mut modules: Vec<Box<dyn ServerModule>> = vec![Box::new(runs)];
     modules.extend(extra);
     match TestServer::start(team_config(), seams, modules).await {
         Ok(s) => s,

@@ -1474,3 +1474,136 @@ async fn foreign_and_missing_projects_are_404_with_no_writes() {
         201
     );
 }
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn solo_runs_are_stored_under_the_project_org_for_every_credential() {
+    use mrl_server::seams::{Principal, PrincipalKind};
+    let db = TestDb::new().await;
+    let org = OrgId::new();
+    let project = ProjectId::new();
+    let person = |token: &str, id: &str, kind, org: Option<String>, role| TestUser {
+        token: token.to_owned(),
+        principal: Principal {
+            id: id.to_owned(),
+            kind,
+            org,
+        },
+        role,
+    };
+    let people = vec![
+        // The solo launch secret: the local owner, no org.
+        person(
+            "solo",
+            "usr_local",
+            PrincipalKind::LocalOwner,
+            None,
+            Role::Owner,
+        ),
+        // A token bound to the project: P16 gives it the project's org.
+        person(
+            "pat",
+            "tok_pat",
+            PrincipalKind::Service,
+            Some(org.to_string()),
+            Role::Viewer,
+        ),
+    ];
+    let runs = format!("/api/v1/projects/{project}/runs");
+    let nil_rows = || async {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT (SELECT count(*) FROM runs WHERE org_id = $1) \
+                  + (SELECT count(*) FROM jobs WHERE org_id = $1) \
+                  + (SELECT count(*) FROM run_configs WHERE org_id = $1) \
+                  + (SELECT count(*) FROM experiments WHERE org_id = $1)",
+        )
+        .bind(uuid::Uuid::nil())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        n
+    };
+
+    // A build without a project directory (solo, before P16) stores under the nil org.
+    let old = runs_server_with(
+        db.db(),
+        accepting_chains(),
+        &people,
+        vec![],
+        &Harness::default(),
+    )
+    .await;
+    let first = call(
+        &old,
+        Method::POST,
+        &runs,
+        "solo",
+        Some("a"),
+        Some(&submission("old")),
+    )
+    .await;
+    assert_eq!(first.status, 201, "{}", first.text());
+    let first = first.json();
+    old.shutdown().await.unwrap();
+    assert_eq!(
+        nil_rows().await,
+        4,
+        "run, job, config and default experiment"
+    );
+
+    // With the directory, startup moves those rows to the project's org ...
+    let harness = Harness::default();
+    *harness.rules.lock().unwrap() = AuthRules::with_projects(&[(project, org)]);
+    let srv = runs_server_with(db.db(), accepting_chains(), &people, vec![], &harness).await;
+    assert_eq!(nil_rows().await, 0);
+    // ... and new solo submissions are stored there too.
+    let second = call(
+        &srv,
+        Method::POST,
+        &runs,
+        "solo",
+        Some("b"),
+        Some(&submission("new")),
+    )
+    .await;
+    assert_eq!(second.status, 201, "{}", second.text());
+    let second = second.json();
+    assert_eq!(nil_rows().await, 0);
+
+    // The project-bound token lists and fetches both.
+    let get = |path: String| {
+        let srv = &srv;
+        async move { call(srv, Method::GET, &path, "pat", None, None).await }
+    };
+    let page = get(runs.clone()).await;
+    assert_eq!(page.status, 200, "{}", page.text());
+    let listed: Vec<String> = page.json()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_str().unwrap().to_owned())
+        .collect();
+    for run in [&first, &second] {
+        let id = run["id"].as_str().unwrap();
+        assert!(listed.iter().any(|l| l == id), "{id} not in {listed:?}");
+        let job = run["job_id"].as_str().unwrap();
+        for path in [
+            format!("/api/v1/runs/{id}"),
+            format!("/api/v1/runs/{id}/config"),
+            format!("/api/v1/runs/{id}/attempts"),
+            format!("/api/v1/jobs/{job}"),
+        ] {
+            let res = get(path.clone()).await;
+            assert_eq!(res.status, 200, "{path}: {}", res.text());
+        }
+        let tl = get(format!("/api/v1/runs/{id}/timeline")).await.json();
+        assert_eq!(tl["items"][0]["type"], "job.created", "{tl}");
+    }
+    let jobs = get(format!("/api/v1/jobs?project={project}")).await.json();
+    assert_eq!(jobs["items"].as_array().unwrap().len(), 2, "{jobs}");
+    let mine = call(&srv, Method::GET, "/api/v1/jobs", "solo", None, None)
+        .await
+        .json();
+    assert_eq!(mine["items"].as_array().unwrap().len(), 2, "{mine}");
+    srv.shutdown().await.unwrap();
+}

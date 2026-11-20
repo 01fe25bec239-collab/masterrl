@@ -6,7 +6,7 @@ use crate::http::etag;
 use crate::http::pagination::{Page, PageQuery};
 use crate::modules::jobs::api::with_etag;
 use crate::modules::jobs::scope::{self, resource};
-use crate::modules::jobs::{codes, JobsError};
+use crate::modules::jobs::{codes, JobsError, Projects};
 use crate::seams::RequestContext;
 use crate::Db;
 use axum::extract::{Path, Query, State};
@@ -166,15 +166,17 @@ fn name_taken(e: JobsError) -> JobsError {
     }
 }
 
-/// Checks `action` on project `prj` and returns (org, project).
+/// Checks `action` on project `prj` and returns (org, project). The org is the project's
+/// owner ([`Projects::org_for`]), whoever asks.
 pub async fn project_scope(
     state: &AppState,
     ctx: &RequestContext,
+    projects: &Projects,
     prj: &str,
     action: &str,
 ) -> Result<(Uuid, Uuid), JobsError> {
-    let org = scope::tenant(ctx)?;
     let project: ProjectId = scope::parse_id(prj, "project")?;
+    let org = projects.org_for(ctx, project).await?;
     let res = resource("project", Some(project.to_string()), org, project.as_uuid());
     let ctx = ctx.clone().with_project(project.to_string());
     scope::authorize(state, &ctx, action, &res).await?;
@@ -219,11 +221,12 @@ pub async fn get_or_create(
 pub async fn create(
     State(state): State<AppState>,
     Extension(db): Extension<Db>,
+    Extension(projects): Extension<Projects>,
     ctx: RequestContext,
     Path(prj): Path<String>,
     Json(body): Json<NewExperiment>,
 ) -> Result<Response, JobsError> {
-    let (org, project) = project_scope(&state, &ctx, &prj, "runs.submit").await?;
+    let (org, project) = project_scope(&state, &ctx, &projects, &prj, "runs.submit").await?;
     check_fields(Some(&body.name), Some(&body.tags))?;
     let row = sqlx::query_as::<_, ExperimentRow>(concat!(
         "INSERT INTO experiments (id, org_id, project_id, name, description, tags, created_by) \
@@ -262,11 +265,12 @@ pub async fn create(
 pub async fn list(
     State(state): State<AppState>,
     Extension(db): Extension<Db>,
+    Extension(projects): Extension<Projects>,
     ctx: RequestContext,
     Path(prj): Path<String>,
     Query(q): Query<PageQuery>,
 ) -> Result<Json<Page<Experiment>>, JobsError> {
-    let (org, project) = project_scope(&state, &ctx, &prj, "runs.read").await?;
+    let (org, project) = project_scope(&state, &ctx, &projects, &prj, "runs.read").await?;
     let page = q.resolve()?;
     let after = scope::after::<ExperimentId>(&page, |e| e.as_uuid())?;
     let rows = sqlx::query_as::<_, ExperimentRow>(concat!(
@@ -296,15 +300,14 @@ async fn read(
     exp: &str,
     action: &str,
 ) -> Result<ExperimentRow, JobsError> {
-    let org = scope::tenant(ctx)?;
+    // By id alone: the authorizer decides who may see it (other orgs get 404).
     let id: ExperimentId = scope::parse_id(exp, "experiment")?;
     let row = sqlx::query_as::<_, ExperimentRow>(concat!(
         "SELECT ",
         experiment_cols!(),
-        " FROM experiments WHERE id = $1 AND org_id = $2"
+        " FROM experiments WHERE id = $1"
     ))
     .bind(id.as_uuid())
-    .bind(org)
     .fetch_optional(db.pool())
     .await?
     .ok_or_else(|| JobsError::not_found("experiment"))?;

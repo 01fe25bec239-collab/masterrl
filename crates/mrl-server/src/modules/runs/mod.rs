@@ -7,27 +7,46 @@ pub mod experiments;
 
 use crate::app::{AppState, ServerModule};
 use crate::db::Db;
-use crate::modules::jobs::{self, Chains};
+use crate::modules::jobs::{self, Chains, Projects, RehomeLocalRows};
+use crate::seams::StartupStep;
 use axum::routing::get;
 use axum::{Extension, Router};
+use std::sync::Arc;
 use utoipa::OpenApi;
 
 /// The runs and jobs module.
 pub struct RunsModule {
     db: Db,
     chains: Chains,
+    projects: Projects,
 }
 
 impl RunsModule {
-    /// The module with every registered chain member ([`Chains::registered`]).
+    /// The module with every registered chain member and project directory
+    /// ([`Chains::registered`], [`Projects::registered`]).
     pub fn new(db: Db) -> Self {
         let chains = Chains::registered(&db);
-        Self { db, chains }
+        let projects = Projects::registered(&db);
+        Self {
+            db,
+            chains,
+            projects,
+        }
     }
 
-    /// The module with exactly these chains (tests use this).
+    /// The module with exactly these chains and no project directory (tests use this).
     pub fn with_chains(db: Db, chains: Chains) -> Self {
-        Self { db, chains }
+        Self {
+            db,
+            chains,
+            projects: Projects::default(),
+        }
+    }
+
+    /// The same module with this project directory (tests use this).
+    pub fn with_projects(mut self, projects: Projects) -> Self {
+        self.projects = projects;
+        self
     }
 }
 
@@ -80,6 +99,14 @@ impl ServerModule for RunsModule {
             .route_layer(axum::middleware::from_fn(jobs::error::render))
             .layer(Extension(self.db.clone()))
             .layer(Extension(self.chains.clone()))
+            .layer(Extension(self.projects.clone()))
+    }
+
+    fn startup_steps(&self) -> Vec<Arc<dyn StartupStep>> {
+        vec![Arc::new(RehomeLocalRows::new(
+            self.db.clone(),
+            self.projects.clone(),
+        ))]
     }
 
     fn openapi(&self) -> utoipa::openapi::OpenApi {
