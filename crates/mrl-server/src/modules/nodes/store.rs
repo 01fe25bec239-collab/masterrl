@@ -168,11 +168,17 @@ pub async fn list_nodes(
 
 /// One node with its GPUs, latest telemetry and inventory.
 pub async fn get_node(db: &Db, node: Uuid) -> Result<Option<NodeDetail>, NodesError> {
+    // One snapshot for the node row and its GPUs: a telemetry write between the two reads would
+    // otherwise show new GPU readings beside the older node telemetry.
+    let mut tx = db.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
     let Some(row) = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {NODE_COLS}, inventory, telemetry, telemetry_at FROM compute_nodes WHERE id = $1"
     )))
     .bind(node)
-    .fetch_optional(db.pool())
+    .fetch_optional(&mut *tx)
     .await?
     else {
         return Ok(None);
@@ -184,7 +190,7 @@ pub async fn get_node(db: &Db, node: Uuid) -> Result<Option<NodeDetail>, NodesEr
          WHERE g.node_id = $1 AND g.present ORDER BY g.index_on_node",
     )
     .bind(node)
-    .fetch_all(db.pool())
+    .fetch_all(&mut *tx)
     .await?
     .iter()
     .map(|g| {
