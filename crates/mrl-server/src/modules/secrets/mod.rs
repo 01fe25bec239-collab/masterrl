@@ -8,8 +8,9 @@
 //!   never point at it.
 //! - `PUT /secrets/{sec}/value {value}`: write-only; the answer is `204` with no body.
 //! - `DELETE /secrets/{sec}`: marks the secret as being deleted, removes the value from the
-//!   store, then the metadata and grants. A failure leaves it marked (rotation and resolution
-//!   refuse it, MRL-CONFLICT-192); deleting again finishes. Rotation holds the row lock while
+//!   store, then the metadata and grants. A failure, or a server running without its store,
+//!   leaves it marked (rotation and resolution refuse it, MRL-CONFLICT-192); deleting again
+//!   finishes. Rotation holds the row lock while
 //!   it writes, so the two never interleave, even across server replicas.
 //! - [`SecretResolver::grant`]: lets a run receive the secret (needs the `run` use). There is
 //!   no public endpoint: the runs module (P17) calls it in the transaction where it checked
@@ -25,7 +26,7 @@ use crate::config::Mode;
 use crate::db::{Db, Tx};
 use crate::error::{ApiError, ErrorCode, FieldError};
 use crate::modules::artifacts::{
-    check_name, codes, field, not_found, org_of, owned, resource, ArtifactStore, Error,
+    check_name, codes, destination, field, not_found, org_of, owned, resource, ArtifactStore, Error,
 };
 use crate::seams::{
     AuditEvent, AuditOutcome, Decision, RequestContext, Resource, Secret, SecretStore,
@@ -47,7 +48,7 @@ pub const RUN_USE: &str = "run";
 /// Largest value, in bytes.
 pub const MAX_VALUE: usize = 64 * 1024;
 /// The action that reads secret metadata.
-const READ: &str = "tenancy.read";
+pub(crate) const READ: &str = "tenancy.read";
 /// The action that changes secrets.
 const MANAGE: &str = "secrets.manage";
 
@@ -198,6 +199,42 @@ impl SecretResolver {
             return Err(deleting(&row));
         }
         Ok(row)
+    }
+
+    /// Deletes secret `id` of `org`: marks it (which waits for a rotation in progress, since
+    /// that holds the row lock, and makes later rotations, grants and resolutions refuse
+    /// it), removes the value from `store` and checks it is gone, then deletes the metadata
+    /// and grants. A stored secret needs the store: without one, or when it fails, the
+    /// marked row stays and the error is retryable (503); deleting again carries on.
+    pub async fn delete(
+        &self,
+        store: Option<&Arc<dyn SecretStore>>,
+        org: &str,
+        id: Uuid,
+    ) -> Result<(), Error> {
+        let row = self.row_any(org, id).await?;
+        sqlx::query("UPDATE secrets_metadata SET deleting = true WHERE org_id = $1 AND id = $2")
+            .bind(org)
+            .bind(id)
+            .execute(self.db.pool())
+            .await?;
+        if row.backend == "secret_store" {
+            let st = store_of(store)?;
+            st.delete(&row.reference).await?;
+            if st.get(&row.reference).await?.is_some() {
+                return Err(ApiError::new(
+                    ErrorCode::Unavailable,
+                    "The secret store still has the value. Delete the secret again.",
+                )
+                .into());
+            }
+        }
+        sqlx::query("DELETE FROM secrets_metadata WHERE org_id = $1 AND id = $2")
+            .bind(org)
+            .bind(id)
+            .execute(self.db.pool())
+            .await?;
+        Ok(())
     }
 
     /// Lets `run` receive `secret` of `org`, mounted as `env` or `file`. Call it inside the
@@ -458,13 +495,17 @@ pub(crate) async fn create(
     ctx: RequestContext,
     Json(new): Json<NewSecret>,
 ) -> Result<(StatusCode, Json<SecretMeta>), Error> {
-    s.authorize(&ctx, MANAGE, &resource(&ctx, "secret", None))
-        .await?;
+    let org = org_of(&ctx)?;
+    s.authorize(
+        &ctx,
+        MANAGE,
+        &destination("secret", &org, new.project_id.clone()),
+    )
+    .await?;
     let uses = check_new(&new)?;
     if new.env_var.is_some() && s.config.server.mode != Mode::Solo {
         return Err(env_refused());
     }
-    let org = org_of(&ctx)?;
     let id = s.seams.ids.new_uuid();
     let (backend, reference) = match &new.env_var {
         Some(v) => ("env", v.clone()),
@@ -645,32 +686,8 @@ pub(crate) async fn delete(
         .row_any(&org, id)
         .await?;
     s.authorize(&ctx, MANAGE, &row.resource(&org)).await?;
-    // 1. Mark it. This waits for a rotation in progress (it holds the row lock) and makes
-    //    later rotations, grants and resolutions refuse it.
-    sqlx::query("UPDATE secrets_metadata SET deleting = true WHERE org_id = $1 AND id = $2")
-        .bind(&org)
-        .bind(id)
-        .execute(store.db().pool())
-        .await?;
-    // 2. Remove the value and make sure it is gone. A store error keeps the marked row, so
-    //    the reference is not lost; deleting again carries on from here.
-    if row.backend == "secret_store" {
-        if let Some(st) = s.seams.secrets.as_ref() {
-            st.delete(&row.reference).await?;
-            if st.get(&row.reference).await?.is_some() {
-                return Err(ApiError::new(
-                    ErrorCode::Unavailable,
-                    "The secret store still has the value. Delete the secret again.",
-                )
-                .into());
-            }
-        }
-    }
-    // 3. The metadata, and with it the grants.
-    sqlx::query("DELETE FROM secrets_metadata WHERE org_id = $1 AND id = $2")
-        .bind(&org)
-        .bind(id)
-        .execute(store.db().pool())
+    SecretResolver::new(store.db().clone(), s.config.server.mode)
+        .delete(s.seams.secrets.as_ref(), &org, id)
         .await?;
     audit(&s, &ctx, &org, "secrets.delete", sec).await?;
     Ok(StatusCode::NO_CONTENT)

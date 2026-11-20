@@ -9,8 +9,8 @@
 //!
 //! ```text
 //! let store = module.store();                                    // Arc<ArtifactStore>
-//! let t = store.ticket(&state, &ctx, &key, TicketMethod::Get, max).await?;  // audited
-//! let art = store.register(&state, &ctx, new_artifact).await?;   // checks every object
+//! let t = store.ticket(&seams, &ctx, &key, TicketMethod::Get, max).await?;  // audited
+//! let art = store.register(&seams, &ctx, new_artifact).await?;   // checks every file
 //! ```
 
 mod error;
@@ -27,7 +27,7 @@ use crate::error::{ApiError, ErrorCode, FieldError};
 use crate::http::pagination::{Page, PageQuery};
 use crate::modules::lineage::{LineageWriter, NodeRef, Relation};
 use crate::seams::{
-    AuditEvent, AuditOutcome, Decision, PrincipalKind, RequestContext, Resource, SecretStore,
+    AuditEvent, AuditOutcome, Decision, PrincipalKind, RequestContext, Resource, Seams, SecretStore,
 };
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -40,6 +40,7 @@ use mrl_storage::{
     TicketClaims, TicketKey, TicketMethod, TransferOptions, TransferTicket,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -211,7 +212,9 @@ pub struct ArtifactStore {
     config: Result<BackendConfig, String>,
     mode: Mode,
     scratch: std::path::PathBuf,
-    backend: OnceCell<(Backend, TicketKey)>,
+    plain: OnceCell<Backend>,
+    signing: OnceCell<(Backend, TicketKey)>,
+    lookups: std::sync::RwLock<HashMap<String, Arc<dyn NodeLookup>>>,
 }
 
 impl ArtifactStore {
@@ -226,7 +229,9 @@ impl ArtifactStore {
             config,
             mode,
             scratch,
-            backend: OnceCell::new(),
+            plain: OnceCell::new(),
+            signing: OnceCell::new(),
+            lookups: std::sync::RwLock::new(HashMap::new()),
         }
     }
 
@@ -245,44 +250,59 @@ impl ArtifactStore {
         &self.db
     }
 
-    fn connect(&self) -> Result<Backend, Error> {
-        let config = self.config.as_ref().map_err(|e| {
-            Error::coded(
-                "MRL-STORE-006",
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("The storage settings can't be used: {e}"),
-            )
-        })?;
-        Ok(Backend::connect(config)?)
+    /// Lets lineage show items of `kind` (an id prefix like `run`): the module that owns
+    /// them says which exist in an org and how reading one is authorized. Items of a kind
+    /// with no lookup are redacted in graphs and are never a root.
+    pub fn add_lineage_lookup(&self, kind: &str, lookup: Arc<dyn NodeLookup>) {
+        if let Ok(mut l) = self.lookups.write() {
+            l.insert(kind.to_owned(), lookup);
+        }
     }
 
-    /// The backend with its ticket key (see [`ticket_key`]). A failure is not kept: the next
-    /// call tries again.
-    pub async fn backend(&self, secrets: Option<&Arc<dyn SecretStore>>) -> Result<&Backend, Error> {
-        Ok(&self.keyed(secrets).await?.0)
+    pub(crate) fn lookup(&self, kind: &str) -> Option<Arc<dyn NodeLookup>> {
+        self.lookups.read().ok().and_then(|l| l.get(kind).cloned())
     }
 
-    async fn keyed(
+    /// The storage backend, without a signing key. A failure is not kept: the next call
+    /// tries again.
+    pub(crate) async fn backend(&self) -> Result<&Backend, Error> {
+        self.plain
+            .get_or_try_init(|| async {
+                let config = self.config.as_ref().map_err(|e| {
+                    Error::coded(
+                        "MRL-STORE-006",
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("The storage settings can't be used: {e}"),
+                    )
+                })?;
+                Ok::<_, Error>(Backend::connect(config)?)
+            })
+            .await
+    }
+
+    /// The backend with the ticket signing key (see [`ticket_key`]). Only tickets need it.
+    async fn signing(
         &self,
         secrets: Option<&Arc<dyn SecretStore>>,
     ) -> Result<&(Backend, TicketKey), Error> {
-        self.backend
+        self.signing
             .get_or_try_init(|| async {
                 let key = ticket_key(&self.db, self.mode, secrets).await?;
-                Ok::<_, Error>((self.connect()?.with_ticket_key(key.clone()), key))
+                let backend = self.backend().await?.clone().with_ticket_key(key.clone());
+                Ok::<_, Error>((backend, key))
             })
             .await
     }
 
     /// Checks a ticket token for `method` and returns what it allows. `secrets` is the
-    /// server's `SecretStore` (`state.seams.secrets`), which holds the shared signing key.
+    /// server's `SecretStore` (`seams.secrets`), which holds the shared signing key.
     pub async fn verify(
         &self,
         secrets: Option<&Arc<dyn SecretStore>>,
         token: &str,
         method: TicketMethod,
     ) -> Result<TicketClaims, Error> {
-        let (_, key) = self.keyed(secrets).await?;
+        let (_, key) = self.signing(secrets).await?;
         Ok(verify_ticket(
             key,
             token,
@@ -291,33 +311,24 @@ impl ArtifactStore {
         )?)
     }
 
-    /// A store for `org`, signing tickets with the shared key. `secrets` is the server's
-    /// `SecretStore` (`state.seams.secrets`).
-    pub async fn org_store(
-        &self,
-        secrets: Option<&Arc<dyn SecretStore>>,
-        org: &str,
-    ) -> Result<Store, Error> {
-        Ok(self.backend(secrets).await?.org(org)?)
-    }
-
-    /// A backend without a ticket key, for the cleanup job.
-    pub(crate) fn plain_backend(&self) -> Result<Backend, Error> {
-        self.connect()
+    /// Storage of `org` for reading and writing. It signs no tickets, so it works without a
+    /// signing key; use [`ArtifactStore::ticket`] for those.
+    pub async fn org_store(&self, org: &str) -> Result<Store, Error> {
+        Ok(self.backend().await?.org(org)?)
     }
 
     /// A transfer ticket for `key` in the caller's org. GET tickets (downloads) are audited.
-    /// PUT tickets never point into `blobs/`, where committed content lives.
+    /// PUT tickets never point into the reserved `blobs/` area, however it is spelled.
     pub async fn ticket(
         &self,
-        state: &AppState,
+        seams: &Seams,
         ctx: &RequestContext,
         key: &str,
         method: TicketMethod,
         max_size: u64,
     ) -> Result<TransferTicket, Error> {
         let org = org_of(ctx)?;
-        let store = self.org_store(state.seams.secrets.as_ref(), &org).await?;
+        let store = self.signing(seams.secrets.as_ref()).await?.0.org(&org)?;
         if method == TicketMethod::Put && is_immutable(&store, key) {
             return Err(immutable());
         }
@@ -325,11 +336,10 @@ impl ArtifactStore {
             .transfer_ticket(key, method, max_size, TICKET_TTL)
             .await?;
         if method == TicketMethod::Get {
-            state
-                .seams
+            seams
                 .audit
                 .record(AuditEvent {
-                    at: state.seams.clock.now(),
+                    at: seams.clock.now(),
                     actor: ctx.principal.id.clone(),
                     org: Some(org),
                     project: ctx.project.clone(),
@@ -344,18 +354,24 @@ impl ArtifactStore {
     }
 
     /// Registers an artifact in two phases: a PENDING row reserves the name; every file is
-    /// copied into content-addressed storage (`blobs/sha256/…`) and the copy is checked
-    /// against the manifest (size and sha256); then the row is COMMITTED with its lineage
+    /// made a checked copy in `blobs/sha256/…`; then the row is COMMITTED with its lineage
     /// links in one transaction. Any failure after the reservation marks it FAILED (a
     /// mismatch is MRL-STORE-011) and frees the name. Downloads read the copies, so changing
-    /// the source files later can't change a committed artifact.
+    /// a source later can't change a committed artifact.
+    ///
+    /// Files come either from `uploads` (completed uploads the caller may see; what the HTTP
+    /// API accepts) or, for the server's own modules only, from a storage `prefix`, whose
+    /// files are downloaded, hashed and stored. The caller is checked against the
+    /// destination (org and `project_id`) before anything is reserved.
     pub async fn register(
         &self,
-        state: &AppState,
+        seams: &Seams,
         ctx: &RequestContext,
         new: NewArtifact,
     ) -> Result<Artifact, Error> {
         let org = org_of(ctx)?;
+        let dest = destination("artifact", &org, new.project_id.clone());
+        allow(seams, ctx, crate::modules::uploads::ACTION, &dest).await?;
         let manifest_json = serde_json::to_vec(&new.manifest).map_err(|e| {
             Error::coded(
                 "MRL-STORE-012",
@@ -374,40 +390,14 @@ impl ArtifactStore {
             .collect::<Result<Vec<_>, _>>()?;
         for (i, (from, _, to)) in links.iter().enumerate() {
             if let Some(n) = from.or(*to) {
-                self.check_link(state, ctx, &org, i, n).await?;
+                self.check_link(seams, ctx, &org, i, n).await?;
             }
         }
-        let id = state.seams.ids.new_uuid();
-        let store = self.org_store(state.seams.secrets.as_ref(), &org).await?;
-        let prefix = match &new.prefix {
-            Some(p) => {
-                let full = format!("{}{}", store.keys().prefix(), p.trim_start_matches('/'));
-                store.keys().check_prefix(&full)?;
-                if !full.ends_with('/') || full == store.keys().prefix() {
-                    return Err(field(
-                        "/prefix",
-                        "The prefix must be a folder inside your storage, ending in `/`.",
-                    ));
-                }
-                full
-            }
-            None => format!(
-                "{}artifacts/{}/",
-                store.keys().prefix(),
-                ArtifactId::from_uuid(id)
-            ),
-        };
-        // Staging areas are cleaned up or rewritten (upload parts, checkpoint attempts):
-        // register the finished upload or checkpoint instead.
-        for f in &manifest.files {
-            let key = store.keys().join(&prefix, &f.path)?;
-            if is_staging(&key[store.keys().prefix().len()..]) {
-                return Err(field(
-                    "/prefix",
-                    "Artifact files can't live in a staging folder (`uploads/` or `_staging/`); finish the upload first and use its stored file.",
-                ));
-            }
-        }
+        let id = seams.ids.new_uuid();
+        let store = self.org_store(&org).await?;
+        let (prefix, sources) = self
+            .sources(seams, ctx, &org, &store, id, &new, &manifest)
+            .await?;
         let inserted = sqlx::query(
             "INSERT INTO artifacts (id, org_id, project_id, name, kind, prefix, manifest, size_bytes, state, created_by)
              VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'PENDING', $9)",
@@ -433,7 +423,7 @@ impl ArtifactStore {
             }
             other => other?,
         };
-        let done = match snapshot(self, &store, &prefix, &manifest).await {
+        let done = match self.snapshot(&store, &manifest, sources).await {
             Ok(()) => self.commit(&org, id, &links).await,
             Err(e) => Err(e),
         };
@@ -449,6 +439,156 @@ impl ArtifactStore {
         self.get(&org, id)
             .await?
             .ok_or_else(|| not_found("artifact"))
+    }
+
+    /// Where each manifest file comes from, checked before anything is reserved, and the
+    /// prefix recorded on the row.
+    #[allow(clippy::too_many_arguments)]
+    async fn sources(
+        &self,
+        seams: &Seams,
+        ctx: &RequestContext,
+        org: &str,
+        store: &Store,
+        id: Uuid,
+        new: &NewArtifact,
+        manifest: &ArtifactManifest,
+    ) -> Result<(String, Vec<Source>), Error> {
+        let keys = store.keys();
+        if let Some(p) = &new.prefix {
+            if !new.uploads.is_empty() {
+                return Err(field(
+                    "/uploads",
+                    "Give either `prefix` or `uploads`, not both.",
+                ));
+            }
+            let full = format!("{}{}", keys.prefix(), p.trim_start_matches('/'));
+            keys.check_prefix(&full)?;
+            if !full.ends_with('/') || full == keys.prefix() {
+                return Err(field(
+                    "/prefix",
+                    "The prefix must be a folder inside your storage, ending in `/`.",
+                ));
+            }
+            let mut sources = Vec::with_capacity(manifest.files.len());
+            for f in &manifest.files {
+                let key = keys.join(&full, &f.path)?;
+                // Staging areas are cleaned up or rewritten (upload parts, checkpoint
+                // attempts): register the finished upload or checkpoint instead.
+                if is_staging(&key[keys.prefix().len()..]) {
+                    return Err(field(
+                        "/prefix",
+                        "Artifact files can't live in a staging folder (`uploads/` or `_staging/`); finish the upload first and use its stored file.",
+                    ));
+                }
+                sources.push(Source::Key(key));
+            }
+            return Ok((full, sources));
+        }
+        if let Some(extra) = new
+            .uploads
+            .keys()
+            .find(|p| !manifest.files.iter().any(|f| &f.path == *p))
+        {
+            return Err(field(
+                &format!("/uploads/{extra}"),
+                "The manifest has no file at this path.",
+            ));
+        }
+        let mut sources = Vec::with_capacity(manifest.files.len());
+        for f in &manifest.files {
+            let up = new.uploads.get(&f.path).ok_or_else(|| {
+                field(
+                    &format!("/uploads/{}", f.path),
+                    "Every file needs the id of a finished upload with its bytes.",
+                )
+            })?;
+            let blob = crate::modules::uploads::finished(self, seams, ctx, org, up).await?;
+            sources.push(Source::Upload(up.clone(), blob));
+        }
+        Ok((
+            format!("{}artifacts/{}/", keys.prefix(), ArtifactId::from_uuid(id)),
+            sources,
+        ))
+    }
+
+    /// Makes every file a checked copy in `blobs/sha256/…` (see [`snapshot_file`]). A
+    /// finished upload already is one; only its size and hash are compared.
+    async fn snapshot(
+        &self,
+        store: &Store,
+        manifest: &ArtifactManifest,
+        sources: Vec<Source>,
+    ) -> Result<(), Error> {
+        let mut problems = Vec::new();
+        for (f, src) in manifest.files.iter().zip(sources) {
+            let problem = match src {
+                Source::Key(key) => self.snapshot_file(store, &key, f).await?,
+                Source::Upload(up, b) => (b.size != f.size || b.sha256 != f.sha256)
+                    .then(|| format!("{}: upload {up} has other content", f.path)),
+            };
+            problems.extend(problem);
+        }
+        if problems.is_empty() {
+            Ok(())
+        } else {
+            Err(mismatch(&problems))
+        }
+    }
+
+    /// Copies `src` to `blobs/sha256/…` when its bytes match `f`. The copy is checked, not
+    /// the source: the bytes are downloaded into a private folder, hashed there, and those
+    /// same bytes are stored, so a source rewritten meanwhile can't slip in. Content already
+    /// stored is not written again; nothing under `blobs/` is ever deleted here. Returns
+    /// the problem when the source does not match.
+    async fn snapshot_file(
+        &self,
+        store: &Store,
+        src: &str,
+        f: &mrl_storage::ManifestFile,
+    ) -> Result<Option<String>, Error> {
+        // ponytail: one file at a time through local disk; copy server-side and hash in
+        // parallel when large artifacts make registration slow.
+        match store.head(src).await {
+            Ok(info) if info.size == f.size => {}
+            Ok(info) => {
+                return Ok(Some(format!(
+                    "{}: {} bytes, the manifest says {}",
+                    f.path, info.size, f.size
+                )))
+            }
+            Err(StorageError::NotFound { .. }) => return Ok(Some(format!("{}: missing", f.path))),
+            Err(e) => return Err(e.into()),
+        }
+        let dir = self.scratch_dir()?;
+        let local = dir.path().join("file");
+        let opts = TransferOptions::default();
+        match store
+            .download_file(src, &local, Some(&f.sha256), opts)
+            .await
+        {
+            Ok(got) if got.size == f.size => {}
+            Ok(got) => {
+                return Ok(Some(format!(
+                    "{}: {} bytes, the manifest says {}",
+                    f.path, got.size, f.size
+                )))
+            }
+            Err(StorageError::ChecksumMismatch { .. }) => {
+                return Ok(Some(format!(
+                    "{}: its sha256 differs from the manifest",
+                    f.path
+                )))
+            }
+            Err(StorageError::NotFound { .. }) => return Ok(Some(format!("{}: missing", f.path))),
+            Err(e) => return Err(e.into()),
+        }
+        let blob = store.keys().blob(&f.sha256)?;
+        if !blob_stored(store, &blob, f.size).await? {
+            crate::modules::uploads::store_file(store, &local, &blob, f.size).await?;
+        }
+        scratch::close(dir)?;
+        Ok(None)
     }
 
     /// PENDING → COMMITTED plus the lineage links, in one transaction. Nothing is linked
@@ -492,36 +632,36 @@ impl ArtifactStore {
     }
 
     /// A link given by a caller may point only at an artifact or upload of the caller's org
-    /// that the caller may see. Other kinds are linked by the modules that own them (inside
-    /// the transaction that creates them), since only they can tell whether an id is real.
+    /// that the caller may see; anything else is not found (404), like a GET of it. Other
+    /// kinds are linked by the modules that own them (in the transaction that creates
+    /// them), since only they can tell whether an id is real.
     async fn check_link(
         &self,
-        state: &AppState,
+        seams: &Seams,
         ctx: &RequestContext,
         org: &str,
         i: usize,
         node: NodeRef,
     ) -> Result<(), Error> {
-        let path = format!("/links/{i}");
         if !crate::modules::lineage::has_table(node.kind) {
             return Err(field(
-                &path,
+                &format!("/links/{i}"),
                 &format!(
                     "Links to {}_… ids can't be added here; the part of the app that makes them records their links.",
                     node.kind
                 ),
             ));
         }
-        let visible = match crate::modules::lineage::access(&self.db, org, node).await? {
+        let visible = match crate::modules::lineage::access(self, org, node).await? {
             Some((action, res)) => {
-                state.seams.authorizer.authorize(ctx, action, &res).await? == Decision::Allow
+                seams.authorizer.authorize(ctx, action, &res).await? == Decision::Allow
             }
             None => false,
         };
         if visible {
             Ok(())
         } else {
-            Err(field(&path, "No item with this id exists here."))
+            Err(not_found("item"))
         }
     }
 
@@ -539,6 +679,80 @@ impl ArtifactStore {
     }
 }
 
+/// Finds items of one kind for lineage graphs. The module that owns the kind implements it
+/// and registers it with [`ArtifactStore::add_lineage_lookup`].
+#[async_trait::async_trait]
+pub trait NodeLookup: Send + Sync {
+    /// When `id` is an item of `org`: the action and resource that reading it is checked
+    /// against, exactly as the owning module's own GET checks it. `None`: not in `org`.
+    async fn find(&self, org: &str, id: Uuid) -> Result<Option<(&'static str, Resource)>, Error>;
+}
+
+/// A checked blob of a finished upload.
+pub(crate) struct UploadBlob {
+    pub(crate) size: u64,
+    pub(crate) sha256: String,
+}
+
+/// Where a manifest file comes from.
+enum Source {
+    /// A key the server reads, checks and copies (trusted callers only).
+    Key(String),
+    /// A finished upload (id, its blob).
+    Upload(String, UploadBlob),
+}
+
+/// True when `blob` exists with `size` bytes.
+async fn blob_stored(store: &Store, blob: &str, size: u64) -> Result<bool, Error> {
+    match store.head(blob).await {
+        Ok(info) => Ok(info.size == size),
+        Err(StorageError::NotFound { .. }) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
+fn mismatch(problems: &[String]) -> Error {
+    let shown: Vec<&str> = problems.iter().take(20).map(String::as_str).collect();
+    Error::coded(
+        "MRL-STORE-011",
+        StatusCode::UNPROCESSABLE_ENTITY,
+        format!(
+            "{} file(s) do not match the manifest: {}",
+            problems.len(),
+            shown.join("; ")
+        ),
+    )
+}
+
+/// A new item of `kind` about to be created in `org` and `project`: creation is
+/// authorized against exactly where it will live.
+pub(crate) fn destination(kind: &str, org: &str, project: Option<String>) -> Resource {
+    Resource {
+        kind: kind.to_owned(),
+        id: None,
+        org: Some(org.to_owned()),
+        project,
+    }
+}
+
+/// `seams.authorize`, as the HTTP layer maps it: Deny → 403, Hide → 404.
+pub(crate) async fn allow(
+    seams: &Seams,
+    ctx: &RequestContext,
+    action: &str,
+    res: &Resource,
+) -> Result<(), Error> {
+    match seams.authorizer.authorize(ctx, action, res).await? {
+        Decision::Allow => Ok(()),
+        Decision::Deny => Err(ApiError::new(
+            ErrorCode::Forbidden,
+            "You don't have permission to do this.",
+        )
+        .into()),
+        Decision::Hide => Err(not_found(&res.kind)),
+    }
+}
+
 /// The sum of the file sizes, which must fit PostgreSQL's `bigint`.
 fn total_size(m: &ArtifactManifest) -> Result<i64, Error> {
     m.files
@@ -553,99 +767,33 @@ fn total_size(m: &ArtifactManifest) -> Result<i64, Error> {
         })
 }
 
-/// Copies each file of `manifest` (under `prefix`) to `blobs/sha256/…`. The copy is
-/// checked, not the source: the bytes are downloaded into a private folder, hashed there,
-/// and those same bytes are stored, so a source rewritten meanwhile can't slip in. Content
-/// already stored (by an upload or another artifact) is not written again; nothing under
-/// `blobs/` is ever deleted here.
-async fn snapshot(
-    this: &ArtifactStore,
-    store: &Store,
-    prefix: &str,
-    manifest: &ArtifactManifest,
-) -> Result<(), Error> {
-    // ponytail: one file at a time through local disk; copy server-side and hash in
-    // parallel when large artifacts make registration slow.
-    let mut problems = Vec::new();
-    for f in &manifest.files {
-        let src = store.keys().join(prefix, &f.path)?;
-        match store.head(&src).await {
-            Ok(info) if info.size == f.size => {}
-            Ok(info) => {
-                problems.push(format!(
-                    "{}: {} bytes, the manifest says {}",
-                    f.path, info.size, f.size
-                ));
-                continue;
-            }
-            Err(StorageError::NotFound { .. }) => {
-                problems.push(format!("{}: missing", f.path));
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        }
-        let dir = this.scratch_dir()?;
-        let local = dir.path().join("file");
-        let opts = TransferOptions::default();
-        match store
-            .download_file(&src, &local, Some(&f.sha256), opts)
-            .await
-        {
-            Ok(got) if got.size == f.size => {}
-            Ok(got) => {
-                problems.push(format!(
-                    "{}: {} bytes, the manifest says {}",
-                    f.path, got.size, f.size
-                ));
-                continue;
-            }
-            Err(StorageError::ChecksumMismatch { .. }) => {
-                problems.push(format!("{}: its sha256 differs from the manifest", f.path));
-                continue;
-            }
-            Err(StorageError::NotFound { .. }) => {
-                problems.push(format!("{}: missing", f.path));
-                continue;
-            }
-            Err(e) => return Err(e.into()),
-        }
-        let blob = store.keys().blob(&f.sha256)?;
-        let stored = match store.head(&blob).await {
-            Ok(info) => info.size == f.size,
-            Err(StorageError::NotFound { .. }) => false,
-            Err(e) => return Err(e.into()),
-        };
-        if !stored {
-            crate::modules::uploads::store_file(store, &local, &blob, f.size).await?;
-        }
-        scratch::close(dir)?;
-    }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        let shown: Vec<&str> = problems.iter().take(20).map(String::as_str).collect();
-        Err(Error::coded(
-            "MRL-STORE-011",
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!(
-                "{} file(s) do not match the manifest: {}",
-                problems.len(),
-                shown.join("; ")
-            ),
-        ))
-    }
+/// One path segment as a case-insensitive file system sees it: lowercase, without the
+/// trailing dots and spaces Windows ignores.
+fn canonical(segment: &str) -> String {
+    segment.trim_end_matches(['.', ' ']).to_lowercase()
 }
 
 /// True for keys (relative to the org) in an area that is cleaned up or rewritten.
 fn is_staging(relative: &str) -> bool {
-    relative.starts_with("uploads/") || relative.split('/').any(|p| p == "_staging")
+    let mut segs = relative.split('/').filter(|s| !s.is_empty()).map(canonical);
+    let first = segs.next();
+    first.as_deref() == Some("uploads")
+        || first.as_deref() == Some("_staging")
+        || segs.any(|s| s == "_staging")
 }
 
-/// True for keys under the org's `blobs/`: content-addressed, written only after the server
-/// checked the bytes, and referenced by committed artifacts and finished uploads.
+/// True for keys in the org's reserved `blobs/` area, however it is spelled (`BLOBS`,
+/// `Blobs.`): content-addressed, written only after the server checked the bytes, and
+/// referenced by committed artifacts and finished uploads.
 fn is_immutable(store: &Store, key: &str) -> bool {
-    key.strip_prefix(store.keys().prefix())
-        .is_some_and(|k| k.starts_with("blobs/"))
+    let prefix = store.keys().prefix();
+    let rest = match key.get(..prefix.len()) {
+        Some(p) if p.eq_ignore_ascii_case(prefix) => &key[prefix.len()..],
+        _ => key,
+    };
+    rest.split('/')
+        .find(|s| !s.is_empty())
+        .is_some_and(|s| canonical(s) == "blobs")
 }
 
 fn immutable() -> Error {
@@ -836,8 +984,10 @@ impl NewLink {
 pub struct NewArtifact {
     /// Unique name in the org (or project).
     pub name: String,
-    /// Folder of the files, relative to the org, ending in `/` (like `exports/exp1/`).
-    /// Default: `artifacts/{id}/`.
+    /// Folder of the files, relative to the org, ending in `/` (like `exports/exp1/`). Only
+    /// the server's own modules may use it ([`ArtifactStore::register`]); the HTTP API
+    /// refuses it and takes `uploads` instead, since a folder says nothing about who may
+    /// read its files.
     #[serde(default)]
     pub prefix: Option<String>,
     /// The `artifact-manifest/v1` document.
@@ -849,6 +999,10 @@ pub struct NewArtifact {
     /// Lineage links written when the artifact commits.
     #[serde(default)]
     pub links: Vec<NewLink>,
+    /// Where each file's bytes are: manifest path → id of a finished upload the caller may
+    /// see, with exactly that size and sha256. Every file needs one.
+    #[serde(default)]
+    pub uploads: BTreeMap<String, String>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -962,15 +1116,15 @@ async fn register(
     ctx: RequestContext,
     Json(body): Json<NewArtifact>,
 ) -> Result<(StatusCode, Json<Artifact>), Error> {
-    s.authorize(
-        &ctx,
-        crate::modules::uploads::ACTION,
-        &resource(&ctx, "artifact", None),
-    )
-    .await?;
+    if body.prefix.is_some() {
+        return Err(field(
+            "/prefix",
+            "Send each file as a finished upload in `uploads`; storage folders are only for the server's own modules.",
+        ));
+    }
     Ok((
         StatusCode::CREATED,
-        Json(store.register(&s, &ctx, body).await?),
+        Json(store.register(&s.seams, &ctx, body).await?),
     ))
 }
 
@@ -1096,11 +1250,18 @@ async fn action(
         .find(|f| f.path == body.path)
         .ok_or_else(|| field("/path", "This artifact has no file at this path."))?;
     // Committed files are read from their checked copies, never from the source prefix.
-    let keys = store.org_store(s.seams.secrets.as_ref(), &org).await?;
-    let key = keys.keys().blob(&file.sha256)?;
+    // Artifacts registered before copies existed get theirs now, from the prefix, checked.
+    let st = store.org_store(&org).await?;
+    let key = st.keys().blob(&file.sha256)?;
+    if !blob_stored(&st, &key, file.size).await? {
+        let src = st.keys().join(&found.prefix, &file.path)?;
+        if let Some(problem) = store.snapshot_file(&st, &src, file).await? {
+            return Err(mismatch(&[problem]));
+        }
+    }
     Ok(Json(
         store
-            .ticket(&s, &ctx, &key, TicketMethod::Get, file.size)
+            .ticket(&s.seams, &ctx, &key, TicketMethod::Get, file.size)
             .await?,
     ))
 }

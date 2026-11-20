@@ -16,12 +16,14 @@
 //! ([`Relation::upstream_is_to`]): `run trained_on dsv` makes the dataset upstream of the
 //! run, `run produced ckpt` makes the run upstream of the checkpoint. `up` follows
 //! dependencies, `down` what was made from the node; edges are returned as stored. Every node
-//! is checked with the `Authorizer` (its family's read action, like `runs.read`; artifacts
-//! and uploads as their own endpoints check them); a node the caller may not see is returned
-//! as `{"id": "hidden-N", "kind": null, "redacted": true}` and is not followed further.
+//! is checked exactly as its owner's GET checks it: P19's kinds (artifacts, uploads, secrets)
+//! here, other kinds through a [`NodeLookup`](crate::modules::artifacts::NodeLookup) their
+//! module registers. A node the caller may not see, or that nobody can resolve, is returned
+//! as `{"id": "hidden-N", "kind": null, "redacted": true}` and is not followed further; such
+//! a root is not found.
 
 use crate::app::AppState;
-use crate::db::{Db, DbError, Tx};
+use crate::db::{DbError, Tx};
 use crate::error::{ApiError, ErrorCode};
 use crate::modules::artifacts::{field, org_of, owned, ArtifactStore, Error, READ};
 use crate::seams::{Decision, RequestContext, Resource};
@@ -193,57 +195,48 @@ pub(crate) fn has_table(kind: &str) -> bool {
     matches!(kind, "art" | "up")
 }
 
-/// How to check the caller may see `node` of `org`: the action and resource. Artifacts
-/// (committed) and uploads are looked up and checked exactly as their own endpoints check
-/// them; `None` when they are not in `org`. Other kinds get their family's read action;
-/// whether they exist is up to their owners (see [`belongs`]).
+/// How to check the caller may see `node` of `org`: the action and resource its owner's
+/// own GET checks. P19's kinds are looked up here (artifacts when committed, uploads,
+/// secrets unless being deleted), others through the lookup their module registered
+/// ([`ArtifactStore::add_lineage_lookup`]). `None`: not in `org`, or a kind nobody can
+/// resolve; such nodes are redacted and never a root.
 pub(crate) async fn access(
-    db: &Db,
+    store: &ArtifactStore,
     org: &str,
     node: NodeRef,
-) -> Result<Option<(&'static str, Resource)>, DbError> {
+) -> Result<Option<(&'static str, Resource)>, Error> {
     let project = |sql: &'static str| async move {
         sqlx::query_scalar::<_, Option<String>>(sql)
             .bind(org)
             .bind(node.id)
-            .fetch_optional(db.pool())
+            .fetch_optional(store.db().pool())
             .await
     };
+    let id = node.to_string();
     Ok(match node.kind {
         "art" => project(
             "SELECT project_id FROM artifacts WHERE org_id = $1 AND id = $2 AND state = 'COMMITTED'",
         )
         .await?
-        .map(|p| (READ, owned("artifact", org, node.to_string(), p))),
+        .map(|p| (READ, owned("artifact", org, id, p))),
         "up" => project("SELECT project_id FROM uploads WHERE org_id = $1 AND id = $2")
             .await?
-            .map(|p| {
-                (
-                    crate::modules::uploads::ACTION,
-                    owned("upload", org, node.to_string(), p),
-                )
-            }),
-        kind => Some((read_action(kind), node_resource(org, Some(node)))),
+            .map(|p| (crate::modules::uploads::ACTION, owned("upload", org, id, p))),
+        "sec" => project(
+            "SELECT project_id FROM secrets_metadata WHERE org_id = $1 AND id = $2 AND NOT deleting",
+        )
+        .await?
+        .map(|p| (crate::modules::secrets::READ, owned("secret", org, id, p))),
+        kind => match store.lookup(kind) {
+            Some(l) => l.find(org, node.id).await?,
+            None => None,
+        },
     })
 }
 
-/// True when `node` may be a lineage root in `org`: artifacts and uploads by their own row;
-/// other kinds (whose tables belong to other parts) when an edge of `org` touches them.
-/// Only modules that checked both ends write such edges, so an edge of `org` is evidence
-/// for a root, but never for a new link.
-pub async fn belongs(db: &Db, org: &str, node: NodeRef) -> Result<bool, DbError> {
-    if has_table(node.kind) {
-        return Ok(access(db, org, node).await?.is_some());
-    }
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM lineage_edges WHERE org_id = $1
-           AND ((from_kind = $2 AND from_id = $3) OR (to_kind = $2 AND to_id = $3)))",
-    )
-    .bind(org)
-    .bind(node.kind)
-    .bind(node.id)
-    .fetch_one(db.pool())
-    .await?)
+/// True when `node` may be a lineage root in `org`: its owner finds it there.
+pub async fn belongs(store: &ArtifactStore, org: &str, node: NodeRef) -> Result<bool, Error> {
+    Ok(access(store, org, node).await?.is_some())
 }
 
 /// The read action for a node kind.
@@ -346,22 +339,20 @@ pub(crate) async fn query(
     let root = NodeRef::parse(&id)
         .map_err(|_| ApiError::new(ErrorCode::NotFound, "No item with this id exists."))?;
     let org = org_of(&ctx)?;
-    s.authorize(&ctx, READ, &node_resource(&org, None)).await?;
+    s.authorize(&ctx, READ, &graph_resource(&org)).await?;
     let gone = || ApiError::new(ErrorCode::NotFound, "No item with this id exists.");
-    if !belongs(store.db(), &org, root).await? {
-        return Err(gone().into());
-    }
-    let (action, res) = access(store.db(), &org, root).await?.ok_or_else(gone)?;
+    let (action, res) = access(&store, &org, root).await?.ok_or_else(gone)?;
     s.authorize(&ctx, action, &res).await?;
     Ok(Json(
         walk(&s, &store, &ctx, &org, root, up, down, depth).await?,
     ))
 }
 
-fn node_resource(org: &str, node: Option<NodeRef>) -> Resource {
+/// The lineage graph of `org` as a whole.
+fn graph_resource(org: &str) -> Resource {
     Resource {
-        kind: node.map_or("lineage", |n| n.kind).to_owned(),
-        id: node.map(|n| n.to_string()),
+        kind: "lineage".to_owned(),
+        id: None,
         org: Some(org.to_owned()),
         project: None,
     }
@@ -471,7 +462,7 @@ async fn walk(
                 let visible = match shown.get(&n) {
                     Some(node) => !node.redacted,
                     None => {
-                        let visible = match access(store.db(), org, n).await? {
+                        let visible = match access(store, org, n).await? {
                             Some((action, res)) => {
                                 s.seams.authorizer.authorize(ctx, action, &res).await?
                                     == Decision::Allow

@@ -18,7 +18,8 @@ use crate::app::AppState;
 use crate::error::{ApiError, ErrorCode, FieldError};
 use crate::http::BODY_LIMIT;
 use crate::modules::artifacts::{
-    codes, field, not_found, org_of, owned, resource, scratch, split_action, ArtifactStore, Error,
+    allow, codes, destination, field, not_found, org_of, owned, scratch, split_action,
+    ArtifactStore, Error, UploadBlob,
 };
 use crate::seams::RequestContext;
 use axum::body::Bytes;
@@ -218,6 +219,36 @@ async fn load_visible(
     Ok(row)
 }
 
+/// The blob of the finished upload `up` of `org`, for registering an artifact from it. Not
+/// found (404) unless it exists in `org` and the caller may see it; it must be COMPLETED.
+pub(crate) async fn finished(
+    store: &ArtifactStore,
+    seams: &crate::seams::Seams,
+    ctx: &RequestContext,
+    org: &str,
+    up: &str,
+) -> Result<UploadBlob, Error> {
+    let row = load(store, org, up).await?;
+    allow(
+        seams,
+        ctx,
+        ACTION,
+        &owned("upload", org, row.key(), row.project_id.clone()),
+    )
+    .await
+    .map_err(|_| not_found("upload"))?;
+    if row.state != "COMPLETED" {
+        return Err(field(
+            &format!("/uploads/{up}"),
+            "This upload is not finished; complete it first.",
+        ));
+    }
+    Ok(UploadBlob {
+        size: row.size(),
+        sha256: row.sha256,
+    })
+}
+
 async fn load(store: &ArtifactStore, org: &str, up: &str) -> Result<Row, Error> {
     let id = up
         .parse::<UploadId>()
@@ -321,10 +352,14 @@ pub(crate) async fn create(
     ctx: RequestContext,
     Json(new): Json<NewUpload>,
 ) -> Result<(StatusCode, Json<Upload>), Error> {
-    s.authorize(&ctx, ACTION, &resource(&ctx, "upload", None))
-        .await?;
-    let part_size = check_new(&new)?;
     let org = org_of(&ctx)?;
+    s.authorize(
+        &ctx,
+        ACTION,
+        &destination("upload", &org, new.project_id.clone()),
+    )
+    .await?;
+    let part_size = check_new(&new)?;
     let id = s.seams.ids.new_uuid();
     let row: Row = sqlx::query_as(concat!(
         "INSERT INTO uploads (id, org_id, project_id, created_by, filename, size, sha256, part_size, state, expires_at)
@@ -358,7 +393,7 @@ pub(crate) async fn get(
     let org = org_of(&ctx)?;
     let row = load_visible(&s, &store, &ctx, &org, &up).await?;
     let parts = if row.state == "OPEN" {
-        let st = store.org_store(s.seams.secrets.as_ref(), &org).await?;
+        let st = store.org_store(&org).await?;
         received(&st, &row)
             .await?
             .into_iter()
@@ -414,7 +449,7 @@ pub(crate) async fn put_part(
             .into());
         }
     }
-    let st = store.org_store(s.seams.secrets.as_ref(), &org).await?;
+    let st = store.org_store(&org).await?;
     st.put(&part_key(&st, &row, n)?, body).await?;
     Ok(Json(
         serde_json::json!({ "part": n, "size": want, "sha256": sha }),
@@ -472,7 +507,7 @@ async fn presign_upload(
     if !row.is_open() {
         return Err(closed(&row));
     }
-    let st = store.org_store(s.seams.secrets.as_ref(), &org).await?;
+    let st = store.org_store(&org).await?;
     let parts = match req.parts {
         Some(p) => p,
         None => {
@@ -496,7 +531,7 @@ async fn presign_upload(
         }
         let key = part_key(&st, &row, n)?;
         let ticket = store
-            .ticket(s, ctx, &key, TicketMethod::Put, row.part_len(n))
+            .ticket(&s.seams, ctx, &key, TicketMethod::Put, row.part_len(n))
             .await?;
         out.push(PartTicket { part: n, ticket });
     }
@@ -525,11 +560,7 @@ async fn abort_upload(
     if done == 0 {
         return Err(closed(&row));
     }
-    delete_parts(
-        &store.org_store(s.seams.secrets.as_ref(), org).await?,
-        &row.key(),
-    )
-    .await?;
+    delete_parts(&store.org_store(org).await?, &row.key()).await?;
     let row = load(store, org, &row.key()).await?;
     Ok(row.into_upload(Vec::new()))
 }
@@ -550,7 +581,7 @@ async fn complete_upload(
     if !row.is_open() {
         return Err(closed(&row));
     }
-    let st = store.org_store(s.seams.secrets.as_ref(), org).await?;
+    let st = store.org_store(org).await?;
     let have = received(&st, &row).await?;
     let wrong: Vec<String> = (0..row.part_count())
         .filter_map(|n| match have.get(&n) {
@@ -692,7 +723,7 @@ pub async fn sweep(store: &ArtifactStore) -> Result<Swept, Error> {
         .into_iter()
         .map(|id| UploadId::from_uuid(id).to_string())
         .collect();
-    let backend = store.plain_backend()?;
+    let backend = store.backend().await?;
     let cutoff = OffsetDateTime::now_utc() - time::Duration::hours(24);
     let mut objects = 0;
     for org in orgs {

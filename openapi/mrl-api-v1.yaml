@@ -730,13 +730,24 @@ components:
           - string
           - 'null'
           description: |-
-            Folder of the files, relative to the org, ending in `/` (like `exports/exp1/`).
-            Default: `artifacts/{id}/`.
+            Folder of the files, relative to the org, ending in `/` (like `exports/exp1/`). Only
+            the server's own modules may use it ([`ArtifactStore::register`]); the HTTP API
+            refuses it and takes `uploads` instead, since a folder says nothing about who may
+            read its files.
         project_id:
           type:
           - string
           - 'null'
           description: Project, if the artifact belongs to one.
+        uploads:
+          type: object
+          description: |-
+            Where each file's bytes are: manifest path → id of a finished upload the caller may
+            see, with exactly that size and sha256. Every file needs one.
+          additionalProperties:
+            type: string
+          propertyNames:
+            type: string
       additionalProperties: false
     NewLink:
       type: object

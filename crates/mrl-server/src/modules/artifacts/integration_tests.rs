@@ -12,10 +12,13 @@ use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::Method;
 use mrl_server::config::{Config, Mode};
-use mrl_server::modules::artifacts::{ArtifactStore, ArtifactsModule, TICKET_KEY_NAME};
+use mrl_server::modules::artifacts::{
+    ArtifactStore, ArtifactsModule, NewArtifact, NodeLookup, TICKET_KEY_NAME,
+};
 use mrl_server::modules::secrets::SecretResolver;
 use mrl_server::seams::{
-    Authorizer, Decision, RequestContext, Resource, SeamError, Secret, SecretStore,
+    Authorizer, Decision, RequestContext, RequestMeta, Resource, SeamError, Seams, Secret,
+    SecretStore,
 };
 use mrl_storage::{
     sha256_hex, sign_ticket, Backend, BackendConfig, TicketClaims, TicketKey, TicketMethod,
@@ -111,8 +114,42 @@ impl Authorizer for ViewerRules {
     }
 }
 
+/// Stands in for the modules that own runs, datasets and checkpoints: it finds the ids the
+/// test said exist, checked with the kind's read action like their GETs would be.
+#[derive(Clone, Default)]
+struct Known(Arc<Mutex<std::collections::HashSet<(String, uuid::Uuid)>>>);
+
+struct KindLookup(&'static str, Known);
+
+#[async_trait]
+impl NodeLookup for KindLookup {
+    async fn find(
+        &self,
+        org: &str,
+        id: uuid::Uuid,
+    ) -> Result<Option<(&'static str, Resource)>, mrl_server::modules::artifacts::Error> {
+        let known = self.1 .0.lock().unwrap().contains(&(org.to_owned(), id));
+        Ok(known.then(|| {
+            (
+                mrl_server::modules::lineage::read_action(self.0),
+                Resource {
+                    kind: self.0.to_owned(),
+                    id: Some(id.to_string()),
+                    org: Some(org.to_owned()),
+                    project: None,
+                },
+            )
+        }))
+    }
+}
+
+/// The kinds the test lookups cover.
+const LOOKED_UP: [&str; 3] = ["run", "dsv", "ckpt"];
+
 struct Env {
     srv: TestServer,
+    seams: Seams,
+    known: Known,
     db: TestDb,
     store: Arc<ArtifactStore>,
     resolver: SecretResolver,
@@ -126,6 +163,11 @@ struct Env {
 
 impl Env {
     async fn start(kind: Kind) -> Option<Env> {
+        Self::start_with(kind, true).await
+    }
+
+    /// A team server; `secret_store: false` starts it without a `SecretStore`.
+    async fn start_with(kind: Kind, secret_store: bool) -> Option<Env> {
         let (config, dir) = match kind {
             Kind::Fs => {
                 let dir = tempfile::tempdir().unwrap();
@@ -175,11 +217,21 @@ impl Env {
         ] {
             (b.per_second, b.burst) = (100_000, 100_000);
         }
-        let srv = TestServer::start(c, ts::build(builder, Mode::Team), vec![Box::new(module)])
+        let known = Known::default();
+        for k in LOOKED_UP {
+            store.add_lineage_lookup(k, Arc::new(KindLookup(k, known.clone())));
+        }
+        let mut seams = ts::build(builder, Mode::Team);
+        if !secret_store {
+            seams.secrets = None;
+        }
+        let srv = TestServer::start(c, seams.clone(), vec![Box::new(module)])
             .await
             .unwrap_or_else(|e| panic!("{}", e.explain()));
         Some(Env {
             srv,
+            seams,
+            known,
             db,
             store,
             resolver,
@@ -190,6 +242,90 @@ impl Env {
             scratch,
             _dir: dir,
         })
+    }
+
+    /// Tells the stand-in lookups that these ids exist in `org`.
+    fn exists(&self, org: &str, ids: &[&str]) {
+        let mut k = self.known.0.lock().unwrap();
+        for id in ids {
+            let n = mrl_server::modules::lineage::NodeRef::parse(id).unwrap();
+            k.insert((org.to_owned(), n.id));
+        }
+    }
+
+    /// `usr-a`'s context, for calls the server's own modules make.
+    fn ctx_a(&self) -> RequestContext {
+        RequestContext::new(
+            user("usr-a", "org-a"),
+            &RequestMeta {
+                trace_id: "0".repeat(32),
+                request_id: "test".to_owned(),
+            },
+        )
+    }
+
+    /// Registers like a module of the server does: from a storage folder.
+    async fn register_from(
+        &self,
+        name: &str,
+        prefix: &str,
+        manifest: Value,
+    ) -> Result<Value, mrl_server::modules::artifacts::Error> {
+        let new: NewArtifact =
+            serde_json::from_value(json!({"name": name, "prefix": prefix, "manifest": manifest}))
+                .unwrap();
+        let art = self.store.register(&self.seams, &self.ctx_a(), new).await?;
+        Ok(serde_json::to_value(art).unwrap())
+    }
+
+    /// Uploads `bytes` as `auth` (one part) and finishes it; returns the upload id.
+    async fn upload(&self, auth: &str, bytes: &[u8], project: Option<&str>) -> String {
+        let r = self
+            .call(
+                Method::POST,
+                "/api/v1/uploads",
+                auth,
+                Some(json!({"filename": "f", "size": bytes.len(), "sha256": sha256_hex(bytes), "project_id": project})),
+            )
+            .await;
+        assert_eq!(r.status, 201, "{}", r.text());
+        let up = r.json()["id"].as_str().unwrap().to_owned();
+        if !bytes.is_empty() {
+            let r = self
+                .put_bytes(
+                    &format!("/api/v1/uploads/{up}/parts/0"),
+                    Some(auth),
+                    bytes.to_vec(),
+                    &[],
+                )
+                .await;
+            assert_eq!(r.status, 200, "{}", r.text());
+        }
+        let r = self
+            .call(
+                Method::POST,
+                &format!("/api/v1/uploads/{up}:complete"),
+                auth,
+                None,
+            )
+            .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        up
+    }
+
+    /// Uploads `files` as `usr-a`; returns the manifest and the `uploads` map for them.
+    async fn upload_files(&self, files: &[(&str, &[u8])]) -> (Value, Value) {
+        let mut list = Vec::new();
+        let mut uploads = serde_json::Map::new();
+        for (path, bytes) in files {
+            let up = self.upload(A, bytes, None).await;
+            uploads.insert((*path).to_owned(), json!(up));
+            list.push(json!({"path": path, "size": bytes.len(), "sha256": sha256_hex(bytes), "role": "report"}));
+        }
+        (
+            json!({"schema_version": "artifact-manifest/v1", "kind": "eval", "created_at": "2026-11-16T00:00:00Z", "files": list}),
+            Value::Object(uploads),
+        )
     }
 
     /// The server's secret store, as the test sees it.
@@ -786,16 +922,13 @@ async fn artifacts_register_and_download(kind: Kind) {
     let Some(e) = Env::start(kind).await else {
         return;
     };
-    let manifest = put_files(
-        &e,
-        "evals/e1/",
-        &[
+    let (manifest, uploads) = e
+        .upload_files(&[
             ("results.json", b"{\"score\": 1}"),
             ("notes.txt", b"hello world"),
-        ],
-    )
-    .await;
-    let body = json!({"name": "eval-1", "prefix": "evals/e1/", "manifest": manifest});
+        ])
+        .await;
+    let body = json!({"name": "eval-1", "manifest": manifest, "uploads": uploads});
     let r = e
         .call(Method::POST, "/api/v1/artifacts", A, Some(body.clone()))
         .await;
@@ -808,7 +941,7 @@ async fn artifacts_register_and_download(kind: Kind) {
         .call(Method::POST, "/api/v1/artifacts", A, Some(body))
         .await;
     assert_eq!((r.status, code(&r).as_str()), (409, "MRL-CONFLICT-190"));
-    // A manifest that does not match storage fails and frees its name.
+    // A manifest that does not match its upload fails and frees its name.
     let mut wrong = manifest.clone();
     wrong["files"][1]["sha256"] = json!(sha256_hex(b"something else"));
     let r = e
@@ -816,7 +949,7 @@ async fn artifacts_register_and_download(kind: Kind) {
             Method::POST,
             "/api/v1/artifacts",
             A,
-            Some(json!({"name": "eval-2", "prefix": "evals/e1/", "manifest": wrong})),
+            Some(json!({"name": "eval-2", "manifest": wrong, "uploads": uploads})),
         )
         .await;
     assert_eq!(
@@ -826,17 +959,17 @@ async fn artifacts_register_and_download(kind: Kind) {
         r.text()
     );
     assert!(r.json()["detail"].as_str().unwrap().contains("notes.txt"));
-    let missing = json!({"schema_version": "artifact-manifest/v1", "kind": "export", "created_at": "2026-11-16T00:00:00Z",
-        "files": [{"path": "gone.bin", "size": 1, "sha256": sha256_hex(b"x"), "role": "weights"}]});
+    // Every file needs an upload; storage folders are for the server's own modules.
     let r = e
         .call(
             Method::POST,
             "/api/v1/artifacts",
             A,
-            Some(json!({"name": "eval-2", "manifest": missing})),
+            Some(json!({"name": "eval-2", "manifest": manifest})),
         )
         .await;
-    assert_eq!(code(&r), "MRL-STORE-011");
+    assert_eq!(r.status, 422, "{}", r.text());
+    assert!(r.text().contains("/uploads/"), "{}", r.text());
     let r = e
         .call(
             Method::POST,
@@ -845,30 +978,53 @@ async fn artifacts_register_and_download(kind: Kind) {
             Some(json!({"name": "eval-2", "prefix": "evals/e1/", "manifest": manifest})),
         )
         .await;
-    assert_eq!(
-        r.status,
-        201,
-        "a failed registration frees the name: {}",
-        r.text()
-    );
-    let id2 = r.json()["id"].as_str().unwrap().to_owned();
-    // Staging areas are refused: their files are deleted or rewritten later.
+    assert_eq!(r.status, 422, "{}", r.text());
+    assert!(r.text().contains("/prefix"), "{}", r.text());
     let r = e
         .call(
             Method::POST,
-            "/api/v1/uploads",
+            "/api/v1/artifacts",
             A,
-            Some(json!({"filename": "p", "size": 12, "sha256": sha256_hex(b"{\"score\": 1}")})),
+            Some(json!({"name": "eval-2", "manifest": manifest, "uploads": uploads})),
         )
         .await;
-    let up = r.json()["id"].as_str().unwrap().to_owned();
-    e.put_bytes(
-        &format!("/api/v1/uploads/{up}/parts/0"),
-        Some(A),
-        b"{\"score\": 1}".to_vec(),
-        &[],
+    assert_eq!(
+        r.status,
+        201,
+        "a failed registration frees the name; content is shared: {}",
+        r.text()
+    );
+    let id2 = r.json()["id"].as_str().unwrap().to_owned();
+    // The server's own modules register from a folder: the files are copied and checked.
+    let folder = put_files(
+        &e,
+        "evals/e3/",
+        &[("results.json", b"{\"score\": 3}"), ("notes.txt", b"third")],
     )
     .await;
+    let id3 = e
+        .register_from("eval-3", "evals/e3/", folder.clone())
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut bad = folder.clone();
+    bad["files"][1]["sha256"] = json!(sha256_hex(b"other"));
+    let err = e
+        .register_from("eval-4", "evals/e3/", bad)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "MRL-STORE-011");
+    let missing = json!({"schema_version": "artifact-manifest/v1", "kind": "export", "created_at": "2026-11-16T00:00:00Z",
+        "files": [{"path": "gone.bin", "size": 1, "sha256": sha256_hex(b"x"), "role": "weights"}]});
+    let err = e
+        .register_from("eval-4", "evals/e3/", missing)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "MRL-STORE-011");
+    // Staging areas are refused: their files are deleted or rewritten later.
+    let up = e.upload(A, b"{\"score\": 1}", None).await;
     let part = json!({"schema_version": "artifact-manifest/v1", "kind": "eval", "created_at": "2026-11-16T00:00:00Z",
         "files": [{"path": "000000", "size": 12, "sha256": sha256_hex(b"{\"score\": 1}"), "role": "report"}]});
     let staged = put_files(
@@ -878,22 +1034,15 @@ async fn artifacts_register_and_download(kind: Kind) {
     )
     .await;
     for (prefix, m) in [
-        (format!("uploads/{up}/parts/"), part),
+        (format!("uploads/{up}/parts/"), part.clone()),
+        (format!("UPLOADS/{up}/parts/"), part),
         (
             "runs/r/checkpoints/c/_staging/attempt-1/".to_owned(),
             staged,
         ),
     ] {
-        let r = e
-            .call(
-                Method::POST,
-                "/api/v1/artifacts",
-                A,
-                Some(json!({"name": "staged", "prefix": prefix, "manifest": m})),
-            )
-            .await;
-        assert_eq!(r.status, 422, "{prefix}: {}", r.text());
-        assert!(r.text().contains("staging"), "{}", r.text());
+        let err = e.register_from("staged", &prefix, m).await.unwrap_err();
+        assert!(format!("{err:?}").contains("staging"), "{prefix}: {err:?}");
     }
     let r = e
         .call(Method::GET, "/api/v1/artifacts?kind=eval&limit=1", A, None)
@@ -919,10 +1068,10 @@ async fn artifacts_register_and_download(kind: Kind) {
         .collect();
     assert_eq!(issued.len(), 1);
     assert_eq!(issued[0].actor, "usr-a");
+    let blob = issued[0].target.clone();
     assert!(
-        issued[0].target.ends_with(&sha256_hex(b"hello world")),
-        "downloads read the checked copy: {}",
-        issued[0].target
+        blob.ends_with(&sha256_hex(b"hello world")) && blob.contains("/blobs/"),
+        "downloads read the checked copy: {blob}"
     );
     match kind {
         Kind::Fs => {
@@ -957,34 +1106,92 @@ async fn artifacts_register_and_download(kind: Kind) {
         }
         Kind::S3 => assert_eq!(t["presigned"], true),
     }
-    // Rewriting the source (same length, other bytes) changes no committed artifact, nor
-    // the one sharing its content.
+    // The reserved blob area can't be written, however it is spelled (on a case-insensitive
+    // disk `BLOBS` is the same folder): neither issued nor redeemed.
+    let key = e.ticket_key().await;
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    for spelling in ["/BLOBS/", "/Blobs/", "/blobs./"] {
+        let target = blob.replacen("/blobs/", spelling, 1);
+        let err = e
+            .store
+            .ticket(&e.seams, &e.ctx_a(), &target, TicketMethod::Put, 11)
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), "MRL-PERM-001", "{spelling}");
+        let forged = sign_ticket(
+            &key,
+            &TicketClaims {
+                key: target,
+                method: TicketMethod::Put,
+                max_size: 11,
+                issued_at: now,
+                expires_at: now + 300,
+            },
+        )
+        .unwrap();
+        let r = e
+            .put_bytes(
+                &format!("/api/v1/transfer/{forged}"),
+                None,
+                b"HELLO WORLD".to_vec(),
+                &[],
+            )
+            .await;
+        assert_eq!(r.status, 403, "{spelling}: {}", r.text());
+    }
+    // Rewriting a source folder (same length, other bytes) changes no committed artifact,
+    // nor the ones sharing its content.
     put_files(
         &e,
-        "evals/e1/",
-        &[
-            ("results.json", b"{\"score\": 0}"),
-            ("notes.txt", b"HELLO WORLD"),
-        ],
+        "evals/e3/",
+        &[("results.json", b"{\"score\": 0}"), ("notes.txt", b"THIRD")],
     )
     .await;
-    for art in [&id, &id2] {
-        for (path, want) in [
-            ("notes.txt", &b"hello world"[..]),
-            ("results.json", b"{\"score\": 1}"),
-        ] {
-            let r = e
-                .call(
-                    Method::POST,
-                    &format!("/api/v1/artifacts/{art}:download"),
-                    A,
-                    Some(json!({"path": path})),
-                )
-                .await;
-            assert_eq!(r.status, 200, "{}", r.text());
-            assert_eq!(e.fetch(&r.json()).await, want, "{art} {path}");
-        }
+    for (art, path, want) in [
+        (&id, "notes.txt", &b"hello world"[..]),
+        (&id, "results.json", b"{\"score\": 1}"),
+        (&id2, "notes.txt", b"hello world"),
+        (&id3, "notes.txt", b"third"),
+        (&id3, "results.json", b"{\"score\": 3}"),
+    ] {
+        let r = e
+            .call(
+                Method::POST,
+                &format!("/api/v1/artifacts/{art}:download"),
+                A,
+                Some(json!({"path": path})),
+            )
+            .await;
+        assert_eq!(r.status, 200, "{}", r.text());
+        assert_eq!(e.fetch(&r.json()).await, want, "{art} {path}");
     }
+    // An artifact committed before files were copied (only its folder has them) gets its
+    // checked copy on the first download.
+    let legacy = uuid::Uuid::now_v7();
+    let legacy_bytes = b"legacy bytes";
+    let legacy_manifest = put_files(&e, "old/l1/", &[("l.bin", legacy_bytes)]).await;
+    e.db.seed(&format!(
+        "INSERT INTO artifacts (id, org_id, name, kind, prefix, manifest, size_bytes, state, created_by, committed_at)
+         VALUES ('{legacy}', 'org-a', 'legacy', 'eval', 'orgs/org-a/old/l1/', '{}', {}, 'COMMITTED', 'usr-a', now())",
+        legacy_manifest, legacy_bytes.len()
+    ))
+    .await;
+    let legacy_id = mrl_domain::ids::ArtifactId::from_uuid(legacy).to_string();
+    let r = e
+        .call(
+            Method::POST,
+            &format!("/api/v1/artifacts/{legacy_id}:download"),
+            A,
+            Some(json!({"path": "l.bin"})),
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(e.fetch(&r.json()).await, legacy_bytes);
+    let st = e.backend.org("org-a").unwrap();
+    assert!(st
+        .head(&st.keys().blob(&sha256_hex(legacy_bytes)).unwrap())
+        .await
+        .is_ok());
     e.scratch_cleaned("registration").await;
     let r = e
         .call(
@@ -1033,13 +1240,14 @@ async fn lineage_redacts_what_the_caller_cannot_see() {
         .await
         .unwrap();
     tx.commit().await.unwrap();
-    let manifest = put_files(&e, "evals/l/", &[("r.json", b"{}")]).await;
+    e.exists("org-a", &[&run, &dsv, &ckpt]);
+    let (manifest, uploads) = e.upload_files(&[("r.json", b"{}")]).await;
     let r = e
         .call(
             Method::POST,
             "/api/v1/artifacts",
             A,
-            Some(json!({"name": "l", "prefix": "evals/l/", "manifest": manifest})),
+            Some(json!({"name": "l", "manifest": manifest, "uploads": uploads})),
         )
         .await;
     let art = r.json()["id"].as_str().unwrap().to_owned();
@@ -1120,6 +1328,7 @@ async fn lineage_follows_what_depends_on_what() {
     );
     use mrl_server::modules::lineage::{LineageWriter, NodeRef, Relation};
     let n = |s: &str| NodeRef::parse(s).unwrap();
+    e.exists("org-a", &[&run, &dsv, &ckpt]);
     let mut tx = e.db.db().begin().await.unwrap();
     LineageWriter::link(&mut tx, "org-a", n(&run), Relation::TrainedOn, n(&dsv))
         .await
@@ -1264,7 +1473,8 @@ async fn links_need_a_visible_item_of_the_org() {
                 )),
             )
             .await;
-        assert_eq!(r.status, 422, "{to}: {}", r.text());
+        let want = if to == &run { 422 } else { 404 };
+        assert_eq!(r.status, want, "{to}: {}", r.text());
         assert!(!r.text().contains("theirs"), "{}", r.text());
     }
     assert_eq!(e.db.count("lineage_edges").await, 0, "no edge was written");
@@ -1510,14 +1720,15 @@ async fn other_orgs_see_nothing() {
         )
         .await;
     let up = r.json()["id"].as_str().unwrap().to_owned();
-    let manifest = put_files(&e, "evals/x/", &[("a.json", b"{}")]).await;
+    let (manifest, uploads) = e.upload_files(&[("a.json", b"{}")]).await;
     let ckpt = mrl_domain::ids::CheckpointId::new().to_string();
+    e.exists("org-a", &[&ckpt]);
     let r = e
         .call(
             Method::POST,
             "/api/v1/artifacts",
             A,
-            Some(json!({"name": "x", "prefix": "evals/x/", "manifest": manifest})),
+            Some(json!({"name": "x", "manifest": manifest, "uploads": uploads})),
         )
         .await;
     let art = r.json()["id"].as_str().unwrap().to_owned();
@@ -1612,7 +1823,24 @@ async fn other_orgs_see_nothing() {
             Some(json!({"name": "b", "manifest": manifest_b, "links": [{"relation": "derived_from", "to": art}]})),
         )
         .await;
-    assert_eq!(r.status, 422, "{}", r.text());
+    assert_eq!(r.status, 404, "{}", r.text());
+    // Nor build an artifact from org-a's upload.
+    let first = uploads
+        .as_object()
+        .unwrap()
+        .values()
+        .next()
+        .unwrap()
+        .clone();
+    let r = e
+        .call(
+            Method::POST,
+            "/api/v1/artifacts",
+            B,
+            Some(json!({"name": "b2", "manifest": manifest, "uploads": {"a.json": first}})),
+        )
+        .await;
+    assert_eq!(r.status, 404, "{}", r.text());
     // org-b's own storage is separate from org-a's.
     assert!(e
         .backend
@@ -2121,6 +2349,26 @@ async fn secret_delete_and_rotation_never_interleave() {
     assert!(stored(&e, &sec).await.is_none());
     assert_eq!(secret_rows(&e, &sec).await, 0);
 
+    // A server restarted without its secret store: the reference is kept (503), and a
+    // retry once the store is back removes the value.
+    let sec = new_secret(&e, "five").await;
+    assert_eq!(set_secret(&e, &sec, "v").await.status, 204);
+    let id: mrl_domain::ids::SecretId = sec.parse().unwrap();
+    let err = e
+        .resolver
+        .delete(None, "org-a", id.as_uuid())
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "MRL-ENV-190");
+    assert_eq!(secret_rows(&e, &sec).await, 1, "the reference is kept");
+    assert!(stored(&e, &sec).await.is_some());
+    e.resolver
+        .delete(Some(&e.store_seam()), "org-a", id.as_uuid())
+        .await
+        .unwrap();
+    assert!(stored(&e, &sec).await.is_none());
+    assert_eq!(secret_rows(&e, &sec).await, 0);
+
     // A server stopped after removing the value but before the metadata: deleting again
     // finishes, grants included.
     let sec = new_secret(&e, "four").await;
@@ -2157,10 +2405,31 @@ async fn team_replicas_share_one_ticket_key() {
     let replica = |db: mrl_server::db::Db, mode: Mode| {
         ArtifactsModule::with_backend(db, config.clone(), mode, dir.path().join("scratch")).store()
     };
+    // Seams of a server whose secret store is `store`.
+    let seams_with = |store: Option<Arc<dyn SecretStore>>, mode: Mode| {
+        let b = if mode == Mode::Solo {
+            ts::solo("s")
+        } else {
+            ts::team(&[])
+        };
+        let mut seams = ts::build(b, mode);
+        seams.secrets = store;
+        seams
+    };
+    let ctx = |org: &str| {
+        RequestContext::new(
+            user("usr-a", org),
+            &RequestMeta {
+                trace_id: "0".repeat(32),
+                request_id: "test".to_owned(),
+            },
+        )
+    };
     let shared: Arc<dyn SecretStore> = Arc::new(Shared(
         Arc::new(InMemorySecretStore::default()),
         Arc::new(Ctl::default()),
     ));
+    let team = seams_with(Some(shared.clone()), Mode::Team);
     let key = "orgs/org-a/runs/r/w.bin";
     let token =
         |t: mrl_storage::TransferTicket| t.url.trim_start_matches("/api/v1/transfer/").to_owned();
@@ -2169,23 +2438,12 @@ async fn team_replicas_share_one_ticket_key() {
         replica(db.db().clone(), Mode::Team),
         replica(db.replica(), Mode::Team),
     );
+    let (c1, c2) = (ctx("org-a"), ctx("org-a"));
     let (a, b) = tokio::join!(
-        one.org_store(Some(&shared), "org-a"),
-        two.org_store(Some(&shared), "org-a")
+        one.ticket(&team, &c1, key, TicketMethod::Put, 10),
+        two.ticket(&team, &c2, key, TicketMethod::Put, 10)
     );
-    let ttl = Duration::from_secs(600);
-    let from_one = token(
-        a.unwrap()
-            .transfer_ticket(key, TicketMethod::Put, 10, ttl)
-            .await
-            .unwrap(),
-    );
-    let from_two = token(
-        b.unwrap()
-            .transfer_ticket(key, TicketMethod::Put, 10, ttl)
-            .await
-            .unwrap(),
-    );
+    let (from_one, from_two) = (token(a.unwrap()), token(b.unwrap()));
     one.verify(Some(&shared), &from_two, TicketMethod::Put)
         .await
         .unwrap();
@@ -2198,7 +2456,8 @@ async fn team_replicas_share_one_ticket_key() {
         .verify(Some(&shared), &from_one, TicketMethod::Put)
         .await
         .unwrap();
-    // No usable store: a team server signs nothing rather than use a key of its own.
+    // No usable store: a team server signs nothing rather than use a key of its own, while
+    // plain storage keeps working.
     let ctl = Arc::new(Ctl::default());
     ctl.down.store(true, Ordering::SeqCst);
     let down: Arc<dyn SecretStore> = Arc::new(Shared(
@@ -2206,17 +2465,67 @@ async fn team_replicas_share_one_ticket_key() {
         ctl.clone(),
     ));
     let four = replica(db.replica(), Mode::Team);
-    let err = four.org_store(Some(&down), "org-a").await.unwrap_err();
-    assert_eq!(err.code(), "MRL-INTERNAL-002");
-    let err = four.org_store(None, "org-a").await.unwrap_err();
-    assert_eq!(err.code(), "MRL-ENV-190");
-    ctl.down.store(false, Ordering::SeqCst);
-    four.org_store(Some(&down), "org-a")
+    let err = four
+        .ticket(
+            &seams_with(Some(down.clone()), Mode::Team),
+            &c1,
+            key,
+            TicketMethod::Put,
+            10,
+        )
         .await
-        .expect("a store that answers again is used on the next call");
+        .unwrap_err();
+    assert_eq!(err.code(), "MRL-INTERNAL-002");
+    let err = four
+        .ticket(
+            &seams_with(None, Mode::Team),
+            &c1,
+            key,
+            TicketMethod::Put,
+            10,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "MRL-ENV-190");
+    let err = four
+        .verify(None, &from_one, TicketMethod::Put)
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), "MRL-ENV-190");
+    four.org_store("org-a")
+        .await
+        .unwrap()
+        .put(key, b"x".to_vec().into())
+        .await
+        .unwrap();
+    ctl.down.store(false, Ordering::SeqCst);
+    four.ticket(
+        &seams_with(Some(down), Mode::Team),
+        &c1,
+        key,
+        TicketMethod::Put,
+        10,
+    )
+    .await
+    .expect("a store that answers again is used on the next call");
     // A solo server has one process: a key of its own is fine.
     let solo = replica(db.replica(), Mode::Solo);
-    solo.org_store(None, "local").await.unwrap();
+    let local = RequestContext::new(
+        mrl_server::seams::Principal::local_owner(),
+        &RequestMeta {
+            trace_id: "0".repeat(32),
+            request_id: "test".to_owned(),
+        },
+    );
+    solo.ticket(
+        &seams_with(None, Mode::Solo),
+        &local,
+        "orgs/local/runs/r/w.bin",
+        TicketMethod::Put,
+        10,
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -2224,13 +2533,13 @@ async fn team_replicas_share_one_ticket_key() {
 async fn transfer_tickets_stay_out_of_telemetry() {
     let logs = logs();
     let e = Env::start(Kind::Fs).await.unwrap();
-    let manifest = put_files(&e, "evals/t/", &[("t.txt", b"telemetry")]).await;
+    let (manifest, uploads) = e.upload_files(&[("t.txt", b"telemetry")]).await;
     let r = e
         .call(
             Method::POST,
             "/api/v1/artifacts",
             A,
-            Some(json!({"name": "t", "prefix": "evals/t/", "manifest": manifest})),
+            Some(json!({"name": "t", "manifest": manifest, "uploads": uploads})),
         )
         .await;
     let art = r.json()["id"].as_str().unwrap().to_owned();
@@ -2312,22 +2621,42 @@ async fn solo_ticket_urls_still_need_the_launch_secret() {
         ("x-mrl-launch-secret", srv.secret.as_str()),
         ("content-type", "application/json"),
     ];
-    let st = Backend::connect(&config).unwrap().org("local").unwrap();
-    st.put("orgs/local/evals/s/s.txt", b"solo".to_vec().into())
-        .await
-        .unwrap();
-    let manifest = json!({"schema_version": "artifact-manifest/v1", "kind": "eval", "created_at": "2026-11-16T00:00:00Z",
-        "files": [{"path": "s.txt", "size": 4, "sha256": sha256_hex(b"solo"), "role": "report"}]});
+    let post = |path: String, body: Value| {
+        let srv = &srv;
+        async move {
+            srv.request(
+                Method::POST,
+                &path,
+                &with_json,
+                Body::from(body.to_string()),
+            )
+            .await
+        }
+    };
+    let r = post(
+        "/api/v1/uploads".into(),
+        json!({"filename": "s", "size": 4, "sha256": sha256_hex(b"solo")}),
+    )
+    .await;
+    let up = r.json()["id"].as_str().unwrap().to_owned();
     let r = srv
         .request(
-            Method::POST,
-            "/api/v1/artifacts",
-            &with_json,
-            Body::from(
-                json!({"name": "s", "prefix": "evals/s/", "manifest": manifest}).to_string(),
-            ),
+            Method::PUT,
+            &format!("/api/v1/uploads/{up}/parts/0"),
+            &gate,
+            Body::from(b"solo".to_vec()),
         )
         .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let r = post(format!("/api/v1/uploads/{up}:complete"), json!({})).await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let manifest = json!({"schema_version": "artifact-manifest/v1", "kind": "eval", "created_at": "2026-11-16T00:00:00Z",
+        "files": [{"path": "s.txt", "size": 4, "sha256": sha256_hex(b"solo"), "role": "report"}]});
+    let r = post(
+        "/api/v1/artifacts".into(),
+        json!({"name": "s", "manifest": manifest, "uploads": {"s.txt": up}}),
+    )
+    .await;
     assert_eq!(r.status, 201, "{}", r.text());
     let art = r.json()["id"].as_str().unwrap().to_owned();
     let r = srv
@@ -2358,4 +2687,159 @@ async fn solo_ticket_urls_still_need_the_launch_secret() {
     ] {
         assert_eq!(srv.get(path).await.status, 401, "{path}");
     }
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn creating_needs_the_destination_and_a_visible_source() {
+    let e = Env::start(Kind::Fs).await.unwrap();
+    let empty = json!({"schema_version": "artifact-manifest/v1", "kind": "eval", "created_at": "2026-11-16T00:00:00Z", "files": []});
+    // The viewer can't create anything in the project it can't see.
+    for (path, body) in [
+        (
+            "/api/v1/artifacts",
+            json!({"name": "p-art", "project_id": PRIVATE, "manifest": empty}),
+        ),
+        (
+            "/api/v1/uploads",
+            json!({"filename": "p", "size": 1, "sha256": sha256_hex(b"p"), "project_id": PRIVATE}),
+        ),
+        (
+            "/api/v1/secrets",
+            json!({"name": "p-sec", "kind": "generic", "allowed_uses": ["run"], "project_id": PRIVATE}),
+        ),
+    ] {
+        let r = e.call(Method::POST, path, VIEWER, Some(body)).await;
+        assert_eq!(r.status, 404, "{path}: {}", r.text());
+    }
+    for table in ["artifacts", "uploads", "secrets_metadata"] {
+        assert_eq!(e.db.count(table).await, 0, "{table}");
+    }
+    // Nor build an artifact from an upload it can't see, even knowing its size and hash.
+    let bytes = b"private weights";
+    let up = e.upload(A, bytes, Some(PRIVATE)).await;
+    let manifest = json!({"schema_version": "artifact-manifest/v1", "kind": "eval", "created_at": "2026-11-16T00:00:00Z",
+        "files": [{"path": "w.bin", "size": bytes.len(), "sha256": sha256_hex(bytes), "role": "weights"}]});
+    let body = json!({"name": "stolen", "manifest": manifest, "uploads": {"w.bin": up}});
+    let r = e
+        .call(
+            Method::POST,
+            "/api/v1/artifacts",
+            VIEWER,
+            Some(body.clone()),
+        )
+        .await;
+    assert_eq!(r.status, 404, "{}", r.text());
+    assert_eq!(e.db.count("artifacts").await, 0, "no name was reserved");
+    let r = e
+        .call(Method::POST, "/api/v1/artifacts", A, Some(body))
+        .await;
+    assert_eq!(r.status, 201, "its owner can: {}", r.text());
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn lineage_shows_only_nodes_their_owner_resolves() {
+    let e = Env::start(Kind::Fs).await.unwrap();
+    use mrl_server::modules::lineage::{LineageWriter, NodeRef, Relation};
+    let r = e
+        .call(Method::POST, "/api/v1/artifacts", A, Some(json!({"name": "open", "manifest":
+            {"schema_version": "artifact-manifest/v1", "kind": "eval", "created_at": "2026-11-16T00:00:00Z", "files": []}})))
+        .await;
+    let art = r.json()["id"].as_str().unwrap().to_owned();
+    let r = e
+        .call(Method::POST, "/api/v1/secrets", A, Some(json!({"name": "hidden", "kind": "generic", "allowed_uses": ["run"], "project_id": PRIVATE})))
+        .await;
+    let sec = r.json()["id"].as_str().unwrap().to_owned();
+    // A model kind no module resolves yet.
+    let mdl = mrl_domain::ids::ModelId::new().to_string();
+    let n = |s: &str| NodeRef::parse(s).unwrap();
+    let mut tx = e.db.db().begin().await.unwrap();
+    LineageWriter::link(&mut tx, "org-a", n(&art), Relation::GeneratedBy, n(&sec))
+        .await
+        .unwrap();
+    LineageWriter::link(&mut tx, "org-a", n(&art), Relation::DerivedFrom, n(&mdl))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let r = e
+        .call(Method::GET, &format!("/api/v1/secrets/{sec}"), VIEWER, None)
+        .await;
+    assert_eq!(r.status, 404, "the viewer can't read the secret");
+    let g = e
+        .call(Method::GET, &format!("/api/v1/lineage/{art}"), VIEWER, None)
+        .await;
+    assert_eq!(g.status, 200, "{}", g.text());
+    assert!(
+        !g.text().contains(&sec) && !g.text().contains(&mdl),
+        "{}",
+        g.text()
+    );
+    let g = e
+        .call(Method::GET, &format!("/api/v1/lineage/{art}"), A, None)
+        .await;
+    assert!(
+        g.text().contains(&sec),
+        "its owner sees the secret: {}",
+        g.text()
+    );
+    assert!(
+        !g.text().contains(&mdl),
+        "nobody sees an unresolved node: {}",
+        g.text()
+    );
+    let redacted = g.json()["nodes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|n| n["redacted"] == true)
+        .count();
+    assert_eq!(redacted, 1);
+    for root in [&mdl, &sec] {
+        let r = e
+            .call(
+                Method::GET,
+                &format!("/api/v1/lineage/{root}"),
+                VIEWER,
+                None,
+            )
+            .await;
+        assert_eq!(r.status, 404, "{root}");
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn storage_works_without_a_signing_key() {
+    let e = Env::start_with(Kind::Fs, false).await.unwrap();
+    // Uploading through the API needs no ticket, so no signing key.
+    let up = e.upload(A, b"no store", None).await;
+    let r = e
+        .call(Method::GET, &format!("/api/v1/uploads/{up}"), A, None)
+        .await;
+    assert_eq!(r.json()["state"], "COMPLETED");
+    // Tickets do, and fail closed.
+    let r = e
+        .call(
+            Method::POST,
+            "/api/v1/uploads",
+            A,
+            Some(json!({"filename": "t", "size": 3, "sha256": sha256_hex(b"abc")})),
+        )
+        .await;
+    let open = r.json()["id"].as_str().unwrap().to_owned();
+    let r = e
+        .call(
+            Method::POST,
+            &format!("/api/v1/uploads/{open}:presign"),
+            A,
+            None,
+        )
+        .await;
+    assert_eq!(
+        (r.status, code(&r).as_str()),
+        (503, "MRL-ENV-190"),
+        "{}",
+        r.text()
+    );
 }

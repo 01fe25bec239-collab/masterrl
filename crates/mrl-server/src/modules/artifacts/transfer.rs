@@ -46,9 +46,7 @@ pub(super) async fn upload(
     let claims = store
         .verify(s.seams.secrets.as_ref(), &token, TicketMethod::Put)
         .await?;
-    let st = store
-        .org_store(s.seams.secrets.as_ref(), claims.org_id())
-        .await?;
+    let st = store.org_store(claims.org_id()).await?;
     if super::is_immutable(&st, &claims.key) {
         return Err(super::immutable());
     }
@@ -135,9 +133,7 @@ pub(super) async fn download(
     let claims = store
         .verify(s.seams.secrets.as_ref(), &token, TicketMethod::Get)
         .await?;
-    let org = store
-        .org_store(s.seams.secrets.as_ref(), claims.org_id())
-        .await?;
+    let org = store.org_store(claims.org_id()).await?;
     let info = org.head(&claims.key).await?;
     claims.check_size(info.size)?;
     let size = info.size;
