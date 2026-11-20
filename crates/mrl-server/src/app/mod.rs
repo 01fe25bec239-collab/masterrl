@@ -6,7 +6,7 @@
 
 mod module;
 
-pub use module::{ServerModule, Task};
+pub use module::{GrpcTls, ServerModule, Task};
 
 use crate::config::{Config, Mode, Role};
 use crate::error::{ApiError, ErrorCode, ServerError};
@@ -158,8 +158,23 @@ impl App {
             (Some(cfg), false) => Some(crate::http::tls::acceptor(cfg)?),
             _ => None,
         };
+        // A module's mutual TLS takes the gRPC listener over, in solo too (agents connect).
+        let mtls = self.modules.iter().find_map(|m| m.grpc_tls());
+        let grpc_acceptor = match &mtls {
+            Some(t) => Some(crate::http::tls::grpc_acceptor(
+                t,
+                self.config.server.tls.as_ref().filter(|_| !solo),
+            )?),
+            None => acceptor.clone(),
+        };
         let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
         let pick = |configured| if solo { loopback } else { configured };
+        // Agents keep the address they enrolled with, so with mutual TLS solo keeps the
+        // configured gRPC port (on loopback) instead of a random one.
+        let pick_grpc = |configured: SocketAddr| match (&mtls, solo) {
+            (Some(_), true) => SocketAddr::from((Ipv4Addr::LOCALHOST, configured.port())),
+            _ => pick(configured),
+        };
 
         // Bind everything first, so a port clash fails startup before anything runs.
         let api = if api_on {
@@ -168,10 +183,19 @@ impl App {
             None
         };
         let grpc_listener = if gateway_on && grpc.has_routes() {
-            Some(bind(pick(listeners.grpc)).await?)
+            Some(bind(pick_grpc(listeners.grpc)).await?)
         } else {
             None
         };
+        let (open_services, on_listen) = match mtls {
+            Some(t) => (t.open_services, Some(t.on_listen)),
+            None => (Vec::new(), None),
+        };
+        if let (Some(l), Some(tell)) = (&grpc_listener, on_listen) {
+            if let Ok(a) = l.local_addr() {
+                tell(a);
+            }
+        }
         let internal = if solo {
             None
         } else {
@@ -219,8 +243,13 @@ impl App {
                         ServerError::new(ErrorCode::Bind, format!("{name} listener: {e}"))
                     })?;
                     tracker.spawn(async move {
-                        let served =
-                            axum::serve(tls_listener, router).with_graceful_shutdown(shutdown);
+                        // Handlers see who is connected: `ConnectInfo<TlsPeer>`.
+                        let served = axum::serve(
+                            tls_listener,
+                            router
+                                .into_make_service_with_connect_info::<crate::http::tls::TlsPeer>(),
+                        )
+                        .with_graceful_shutdown(shutdown);
                         if let Err(e) = served.await {
                             on_error(e);
                         }
@@ -240,12 +269,27 @@ impl App {
             )?;
         }
         if let Some(l) = grpc_listener {
-            addrs.grpc = serve(
-                l,
-                crate::http::grpc_router(grpc, state.clone(), solo),
-                "grpc",
-                acceptor.as_ref(),
-            )?;
+            // In solo every gRPC call needs the launch secret, except calls to services that
+            // authenticate their callers themselves (agents have no launch secret).
+            let router = if solo && !open_services.is_empty() {
+                let open = crate::http::grpc_router(grpc.clone(), state.clone(), false);
+                open_services.iter().fold(
+                    Router::new().fallback_service(crate::http::grpc_router(
+                        grpc,
+                        state.clone(),
+                        true,
+                    )),
+                    |r, svc| {
+                        r.route_service(
+                            &format!("/{svc}/{{method}}"),
+                            open.clone().into_service::<axum::body::Body>(),
+                        )
+                    },
+                )
+            } else {
+                crate::http::grpc_router(grpc, state.clone(), solo)
+            };
+            addrs.grpc = serve(l, router, "grpc", grpc_acceptor.as_ref())?;
         }
         if let Some(l) = internal {
             addrs.internal = serve(

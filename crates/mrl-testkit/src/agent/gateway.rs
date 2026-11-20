@@ -47,7 +47,25 @@ pub fn fast_config() -> GatewayConfig {
     }
 }
 
-/// A solo-mode server with only the `nodes` module, on its own test database.
+/// Bearer token of the team-mode harness user.
+const TEAM_TOKEN: &str = "tok-gateway";
+
+/// Settings for a test server with `gateway`, every listener on a free loopback port (`grpc`
+/// on `grpc_port`, 0 = any), in `mode`.
+pub fn server_config(gateway: GatewayConfig, mode: Mode, grpc_port: u16) -> Config {
+    let mut cfg = Config {
+        gateway,
+        ..Config::default()
+    };
+    cfg.server.mode = mode;
+    cfg.server.listeners.api = SocketAddr::from(([127, 0, 0, 1], 0));
+    cfg.server.listeners.internal = SocketAddr::from(([127, 0, 0, 1], 0));
+    cfg.server.listeners.grpc = SocketAddr::from(([127, 0, 0, 1], grpc_port));
+    cfg
+}
+
+/// A server with the `nodes` module and another gRPC service on the same listener, on its own
+/// test database. Agents dial the shared gRPC listener.
 pub struct GatewayHarness {
     /// The HTTP server.
     pub server: TestServer,
@@ -60,9 +78,22 @@ pub struct GatewayHarness {
     secrets: Arc<dyn SecretStore>,
     lanes: Arc<LaneRouter>,
     config: GatewayConfig,
+    mode: Mode,
 }
 
 impl GatewayHarness {
+    /// Starts in `mode` with [`fast_config`].
+    pub async fn start_in(db: TestDb, mode: Mode) -> Self {
+        Self::open(
+            db,
+            fast_config(),
+            Arc::new(InMemorySecretStore::default()),
+            LaneRouter::new(),
+            mode,
+        )
+        .await
+    }
+
     /// Starts with [`fast_config`] and creates pool `test`.
     pub async fn start(db: TestDb) -> Self {
         Self::start_with(
@@ -81,7 +112,17 @@ impl GatewayHarness {
         secrets: Arc<dyn SecretStore>,
         lanes: Arc<LaneRouter>,
     ) -> Self {
-        let (server, gw) = Self::boot(&db, &config, secrets.clone(), lanes.clone()).await;
+        Self::open(db, config, secrets, lanes, Mode::Solo).await
+    }
+
+    async fn open(
+        db: TestDb,
+        config: GatewayConfig,
+        secrets: Arc<dyn SecretStore>,
+        lanes: Arc<LaneRouter>,
+        mode: Mode,
+    ) -> Self {
+        let (server, gw) = Self::boot(&db, &config, 0, mode, secrets.clone(), lanes.clone()).await;
         let mut h = Self {
             server,
             gw,
@@ -90,6 +131,7 @@ impl GatewayHarness {
             secrets,
             lanes,
             config,
+            mode,
         };
         let r = h.post("/api/v1/pools", json!({ "name": "test" })).await;
         assert_eq!(r.status, 201, "create pool: {}", r.text());
@@ -100,49 +142,64 @@ impl GatewayHarness {
     async fn boot(
         db: &TestDb,
         config: &GatewayConfig,
+        grpc_port: u16,
+        mode: Mode,
         secrets: Arc<dyn SecretStore>,
         lanes: Arc<LaneRouter>,
     ) -> (TestServer, Arc<Gateway>) {
-        let cfg = Config {
-            gateway: config.clone(),
-            ..Config::default()
-        };
+        let cfg = server_config(config.clone(), mode, grpc_port);
         let module = NodesModule::new(db.db().clone(), &cfg, secrets, lanes);
         let gw = module.gateway();
-        let seams = crate::seams::build(crate::seams::solo(TEST_SECRET), Mode::Solo);
-        match TestServer::start(cfg, seams, vec![Box::new(module)]).await {
+        let seams = match mode {
+            Mode::Solo => crate::seams::build(crate::seams::solo(TEST_SECRET), Mode::Solo),
+            Mode::Team => crate::seams::build(
+                crate::seams::team(&[(TEAM_TOKEN, crate::seams::user("u-gateway", "org-gateway"))]),
+                Mode::Team,
+            ),
+        };
+        // Another gRPC service shares the listener (`mrl.testkit.Ping`).
+        let modules: Vec<Box<dyn mrl_server::app::ServerModule>> = vec![
+            Box::new(module),
+            Box::new(crate::server::TestModule {
+                grpc: true,
+                ..Default::default()
+            }),
+        ];
+        match TestServer::start(cfg, seams, modules).await {
             Ok(s) => (s, gw),
             Err(e) => panic!("gateway test server did not start: {}", e.explain()),
         }
     }
 
-    /// A second server (replica) on the same database and secret store, with its own gateway port.
+    /// A second server (replica) on the same database and secret store, with its own gRPC port.
     pub async fn replica(&self) -> (TestServer, Arc<Gateway>) {
-        let config = GatewayConfig {
-            listen: None,
-            ..self.config.clone()
-        };
-        Self::boot(&self.db, &config, self.secrets.clone(), self.lanes.clone()).await
+        Self::boot(
+            &self.db,
+            &self.config,
+            0,
+            self.mode,
+            self.secrets.clone(),
+            self.lanes.clone(),
+        )
+        .await
     }
 
-    /// Stops the server and starts a new one on the same database, CA and gateway port.
+    /// Stops the server and starts a new one on the same database, CA and gRPC port.
     pub async fn restart(self) -> Self {
         let addr = self.addr();
         if let Err(e) = self.server.shutdown().await {
             panic!("shutdown: {}", e.explain());
         }
-        let config = GatewayConfig {
-            listen: Some(addr),
-            ..self.config.clone()
-        };
-        let (server, gw) =
-            Self::boot(&self.db, &config, self.secrets.clone(), self.lanes.clone()).await;
-        Self {
-            server,
-            gw,
-            config,
-            ..self
-        }
+        let (server, gw) = Self::boot(
+            &self.db,
+            &self.config,
+            addr.port(),
+            self.mode,
+            self.secrets.clone(),
+            self.lanes.clone(),
+        )
+        .await;
+        Self { server, gw, ..self }
     }
 
     /// The gateway address agents dial.
@@ -158,10 +215,7 @@ impl GatewayHarness {
             .request(
                 Method::POST,
                 path,
-                &[
-                    (LAUNCH_SECRET_HEADER, TEST_SECRET),
-                    ("content-type", "application/json"),
-                ],
+                &[self.auth(), ("content-type", "application/json")],
                 Body::from(body.to_string()),
             )
             .await
@@ -169,7 +223,17 @@ impl GatewayHarness {
 
     /// Authenticated GET.
     pub async fn get(&self, path: &str) -> TestResponse {
-        self.server.get_authed(path).await
+        self.server
+            .request(Method::GET, path, &[self.auth()], Body::empty())
+            .await
+    }
+
+    /// The sign-in header for this mode.
+    fn auth(&self) -> (&'static str, &'static str) {
+        match self.mode {
+            Mode::Solo => (LAUNCH_SECRET_HEADER, TEST_SECRET),
+            Mode::Team => ("authorization", "Bearer tok-gateway"),
+        }
     }
 
     /// A join token for the test pool (`body` as for `POST …/enrollment-tokens`).
@@ -1086,10 +1150,7 @@ mod tests {
         replica.shutdown().await.unwrap();
 
         // Another secret store (another machine's local files): refused, no second CA.
-        let cfg = mrl_server::config::Config {
-            gateway: fast_config(),
-            ..mrl_server::config::Config::default()
-        };
+        let cfg = server_config(fast_config(), Mode::Solo, 0);
         let other = NodesModule::new(
             gw.db.db().clone(),
             &cfg,
@@ -1114,48 +1175,82 @@ mod tests {
         assert_eq!(cas, 1);
     }
 
+    /// Calls `mrl.testkit.Ping` on the gateway's listener over TLS (no client certificate):
+    /// the HTTP status and `grpc-status`.
+    async fn ping(gw: &GatewayHarness, secret: Option<&str>) -> (u16, Option<String>) {
+        use mrl_agent::transports::Transport;
+        use tower::{Service, ServiceExt};
+        let pin = gw.gw.ca_fingerprint().unwrap();
+        let tls = mrl_agent::session::tls::enroll_client(&pin).unwrap();
+        let io = mrl_agent::transports::Direct::new(&gw.addr().to_string())
+            .connect()
+            .await
+            .unwrap();
+        let tls = mrl_agent::session::connect_tls(tls, io, &CancellationToken::new())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut channel = mrl_agent::session::channel_over(tls).await.unwrap();
+        let mut req = axum::http::Request::builder()
+            .method("POST")
+            .uri("http://core.masterrl.internal/mrl.testkit.Ping/Ping")
+            .header("content-type", "application/grpc")
+            .header("te", "trailers");
+        if let Some(s) = secret {
+            req = req.header(LAUNCH_SECRET_HEADER, s);
+        }
+        let res = channel
+            .ready()
+            .await
+            .unwrap()
+            .call(req.body(tonic::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        (
+            res.status().as_u16(),
+            res.headers()
+                .get("grpc-status")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+        )
+    }
+
+    /// Enrollment and an mTLS session on the shared gRPC listener, next to another service.
+    async fn agents_use_the_shared_grpc_listener(mode: Mode) {
+        let gw = GatewayHarness::start_in(TestDb::new().await, mode).await;
+        assert_eq!(
+            gw.server.running().grpc_addr(),
+            gw.gw.addr(),
+            "the gateway is on the shared gRPC listener"
+        );
+        let a = TestAgent::new(1, |_| {});
+        let node = a.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
+        let link = a.run();
+        let n = gw.wait_status(&node, "ONLINE").await;
+        assert_eq!(n["transport"], "direct");
+        // The other service shares the TLS and keeps its own rules: in solo it still needs the
+        // launch secret (only the agent gateway authenticates its callers itself).
+        let ok = (200, Some("0".to_owned()));
+        match mode {
+            Mode::Solo => {
+                assert_ne!(ping(&gw, None).await, ok, "no launch secret: refused");
+                assert_eq!(ping(&gw, Some(TEST_SECRET)).await, ok);
+            }
+            Mode::Team => assert_eq!(ping(&gw, None).await, ok),
+        }
+        link.stop().await;
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs PostgreSQL (just test-integration)"]
-    async fn the_gateway_and_shared_grpc_services_start_together_in_team_mode() {
-        let db = TestDb::new().await;
-        let grpc_port = std::net::TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
-        let mut cfg = mrl_server::config::Config::default();
-        cfg.server.mode = Mode::Team;
-        cfg.server.listeners.api = "127.0.0.1:0".parse().unwrap();
-        cfg.server.listeners.internal = "127.0.0.1:0".parse().unwrap();
-        cfg.server.listeners.grpc = format!("127.0.0.1:{grpc_port}").parse().unwrap();
-        cfg.gateway = GatewayConfig {
-            listen: Some("127.0.0.1:0".parse().unwrap()),
-            ..fast_config()
-        };
-        cfg.validate().unwrap();
-        let nodes = NodesModule::new(
-            db.db().clone(),
-            &cfg,
-            Arc::new(InMemorySecretStore::default()),
-            LaneRouter::new(),
-        );
-        let gw = nodes.gateway();
-        let other = crate::server::TestModule {
-            grpc: true,
-            ..Default::default()
-        };
-        let seams = crate::seams::build(crate::seams::team(&[]), Mode::Team);
-        let server =
-            match TestServer::start(cfg, seams, vec![Box::new(nodes), Box::new(other)]).await {
-                Ok(s) => s,
-                Err(e) => panic!("both must start: {}", e.explain()),
-            };
-        assert_eq!(
-            server.running().grpc_addr().map(|a| a.port()),
-            Some(grpc_port)
-        );
-        assert_ne!(gw.addr().unwrap().port(), grpc_port);
-        server.shutdown().await.unwrap();
+    async fn agents_enroll_and_connect_on_the_shared_grpc_listener_in_solo_mode() {
+        agents_use_the_shared_grpc_listener(Mode::Solo).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn agents_enroll_and_connect_on_the_shared_grpc_listener_in_team_mode() {
+        agents_use_the_shared_grpc_listener(Mode::Team).await;
     }
 
     /// Records `(stream, seq)` of every metrics item.
@@ -2167,13 +2262,14 @@ mod tests {
         let start = |dir: std::path::PathBuf, kek: String| {
             let db = db.db().clone();
             async move {
-                let cfg = mrl_server::config::Config {
-                    gateway: GatewayConfig {
+                let cfg = server_config(
+                    GatewayConfig {
                         secrets_dir: Some(dir),
                         ..fast_config()
                     },
-                    ..mrl_server::config::Config::default()
-                };
+                    Mode::Solo,
+                    0,
+                );
                 let m = NodesModule::from_config_with_kek(db, &cfg, Some(&kek));
                 let gw = m.gateway();
                 let seams = crate::seams::build(crate::seams::solo(TEST_SECRET), Mode::Solo);

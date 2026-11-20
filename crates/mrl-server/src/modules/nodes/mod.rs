@@ -17,7 +17,7 @@ pub mod secrets;
 pub mod store;
 
 use crate::app::{ServerModule, Task};
-use crate::config::{Config, Mode, Role};
+use crate::config::{Config, Role};
 use crate::db::{Db, DbError};
 use crate::seams::{ReadinessCheck, SeamError, SecretStore, StartupStep};
 use axum::Router;
@@ -35,10 +35,6 @@ use uuid::Uuid;
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct GatewayConfig {
-    /// mTLS gRPC address agents dial. Default: `0.0.0.0:9444` in team mode, `127.0.0.1:<random>`
-    /// in solo mode (set it to let other machines dial in). Never `server.listeners.grpc`: that
-    /// listener belongs to the shared gRPC services, which can't check client certificates.
-    pub listen: Option<SocketAddr>,
     /// Secret-store name of the internal CA (key and certificate).
     pub ca_secret: String,
     /// Where the CA secret lives: `database` (sealed rows every replica shares; needs the
@@ -88,7 +84,6 @@ pub struct GatewayConfig {
 impl Default for GatewayConfig {
     fn default() -> Self {
         Self {
-            listen: None,
             ca_secret: "gateway_ca".to_owned(),
             ca_store: CaStore::Auto,
             kek_env: "MRL_GATEWAY_KEK".to_owned(),
@@ -114,16 +109,9 @@ impl Default for GatewayConfig {
 }
 
 impl GatewayConfig {
-    /// The gateway address for `mode` (see [`GatewayConfig::listen`]).
-    pub fn listen_addr(&self, mode: Mode) -> SocketAddr {
-        self.listen.unwrap_or(match mode {
-            Mode::Team => SocketAddr::from(([0, 0, 0, 0], DEFAULT_TEAM_PORT)),
-            Mode::Solo => SocketAddr::from(([127, 0, 0, 1], 0)),
-        })
-    }
-
-    /// Problems with the values (pushed into `Config::validate`).
-    pub fn problems(&self, server: &crate::config::ServerConfig) -> Vec<String> {
+    /// Problems with the values (pushed into `Config::validate`). Agents use the shared gRPC
+    /// listener (`server.listeners.grpc`), so nothing here can clash with it.
+    pub fn problems(&self, _server: &crate::config::ServerConfig) -> Vec<String> {
         let mut p = Vec::new();
         let mut range = |name: &str, v: u64, lo: u64, hi: u64| {
             if !(lo..=hi).contains(&v) {
@@ -182,26 +170,6 @@ impl GatewayConfig {
                 self.offline_after_seconds, self.degraded_after_seconds
             ));
         }
-        let listen = self.listen_addr(server.mode);
-        if server.mode == Mode::Team
-            && listen.port() != 0
-            && [
-                server.listeners.grpc,
-                server.listeners.api,
-                server.listeners.internal,
-            ]
-            .iter()
-            .any(|a| {
-                a.port() == listen.port()
-                    && (a.ip() == listen.ip()
-                        || a.ip().is_unspecified()
-                        || listen.ip().is_unspecified())
-            })
-        {
-            p.push(format!(
-                "gateway.listen: {listen} clashes with a server.listeners address; the gateway needs its own port"
-            ));
-        }
         if self.ca_secret.trim().is_empty() {
             p.push("gateway.ca_secret: give the secret-store name of the CA".to_owned());
         }
@@ -221,9 +189,6 @@ pub enum CaStore {
     /// This host's file secret store (`secrets_dir`).
     File,
 }
-
-/// Default gateway port in team mode (next to the shared gRPC port 9443).
-pub const DEFAULT_TEAM_PORT: u16 = 9444;
 
 /// Error codes this part adds (guidance/fragments/errors/p18.yaml).
 pub mod codes {
@@ -305,8 +270,11 @@ impl From<NodesError> for SeamError {
 pub struct Pki {
     /// The CA.
     pub ca: ca::Ca,
-    /// TLS for the gateway listener (agents dial in; client certificate optional for enrollment).
-    pub server_tls: Arc<tokio_rustls::rustls::ServerConfig>,
+    /// Client-certificate check for the shared gRPC listener: optional (a machine without one may
+    /// only enroll); one that is sent must chain to the CA and not be revoked.
+    pub client_verifier: Arc<dyn tokio_rustls::rustls::server::danger::ClientCertVerifier>,
+    /// The core certificate (and CA) with its key, served to agents on the gRPC listener.
+    pub core_key: Arc<tokio_rustls::rustls::sign::CertifiedKey>,
     /// TLS for dialing an enrolled agent (core certificate as client certificate).
     pub dial_tls: Arc<tokio_rustls::rustls::ClientConfig>,
     /// TLS for dialing an agent that waits to enroll (its temporary certificate is not checked;
@@ -444,14 +412,16 @@ impl Sessions {
 pub struct Gateway {
     pub(crate) db: Db,
     pub(crate) config: GatewayConfig,
-    pub(crate) listen: SocketAddr,
+    /// `server.listeners.grpc`'s port (for the enroll command before the listener is bound).
+    pub(crate) grpc_port: u16,
+    /// Cancelled when the server shuts down: every gateway stream ends.
+    pub(crate) stop: CancellationToken,
     pub(crate) core_id: String,
     pub(crate) secrets: Arc<dyn SecretStore>,
     pub(crate) secrets_problem: Option<String>,
     pub(crate) pki: RwLock<Option<Arc<Pki>>>,
     pub(crate) sessions: Sessions,
     pub(crate) lanes: Arc<lanes::LaneRouter>,
-    pub(crate) listener: Mutex<Option<std::net::TcpListener>>,
     pub(crate) addr: OnceLock<SocketAddr>,
     pub(crate) known_hosts: PathBuf,
     /// Revoked, unexpired certificate fingerprints; the TLS verifiers refuse them.
@@ -468,7 +438,7 @@ impl Gateway {
             .ok_or_else(|| NodesError::Ca("the internal CA is not loaded yet".into()))
     }
 
-    /// The bound gateway address (after startup).
+    /// The bound gRPC listener address agents dial (after startup).
     pub fn addr(&self) -> Option<SocketAddr> {
         self.addr.get().copied()
     }
@@ -532,7 +502,6 @@ impl Gateway {
 /// The `nodes` module.
 pub struct NodesModule {
     gw: Arc<Gateway>,
-    roles: Vec<Role>,
 }
 
 impl NodesModule {
@@ -604,7 +573,6 @@ impl NodesModule {
         lanes: Arc<lanes::LaneRouter>,
     ) -> Self {
         let g = &config.gateway;
-        let listen = g.listen_addr(config.server.mode);
         let known_hosts = g.known_hosts.clone().unwrap_or_else(|| {
             g.secrets_dir
                 .clone()
@@ -620,19 +588,18 @@ impl NodesModule {
             gw: Arc::new(Gateway {
                 db,
                 config: g.clone(),
-                listen,
+                grpc_port: config.server.listeners.grpc.port(),
+                stop: CancellationToken::new(),
                 core_id: format!("core-{}", Uuid::new_v4().simple()),
                 secrets,
                 secrets_problem: None,
                 pki: RwLock::new(None),
                 sessions: Sessions::default(),
                 lanes,
-                listener: Mutex::new(None),
                 addr: OnceLock::new(),
                 known_hosts,
                 revoked: Arc::default(),
             }),
-            roles: config.server.roles.clone(),
         }
     }
 
@@ -642,11 +609,10 @@ impl NodesModule {
     }
 }
 
-/// Loads (or creates) the CA, issues the core certificate, builds the TLS settings and binds
-/// the gateway listener, so a port clash fails startup.
+/// Loads (or creates) the CA, issues the core certificate and builds the TLS settings, before
+/// the server asks for [`ServerModule::grpc_tls`].
 struct PkiStep {
     gw: Arc<Gateway>,
-    bind: bool,
 }
 
 #[async_trait::async_trait]
@@ -669,22 +635,6 @@ impl StartupStep for PkiStep {
         let pki = crate::grpc::tls::build(ca, self.gw.revoked.clone())?;
         if let Ok(mut slot) = self.gw.pki.write() {
             *slot = Some(Arc::new(pki));
-        }
-        if self.bind {
-            let l = std::net::TcpListener::bind(self.gw.listen).map_err(|e| {
-                SeamError::new(
-                    "gateway",
-                    format!("could not bind the gateway on {}: {e}", self.gw.listen),
-                )
-            })?;
-            l.set_nonblocking(true)
-                .map_err(|e| SeamError::new("gateway", e.to_string()))?;
-            if let Ok(a) = l.local_addr() {
-                let _ = self.gw.addr.set(a);
-            }
-            if let Ok(mut slot) = self.gw.listener.lock() {
-                *slot = Some(l);
-            }
         }
         Ok(())
     }
@@ -720,8 +670,32 @@ impl ServerModule for NodesModule {
     fn startup_steps(&self) -> Vec<Arc<dyn StartupStep>> {
         vec![Arc::new(PkiStep {
             gw: self.gw.clone(),
-            bind: self.roles.contains(&Role::Gateway),
         })]
+    }
+
+    fn grpc_services(&self, routes: &mut tonic::service::RoutesBuilder) {
+        routes.add_service(crate::grpc::service(self.gw.clone()));
+    }
+
+    fn grpc_tls(&self) -> Option<crate::app::GrpcTls> {
+        let pki = match self.gw.pki() {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::error!(code = e.code(), error = %e, "the gateway has no TLS settings; agents can't connect");
+                return None;
+            }
+        };
+        let gw = self.gw.clone();
+        Some(crate::app::GrpcTls {
+            client_verifier: pki.client_verifier.clone(),
+            certified_key: pki.core_key.clone(),
+            server_names: vec![ca::CORE_NAME.to_owned()],
+            open_services: vec![crate::grpc::SERVICE_NAME],
+            on_listen: Box::new(move |a| {
+                tracing::info!(listener = "grpc", scheme = "mtls", addr = %a, "agent gateway on the gRPC listener");
+                let _ = gw.addr.set(a);
+            }),
+        })
     }
 
     fn readiness_checks(&self) -> Vec<Arc<dyn ReadinessCheck>> {
@@ -737,8 +711,12 @@ impl ServerModule for NodesModule {
             self.gw.clone(),
         );
         vec![
+            // The service itself runs on the shared gRPC listener; this ends its streams at
+            // shutdown so the listener can drain.
             Task::new("nodes.gateway", Role::Gateway, move |cancel| async move {
-                crate::grpc::serve(a, cancel).await.map_err(SeamError::from)
+                cancel.cancelled().await;
+                a.stop.cancel();
+                Ok(())
             }),
             Task::new(
                 "nodes.command_wake",
@@ -793,24 +771,6 @@ mod tests {
         };
         let p = bad.problems(&server);
         assert_eq!(p.len(), 3, "{p:?}");
-        // In team mode the gateway never takes the shared gRPC port.
-        let team = crate::config::ServerConfig {
-            mode: Mode::Team,
-            ..crate::config::ServerConfig::default()
-        };
-        let g = GatewayConfig::default();
-        assert_eq!(g.listen_addr(Mode::Team).port(), DEFAULT_TEAM_PORT);
-        assert_ne!(g.listen_addr(Mode::Team), team.listeners.grpc);
-        assert!(g.problems(&team).is_empty());
-        let clash = GatewayConfig {
-            listen: Some(team.listeners.grpc),
-            ..GatewayConfig::default()
-        };
-        assert!(
-            clash.problems(&team)[0].contains("clashes"),
-            "{:?}",
-            clash.problems(&team)
-        );
     }
 
     #[test]

@@ -28,7 +28,7 @@ use tokio_rustls::rustls::server::danger::{ClientCertVerified, ClientCertVerifie
 use tokio_rustls::rustls::server::WebPkiClientVerifier;
 use tokio_rustls::rustls::{
     self, CertificateError, ClientConfig, DigitallySignedStruct, DistinguishedName, RootCertStore,
-    ServerConfig, SignatureScheme,
+    SignatureScheme,
 };
 
 /// Revoked certificate fingerprints (hex SHA-256 of the DER).
@@ -63,13 +63,11 @@ pub fn build(ca: Ca, revoked: Revoked) -> Result<Pki, NodesError> {
             .map_err(err)?,
         revoked: revoked.clone(),
     });
-    let mut server = ServerConfig::builder_with_provider(provider())
-        .with_safe_default_protocol_versions()
-        .map_err(err)?
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(chain.clone(), PrivateKeyDer::Pkcs8(core_key.clone_key()))
+    let signer = provider()
+        .key_provider
+        .load_private_key(PrivateKeyDer::Pkcs8(core_key.clone_key()))
         .map_err(err)?;
-    server.alpn_protocols = vec![b"h2".to_vec()];
+    let served = Arc::new(rustls::sign::CertifiedKey::new(chain.clone(), signer));
 
     let dial_verifier = Arc::new(CheckedServer {
         inner: WebPkiServerVerifier::builder_with_provider(roots, provider())
@@ -97,7 +95,8 @@ pub fn build(ca: Ca, revoked: Revoked) -> Result<Pki, NodesError> {
 
     Ok(Pki {
         ca,
-        server_tls: Arc::new(server),
+        client_verifier: verifier,
+        core_key: served,
         dial_tls: Arc::new(dial),
         enroll_tls: Arc::new(enroll),
     })

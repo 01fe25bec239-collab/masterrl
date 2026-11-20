@@ -421,7 +421,7 @@ async fn create_token(
     let enroll_command = match &body.endpoint {
         None => format!(
             "mrl-agent enroll --server <this server>:{} --token {token}",
-            gw.addr().map_or(gw.listen.port(), |a| a.port())
+            gw.addr().map_or(gw.grpc_port, |a| a.port())
         ),
         Some(Endpoint::Ssh { agent_port, .. }) => {
             format!("mrl-agent enroll --listen 127.0.0.1:{agent_port} --token {token}")
