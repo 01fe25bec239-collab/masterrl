@@ -20,6 +20,9 @@ pub mod supabase;
 // <mrl:testkit P18> P18 `pub mod` lines go right below this line.
 
 // <mrl:testkit P19> P19 `pub mod` lines go right below this line.
+#[cfg(test)]
+#[path = "../../mrl-server/src/modules/artifacts/integration_tests.rs"]
+mod p19_artifacts;
 
 // <mrl:testkit P20> P20 `pub mod` lines go right below this line.
 

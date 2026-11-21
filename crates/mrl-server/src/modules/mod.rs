@@ -19,4 +19,8 @@ pub mod runs;
 pub mod nodes;
 
 // <mrl:modules P19> P19 `pub mod` lines go right below this line.
+pub mod artifacts;
+pub mod lineage;
+pub mod secrets;
+pub mod uploads;
 // </mrl:modules>

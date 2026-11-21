@@ -2224,6 +2224,38 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-CONFLICT-190",
+      "title": "This name is already used here.",
+      "why": "Another artifact or secret in this place already has this name.",
+      "what_to_do": {
+        "steps": [
+          "Pick a different name, then try again.",
+          "To replace the old one, delete it first."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CONFLICT-191",
+      "title": "This upload is already finished.",
+      "why": "The upload was completed, cancelled, or it expired after 24 hours. It takes no more changes.",
+      "what_to_do": {
+        "steps": [
+          "Start a new upload for the file."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CONFLICT-192",
+      "title": "This secret is being deleted.",
+      "why": "Someone started deleting this secret, so its value can't be changed or read any more. A delete that stopped halfway leaves it in this state.",
+      "what_to_do": {
+        "steps": [
+          "Delete the secret again to finish.",
+          "Then create a new secret if you still need one."
+        ]
+      }
+    },
+    {
       "code": "MRL-DATA-001",
       "title": "Your dataset did not pass its checks.",
       "why": "Some rows are empty, are missing fields, or don't match the chosen format.",
@@ -2561,6 +2593,18 @@ export const catalog = deepFreeze({
           "Check the address with `mrl config show`.",
           "Make sure the server or the desktop app is running.",
           "Change the address with `mrl config set-server <address>`."
+        ]
+      }
+    },
+    {
+      "code": "MRL-ENV-190",
+      "title": "This server has no place to keep secret values.",
+      "why": "The server was started without a secret store, so it can't save or read secret values. A team server also needs it to sign download and upload links that every server copy accepts.",
+      "what_to_do": {
+        "steps": [
+          "Start the server from the desktop app, which keeps secrets in your computer's keychain.",
+          "On a solo server, you can also use a secret read from an environment variable.",
+          "On a team server, ask your admin to set up the shared secret store."
         ]
       }
     },
@@ -3139,6 +3183,17 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-PERM-190",
+      "title": "This secret can't be used for this.",
+      "why": "The secret's settings list the uses it allows, and this use is not one of them.",
+      "what_to_do": {
+        "steps": [
+          "Add this use to the secret's allowed uses, if your team agrees.",
+          "Or pick a secret made for this use."
+        ]
+      }
+    },
+    {
       "code": "MRL-QUOTA-001",
       "title": "Your team reached its limit on jobs or GPUs.",
       "why": "Your org limits how many jobs and GPUs a project can use at once.",
@@ -3198,6 +3253,17 @@ export const catalog = deepFreeze({
         "steps": [
           "Run `mrl sync status` to see the saved copies.",
           "On the computer that has your setup, run `mrl sync push` first."
+        ]
+      }
+    },
+    {
+      "code": "MRL-RES-190",
+      "title": "This secret has no value yet.",
+      "why": "The secret exists, but nobody saved its value. Or its environment variable is not set on the server.",
+      "what_to_do": {
+        "steps": [
+          "Save the secret's value in the app, then try again.",
+          "For a secret read from an environment variable, set that variable and restart the server."
         ]
       }
     },
@@ -3491,6 +3557,17 @@ export const catalog = deepFreeze({
         "steps": [
           "Wait until nothing else is writing to the file.",
           "Start the upload again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STORE-190",
+      "title": "Some parts of this upload are missing or the wrong size.",
+      "why": "The app can finish an upload only when every part has arrived at its full size. Details list the parts.",
+      "what_to_do": {
+        "steps": [
+          "Send the parts listed in Details again.",
+          "Then finish the upload again."
         ]
       }
     },

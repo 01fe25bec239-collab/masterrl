@@ -51,6 +51,10 @@ pub fn modules(db: &Db, config: &crate::Config) -> Vec<Box<dyn ServerModule>> {
             config,
         )),
         // <mrl:register P19> P19 modules go right below this line.
+        Box::new(crate::modules::artifacts::ArtifactsModule::new(
+            db.clone(),
+            config,
+        )),
         // </mrl:register>
     ]
 }

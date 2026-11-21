@@ -1,7 +1,8 @@
 //! HTTP framework: router composition from modules and the middleware every request passes.
 //!
 //! Order, outermost first: request ids and trace → metrics → compression → problem
-//! renderer → (solo: launch-secret check on every path) → body limit (2 MiB) → panic
+//! renderer → (solo: launch-secret check on every path) → body limit (2 MiB; ticket PUTs are
+//! exempt and capped by their ticket) → panic
 //! catcher → route. Module routes under `/api/v1` add, outermost first: authentication
 //! (team; solo already checked) → rate limit → idempotency → problem renderer.
 
@@ -32,6 +33,12 @@ use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 /// Largest request body accepted (2 MiB). Larger content goes through uploads.
 pub const BODY_LIMIT: usize = 2 * 1024 * 1024;
+/// `PUT` bodies under this path skip [`BODY_LIMIT`]: the transfer ticket carries its own size
+/// limit, and the endpoint enforces it (P19).
+pub const UNLIMITED_PUT_PREFIX: &str = "/api/v1/transfer/";
+/// How a transfer path appears in spans, logs and problem `instance`s: the path itself
+/// carries the ticket, which is a credential.
+pub const TRANSFER_ROUTE: &str = "/api/v1/transfer/{ticket}";
 /// Request id header (echoed on every response).
 pub const REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 /// W3C trace context header.
@@ -120,7 +127,7 @@ fn finish(router: Router<AppState>, state: AppState, gate: bool) -> Router {
             ApiError::new(ErrorCode::Internal, "The server hit an internal problem.")
                 .into_response()
         }))
-        .layer(tower_http::limit::RequestBodyLimitLayer::new(BODY_LIMIT));
+        .layer(from_fn(limit_body));
     let router = if gate {
         router.layer(from_fn_with_state(state.clone(), authenticate))
     } else {
@@ -151,7 +158,8 @@ async fn metrics(State(state): State<AppState>) -> Response {
         .into_response()
 }
 
-/// Sets `RequestMeta` (request id, trace id), opens the request span and links the
+/// Sets `RequestMeta` (request id, trace id), opens the request span (its `path` is the
+/// matched route template, never a raw transfer path) and links the
 /// incoming W3C trace context so OTLP traces join the caller's trace.
 async fn request_meta(State(state): State<AppState>, mut req: Request, next: Next) -> Response {
     let request_id = req
@@ -178,7 +186,10 @@ async fn request_meta(State(state): State<AppState>, mut req: Request, next: Nex
     let span = tracing::info_span!(
         "http.request",
         method = %req.method(),
-        path = %req.uri().path(),
+        path = %req
+            .extensions()
+            .get::<MatchedPath>()
+            .map_or_else(|| shown_path(req.uri().path()), |m| m.as_str()),
         trace_id = %trace_id,
         request_id = %request_id,
     );
@@ -194,6 +205,16 @@ async fn request_meta(State(state): State<AppState>, mut req: Request, next: Nex
         res.headers_mut().insert(REQUEST_ID, v);
     }
     res
+}
+
+/// `path` as spans, logs and problem `instance`s may show it: any transfer path (matched
+/// or not) becomes [`TRANSFER_ROUTE`], so its ticket is never recorded.
+pub fn shown_path(path: &str) -> &str {
+    if path.contains("/transfer/") {
+        TRANSFER_ROUTE
+    } else {
+        path
+    }
 }
 
 /// `00-<32 hex>-<16 hex>-<2 hex>` → (trace id, header). All-zero ids are not valid.
@@ -266,11 +287,28 @@ fn meta_of(req: &Request) -> RequestMeta {
         })
 }
 
+/// [`BODY_LIMIT`] on every request except ticket uploads (`PUT` under [`UNLIMITED_PUT_PREFIX`]).
+async fn limit_body(req: Request, next: Next) -> Response {
+    use tower::ServiceExt;
+    if req.method() == axum::http::Method::PUT && req.uri().path().starts_with(UNLIMITED_PUT_PREFIX)
+    {
+        return next.run(req).await;
+    }
+    let inner = tower::util::MapRequest::new(next, |r: axum::http::Request<_>| r.map(Body::new));
+    match tower_http::limit::RequestBodyLimit::new(inner, BODY_LIMIT)
+        .oneshot(req)
+        .await
+    {
+        Ok(res) => res.map(Body::new),
+        Err(never) => match never {},
+    }
+}
+
 /// Renders `ApiError`s and bare error responses (axum rejections, body limit) as
 /// `application/problem+json` with `instance` and `trace_id`.
 async fn render_problems(req: Request, next: Next) -> Response {
     let meta = meta_of(&req);
-    let instance = req.uri().path().to_owned();
+    let instance = shown_path(req.uri().path()).to_owned();
     let res = next.run(req).await;
     let status = res.status();
     if let Some(err) = res.extensions().get::<Arc<ApiError>>().cloned() {
@@ -587,5 +625,20 @@ pub(crate) mod tests {
         assert_eq!(headers[header::CONTENT_TYPE], PROBLEM_JSON);
         assert_eq!(json["code"], "MRL-VAL-007");
         assert_eq!(json["trace_id"].as_str().unwrap().len(), 32);
+    }
+
+    #[test]
+    fn transfer_paths_never_show_their_ticket() {
+        for p in [
+            "/api/v1/transfer/eyJrZXkiOi.sig",
+            "/api/v1/transfer/eyJrZXkiOi.sig/extra",
+            "/api/v1//transfer/eyJrZXkiOi.sig",
+        ] {
+            assert_eq!(shown_path(p), TRANSFER_ROUTE, "{p}");
+        }
+        assert_eq!(
+            shown_path("/api/v1/artifacts/art_1"),
+            "/api/v1/artifacts/art_1"
+        );
     }
 }

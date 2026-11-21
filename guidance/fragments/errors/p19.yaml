@@ -1,0 +1,57 @@
+# P19 uploads, artifacts, lineage and secrets.
+errors:
+  - code: MRL-CONFLICT-190
+    title: This name is already used here.
+    why: Another artifact or secret in this place already has this name.
+    what_to_do:
+      steps:
+        - Pick a different name, then try again.
+        - To replace the old one, delete it first.
+
+  - code: MRL-CONFLICT-191
+    title: This upload is already finished.
+    why: The upload was completed, cancelled, or it expired after 24 hours. It takes no more changes.
+    what_to_do:
+      steps:
+        - Start a new upload for the file.
+
+  - code: MRL-CONFLICT-192
+    title: This secret is being deleted.
+    why: Someone started deleting this secret, so its value can't be changed or read any more. A delete that stopped halfway leaves it in this state.
+    what_to_do:
+      steps:
+        - Delete the secret again to finish.
+        - Then create a new secret if you still need one.
+
+  - code: MRL-STORE-190
+    title: Some parts of this upload are missing or the wrong size.
+    why: The app can finish an upload only when every part has arrived at its full size. Details list the parts.
+    what_to_do:
+      steps:
+        - Send the parts listed in Details again.
+        - Then finish the upload again.
+
+  - code: MRL-PERM-190
+    title: This secret can't be used for this.
+    why: The secret's settings list the uses it allows, and this use is not one of them.
+    what_to_do:
+      steps:
+        - Add this use to the secret's allowed uses, if your team agrees.
+        - Or pick a secret made for this use.
+
+  - code: MRL-RES-190
+    title: This secret has no value yet.
+    why: The secret exists, but nobody saved its value. Or its environment variable is not set on the server.
+    what_to_do:
+      steps:
+        - Save the secret's value in the app, then try again.
+        - For a secret read from an environment variable, set that variable and restart the server.
+
+  - code: MRL-ENV-190
+    title: This server has no place to keep secret values.
+    why: The server was started without a secret store, so it can't save or read secret values. A team server also needs it to sign download and upload links that every server copy accepts.
+    what_to_do:
+      steps:
+        - Start the server from the desktop app, which keeps secrets in your computer's keychain.
+        - On a solo server, you can also use a secret read from an environment variable.
+        - On a team server, ask your admin to set up the shared secret store.

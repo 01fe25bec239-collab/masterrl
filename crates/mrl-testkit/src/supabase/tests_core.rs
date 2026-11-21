@@ -488,7 +488,12 @@ async fn every_route_answers_by_role_in_team_mode() {
             None,
         ),
     ];
-    let public = ["/api/v1/auth/login", "/api/v1/auth/callback"];
+    // Transfer tickets are their own credential (P19).
+    let public = [
+        "/api/v1/auth/login",
+        "/api/v1/auth/callback",
+        "/api/v1/transfer/{ticket}",
+    ];
     let sb = MockSupabase::start().await;
     // Every role calls every route in one org, past the default rate limits.
     let mut cfg = config(Mode::Team, &sb);
@@ -576,13 +581,80 @@ async fn every_route_answers_by_role_in_team_mode() {
         .call(
             Method::POST,
             "/api/v1/pools",
-            &Auth::Bearer(seed_jwt),
+            &Auth::Bearer(seed_jwt.clone()),
             Some(json!({"name": "seed-pool"})),
         )
         .await;
     assert_eq!(pool.status, 201, "{}", pool.text());
     let pool = pool.json()["id"].as_str().unwrap().to_owned();
     let node = NodeId::new();
+    // Storage (P19): one finished upload registered as an artifact, an open upload, and a
+    // secret. Every role works on these (another person's).
+    let seed = |m: Method, p: String, body: Value| {
+        let (core, jwt) = (&core, seed_jwt.clone());
+        async move {
+            let r = core.call(m, &p, &Auth::Bearer(jwt), Some(body)).await;
+            assert!(r.status < 300, "seed {p}: {} {}", r.status, r.text());
+            r.json()
+        }
+    };
+    let sha = "2552b1c0272ab701af519fff4e4299f03720e72a3e3b57f7214b81d13c7eceff"; // "rbac"
+    let new_upload = json!({"filename": "rbac.bin", "size": 4, "sha256": sha});
+    let done = seed(Method::POST, "/api/v1/uploads".into(), new_upload.clone()).await;
+    let done = done["id"].as_str().unwrap().to_owned();
+    let bearer = format!("Bearer {seed_jwt}");
+    let put = core
+        .server
+        .request(
+            Method::PUT,
+            &format!("/api/v1/uploads/{done}/parts/0"),
+            &[
+                ("authorization", &bearer),
+                ("content-type", "application/octet-stream"),
+            ],
+            b"rbac".to_vec(),
+        )
+        .await;
+    assert!(put.status < 300, "seed part: {} {}", put.status, put.text());
+    seed(
+        Method::POST,
+        format!("/api/v1/uploads/{done}:complete"),
+        json!({}),
+    )
+    .await;
+    let manifest = json!({"schema_version": "artifact-manifest/v1", "kind": "eval",
+        "created_at": "2026-11-16T00:00:00Z",
+        "files": [{"path": "rbac.bin", "size": 4, "sha256": sha, "role": "report"}]});
+    let art = seed(
+        Method::POST,
+        "/api/v1/artifacts".into(),
+        json!({"name": "seed-artifact", "manifest": manifest, "uploads": {"rbac.bin": done}}),
+    )
+    .await;
+    let art = art["id"].as_str().unwrap().to_owned();
+    let open = seed(Method::POST, "/api/v1/uploads".into(), new_upload.clone()).await;
+    let open = open["id"].as_str().unwrap().to_owned();
+    let new_secret = |name: &str| json!({"name": name, "kind": "generic", "allowed_uses": ["run"]});
+    let sec = seed(
+        Method::POST,
+        "/api/v1/secrets".into(),
+        new_secret("seed-secret"),
+    )
+    .await;
+    let sec = sec["id"].as_str().unwrap().to_owned();
+    // An allowed role deletes the secret; put it back before each call, so the next role
+    // still meets a real secret (and is refused, not told it is missing).
+    core.db
+        .seed(&format!(
+            "CREATE TABLE rbac_secret_copy AS SELECT * FROM secrets_metadata WHERE id = '{}';",
+            mrl_domain::ids::SecretId::from_str(&sec).unwrap().as_uuid()
+        ))
+        .await;
+    let restore = || {
+        core.db.seed(
+            "INSERT INTO secrets_metadata SELECT * FROM rbac_secret_copy ON CONFLICT DO NOTHING;",
+        )
+    };
     core.db
         .seed(&format!(
             "INSERT INTO compute_nodes (id, pool_id, hostname, lifecycle, status)
@@ -723,6 +795,106 @@ async fn every_route_answers_by_role_in_team_mode() {
             None,
         ),
     ]);
+    // Storage (P19): uploads, artifacts, lineage and secrets.
+    let row = |m: Method, p: String, a: Action, body: Option<Value>| (m, p, a, body);
+    routes.extend([
+        row(
+            Method::POST,
+            "/api/v1/uploads".into(),
+            Action::UploadsWrite,
+            Some(new_upload),
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/uploads/{open}"),
+            Action::UploadsWrite,
+            None,
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/uploads/{open}:presign"),
+            Action::UploadsWrite,
+            Some(json!({})),
+        ),
+        row(
+            Method::PUT,
+            format!("/api/v1/uploads/{open}/parts/0"),
+            Action::UploadsWrite,
+            Some(json!("not the bytes")),
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/uploads/{open}:complete"),
+            Action::UploadsWrite,
+            Some(json!({})),
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/uploads/{open}:abort"),
+            Action::UploadsWrite,
+            None,
+        ),
+        row(
+            Method::GET,
+            "/api/v1/artifacts".into(),
+            Action::LineageRead,
+            None,
+        ),
+        row(
+            Method::POST,
+            "/api/v1/artifacts".into(),
+            Action::UploadsWrite,
+            Some(json!({"name": "rbac", "manifest": {}, "uploads": {}})),
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/artifacts/{art}"),
+            Action::LineageRead,
+            None,
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/artifacts/{art}:download"),
+            Action::LineageRead,
+            Some(json!({"path": "rbac.bin"})),
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/lineage/{art}"),
+            Action::LineageRead,
+            None,
+        ),
+        row(
+            Method::GET,
+            "/api/v1/secrets".into(),
+            Action::TenancyRead,
+            None,
+        ),
+        row(
+            Method::POST,
+            "/api/v1/secrets".into(),
+            Action::SecretsManage,
+            Some(new_secret("rbac-secret")),
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/secrets/{sec}"),
+            Action::TenancyRead,
+            None,
+        ),
+        row(
+            Method::PUT,
+            format!("/api/v1/secrets/{sec}/value"),
+            Action::SecretsManage,
+            Some(json!({"value": "not-a-real-secret"})),
+        ),
+        row(
+            Method::DELETE,
+            format!("/api/v1/secrets/{sec}"),
+            Action::SecretsManage,
+            None,
+        ),
+    ]);
     // A run submission needs an Idempotency-Key (keys are per person).
     let key_for = |method: &Method, path: &str| -> &'static [(&'static str, &'static str)] {
         if *method == Method::POST && path.ends_with("/runs") {
@@ -773,6 +945,18 @@ async fn every_route_answers_by_role_in_team_mode() {
             ("POST", "/api/v1/pools") => &[201, 409, 422],
             ("POST", p) if p.ends_with("/enrollment-tokens") => &[201],
             ("POST", p) if p.ends_with(":drain") || p.ends_with(":decommission") => &[200, 422],
+            // The first allowed role aborts the open upload; later ones find it finished
+            // (409). Parts must be the upload's bytes (this body isn't), so they are 422.
+            ("POST", "/api/v1/uploads") => &[201],
+            ("POST", p) if p.ends_with(":presign") => &[200, 409],
+            ("PUT", p) if p.contains("/parts/") => &[409, 422],
+            ("POST", p) if p.ends_with(":complete") => &[409],
+            ("POST", p) if p.ends_with(":abort") => &[200],
+            ("POST", "/api/v1/artifacts") => &[422],
+            ("POST", p) if p.ends_with(":download") => &[200],
+            ("POST", "/api/v1/secrets") => &[201, 409],
+            ("PUT", p) if p.ends_with("/value") => &[204],
+            ("DELETE", p) if p.starts_with("/api/v1/secrets/") => &[204],
             ("GET", _) => &[200],
             _ => &[],
         }
@@ -807,6 +991,7 @@ async fn every_route_answers_by_role_in_team_mode() {
                 continue; // checked last: it would end nothing here, but keep the table honest
             }
             let key = key_for(method, path);
+            restore().await;
             let r = core
                 .call_with(
                     method.clone(),
@@ -875,6 +1060,7 @@ async fn every_route_answers_by_role_in_team_mode() {
         if *method == Method::POST && path == "/api/v1/auth/logout" {
             continue;
         }
+        restore().await;
         let r = core
             .call_with(
                 method.clone(),

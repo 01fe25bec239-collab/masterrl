@@ -5,6 +5,43 @@ from __future__ import annotations
 from typing import Any, Literal, NotRequired, TypedDict
 
 
+class Artifact(TypedDict):
+    """A registered artifact."""
+
+    committed_at: str
+    """When it committed."""
+
+    created_at: str
+    """When it was registered."""
+
+    created_by: str
+    """Who registered it."""
+
+    id: str
+    """`art_…`."""
+
+    kind: str
+    """`model`, `dataset`, `checkpoint`, `eval`, `export` or `other`."""
+
+    manifest: dict[str, Any]
+    """The manifest."""
+
+    name: str
+    """Name."""
+
+    prefix: str
+    """Full key prefix the files were registered from. Downloads read the checked copies in"""
+
+    project_id: NotRequired[str | None]
+    """Project."""
+
+    size_bytes: int
+    """Total bytes."""
+
+    state: str
+    """`PENDING`, `COMMITTED` or `FAILED`."""
+
+
 class Attempt(TypedDict):
     """One attempt at running a job."""
 
@@ -178,6 +215,26 @@ class CreateToken(TypedDict):
     """`["*"]`, or areas like `["runs:write", "datasets:read"]`."""
 
 
+class DownloadRequest(TypedDict):
+    """`POST /artifacts/{art}:download` body."""
+
+    path: str
+    """A file path from the manifest."""
+
+
+class Edge(TypedDict):
+    """An edge in the answer; `from` and `to` are node ids from `nodes`."""
+
+    from_: str
+    """Source node id."""
+
+    relation: Relation
+    """Relation."""
+
+    to: str
+    """Target node id."""
+
+
 Endpoint = dict[str, Any]
 """How the core dials one machine (stored in `compute_nodes.endpoint`)."""
 
@@ -293,6 +350,22 @@ class GpuView(TypedDict):
 
     vram_total_bytes: int
     """Memory."""
+
+
+class Graph(TypedDict):
+    """A lineage graph around one node."""
+
+    edges: list[Edge]
+    """Every edge between them."""
+
+    nodes: list[Node]
+    """Every node reached."""
+
+    root: str
+    """The node asked about."""
+
+    truncated: bool
+    """True when the walk stopped at the edge limit (1000)."""
 
 
 class Health(TypedDict):
@@ -450,6 +523,28 @@ class Me(TypedDict):
     user: NotRequired[dict[str, Any]]
 
 
+class NewArtifact(TypedDict):
+    """`POST /artifacts` body."""
+
+    links: NotRequired[list[NewLink]]
+    """Lineage links written when the artifact commits."""
+
+    manifest: dict[str, Any]
+    """The `artifact-manifest/v1` document."""
+
+    name: str
+    """Unique name in the org (or project)."""
+
+    prefix: NotRequired[str | None]
+    """Folder of the files, relative to the org, ending in `/` (like `exports/exp1/`). Only"""
+
+    project_id: NotRequired[str | None]
+    """Project, if the artifact belongs to one."""
+
+    uploads: NotRequired[dict[str, Any]]
+    """Where each file's bytes are: manifest path → id of a finished upload the caller may"""
+
+
 class NewExperiment(TypedDict):
     """`POST /projects/{prj}/experiments` body."""
 
@@ -473,6 +568,38 @@ class NewItem(TypedDict):
     """Short name used in addresses: 1-63 lower-case letters, digits and `-`, starting with a letter or digit."""
 
 
+class NewLink(TypedDict):
+    """A lineage link given when registering: this artifact `relation` `to`, or `from` `relation`"""
+
+    from_: NotRequired[str | None]
+    """The other entity, when it points at this artifact (like a run that `produced` it)."""
+
+    relation: Relation
+    """How the two are related."""
+
+    to: NotRequired[str | None]
+    """The other entity, when this artifact points at it (like `derived_from` a checkpoint)."""
+
+
+class NewSecret(TypedDict):
+    """`POST /secrets` body."""
+
+    allowed_uses: list[str]
+    """What the secret may be used for, like `run` or `model_download`."""
+
+    env_var: NotRequired[str | None]
+    """Read the value from this environment variable of the server instead of storing it."""
+
+    kind: str
+    """`hf_token`, `cloud_credentials`, `s3`, `oidc` or `generic`."""
+
+    name: str
+    """Unique name in the org (or project)."""
+
+    project_id: NotRequired[str | None]
+    """Project, if the secret belongs to one."""
+
+
 class NewToken(TypedDict):
     """A token, shown once."""
 
@@ -487,6 +614,38 @@ class NewToken(TypedDict):
 
     token: str
     """`mrl_pat_…`. Store it now; it is never shown again."""
+
+
+class NewUpload(TypedDict):
+    """`POST /uploads` body."""
+
+    filename: str
+    """File name, shown to people (1-255 characters, no `/` or `\\`)."""
+
+    part_size: NotRequired[int | None]
+    """Bytes per part, 1-2 MiB (default 2 MiB)."""
+
+    project_id: NotRequired[str | None]
+    """Project, if the upload belongs to one."""
+
+    sha256: str
+    """sha256 of the whole file, lowercase hex."""
+
+    size: int
+    """Total size in bytes."""
+
+
+class Node(TypedDict):
+    """A node in the answer."""
+
+    id: str
+    """The typed id, or `hidden-N` for a node the caller may not see."""
+
+    kind: NotRequired[str | None]
+    """Kind (id prefix); `null` when redacted."""
+
+    redacted: bool
+    """True when the caller may not see this node."""
 
 
 class NodeDetail(TypedDict):
@@ -644,6 +803,16 @@ class OrgPage(TypedDict):
     """Pass as `cursor` for the next page; `null` on the last page."""
 
 
+class PartTicket(TypedDict):
+    """One PUT ticket per part."""
+
+    part: int
+    """Part number."""
+
+    ticket: dict[str, Any]
+    """The ticket: `PUT` its `url` (the server's `/api/v1/transfer/{ticket}`, so"""
+
+
 class PoolView(TypedDict):
     """A pool."""
 
@@ -674,6 +843,20 @@ class PoolViewPage(TypedDict):
 
     next_cursor: NotRequired[str | None]
     """Pass as `cursor` for the next page; `null` on the last page."""
+
+
+class PresignRequest(TypedDict):
+    """`POST /uploads/{up}:presign` body."""
+
+    parts: NotRequired[list[int] | None]
+    """Part numbers; default: every part not received yet (at most 1000)."""
+
+
+class PresignResponse(TypedDict):
+    """`POST /uploads/{up}:presign` answer."""
+
+    tickets: list[PartTicket]
+    """One ticket per part asked for."""
 
 
 class Problem(TypedDict):
@@ -780,6 +963,21 @@ class Rejection(TypedDict):
 
     path: NotRequired[str | None]
     """JSON Pointer into the submission, like `/algorithm_id`."""
+
+
+Relation = Literal[
+    "derived_from",
+    "trained_on",
+    "rewarded_by",
+    "produced",
+    "promoted_to",
+    "deployed_as",
+    "evaluated_by",
+    "exported_as",
+    "labelled_from",
+    "generated_by",
+]
+"""How two entities are related (Doc 09 §3.10)."""
 
 
 class RestoreRequest(TypedDict):
@@ -974,6 +1172,40 @@ class RunSubmission(TypedDict):
 
     seeds: NotRequired[dict[str, Any] | None]
     """Random seeds; the server picks `{"global": n}` when absent."""
+
+
+class SecretMeta(TypedDict):
+    """A secret reference. Never has the value."""
+
+    allowed_uses: list[str]
+    """Allowed uses."""
+
+    backend: str
+    """`secret_store` or `env`."""
+
+    created_at: str
+    """When it was made."""
+
+    created_by: str
+    """Who made it."""
+
+    env_var: NotRequired[str | None]
+    """The environment variable, for `env` secrets."""
+
+    id: str
+    """`sec_…`."""
+
+    kind: str
+    """Kind."""
+
+    name: str
+    """Name."""
+
+    project_id: NotRequired[str | None]
+    """Project."""
+
+    rotated_at: str
+    """When its value was last saved; `null` if never."""
 
 
 class SessionStarted(TypedDict):
@@ -1172,6 +1404,46 @@ class Transport(TypedDict):
     """Login name (SSH)."""
 
 
+class Upload(TypedDict):
+    """An upload and its progress."""
+
+    blob_key: NotRequired[str | None]
+    """The finished file's key (completed uploads only)."""
+
+    created_at: str
+    """When it was opened."""
+
+    expires_at: str
+    """An open upload expires at this time."""
+
+    filename: str
+    """File name."""
+
+    id: str
+    """`up_…`."""
+
+    part_count: int
+    """Number of parts."""
+
+    part_size: int
+    """Bytes per part."""
+
+    parts_received: list[int]
+    """Parts already stored (open uploads only)."""
+
+    project_id: NotRequired[str | None]
+    """Project."""
+
+    sha256: str
+    """Expected sha256."""
+
+    size: int
+    """Total size in bytes."""
+
+    state: str
+    """`OPEN`, `COMPLETED`, `ABORTED` or `EXPIRED`."""
+
+
 class UserInfo(TypedDict):
     """A person."""
 
@@ -1218,6 +1490,7 @@ class WorkspacePage(TypedDict):
 
 
 __all__ = [
+    "Artifact",
     "Attempt",
     "AttemptPage",
     "AuditRecord",
@@ -1228,12 +1501,15 @@ __all__ = [
     "CreateEnrollmentToken",
     "CreatePool",
     "CreateToken",
+    "DownloadRequest",
+    "Edge",
     "Endpoint",
     "Experiment",
     "ExperimentPage",
     "ExperimentPatch",
     "FieldError",
     "GpuView",
+    "Graph",
     "Health",
     "Job",
     "JobPage",
@@ -1243,16 +1519,24 @@ __all__ = [
     "LoginStarted",
     "Machine",
     "Me",
+    "NewArtifact",
     "NewExperiment",
     "NewItem",
+    "NewLink",
+    "NewSecret",
     "NewToken",
+    "NewUpload",
+    "Node",
     "NodeDetail",
     "NodeView",
     "NodeViewPage",
     "Org",
     "OrgPage",
+    "PartTicket",
     "PoolView",
     "PoolViewPage",
+    "PresignRequest",
+    "PresignResponse",
     "Problem",
     "Project",
     "ProjectPage",
@@ -1260,6 +1544,7 @@ __all__ = [
     "Pushed",
     "Readiness",
     "Rejection",
+    "Relation",
     "RestoreRequest",
     "Restored",
     "RoleInfo",
@@ -1268,6 +1553,7 @@ __all__ = [
     "RunKind",
     "RunPage",
     "RunSubmission",
+    "SecretMeta",
     "SessionStarted",
     "SetupDone",
     "SetupProfile",
@@ -1282,6 +1568,7 @@ __all__ = [
     "TokenInfo",
     "TokenInfoPage",
     "Transport",
+    "Upload",
     "UserInfo",
     "Workspace",
     "WorkspacePage",
