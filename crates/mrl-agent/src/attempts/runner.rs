@@ -2074,13 +2074,13 @@ impl Runner {
         self.rec.exit = Some(decision.clone());
         self.save();
         self.status(Some(&decision)).await;
-        if let Some(done) = detached {
-            let _ = done.send(());
-        }
         let report =
             crate::janitor::release(&self.sh.ctx, &self.sh.envs, &self.rec, &self.gpu_uuids).await;
         let line = serde_json::to_string(&report).unwrap_or_default();
         let _ = std::fs::write(self.job_dir.join("cleanup.json"), line);
+        if let Some(done) = detached {
+            let _ = done.send(());
+        }
         decision
     }
 }
