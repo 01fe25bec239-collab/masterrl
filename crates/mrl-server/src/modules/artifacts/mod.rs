@@ -36,8 +36,8 @@ use axum::routing::{get, post, put};
 use axum::{Extension, Json, Router};
 use mrl_domain::ids::ArtifactId;
 use mrl_storage::{
-    verify_ticket, ArtifactManifest, Backend, BackendConfig, S3Config, StorageError, Store,
-    TicketClaims, TicketKey, TicketMethod, TransferOptions, TransferTicket,
+    sign_ticket, verify_ticket, ArtifactManifest, Backend, BackendConfig, S3Config, StorageError,
+    Store, TicketClaims, TicketKey, TicketMethod, TransferOptions, TransferTicket,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -344,26 +344,14 @@ impl ArtifactStore {
         method: TicketMethod,
         max_size: u64,
     ) -> Result<TransferTicket, Error> {
-        self.ticket_for(seams, ctx, key, method, max_size, TICKET_TTL)
-            .await
-    }
-
-    /// [`ArtifactStore::ticket`] valid for `ttl` (at most 15 minutes).
-    pub async fn ticket_for(
-        &self,
-        seams: &Seams,
-        ctx: &RequestContext,
-        key: &str,
-        method: TicketMethod,
-        max_size: u64,
-        ttl: Duration,
-    ) -> Result<TransferTicket, Error> {
         let org = org_of(ctx)?;
         let store = self.signing(seams.secrets.as_ref()).await?.0.org(&org)?;
         if method == TicketMethod::Put && is_immutable(&store, key) {
             return Err(immutable());
         }
-        let ticket = store.transfer_ticket(key, method, max_size, ttl).await?;
+        let ticket = store
+            .transfer_ticket(key, method, max_size, TICKET_TTL)
+            .await?;
         if method == TicketMethod::Get {
             seams
                 .audit
@@ -380,6 +368,43 @@ impl ArtifactStore {
                 .await?;
         }
         Ok(ticket)
+    }
+
+    /// A proxied part PUT ticket whose signed expiry cannot exceed the upload deadline.
+    pub(crate) async fn part_ticket(
+        &self,
+        seams: &Seams,
+        ctx: &RequestContext,
+        key: String,
+        max_size: u64,
+        deadline: OffsetDateTime,
+    ) -> Result<TransferTicket, Error> {
+        let (backend, signer) = self.signing(seams.secrets.as_ref()).await?;
+        backend.org(&org_of(ctx)?)?.keys().check(&key)?;
+        let now = OffsetDateTime::now_utc();
+        let expires_at = deadline.min(now + TICKET_TTL);
+        let claims = TicketClaims {
+            key: key.clone(),
+            method: TicketMethod::Put,
+            max_size,
+            issued_at: now.unix_timestamp(),
+            expires_at: expires_at.unix_timestamp(),
+        };
+        if claims.expires_at <= claims.issued_at {
+            return Err(StorageError::TicketExpired.into());
+        }
+        let token = sign_ticket(signer, &claims)?;
+        let expires_at = OffsetDateTime::from_unix_timestamp(claims.expires_at)
+            .map_err(|_| StorageError::TicketInvalid("the deadline is out of range"))?;
+        Ok(TransferTicket {
+            method: claims.method,
+            key,
+            max_size,
+            expires_at,
+            url: format!("{}{token}", mrl_storage::PROXY_PATH),
+            presigned: false,
+            headers: BTreeMap::new(),
+        })
     }
 
     /// Registers an artifact in two phases: a PENDING row reserves the name; every file is
@@ -429,8 +454,20 @@ impl ArtifactStore {
             .sources(seams, ctx, &org, &store, id, &new, &manifest)
             .await?;
         // A retry of an earlier registration (checked afresh above) answers with its row.
-        if let Some(a) = self.earlier(idem, &org, &ctx.principal.id).await? {
-            return Ok(a);
+        if let Some(a) = self.earlier(seams, ctx, idem, &org).await? {
+            if a.state == "COMMITTED" {
+                return Ok(a);
+            }
+            // The HTTP idempotency claim serializes this key. Replace a reservation left
+            // by a dead owner, using a new ID so its delayed cleanup can't touch this try.
+            fail_pending(&self.db, a.uuid).await?;
+            if let Some(a) = self
+                .get(&org, a.uuid)
+                .await?
+                .filter(|a| a.state == "COMMITTED")
+            {
+                return Ok(a);
+            }
         }
         let inserted = sqlx::query(
             "INSERT INTO artifacts (id, org_id, project_id, name, kind, prefix, manifest, size_bytes, state, created_by, idempotency_key, request_sha256)
@@ -450,18 +487,22 @@ impl ArtifactStore {
         .execute(self.db.pool())
         .await;
         match inserted {
-            Err(e) if is_idempotency_conflict(&e) => {
-                return self
-                    .earlier(idem, &org, &ctx.principal.id)
-                    .await?
-                    .ok_or_else(|| not_found("artifact"))
-            }
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
+                if let Some(a) = self.earlier(seams, ctx, idem, &org).await? {
+                    if a.state == "COMMITTED" {
+                        return Ok(a);
+                    }
+                    return Err(ApiError::new(
+                        ErrorCode::IdempotencyInProgress,
+                        "A request with this key is still running.",
+                    )
+                    .into());
+                }
                 return Err(Error::coded(
                     codes::NAME_TAKEN,
                     StatusCode::CONFLICT,
                     format!("An artifact named {name:?} already exists here."),
-                ))
+                ));
             }
             other => other?,
         };
@@ -534,17 +575,25 @@ impl ArtifactStore {
     /// The artifact an earlier try with this Idempotency-Key made, if any.
     async fn earlier(
         &self,
+        seams: &Seams,
+        ctx: &RequestContext,
         idem: Option<&Idempotency>,
         org: &str,
-        by: &str,
     ) -> Result<Option<Artifact>, Error> {
         let Some(i) = idem else {
             return Ok(None);
         };
-        match i.earlier(&self.db, Created::Artifact, org, by).await? {
-            Some(id) => self.get(org, id).await,
-            None => Ok(None),
+        let Some(id) = i
+            .earlier(&self.db, Created::Artifact, org, &ctx.principal.id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let found = self.get(org, id).await?;
+        if let Some(a) = &found {
+            allow(seams, ctx, READ, &a.resource(org)).await?;
         }
+        Ok(found)
     }
 
     /// Where each manifest file comes from, checked before anything is reserved, and the

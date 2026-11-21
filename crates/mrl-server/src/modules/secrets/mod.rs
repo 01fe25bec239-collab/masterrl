@@ -193,15 +193,6 @@ impl SecretResolver {
         .ok_or_else(|| not_found("secret"))
     }
 
-    /// The secret, unless it is being deleted.
-    async fn row(&self, org: &str, id: Uuid) -> Result<Row, Error> {
-        let row = self.row_any(org, id).await?;
-        if row.deleting {
-            return Err(deleting(&row));
-        }
-        Ok(row)
-    }
-
     /// Deletes secret `id` of `org`: marks it (which waits for a rotation in progress, since
     /// that holds the row lock, and makes later rotations, grants and resolutions refuse
     /// it), removes the value from `store` and checks it is gone, then deletes the metadata
@@ -213,29 +204,43 @@ impl SecretResolver {
         org: &str,
         id: Uuid,
     ) -> Result<(), Error> {
-        let row = self.row_any(org, id).await?;
-        let _lock = SecretLock::take(&self.db, id).await?;
-        sqlx::query("UPDATE secrets_metadata SET deleting = true WHERE org_id = $1 AND id = $2")
-            .bind(org)
-            .bind(id)
-            .execute(self.db.pool())
-            .await?;
-        if row.backend == "secret_store" {
+        self.delete_with_audit(store, org, id, None).await
+    }
+
+    async fn delete_with_audit(
+        &self,
+        store: Option<&Arc<dyn SecretStore>>,
+        org: &str,
+        id: Uuid,
+        audit_id: Option<Uuid>,
+    ) -> Result<(), Error> {
+        let mut lock = SecretLock::take(&self.db, id).await?;
+        let row: Option<(String, String, Option<String>)> = sqlx::query_as(
+            "UPDATE secrets_metadata SET deleting = true WHERE org_id = $1 AND id = $2
+             RETURNING backend, ref, rotation_ref",
+        )
+        .bind(org)
+        .bind(id)
+        .fetch_optional(lock.connection())
+        .await?;
+        let Some((backend, reference, extra)) = row else {
+            return Err(not_found("secret"));
+        };
+        if backend == "secret_store" {
             let st = store_of(store)?;
-            st.delete(&row.reference).await?;
-            if st.get(&row.reference).await?.is_some() {
-                return Err(ApiError::new(
-                    ErrorCode::Unavailable,
-                    "The secret store still has the value. Delete the secret again.",
-                )
-                .into());
+            remove_value(st.as_ref(), &reference).await?;
+            if let Some(extra) = extra {
+                remove_value(st.as_ref(), &extra).await?;
             }
         }
+        let mut tx = sqlx::Connection::begin(lock.connection()).await?;
         sqlx::query("DELETE FROM secrets_metadata WHERE org_id = $1 AND id = $2")
             .bind(org)
             .bind(id)
-            .execute(self.db.pool())
+            .execute(&mut *tx)
             .await?;
+        finish_audit(&mut tx, audit_id, "success").await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -300,8 +305,23 @@ impl SecretResolver {
         secret: SecretId,
         use_: &str,
     ) -> Result<Secret, Error> {
-        let row = self.row(org, secret.as_uuid()).await?;
-        value(store, &row, use_, self.mode).await
+        let mut tx = self.db.pool().begin().await?;
+        let row: Row = sqlx::query_as(concat!(
+            "SELECT ",
+            columns!(),
+            " FROM secrets_metadata WHERE org_id = $1 AND id = $2 FOR SHARE"
+        ))
+        .bind(org)
+        .bind(secret.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| not_found("secret"))?;
+        if row.deleting {
+            return Err(deleting(&row));
+        }
+        let value = value(store, &row, use_, self.mode).await?;
+        tx.commit().await?;
+        Ok(value)
     }
 
     /// Every secret granted to `run` in `org`, with its value, for delivery to the run's agent.
@@ -312,15 +332,16 @@ impl SecretResolver {
         org: &str,
         run: RunId,
     ) -> Result<Vec<GrantedSecret>, Error> {
+        let mut tx = self.db.pool().begin().await?;
         let rows: Vec<(String, Row)> = sqlx::query_as::<_, GrantRow>(
             "SELECT g.mount, s.id, s.project_id, s.name, s.backend, s.ref, s.kind, s.allowed_uses,
                     s.created_by, s.created_at, s.rotated_at, s.deleting
              FROM run_secret_grants g JOIN secrets_metadata s ON s.id = g.secret_id
-             WHERE s.org_id = $1 AND g.run_id = $2 AND NOT s.deleting ORDER BY s.name",
+             WHERE s.org_id = $1 AND g.run_id = $2 AND NOT s.deleting ORDER BY s.name FOR SHARE OF s",
         )
         .bind(org)
         .bind(run.as_uuid())
-        .fetch_all(self.db.pool())
+        .fetch_all(&mut *tx)
         .await?
         .into_iter()
         .map(|g| (g.mount, g.row))
@@ -334,6 +355,7 @@ impl SecretResolver {
                 mount,
             });
         }
+        tx.commit().await?;
         Ok(out)
     }
 }
@@ -383,9 +405,13 @@ async fn value(
 /// deletion take it, so they never interleave, even across server replicas. The connection
 /// is closed instead of reused when this drops, which releases the lock however the
 /// request ends (finished, failed or cancelled).
-struct SecretLock(#[allow(dead_code)] sqlx::pool::PoolConnection<sqlx::Postgres>);
+struct SecretLock(sqlx::pool::PoolConnection<sqlx::Postgres>);
 
 impl SecretLock {
+    fn connection(&mut self) -> &mut sqlx::PgConnection {
+        &mut self.0
+    }
+
     async fn take(db: &Db, id: Uuid) -> Result<Self, Error> {
         let mut conn = db.pool().acquire().await?;
         conn.close_on_drop();
@@ -432,27 +458,108 @@ fn parse_id(s: &str) -> Result<Uuid, Error> {
         .map_err(|_| not_found("secret"))
 }
 
-/// Records `action` on `target`. Every mutation audits before it changes anything, so an
-/// audit that fails leaves nothing changed (503, safe to retry); a mutation that then
-/// fails records a second, `Failed` event (best effort).
-async fn audit(
+/// The attempt event is required before mutation. Its action names the attempt, so a
+/// process stop at this point cannot leave a false record of a completed change.
+async fn audit_attempt(
+    db: &Db,
     s: &AppState,
     ctx: &RequestContext,
     org: &str,
     action: &str,
-    target: String,
-) -> Result<(), Error> {
-    record(s, ctx, org, action, target, AuditOutcome::Success).await
+    target: &str,
+) -> Result<Uuid, Error> {
+    record(
+        s,
+        ctx,
+        org,
+        &format!("{action}.attempt"),
+        target.to_owned(),
+        AuditOutcome::Success,
+    )
+    .await?;
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO secret_mutation_audit (id, org_id, actor, project_id, action, target, trace_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7)",
+    )
+    .bind(id)
+    .bind(org)
+    .bind(&ctx.principal.id)
+    .bind(&ctx.project)
+    .bind(action)
+    .bind(target)
+    .bind(&ctx.trace_id)
+    .execute(db.pool())
+    .await?;
+    Ok(id)
 }
 
-/// Best effort: notes that `action` failed after it was audited.
-async fn audit_failed(s: &AppState, ctx: &RequestContext, org: &str, action: &str, target: String) {
-    if let Err(e) = record(s, ctx, org, action, target, AuditOutcome::Failed).await {
-        tracing::warn!(
-            code = e.code(),
-            action,
-            "could not record a failed secret change"
-        );
+async fn finish_audit(
+    conn: &mut sqlx::PgConnection,
+    id: Option<Uuid>,
+    outcome: &str,
+) -> Result<(), Error> {
+    if let Some(id) = id {
+        sqlx::query(
+            "UPDATE secret_mutation_audit SET outcome = $2, finished_at = clock_timestamp()
+             WHERE id = $1 AND outcome IS NULL",
+        )
+        .bind(id)
+        .bind(outcome)
+        .execute(conn)
+        .await?;
+    }
+    Ok(())
+}
+
+#[derive(sqlx::FromRow)]
+struct AuditRow {
+    finished_at: OffsetDateTime,
+    org_id: String,
+    actor: String,
+    project_id: Option<String>,
+    action: String,
+    target: String,
+    trace_id: String,
+    outcome: String,
+}
+
+/// Forward the durable outcome to the configured sink.
+async fn audit_outcome(db: &Db, s: &AppState, id: Uuid, failed: bool) {
+    let persisted: Result<Option<AuditRow>, Error> = async {
+        let mut conn = db.pool().acquire().await?;
+        if failed {
+            finish_audit(&mut conn, Some(id), "failed").await?;
+        }
+        Ok(sqlx::query_as(
+            "SELECT finished_at, org_id, actor, project_id, action, target, trace_id, outcome
+             FROM secret_mutation_audit WHERE id = $1 AND outcome IS NOT NULL",
+        )
+        .bind(id)
+        .fetch_optional(&mut *conn)
+        .await?)
+    }
+    .await;
+    let Ok(Some(row)) = persisted else {
+        tracing::warn!(audit_id = %id, "could not read the secret change outcome");
+        return;
+    };
+    let event = AuditEvent {
+        at: row.finished_at,
+        org: Some(row.org_id),
+        actor: row.actor,
+        project: row.project_id,
+        action: row.action,
+        target: row.target,
+        trace_id: row.trace_id,
+        outcome: if row.outcome == "success" {
+            AuditOutcome::Success
+        } else {
+            AuditOutcome::Failed
+        },
+    };
+    if s.seams.audit.record(event).await.is_err() {
+        tracing::warn!(audit_id = %id, "could not forward the secret change outcome");
     }
 }
 
@@ -567,7 +674,14 @@ pub(crate) async fn create(
                 .earlier(store.db(), Created::Secret, &org, &ctx.principal.id)
                 .await?
             {
-                Some(id) => Ok(Some(resolver.row_any(&org, id).await?)),
+                Some(id) => {
+                    let row = resolver.row_any(&org, id).await?;
+                    s.authorize(&ctx, READ, &row.resource(&org)).await?;
+                    if row.deleting {
+                        return Err(deleting(&row));
+                    }
+                    Ok(Some(row))
+                }
                 None => Ok(None),
             },
             None => Ok::<_, Error>(None),
@@ -585,7 +699,8 @@ pub(crate) async fn create(
         ),
     };
     let target = SecretId::from_uuid(id).to_string();
-    audit(&s, &ctx, &org, "secrets.create", target.clone()).await?;
+    let audit_id = audit_attempt(store.db(), &s, &ctx, &org, "secrets.create", &target).await?;
+    let mut tx = store.db().pool().begin().await?;
     let row: Result<Row, sqlx::Error> = sqlx::query_as(concat!(
         "INSERT INTO secrets_metadata (id, org_id, project_id, name, backend, ref, kind, allowed_uses, created_by, idempotency_key, request_sha256)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING ",
@@ -602,12 +717,18 @@ pub(crate) async fn create(
     .bind(&ctx.principal.id)
     .bind(idem.as_ref().map(|i| &i.key))
     .bind(idem.as_ref().map(|i| &i.request_sha256))
-    .fetch_one(store.db().pool())
+    .fetch_one(&mut *tx)
     .await;
     let row = match row {
-        Ok(row) => row,
+        Ok(row) => {
+            finish_audit(&mut tx, Some(audit_id), "success").await?;
+            tx.commit().await?;
+            audit_outcome(store.db(), &s, audit_id, false).await;
+            row
+        }
         Err(e) => {
-            audit_failed(&s, &ctx, &org, "secrets.create", target).await;
+            tx.rollback().await?;
+            audit_outcome(store.db(), &s, audit_id, true).await;
             if is_idempotency_conflict(&e) {
                 earlier().await?.ok_or_else(|| not_found("secret"))?
             } else if matches!(&e, sqlx::Error::Database(d) if d.code().as_deref() == Some("23505"))
@@ -722,31 +843,83 @@ pub(crate) async fn set_value(
         ));
     }
     let secrets = store_of(s.seams.secrets.as_ref())?;
-    // Held until the end: a delete waits for this rotation, and one that already began
-    // makes it refuse.
-    let _lock = SecretLock::take(store.db(), id).await?;
-    let state: Option<bool> =
-        sqlx::query_scalar("SELECT deleting FROM secrets_metadata WHERE id = $1")
-            .bind(id)
-            .fetch_optional(store.db().pool())
-            .await?;
-    match state {
-        None => return Err(not_found("secret")),
-        Some(true) => return Err(deleting(&row)),
-        Some(false) => {}
-    }
-    audit(&s, &ctx, &org, "secrets.set_value", sec.clone()).await?;
-    // The time is saved before the value: a stop after the write still shows the rotation
-    // (a failed write only makes the time early, never late).
-    sqlx::query("UPDATE secrets_metadata SET rotated_at = now() WHERE id = $1")
-        .bind(id)
-        .execute(store.db().pool())
-        .await?;
-    if let Err(e) = secrets.set(&row.reference, Secret::new(value)).await {
-        audit_failed(&s, &ctx, &org, "secrets.set_value", sec).await;
-        return Err(e.into());
-    }
+    let audit_id = audit_attempt(store.db(), &s, &ctx, &org, "secrets.set_value", &sec).await?;
+    let result = rotate(
+        store.db(),
+        &row,
+        secrets.as_ref(),
+        Secret::new(value),
+        audit_id,
+    )
+    .await;
+    audit_outcome(store.db(), &s, audit_id, result.is_err()).await;
+    result?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+async fn remove_value(store: &dyn SecretStore, reference: &str) -> Result<(), Error> {
+    store.delete(reference).await?;
+    if store.get(reference).await?.is_some() {
+        return Err(ApiError::new(
+            ErrorCode::Unavailable,
+            "The secret store still has the old value. Try again.",
+        )
+        .into());
+    }
+    Ok(())
+}
+
+async fn rotate(
+    db: &Db,
+    row: &Row,
+    store: &dyn SecretStore,
+    value: Secret,
+    audit_id: Uuid,
+) -> Result<(), Error> {
+    let mut lock = SecretLock::take(db, row.id).await?;
+    let (deleting_now, previous): (bool, Option<String>) =
+        sqlx::query_as("SELECT deleting, rotation_ref FROM secrets_metadata WHERE id = $1")
+            .bind(row.id)
+            .fetch_optional(lock.connection())
+            .await?
+            .ok_or_else(|| not_found("secret"))?;
+    if deleting_now {
+        return Err(deleting(row));
+    }
+    if let Some(previous) = previous {
+        remove_value(store, &previous).await?;
+    }
+
+    // The old reference stays readable until the new value is saved. Either side of a
+    // crash leaves the extra reference recorded for the next rotation or deletion.
+    let candidate = format!("mrl.secret.rotation.{}", Uuid::new_v4().simple());
+    sqlx::query("UPDATE secrets_metadata SET rotation_ref = $2 WHERE id = $1")
+        .bind(row.id)
+        .bind(&candidate)
+        .execute(lock.connection())
+        .await?;
+    store.set(&candidate, value).await?;
+    let mut tx = sqlx::Connection::begin(lock.connection()).await?;
+    let retired: String = sqlx::query_scalar(
+        "UPDATE secrets_metadata SET ref = rotation_ref, rotation_ref = ref, rotated_at = clock_timestamp()
+         WHERE id = $1 RETURNING rotation_ref",
+    )
+    .bind(row.id)
+    .fetch_one(&mut *tx)
+    .await?;
+    finish_audit(&mut tx, Some(audit_id), "success").await?;
+    tx.commit().await?;
+    if let Err(e) = remove_value(store, &retired).await {
+        tracing::warn!(code = e.code(), "could not remove a retired secret value");
+    } else if let Err(e) =
+        sqlx::query("UPDATE secrets_metadata SET rotation_ref = NULL WHERE id = $1")
+            .bind(row.id)
+            .execute(lock.connection())
+            .await
+    {
+        tracing::warn!(error = %e, "could not clear a retired secret reference");
+    }
+    Ok(())
 }
 
 /// Deletes a secret reference, its value and its grants.
@@ -764,14 +937,12 @@ pub(crate) async fn delete(
         .row_any(&org, id)
         .await?;
     s.authorize(&ctx, MANAGE, &row.resource(&org)).await?;
-    audit(&s, &ctx, &org, "secrets.delete", sec.clone()).await?;
-    if let Err(e) = SecretResolver::new(store.db().clone(), s.config.server.mode)
-        .delete(s.seams.secrets.as_ref(), &org, id)
-        .await
-    {
-        audit_failed(&s, &ctx, &org, "secrets.delete", sec).await;
-        return Err(e);
-    }
+    let audit_id = audit_attempt(store.db(), &s, &ctx, &org, "secrets.delete", &sec).await?;
+    let result = SecretResolver::new(store.db().clone(), s.config.server.mode)
+        .delete_with_audit(s.seams.secrets.as_ref(), &org, id, Some(audit_id))
+        .await;
+    audit_outcome(store.db(), &s, audit_id, result.is_err()).await;
+    result?;
     Ok(StatusCode::NO_CONTENT)
 }
 

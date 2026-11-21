@@ -11,8 +11,8 @@
 //!    stores it as the blob `orgs/{org}/blobs/sha256/…` (once per content). `:abort` cancels.
 //!
 //! Every part write (signed in or through a ticket) must have the part's exact length and
-//! lands only while the upload is OPEN and before its deadline: a write that races a
-//! completion, abort or expiry is deleted again and refused. Part tickets never outlive the
+//! is published only while the upload is OPEN and before its deadline. Bytes staged by an
+//! interrupted write stay invisible and are collected with the upload. Part tickets never outlive the
 //! upload. Parts are objects under `orgs/{org}/uploads/{id}/parts/`. The cleanup job expires open
 //! uploads after 24 hours and deletes anything under `uploads/` older than that which no
 //! open upload owns, plus scratch folders a killed process left behind.
@@ -30,7 +30,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::{Extension, Json};
 use mrl_domain::ids::UploadId;
-use mrl_storage::{sha256_hex, StorageError, Store, TicketMethod, TransferOptions, TransferTicket};
+use mrl_storage::{sha256_hex, StorageError, Store, TransferOptions, TransferTicket};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -272,17 +272,47 @@ async fn load(store: &ArtifactStore, org: &str, up: &str) -> Result<Row, Error> 
 }
 
 /// Stored parts: part number → size. Ignores objects that are not parts.
-async fn received(store: &Store, row: &Row) -> Result<BTreeMap<u64, u64>, Error> {
+async fn received(
+    db: &crate::db::Db,
+    store: &Store,
+    row: &Row,
+) -> Result<BTreeMap<u64, (String, u64)>, Error> {
+    let keys: sqlx::types::Json<BTreeMap<u64, String>> =
+        sqlx::query_scalar("SELECT part_keys FROM uploads WHERE id = $1")
+            .bind(row.id)
+            .fetch_one(db.pool())
+            .await?;
     let prefix = store.keys().upload_parts(&row.key())?;
-    Ok(store
-        .list(&prefix)
-        .await?
-        .into_iter()
-        .filter_map(|o| {
-            let n = o.key.strip_prefix(&prefix)?.parse::<u64>().ok()?;
-            Some((n, o.size))
-        })
-        .collect())
+    let objects = store.list(&prefix).await?;
+    let mut parts = BTreeMap::new();
+    for object in objects {
+        let Some(name) = object.key.strip_prefix(&prefix) else {
+            continue;
+        };
+        let number = name.split_once('-').map_or(name, |(n, _)| n);
+        let Ok(n) = number.parse() else { continue };
+        // Legacy canonical keys remain readable until their upload closes. A staged key
+        // is visible only when the database published that exact object.
+        let visible = keys
+            .get(&n)
+            .map_or(name == number, |key| *key == object.key);
+        if visible {
+            parts.insert(n, (object.key, object.size));
+        }
+    }
+    Ok(parts)
+}
+
+async fn lock_upload(tx: &mut crate::db::Tx, id: Uuid) -> Result<Row, Error> {
+    sqlx::query_as(concat!(
+        "SELECT ",
+        columns!(),
+        " FROM uploads WHERE id = $1 FOR UPDATE"
+    ))
+    .bind(id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(Error::from)
 }
 
 /// Deletes a closed upload's parts. The upload's new state is already committed, so a
@@ -297,41 +327,12 @@ async fn tidy(store: &Store, upload_key: &str) {
     }
 }
 
-/// True while upload `id` takes changes: OPEN and before its deadline (database time, the
-/// same check completion and abort make).
-async fn still_open(store: &ArtifactStore, id: Uuid) -> Result<bool, Error> {
-    Ok(sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM uploads WHERE id = $1 AND state = 'OPEN' AND expires_at > now())",
-    )
-    .bind(id)
-    .fetch_one(store.db().pool())
-    .await?)
-}
-
-/// After a part was written: if the upload closed meanwhile (completed, aborted, expired),
-/// the part is deleted again and the write refused, so nothing lands in a closed upload.
-async fn fence(store: &ArtifactStore, st: &Store, row: &Row, key: &str) -> Result<(), Error> {
-    if still_open(store, row.id).await? {
-        return Ok(());
-    }
-    if let Err(e) = st.delete(key).await {
-        tracing::warn!(
-            code = e.code(),
-            "could not delete a late part; the cleanup job will"
-        );
-    }
-    Err(closed(row))
-}
-
-/// A ticket PUT to an upload part (`uploads/{up}/parts/{n}`): the length it must have.
+/// A ticket PUT to an upload part.
 pub(crate) struct PartTarget {
     row: Row,
-    key: String,
-    /// Exact bytes the part needs.
-    pub(crate) len: u64,
+    n: u64,
 }
 
-/// When `key` is a part of an upload of `org`: that part, which must still be open.
 pub(crate) async fn part_target(
     store: &ArtifactStore,
     st: &Store,
@@ -352,30 +353,54 @@ pub(crate) async fn part_target(
     if !row.is_open() {
         return Err(closed(&row));
     }
-    Ok(Some(PartTarget {
-        len: row.part_len(n),
-        key: key.to_owned(),
-        row,
-    }))
+    Ok(Some(PartTarget { row, n }))
 }
 
 impl PartTarget {
-    /// The part's bytes must be exactly [`PartTarget::len`].
     pub(crate) fn check_len(&self, got: u64) -> Result<(), Error> {
-        if got == self.len {
+        let want = self.row.part_len(self.n);
+        if got == want {
             Ok(())
         } else {
             Err(Error::coded(
                 codes::PARTS_INCOMPLETE,
                 StatusCode::UNPROCESSABLE_ENTITY,
-                format!("This part has {got} bytes; it must have {}.", self.len),
+                format!("This part has {got} bytes; it must have {want}."),
             ))
         }
     }
 
-    /// After the write: refused (and the part deleted) if the upload closed meanwhile.
-    pub(crate) async fn fence(&self, store: &ArtifactStore, st: &Store) -> Result<(), Error> {
-        fence(store, st, &self.row, &self.key).await
+    pub(crate) async fn publish(
+        &self,
+        store: &ArtifactStore,
+        st: &Store,
+        body: Bytes,
+        digest: &str,
+    ) -> Result<(), Error> {
+        self.check_len(body.len() as u64)?;
+        let key = format!("{}-{digest}", part_key(st, &self.row, self.n)?);
+        st.put(&key, body).await?;
+
+        let mut tx = store.db().pool().begin().await?;
+        let row = lock_upload(&mut tx, self.row.id).await?;
+        let updated = sqlx::query(
+            "UPDATE uploads SET part_keys = jsonb_set(part_keys, ARRAY[$2], to_jsonb($3::text))
+             WHERE id = $1 AND state = 'OPEN' AND expires_at > clock_timestamp()",
+        )
+        .bind(row.id)
+        .bind(self.n.to_string())
+        .bind(&key)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        tx.commit().await?;
+        if updated == 0 {
+            if let Err(e) = st.delete(&key).await {
+                tracing::warn!(code = e.code(), "could not remove an unpublished part");
+            }
+            return Err(closed(&row));
+        }
+        Ok(())
     }
 }
 
@@ -469,7 +494,8 @@ pub(crate) async fn create(
                 .await?
             {
                 Some(id) => Ok(Some(
-                    load(&store, &org, &UploadId::from_uuid(id).to_string()).await?,
+                    load_visible(&s, &store, &ctx, &org, &UploadId::from_uuid(id).to_string())
+                        .await?,
                 )),
                 None => Ok(None),
             },
@@ -521,10 +547,10 @@ pub(crate) async fn get(
     let row = load_visible(&s, &store, &ctx, &org, &up).await?;
     let parts = if row.state == "OPEN" {
         let st = store.org_store(&org).await?;
-        received(&st, &row)
+        received(store.db(), &st, &row)
             .await?
             .into_iter()
-            .filter(|(n, size)| *n < row.part_count() && *size == row.part_len(*n))
+            .filter(|(n, (_, size))| *n < row.part_count() && *size == row.part_len(*n))
             .map(|(n, _)| n)
             .collect()
     } else {
@@ -557,13 +583,8 @@ pub(crate) async fn put_part(
         .filter(|n| *n < row.part_count())
         .ok_or_else(|| field("/n", "This upload has no part with this number."))?;
     let want = row.part_len(n);
-    if body.len() as u64 != want {
-        return Err(Error::coded(
-            codes::PARTS_INCOMPLETE,
-            StatusCode::UNPROCESSABLE_ENTITY,
-            format!("Part {n} has {} bytes; it must have {want}.", body.len()),
-        ));
-    }
+    let target = PartTarget { row, n };
+    target.check_len(body.len() as u64)?;
     let sha = sha256_hex(&body);
     if let Some(h) = headers.get(crate::modules::artifacts::SHA256_HEADER) {
         let expected = h.to_str().unwrap_or_default();
@@ -577,9 +598,7 @@ pub(crate) async fn put_part(
         }
     }
     let st = store.org_store(&org).await?;
-    let key = part_key(&st, &row, n)?;
-    st.put(&key, body).await?;
-    fence(store.as_ref(), &st, &row, &key).await?;
+    target.publish(&store, &st, body, &sha).await?;
     Ok(Json(
         serde_json::json!({ "part": n, "size": want, "sha256": sha }),
     ))
@@ -640,9 +659,9 @@ async fn presign_upload(
     let parts = match req.parts {
         Some(p) => p,
         None => {
-            let have = received(&st, &row).await?;
+            let have = received(store.db(), &st, &row).await?;
             (0..row.part_count())
-                .filter(|n| have.get(n) != Some(&row.part_len(*n)))
+                .filter(|n| have.get(n).map(|(_, size)| *size) != Some(row.part_len(*n)))
                 .take(MAX_PRESIGN)
                 .collect()
         }
@@ -659,22 +678,8 @@ async fn presign_upload(
             ));
         }
         let key = part_key(&st, &row, n)?;
-        // A part ticket never outlives the upload.
-        let left = std::time::Duration::try_from(row.expires_at - OffsetDateTime::now_utc())
-            .unwrap_or_default()
-            .min(crate::modules::artifacts::TICKET_TTL);
-        if left < std::time::Duration::from_secs(1) {
-            return Err(closed(&row));
-        }
         let ticket = store
-            .ticket_for(
-                &s.seams,
-                ctx,
-                &key,
-                TicketMethod::Put,
-                row.part_len(n),
-                left,
-            )
+            .part_ticket(&s.seams, ctx, key, row.part_len(n), row.expires_at)
             .await?;
         out.push(PartTicket { part: n, ticket });
     }
@@ -693,20 +698,27 @@ async fn abort_upload(
 ) -> Result<Upload, Error> {
     let org = &org_of(ctx)?;
     let row = load_visible(s, store, ctx, org, up).await?;
-    let done = sqlx::query(
-        "UPDATE uploads SET state = 'ABORTED', finished_at = now()
-         WHERE id = $1 AND state = 'OPEN' AND expires_at > now()",
-    )
+    let mut tx = store.db().pool().begin().await?;
+    let row = lock_upload(&mut tx, row.id).await?;
+    let stopped = sqlx::query_as::<_, Row>(concat!(
+        "UPDATE uploads SET state = 'ABORTED', finished_at = clock_timestamp()
+         WHERE id = $1 AND state = 'OPEN' AND expires_at > clock_timestamp() RETURNING ",
+        columns!()
+    ))
     .bind(row.id)
-    .execute(store.db().pool())
-    .await?
-    .rows_affected();
-    if done == 0 {
-        return Err(closed(&row));
+    .fetch_optional(&mut *tx)
+    .await?;
+    let stopped = match stopped {
+        Some(row) => row,
+        None if row.state == "ABORTED" => row,
+        None => return Err(closed(&row)),
+    };
+    tx.commit().await?;
+    match store.org_store(org).await {
+        Ok(st) => tidy(&st, &stopped.key()).await,
+        Err(e) => tracing::warn!(code = e.code(), "could not clean up an aborted upload"),
     }
-    tidy(&store.org_store(org).await?, &row.key()).await;
-    let row = load(store, org, &row.key()).await?;
-    Ok(row.into_upload(Vec::new()))
+    Ok(stopped.into_upload(Vec::new()))
 }
 
 /// Finishes an upload: joins the parts while hashing, checks the sha256 of the whole file
@@ -722,15 +734,18 @@ async fn complete_upload(
 ) -> Result<Upload, Error> {
     let org = &org_of(ctx)?;
     let row = load_visible(s, store, ctx, org, up).await?;
+    if row.state == "COMPLETED" {
+        return Ok(row.into_upload(Vec::new()));
+    }
     if !row.is_open() {
         return Err(closed(&row));
     }
     let st = store.org_store(org).await?;
-    let have = received(&st, &row).await?;
+    let have = received(store.db(), &st, &row).await?;
     let wrong: Vec<String> = (0..row.part_count())
         .filter_map(|n| match have.get(&n) {
             None => Some(format!("{n} (missing)")),
-            Some(size) if *size != row.part_len(n) => Some(format!("{n} ({size} bytes)")),
+            Some((_, size)) if *size != row.part_len(n) => Some(format!("{n} ({size} bytes)")),
             Some(_) => None,
         })
         .collect();
@@ -748,29 +763,39 @@ async fn complete_upload(
     }
     let dir = store.scratch_dir()?;
     let file = dir.path().join("file");
-    let sha = join(&st, &row, &file).await?;
+    let sha = join(&st, &row, &have, &file).await?;
     let blob = st.keys().blob(&sha)?;
     store.put_blob(&st, &file, &blob, row.size(), &sha).await?;
     scratch::close(dir)?;
-    let done = sqlx::query(
-        "UPDATE uploads SET state = 'COMPLETED', blob_key = $2, finished_at = now()
-         WHERE id = $1 AND state = 'OPEN' AND expires_at > now()",
-    )
+    let mut tx = store.db().pool().begin().await?;
+    let row = lock_upload(&mut tx, row.id).await?;
+    let completed = sqlx::query_as::<_, Row>(concat!(
+        "UPDATE uploads SET state = 'COMPLETED', blob_key = $2, finished_at = clock_timestamp()
+         WHERE id = $1 AND state = 'OPEN' AND expires_at > clock_timestamp() RETURNING ",
+        columns!()
+    ))
     .bind(row.id)
     .bind(&blob)
-    .execute(store.db().pool())
-    .await?
-    .rows_affected();
-    if done == 0 {
-        return Err(closed(&row));
-    }
-    tidy(&st, &row.key()).await;
-    Ok(load(store, org, &row.key()).await?.into_upload(Vec::new()))
+    .fetch_optional(&mut *tx)
+    .await?;
+    let completed = match completed {
+        Some(row) => row,
+        None if row.state == "COMPLETED" => row,
+        None => return Err(closed(&row)),
+    };
+    tx.commit().await?;
+    tidy(&st, &completed.key()).await;
+    Ok(completed.into_upload(Vec::new()))
 }
 
 /// Joins the parts into `tmp`, checking each part's length as read, the total and the
 /// sha256; returns the sha256.
-async fn join(st: &Store, row: &Row, tmp: &std::path::Path) -> Result<String, Error> {
+async fn join(
+    st: &Store,
+    row: &Row,
+    parts: &BTreeMap<u64, (String, u64)>,
+    tmp: &std::path::Path,
+) -> Result<String, Error> {
     let io = |e: std::io::Error| {
         Error::from(StorageError::Io {
             path: tmp.to_owned(),
@@ -782,7 +807,14 @@ async fn join(st: &Store, row: &Row, tmp: &std::path::Path) -> Result<String, Er
     let mut total = 0u64;
     // Each part is checked as read, not as listed: a ticket PUT may have replaced it since.
     for n in 0..row.part_count() {
-        let bytes = st.get(&part_key(st, row, n)?).await?;
+        let (key, _) = parts.get(&n).ok_or_else(|| {
+            Error::coded(
+                codes::PARTS_INCOMPLETE,
+                StatusCode::CONFLICT,
+                format!("Part {n} is missing. Send it again."),
+            )
+        })?;
+        let bytes = st.get(key).await?;
         let (got, want) = (bytes.len() as u64, row.part_len(n));
         if got != want {
             return Err(Error::coded(
@@ -1021,10 +1053,10 @@ mod tests {
             created_at: time::OffsetDateTime::now_utc(),
             expires_at: time::OffsetDateTime::now_utc(),
         };
-        st.put(&super::part_key(&st, &row, 0).unwrap(), short.into())
-            .await
-            .unwrap();
-        let err = super::join(&st, &row, &dir.path().join("file"))
+        let key = super::part_key(&st, &row, 0).unwrap();
+        st.put(&key, short.into()).await.unwrap();
+        let parts = std::collections::BTreeMap::from([(0, (key, 10))]);
+        let err = super::join(&st, &row, &parts, &dir.path().join("file"))
             .await
             .unwrap_err();
         assert_eq!(err.code(), super::codes::PARTS_INCOMPLETE);

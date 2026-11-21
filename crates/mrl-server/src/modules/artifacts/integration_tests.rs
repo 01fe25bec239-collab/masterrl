@@ -50,6 +50,7 @@ struct Ctl {
     down: AtomicBool,
     /// Audit records fail.
     audit_down: AtomicBool,
+    hide_existing: AtomicBool,
     /// The next `set` reports through the sender, then waits for the receiver.
     hold: Mutex<
         Option<(
@@ -122,7 +123,7 @@ const BROKEN: &str = "broken";
 
 /// `usr-viewer` may not read runs, nor anything recorded in project [`PRIVATE`] (Hide), and
 /// its checks on project [`BROKEN`] fail; everyone else may do everything.
-struct ViewerRules;
+struct ViewerRules(Arc<Ctl>);
 
 #[async_trait]
 impl Authorizer for ViewerRules {
@@ -132,6 +133,12 @@ impl Authorizer for ViewerRules {
         action: &str,
         res: &Resource,
     ) -> Result<Decision, SeamError> {
+        if self.0.hide_existing.load(Ordering::SeqCst)
+            && res.id.is_some()
+            && matches!(res.kind.as_str(), "upload" | "artifact" | "secret")
+        {
+            return Ok(Decision::Hide);
+        }
         let viewer = ctx.principal.id == "usr-viewer";
         if viewer && res.project.as_deref() == Some(BROKEN) {
             return Err(SeamError::new("authorizer", "the test authorizer is down"));
@@ -206,6 +213,15 @@ impl Env {
 
     /// [`Env::start_with`] using S3 bucket `bucket` (one of its own for tests that sweep).
     async fn start_in(kind: Kind, secret_store: bool, bucket: &str) -> Option<Env> {
+        Self::start_configured(kind, secret_store, bucket, None).await
+    }
+
+    async fn start_configured(
+        kind: Kind,
+        secret_store: bool,
+        bucket: &str,
+        max_connections: Option<u32>,
+    ) -> Option<Env> {
         let permit = permits().acquire_owned().await.unwrap();
         let (config, dir) = match kind {
             Kind::Fs => {
@@ -221,8 +237,16 @@ impl Env {
         };
         let db = TestDb::new().await;
         let scratch = tempfile::tempdir().unwrap();
+        let service_db = match max_connections {
+            Some(max_connections) => db.replica_with(&mrl_server::config::DatabaseConfig {
+                max_connections,
+                acquire_timeout_seconds: 1,
+                ..crate::pg::test_config()
+            }),
+            None => db.db().clone(),
+        };
         let module = ArtifactsModule::with_backend(
-            db.db().clone(),
+            service_db,
             config.clone(),
             Mode::Team,
             scratch.path().to_owned(),
@@ -238,7 +262,7 @@ impl Env {
             // The same person signed in to another org.
             ("tok-a-b", user("usr-a", "org-b")),
         ])
-        .authorizer(ViewerRules)
+        .authorizer(ViewerRules(ctl.clone()))
         .audit(Audit(audit.clone(), ctl.clone()))
         .ids(mrl_server::seams::UuidV7Ids)
         .secrets(Shared(secrets.clone(), ctl.clone()));
@@ -2384,16 +2408,13 @@ async fn canary_secret_never_leaks(kind: Kind) {
     assert_eq!(metrics.status, 200);
     bodies.push(metrics.text());
     bodies.push(format!("{:?}", e.audit.events()));
+    let reference = secret_reference(&e, &sec).await.unwrap();
     let r = e
         .call(Method::DELETE, &format!("/api/v1/secrets/{sec}"), A, None)
         .await;
     assert_eq!(r.status, 204);
     assert!(
-        e.secrets
-            .get(&format!("mrl.secret.org-a.{sec}"))
-            .await
-            .unwrap()
-            .is_none(),
+        e.secrets.get(&reference).await.unwrap().is_none(),
         "the value is gone"
     );
     let logs = logs.text();
@@ -2576,9 +2597,17 @@ async fn delete_secret(e: &Env, sec: &str) -> TestResponse {
         .await
 }
 
+async fn secret_reference(e: &Env, sec: &str) -> Option<String> {
+    sqlx::query_scalar("SELECT ref FROM secrets_metadata WHERE id = $1")
+        .bind(sec.parse::<mrl_domain::ids::SecretId>().unwrap().as_uuid())
+        .fetch_optional(e.db.pool())
+        .await
+        .unwrap()
+}
+
 async fn stored(e: &Env, sec: &str) -> Option<Secret> {
     e.secrets
-        .get(&format!("mrl.secret.org-a.{sec}"))
+        .get(&secret_reference(e, sec).await?)
         .await
         .unwrap()
 }
@@ -2731,7 +2760,7 @@ async fn secret_delete_and_rotation_never_interleave() {
     ))
     .await;
     e.secrets
-        .delete(&format!("mrl.secret.org-a.{sec}"))
+        .delete(&secret_reference(&e, &sec).await.unwrap())
         .await
         .unwrap();
     assert_eq!(delete_secret(&e, &sec).await.status, 204);
@@ -3606,7 +3635,9 @@ async fn the_module_reads_its_storage_settings() {
 #[tokio::test]
 #[ignore = "needs PostgreSQL (just dev)"]
 async fn secret_changes_audit_first_and_grants_check_the_secret() {
-    let e = Env::start(Kind::Fs).await.unwrap();
+    let e = Env::start_configured(Kind::Fs, true, BUCKET, Some(1))
+        .await
+        .unwrap();
     let sec = new_secret(&e, "audited").await;
     assert_eq!(set_secret(&e, &sec, "v1").await.status, 204);
     let rotated = |e: &Env, sec: &str| {
@@ -3652,12 +3683,54 @@ async fn secret_changes_audit_first_and_grants_check_the_secret() {
         .call(Method::GET, &format!("/api/v1/secrets/{sec}"), A, None)
         .await;
     assert_eq!(r.status, 200, "not marked as being deleted: {}", r.text());
-    // The rotation time is saved before the value: a failed write leaves it early, never late.
+    // A failed write preserves both the confirmed value and its rotation time.
     e.ctl.down.store(true, Ordering::SeqCst);
     assert_eq!(set_secret(&e, &sec, "v3").await.status, 503);
     e.ctl.down.store(false, Ordering::SeqCst);
-    assert!(rotated(&e, &sec).await > before);
+    assert_eq!(rotated(&e, &sec).await, before);
     assert_eq!(stored(&e, &sec).await.unwrap().expose(), "v1");
+    // Simulate a stop after saving a candidate and before publishing its reference.
+    let interrupted = "mrl.secret.rotation.interrupted";
+    let id = sec.parse::<mrl_domain::ids::SecretId>().unwrap().as_uuid();
+    sqlx::query("UPDATE secrets_metadata SET rotation_ref = $2 WHERE id = $1")
+        .bind(id)
+        .bind(interrupted)
+        .execute(e.db.pool())
+        .await
+        .unwrap();
+    e.secrets
+        .set(interrupted, Secret::new("never-published"))
+        .await
+        .unwrap();
+    assert_eq!(stored(&e, &sec).await.unwrap().expose(), "v1");
+    assert_eq!(rotated(&e, &sec).await, before);
+    assert_eq!(set_secret(&e, &sec, "v4").await.status, 204);
+    assert_eq!(stored(&e, &sec).await.unwrap().expose(), "v4");
+    assert!(e.secrets.get(interrupted).await.unwrap().is_none());
+    let active = secret_reference(&e, &sec).await.unwrap();
+    assert_eq!(delete_secret(&e, &sec).await.status, 204);
+    assert!(e.secrets.get(&active).await.unwrap().is_none());
+    let outcomes = e.audit.events();
+    assert!(outcomes
+        .iter()
+        .any(|ev| ev.action == "secrets.delete.attempt"));
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|ev| ev.action == "secrets.set_value"
+                && ev.outcome == mrl_server::seams::AuditOutcome::Success)
+            .count(),
+        2
+    );
+    let durable: Vec<String> = sqlx::query_scalar(
+        "SELECT outcome FROM secret_mutation_audit WHERE target = $1
+         AND action = 'secrets.set_value' ORDER BY attempted_at",
+    )
+    .bind(&sec)
+    .fetch_all(e.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(durable, ["success", "failed", "success"]);
     // A grant needs permission on the secret itself (with its project), not only the run.
     let r = e
         .call(Method::POST, "/api/v1/secrets", A, Some(json!({"name": "p", "kind": "generic", "allowed_uses": ["run"], "project_id": PRIVATE})))
@@ -3689,9 +3762,8 @@ async fn secret_changes_audit_first_and_grants_check_the_secret() {
     assert_eq!(e.db.count("run_secret_grants").await, 0);
 }
 
-/// A cleanup pass that runs while `:complete` reuses a stored blob (left by a commit that
-/// never happened, its intent two days old) keeps it: the completion recorded a fresh
-/// intent under the blob's lock before it checked the blob.
+/// When cleanup wins the blob lock first, completion waits and recreates the orphan
+/// before publishing its reference.
 #[tokio::test]
 #[ignore = "needs PostgreSQL (just dev)"]
 async fn cleanup_keeps_a_blob_a_completion_is_reusing() {
@@ -3729,21 +3801,39 @@ async fn cleanup_keeps_a_blob_a_completion_is_reusing() {
         )
         .await;
     assert_eq!(r.status, 200, "{}", r.text());
-    // The completion waits 3 s right before it records COMPLETED; the pass runs meanwhile.
-    e.db.seed(
-        "CREATE FUNCTION p19_wait() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$;
-         CREATE TRIGGER p19_wait BEFORE UPDATE ON uploads FOR EACH ROW
-           WHEN (NEW.state = 'COMPLETED') EXECUTE FUNCTION p19_wait();",
-    )
-    .await;
+    // Queue the sweep first. Both operations must wait on the same advisory lock.
+    let mut gate = e.db.pool().begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("mrl.object:org-a:{blob}"))
+        .execute(&mut *gate)
+        .await
+        .unwrap();
+    let sweep = mrl_server::modules::uploads::sweep(&e.store);
     let complete = format!("/api/v1/uploads/{up}:complete");
-    let (r, swept) = tokio::join!(
-        e.call(Method::POST, &complete, A, None),
-        async {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            mrl_server::modules::uploads::sweep(&e.store).await.unwrap()
-        }
-    );
+    let drive = async {
+        let pool = e.db.pool();
+        let waiters = |count: i64| async move {
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let waiting: i64 = sqlx::query_scalar(
+                        "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted
+                         AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+                    ).fetch_one(pool).await.unwrap();
+                    if waiting == count { break; }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }).await.unwrap();
+        };
+        waiters(1).await;
+        let (response, ()) = tokio::join!(e.call(Method::POST, &complete, A, None), async {
+            waiters(2).await;
+            gate.commit().await.unwrap();
+        });
+        response
+    };
+    let (swept, r) = tokio::join!(sweep, drive);
+    let swept = swept.unwrap();
+    assert_eq!(swept.blobs, 1, "the sweep won the lock first");
     assert_eq!(r.status, 200, "{}", r.text());
     assert_eq!(r.json()["blob_key"], json!(blob));
     assert_eq!(
@@ -3792,4 +3882,169 @@ async fn a_cancelled_registration_frees_its_name() {
         .await
         .unwrap();
     assert_eq!(art["state"], "COMMITTED");
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn creation_retries_recover_and_check_the_current_item() {
+    use mrl_server::modules::artifacts::Idempotency;
+
+    let e = Env::start(Kind::Fs).await.unwrap();
+    let headers = [("idempotency-key", "recover")];
+    let body = json!({
+        "name": "after-stop",
+        "manifest": {
+            "schema_version": "artifact-manifest/v1", "kind": "eval",
+            "created_at": "2026-11-16T00:00:00Z", "files": []
+        }
+    });
+    let new: NewArtifact = serde_json::from_value(body.clone()).unwrap();
+    let mut request_headers = axum::http::HeaderMap::new();
+    request_headers.insert(
+        "idempotency-key",
+        axum::http::HeaderValue::from_static("recover"),
+    );
+    let idem = Idempotency::of(&request_headers, &new).unwrap();
+    let pending = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO artifacts (id, org_id, name, kind, prefix, manifest, size_bytes, state, created_by, idempotency_key, request_sha256)
+         VALUES ($1, 'org-a', 'after-stop', 'eval', 'orgs/org-a/artifacts/old/', $2, 0, 'PENDING', 'usr-a', $3, $4)",
+    )
+    .bind(pending)
+    .bind(&new.manifest)
+    .bind(&idem.key)
+    .bind(&idem.request_sha256)
+    .execute(e.db.pool())
+    .await
+    .unwrap();
+
+    let response = e
+        .call_h(Method::POST, "/api/v1/artifacts", A, &headers, body.clone())
+        .await;
+    assert_eq!(response.status, 201, "{}", response.text());
+    assert_eq!(response.json()["state"], "COMMITTED");
+    let state: String = sqlx::query_scalar("SELECT state FROM artifacts WHERE id = $1")
+        .bind(pending)
+        .fetch_one(e.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(state, "FAILED");
+
+    let upload = json!({"filename": "retry", "size": 0, "sha256": sha256_hex(b"")});
+    let secret = json!({"name": "retry", "kind": "generic", "allowed_uses": ["run"]});
+    for (path, body) in [("/api/v1/uploads", &upload), ("/api/v1/secrets", &secret)] {
+        assert_eq!(
+            e.call_h(Method::POST, path, A, &headers, body.clone())
+                .await
+                .status,
+            201
+        );
+    }
+    e.ctl.hide_existing.store(true, Ordering::SeqCst);
+    for (path, body) in [
+        ("/api/v1/uploads", upload),
+        ("/api/v1/artifacts", body),
+        ("/api/v1/secrets", secret),
+    ] {
+        let denied = e.call_h(Method::POST, path, A, &headers, body).await;
+        assert_eq!(denied.status, 404, "{path}: {}", denied.text());
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn upload_actions_recover_and_unpublished_parts_stay_hidden() {
+    let e = Env::start(Kind::Fs).await.unwrap();
+    let bytes = b"part";
+    let digest = sha256_hex(bytes);
+    let new = || async {
+        let response = e
+            .call(
+                Method::POST,
+                "/api/v1/uploads",
+                A,
+                Some(json!({"filename": "f", "size": bytes.len(), "sha256": digest})),
+            )
+            .await;
+        assert_eq!(response.status, 201, "{}", response.text());
+        response.json()["id"].as_str().unwrap().to_owned()
+    };
+    let up = new().await;
+    let st = e.backend.org("org-a").unwrap();
+    let staged = format!("{}-{digest}", st.keys().upload_part(&up, 0).unwrap());
+    st.put(&staged, bytes.to_vec().into()).await.unwrap();
+    let r = e
+        .call(Method::GET, &format!("/api/v1/uploads/{up}"), A, None)
+        .await;
+    assert_eq!(r.json()["parts_received"], json!([]));
+
+    let complete = format!("/api/v1/uploads/{up}:complete");
+    assert_eq!(
+        code(&e.call(Method::POST, &complete, A, None).await),
+        "MRL-STORE-190"
+    );
+    let part = format!("/api/v1/uploads/{up}/parts/0");
+    assert_eq!(
+        e.put_bytes(&part, Some(A), bytes.to_vec(), &[])
+            .await
+            .status,
+        200
+    );
+    let first = e.call(Method::POST, &complete, A, None).await;
+    let retry = e.call(Method::POST, &complete, A, None).await;
+    assert_eq!((first.status, retry.status), (200, 200));
+    assert_eq!(first.json(), retry.json());
+
+    let up = new().await;
+    let abort = format!("/api/v1/uploads/{up}:abort");
+    let first = e.call(Method::POST, &abort, A, None).await;
+    let retry = e.call(Method::POST, &abort, A, None).await;
+    assert_eq!((first.status, retry.status), (200, 200));
+    assert_eq!(first.json(), retry.json());
+
+    let up = new().await;
+    let id = up.parse::<mrl_domain::ids::UploadId>().unwrap().as_uuid();
+    sqlx::query(
+        "UPDATE uploads SET expires_at = clock_timestamp() + interval '1 second' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(e.db.pool())
+    .await
+    .unwrap();
+    let mut lock = e.db.pool().begin().await.unwrap();
+    sqlx::query("SELECT id FROM uploads WHERE id = $1 FOR UPDATE")
+        .bind(id)
+        .execute(&mut *lock)
+        .await
+        .unwrap();
+    let abort = format!("/api/v1/uploads/{up}:abort");
+    let (late, ()) = tokio::join!(e.call(Method::POST, &abort, A, None), async {
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        lock.commit().await.unwrap();
+    });
+    assert_eq!(code(&late), "MRL-CONFLICT-191");
+
+    // Signing-key initialization can finish after the expiry.
+    let up = new().await;
+    let id = up.parse::<mrl_domain::ids::UploadId>().unwrap().as_uuid();
+    sqlx::query(
+        "UPDATE uploads SET expires_at = clock_timestamp() + interval '1 second' WHERE id = $1",
+    )
+    .bind(id)
+    .execute(e.db.pool())
+    .await
+    .unwrap();
+    let (entered, wait_for_key) = tokio::sync::oneshot::channel();
+    let (release, blocked) = tokio::sync::oneshot::channel();
+    *e.ctl.hold.lock().unwrap() = Some((entered, blocked));
+    let presign = format!("/api/v1/uploads/{up}:presign");
+    let (late, ()) = tokio::join!(e.call(Method::POST, &presign, A, None), async {
+        tokio::time::timeout(Duration::from_secs(5), wait_for_key)
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        release.send(()).unwrap();
+    });
+    assert_eq!((late.status, code(&late).as_str()), (403, "MRL-STORE-008"));
 }
