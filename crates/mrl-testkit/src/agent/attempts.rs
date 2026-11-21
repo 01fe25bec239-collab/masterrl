@@ -1526,8 +1526,7 @@ mod runner_tests {
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, b"weights").unwrap();
         // Every save fails: a folder sits where the record goes.
-        let job = fx.staging().parent().unwrap().to_path_buf();
-        let record = job.join("attempt.json");
+        let record = fx.staging().parent().unwrap().join("attempt.json");
         std::fs::remove_file(&record).unwrap();
         std::fs::create_dir_all(record.join("blocker")).unwrap();
         let (mut w, _) = fx.worker("trainer").await;
@@ -1542,7 +1541,6 @@ mod runner_tests {
         // Saving works again (the ticket has expired): the kept result is saved and only then
         // acknowledged, with no second upload.
         std::fs::remove_dir_all(&record).unwrap();
-        fx.record.save(&job).unwrap();
         let acks = read_until(&mut w, |b| matches!(b, AgentBody::CheckpointCommitAck(_)))
             .await
             .unwrap();
