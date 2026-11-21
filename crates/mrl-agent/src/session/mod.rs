@@ -9,7 +9,8 @@
 //!   not acked; inventory; heartbeats; commands are written to the [`crate::journal`] *before* they
 //!   are acked (RECEIVED), run once by their [`CommandHandler`], and answered with a
 //!   `CommandResult` through the spool. A command with no handler is answered FAILED
-//!   `unsupported_command`. The certificate is renewed at 2/3 of its lifetime.
+//!   `unsupported_command`, except a kind a service announced ([`Link::expect`]): it waits up
+//!   to [`HANDLER_WAIT`] for that service to register. The certificate is renewed at 2/3 of its lifetime.
 //! - TELEMETRY: node telemetry from the hardware backends every `telemetry_interval_secs`
 //!   (latest wins, never spooled) plus relayed worker metrics (bounded, decimated on overflow).
 //! - BULK: relayed log chunks (bounded; on overflow a marker chunk says how many were dropped).
@@ -55,6 +56,9 @@ use tokio_util::sync::CancellationToken;
 pub const PROTOCOL_VERSION: &str = "mrl.agent.v1";
 /// Largest message on a session.
 pub const MAX_MESSAGE_BYTES: usize = 4 << 20;
+
+/// How long a command of an announced kind waits for its service to register its handler.
+pub const HANDLER_WAIT: Duration = Duration::from_secs(60);
 const KEEPALIVE: Duration = Duration::from_secs(20);
 
 /// `[gateway]` in `agent.toml`. Enrollment writes the server or listen address to the identity;
@@ -369,6 +373,9 @@ pub struct Link {
     metrics_wake: Notify,
     logs_wake: Notify,
     handlers: RwLock<HashMap<&'static str, Arc<dyn CommandHandler>>>,
+    /// Kinds a service will register a handler for (announced before any service starts).
+    expected: RwLock<std::collections::HashSet<&'static str>>,
+    registered: Notify,
     leases: broadcast::Sender<LeaseGrant>,
     reconcile: broadcast::Sender<ReconcileResult>,
     running: Mutex<Vec<AttemptRef>>,
@@ -477,6 +484,8 @@ impl Link {
             metrics_wake: Notify::new(),
             logs_wake: Notify::new(),
             handlers: RwLock::default(),
+            expected: RwLock::default(),
+            registered: Notify::new(),
             leases: broadcast::channel(64).0,
             reconcile: broadcast::channel(16).0,
             running: Mutex::default(),
@@ -556,6 +565,32 @@ impl Link {
     pub fn register(&self, kind: &'static str, handler: Arc<dyn CommandHandler>) {
         if let Ok(mut h) = self.handlers.write() {
             h.insert(kind, handler);
+        }
+        self.registered.notify_waiters();
+    }
+
+    /// Announces command kinds a service will register handlers for. Called before services
+    /// start (`run_agent`), so a command delivered before its service is up waits for it.
+    pub fn expect(&self, kinds: &[&'static str]) {
+        if let Ok(mut e) = self.expected.write() {
+            e.extend(kinds.iter().copied());
+        }
+    }
+
+    /// The handler for `kind`; for an announced kind, waits up to [`HANDLER_WAIT`] for it.
+    async fn handler(&self, kind: &str) -> Option<Arc<dyn CommandHandler>> {
+        let deadline = tokio::time::Instant::now() + HANDLER_WAIT;
+        loop {
+            let registered = self.registered.notified();
+            tokio::pin!(registered);
+            registered.as_mut().enable();
+            if let Some(h) = self.handlers.read().ok().and_then(|h| h.get(kind).cloned()) {
+                return Some(h);
+            }
+            let expected = self.expected.read().is_ok_and(|e| e.contains(kind));
+            if !expected || tokio::time::timeout_at(deadline, registered).await.is_err() {
+                return None;
+            }
         }
     }
 
@@ -785,11 +820,15 @@ impl Link {
         let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
         drop(starts);
         drop(journal);
-        let handler = self.handlers.read().ok().and_then(|h| h.get(kind).cloned());
         let link = self.clone();
         tokio::spawn(async move {
             let _activity = activity;
             let id = cmd.command_id.clone();
+            let handler = if refused {
+                None
+            } else {
+                link.handler(kind).await
+            };
             let outcome = match (refused, handler) {
                 (true, _) => Err(Failure {
                     class: FailureClass::InfraTransient as i32,
@@ -1852,6 +1891,33 @@ mod tests {
             self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn a_command_of_an_announced_kind_waits_for_its_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = Arc::new(Link::open(dir.path(), &GatewaySettings::default()).unwrap());
+        link.expect(&["Probe"]);
+        let waiting = tokio::spawn({
+            let link = link.clone();
+            async move { link.handler("Probe").await.is_some() }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiting.is_finished(),
+            "answered before the handler was registered"
+        );
+        link.register(
+            "Probe",
+            Arc::new(Count(std::sync::atomic::AtomicUsize::new(0))),
+        );
+        assert!(tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap());
+        // A kind no service announced is answered at once.
+        let other = tokio::time::timeout(Duration::from_secs(1), link.handler("Drain")).await;
+        assert!(other.unwrap().is_none());
     }
 
     #[tokio::test]
