@@ -335,20 +335,23 @@ fn pending_key_in(
     }
     let token_sha256 = sha256_hex(token.as_bytes());
     let path = dir.join(PENDING_FILE);
-    if let Some(p) = std::fs::read(&path)
-        .ok()
-        .and_then(|b| serde_json::from_slice::<Pending>(&b).ok())
-    {
+    let previous =
+        match std::fs::read(&path) {
+            Ok(bytes) => Some(serde_json::from_slice::<Pending>(&bytes).map_err(|e| {
+                LinkError::Protocol(format!("could not read pending enrollment: {e}"))
+            })?),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(io_err(&path)(e)),
+        };
+    if let Some(p) = &previous {
         if p.token_sha256 == token_sha256 {
-            let kept = keys::get(&dir, &p.key)
-                .ok()
-                .and_then(|der| rcgen::KeyPair::try_from(der.as_slice()).ok());
-            if let Some(key) = kept {
-                let csr = csr_for(&key)?;
-                return Ok((key, csr));
-            }
+            let der = keys::get(&dir, &p.key)?;
+            let key = rcgen::KeyPair::try_from(der.as_slice()).map_err(|e| {
+                LinkError::Certificate(format!("could not load pending enrollment key: {e}"))
+            })?;
+            let csr = csr_for(&key)?;
+            return Ok((key, csr));
         }
-        keys::delete(&dir, &p.key); // another token's key: not needed any more
     }
     let key = rcgen::KeyPair::generate().map_err(|e| LinkError::Certificate(e.to_string()))?;
     let key_ref = keys::put(
@@ -363,6 +366,9 @@ fn pending_key_in(
     })
     .map_err(|e| LinkError::Protocol(e.to_string()))?;
     atomic_write(&path, &bytes).map_err(io_err(&path))?;
+    if let Some(p) = previous {
+        keys::delete(&dir, &p.key);
+    }
     let csr = csr_for(&key)?;
     Ok((key, csr))
 }
@@ -481,18 +487,23 @@ pub async fn enroll_dial(
     force: bool,
 ) -> Result<Identity, LinkError> {
     check_not_enrolled(ctx, force)?;
-    let raw = token;
     let token = JoinToken::parse(token)?;
-    let (key, csr) = pending_key(ctx, raw)?;
+    let (key, csr) = pending_key(ctx, &token.token)?;
     let t = link::dial_transport(&ctx.config.gateway, transport, server);
     let io = t.connect().await?;
-    let tls_io = match link::connect_tls(tls::enroll_client(&token.ca_sha256)?, io, &CancellationToken::new()).await {
+    let tls_io = match link::connect_tls(
+        tls::enroll_client(&token.ca_sha256)?,
+        io,
+        &CancellationToken::new(),
+    )
+    .await
+    {
         Ok(Some(t)) => t,
         Ok(None) => return Err(LinkError::Unreachable("stopped".into())),
         Err(LinkError::Certificate(e)) => {
             return Err(LinkError::Certificate(format!(
                 "the server at {server} is not the app this token came from, or its certificate can't be used ({e})"
-            )))
+            )));
         }
         Err(e) => return Err(e),
     };
@@ -597,9 +608,8 @@ pub async fn enroll_listen(
     cancel: CancellationToken,
 ) -> Result<Identity, LinkError> {
     check_not_enrolled(ctx, force)?;
-    let raw = token;
     let token = JoinToken::parse(token)?;
-    let (key, csr) = pending_key(ctx, raw)?;
+    let (key, csr) = pending_key(ctx, &token.token)?;
     let l = crate::transports::Listen::new(listen, transport);
     let bound = l.bind().await?;
     tracing_line(&format!("waiting for the app to connect on {bound}"));
@@ -695,6 +705,29 @@ mod tests {
         assert!(!dir.path().join(PENDING_FILE).exists());
         let (fresh, _) = pending_key_in(dir.path(), file, "tok-2").unwrap();
         assert_ne!(other.serialize_der(), fresh.serialize_der());
+    }
+
+    #[test]
+    fn an_unavailable_pending_key_is_never_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = keys::KeyStoreChoice::File;
+        let token = format!("mrlj_{}_{}", "5".repeat(64), "6".repeat(64));
+        let parsed = JoinToken::parse(&format!(" {token} ")).unwrap();
+        let (key, _) = pending_key_in(dir.path(), store, &parsed.token).unwrap();
+        let path = dir.path().join(PENDING_FILE);
+        let before = std::fs::read(&path).unwrap();
+        let pending: Pending = serde_json::from_slice(&before).unwrap();
+        let keys::KeyRef::File { file } = pending.key else {
+            panic!("expected a file")
+        };
+        let path_to_key = dir.path().join(file);
+        let saved = std::fs::read(&path_to_key).unwrap();
+        std::fs::remove_file(&path_to_key).unwrap();
+        assert!(pending_key_in(dir.path(), store, &token).is_err());
+        assert_eq!(std::fs::read(path).unwrap(), before);
+        std::fs::write(path_to_key, saved).unwrap();
+        let (retry, _) = pending_key_in(dir.path(), store, &token).unwrap();
+        assert_eq!(retry.serialize_der(), key.serialize_der());
     }
 
     #[test]

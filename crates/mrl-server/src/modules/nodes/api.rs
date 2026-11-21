@@ -336,14 +336,29 @@ async fn list_pools(
     s.authorize(&ctx, "compute.read", &scoped("pool", None, org))
         .await?;
     let page = q.resolve()?;
-    let rows = store::list_pools(
-        &gw.db,
-        org,
-        after(page.after.clone(), pool_id)?,
-        page.fetch(),
-    )
-    .await
-    .map_err(internal)?;
+    let mut cursor = after(page.after.clone(), pool_id)?;
+    let mut rows = Vec::new();
+    while rows.len() < page.fetch() {
+        let candidates = store::list_pools(&gw.db, org, cursor, page.fetch())
+            .await
+            .map_err(internal)?;
+        let exhausted = candidates.len() < page.fetch();
+        for (pool, owner) in candidates {
+            cursor = Some(pool_id(&pool.id)?);
+            let resource = scoped("pool", Some(pool.id.clone()), owner);
+            match s.authorize(&ctx, "compute.read", &resource).await {
+                Ok(()) => rows.push(pool),
+                Err(e) if matches!(e.code, ErrorCode::Forbidden | ErrorCode::NotFound) => {}
+                Err(e) => return Err(e),
+            }
+            if rows.len() == page.fetch() {
+                break;
+            }
+        }
+        if exhausted {
+            break;
+        }
+    }
     Ok(Json(Page::from_overfetch(rows, &page, |p| p.id.clone())))
 }
 
@@ -571,6 +586,9 @@ async fn node_action(
         .db
         .transaction(move |tx| {
             Box::pin(async move {
+                if decommission {
+                    store::lock_lane_epoch(tx, node, false).await?;
+                }
                 let row: Option<(String, i32)> = sqlx::query_as(
                     "SELECT status, running_attempts FROM compute_nodes WHERE id = $1 FOR UPDATE",
                 )

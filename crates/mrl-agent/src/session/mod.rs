@@ -189,7 +189,9 @@ impl LinkError {
 /// Runs one command kind. Results are reported once; never runs a command twice.
 #[async_trait::async_trait]
 pub trait CommandHandler: Send + Sync {
-    /// Runs `command`; `Err` reports it FAILED with that failure.
+    /// Runs `command`; `Err` reports it FAILED with that failure. A successful work start
+    /// publishes its running attempt through [`Link::set_running`] before returning, so a
+    /// subsequent drain acknowledgement and heartbeat account for the started work.
     async fn handle(&self, command: Command) -> Result<(), Failure>;
 }
 
@@ -222,7 +224,8 @@ struct Queue {
     dropped: u64,
     decimate: bool,
     /// LOGS: chunks dropped, per relay (attempt and role), in the order they were first lost.
-    lost: Vec<(Option<AttemptRef>, String, u64)>,
+    lost: VecDeque<(Option<AttemptRef>, String, u64)>,
+    unattributed: u64,
 }
 
 impl Queue {
@@ -232,13 +235,14 @@ impl Queue {
             cap: cap.max(2),
             dropped: 0,
             decimate,
-            lost: Vec::new(),
+            lost: VecDeque::new(),
+            unattributed: 0,
         }
     }
 
     fn push(&mut self, msg: AgentMessage) {
+        self.flush_markers();
         if self.items.len() < self.cap {
-            self.flush_markers();
             self.items.push_back(msg);
             return;
         }
@@ -257,20 +261,29 @@ impl Queue {
                 Some(agent_message::Body::Worker(w)) => (w.attempt.clone(), w.role_id.clone()),
                 _ => (None, String::new()),
             };
+            let has_room = self.lost.len() < self.cap;
             match self
                 .lost
                 .iter_mut()
                 .find(|(a, r, _)| *a == attempt && *r == role)
             {
-                Some((_, _, n)) => *n += 1,
-                None => self.lost.push((attempt, role, 1)),
+                Some((_, _, n)) => *n = n.saturating_add(1),
+                None if has_room => self.lost.push_back((attempt, role, 1)),
+                None => self.unattributed = self.unattributed.saturating_add(1),
             }
         }
     }
 
     /// LOGS: one marker per relay that lost chunks, in that relay's own log.
     fn flush_markers(&mut self) {
-        for (attempt, role_id, n) in std::mem::take(&mut self.lost) {
+        while self.items.len() < self.cap {
+            let (attempt, role_id, n) = if let Some(relay) = self.lost.pop_front() {
+                relay
+            } else if self.unattributed > 0 {
+                (None, String::new(), std::mem::take(&mut self.unattributed))
+            } else {
+                break;
+            };
             self.items.push_back(AgentMessage {
                 body: Some(agent_message::Body::Worker(WorkerRelay {
                     attempt,
@@ -293,9 +306,7 @@ impl Queue {
     }
 
     fn take(&mut self) -> Vec<AgentMessage> {
-        if self.items.len() < self.cap {
-            self.flush_markers();
-        }
+        self.flush_markers();
         self.items.drain(..).collect()
     }
 }
@@ -329,6 +340,25 @@ fn envelope_len(body: &agent_message::Body) -> usize {
     })
 }
 
+// This seq-zero gateway Drain is exchanged on CONTROL without a registered handler.
+const DRAIN_FENCE: &str = "gateway-drain-fence";
+
+#[derive(Default)]
+struct WorkStarts {
+    draining: bool,
+    active: usize,
+}
+
+struct WorkStart(Arc<Link>);
+
+impl Drop for WorkStart {
+    fn drop(&mut self) {
+        if let Ok(mut starts) = self.0.work_starts.lock() {
+            starts.active -= 1;
+        }
+    }
+}
+
 /// One agent's link state, shared by the session and other agent services.
 pub struct Link {
     spool: Mutex<Spool>,
@@ -342,6 +372,7 @@ pub struct Link {
     leases: broadcast::Sender<LeaseGrant>,
     reconcile: broadcast::Sender<ReconcileResult>,
     running: Mutex<Vec<AttemptRef>>,
+    work_starts: Mutex<WorkStarts>,
     reporting: Mutex<()>,
     data_seq: Mutex<DataSeq>,
     dir: PathBuf,
@@ -447,6 +478,7 @@ impl Link {
             leases: broadcast::channel(64).0,
             reconcile: broadcast::channel(16).0,
             running: Mutex::default(),
+            work_starts: Mutex::default(),
             reporting: Mutex::default(),
             data_seq: Mutex::new(data_seq),
             generation: std::sync::atomic::AtomicU64::new(0),
@@ -466,12 +498,13 @@ impl Link {
         let _one = self.reporting.lock().map_err(|_| poisoned())?;
         let mut spool = self.spool.lock().map_err(|_| poisoned())?;
         let mut journal = self.journal.lock().map_err(|_| poisoned())?;
+        let mut starts = self.work_starts.lock().map_err(|_| poisoned())?;
         let mut data_seq = self.data_seq.lock().map_err(|_| poisoned())?;
         if owner.is_some() {
             let spool_dir = self.dir.join("spool");
             match std::fs::remove_dir_all(&spool_dir) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                    return Err(AgentError::state(&spool_dir, e).into())
+                    return Err(AgentError::state(&spool_dir, e).into());
                 }
                 _ => {}
             }
@@ -479,7 +512,7 @@ impl Link {
                 let p = self.dir.join(f);
                 match std::fs::remove_file(&p) {
                     Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                        return Err(AgentError::state(&p, e).into())
+                        return Err(AgentError::state(&p, e).into());
                     }
                     _ => {}
                 }
@@ -501,6 +534,7 @@ impl Link {
         crate::state::atomic_write(&path, node_id.as_bytes())
             .map_err(|e| AgentError::state(&path, e))?;
         *owner = Some(node_id.to_owned());
+        starts.draining = false;
         Ok(true)
     }
 
@@ -714,23 +748,43 @@ impl Link {
 
     /// Journals and runs a delivered command (once).
     fn deliver(self: &Arc<Self>, seq: u64, cmd: Command) -> Result<(), LinkError> {
-        let fresh = self
+        let kind = kind_name(cmd.kind.as_ref());
+        let starts_work = matches!(kind, "LaunchAttempt" | "StartAttempt" | "LaunchDeployment");
+        let mut journal = self
             .journal
             .lock()
-            .map_err(|_| LinkError::Protocol("journal lock poisoned".into()))?
-            .receive(seq, &cmd.command_id)?;
-        if fresh == Delivery::Repeat {
+            .map_err(|_| LinkError::Protocol("journal lock poisoned".into()))?;
+        let mut starts = self
+            .work_starts
+            .lock()
+            .map_err(|_| LinkError::Protocol("work start lock poisoned".into()))?;
+        if journal.receive(seq, &cmd.command_id)? == Delivery::Repeat {
             return Ok(());
         }
-        let kind = kind_name(cmd.kind.as_ref());
+        let refused = starts_work && starts.draining;
+        let activity = if starts_work && !refused {
+            starts.active += 1;
+            Some(WorkStart(self.clone()))
+        } else {
+            None
+        };
+        let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
+        drop(starts);
+        drop(journal);
         let handler = self.handlers.read().ok().and_then(|h| h.get(kind).cloned());
         let link = self.clone();
-        let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
         tokio::spawn(async move {
+            let _activity = activity;
             let id = cmd.command_id.clone();
-            let outcome = match handler {
-                Some(h) => h.handle(cmd).await,
-                None => Err(Failure {
+            let outcome = match (refused, handler) {
+                (true, _) => Err(Failure {
+                    class: FailureClass::InfraTransient as i32,
+                    sub_code: "node_draining".into(),
+                    message: "the machine is draining and takes no new work".into(),
+                    ..Failure::default()
+                }),
+                (false, Some(h)) => h.handle(cmd).await,
+                (false, None) => Err(Failure {
                     class: FailureClass::DependencyEnv as i32,
                     sub_code: "unsupported_command".into(),
                     message: format!("this agent has no handler for {kind} commands yet"),
@@ -1127,6 +1181,7 @@ async fn control_lane(
     let renew = tokio::time::sleep(renew_in);
     tokio::pin!(renew);
     let mut pending_key: Option<rcgen::KeyPair> = None;
+    let mut drain_pending = false;
     loop {
         tokio::select! {
             biased;
@@ -1142,6 +1197,15 @@ async fn control_lane(
                     Some(core_message::Body::Command(cmd)) if m.seq > 0 => {
                         l.link.deliver(m.seq, cmd)?;
                         put(&out, AgentMessage { ack_seq: l.link.journal_seq(), sent_at: now_ts(), ..AgentMessage::default() }).await?;
+                    }
+                    Some(core_message::Body::Command(cmd))
+                        if m.seq == 0 && cmd.command_id == DRAIN_FENCE
+                            && matches!(cmd.kind, Some(command::Kind::Drain(_))) =>
+                    {
+                        l.link.work_starts.lock()
+                            .map_err(|_| LinkError::Protocol("work start lock poisoned".into()))?
+                            .draining = true;
+                        drain_pending = true;
                     }
                     Some(core_message::Body::Lease(g)) => {
                         let _ = l.link.leases.send(g);
@@ -1169,6 +1233,13 @@ async fn control_lane(
             () = l.link.wake.notified() => { flush(l, &out, &mut last, None).await?; }
             _ = heartbeat.tick() => {
                 l.link.report_results()?;
+                if drain_pending && l.link.work_starts.lock()
+                    .map_err(|_| LinkError::Protocol("work start lock poisoned".into()))?.active == 0
+                {
+                    let ack = CommandResult { command_id: DRAIN_FENCE.to_owned(), accepted: true, failure: None };
+                    flush(l, &out, &mut last, Some(agent_message::Body::CommandResult(ack))).await?;
+                    drain_pending = false;
+                }
                 let running = l.link.running.lock().map(|r| r.clone()).unwrap_or_default();
                 flush(l, &out, &mut last, Some(agent_message::Body::Heartbeat(Heartbeat { time: now_ts(), running }))).await?;
             }
@@ -1208,7 +1279,18 @@ async fn data_lane(
     let mut batch: Vec<AgentMessage> = Vec::new();
     loop {
         // Drain first: items queued while disconnected go out right after the hello.
-        batch.extend(queued.lock().map(|mut q| q.take()).unwrap_or_default());
+        batch.extend(
+            queued
+                .lock()
+                .map(|mut q| {
+                    let taken = q.take();
+                    if !q.lost.is_empty() || q.unattributed > 0 {
+                        wake.notify_one();
+                    }
+                    taken
+                })
+                .unwrap_or_default(),
+        );
         for mut m in batch.drain(..) {
             m.seq = l.link.next_data_seq(stream)?;
             m.sent_at = now_ts();
@@ -1560,7 +1642,7 @@ impl crate::registry::AgentService for GatewayService {
                     return Err(AgentError::Config {
                         path: crate::enroll::identity_dir(ctx.state.root()),
                         reason: e.explain(),
-                    })
+                    });
                 }
             };
             if let Err(e) = link.bind(&id.link.node_id) {
@@ -1600,7 +1682,7 @@ impl crate::registry::AgentService for GatewayService {
                     return Err(AgentError::Config {
                         path: crate::enroll::identity_dir(ctx.state.root()),
                         reason: e.explain(),
-                    })
+                    });
                 }
             };
             let started = tokio::time::Instant::now();
@@ -1716,6 +1798,30 @@ mod tests {
         assert!(markers[0].1.contains("2 log chunk(s)"));
         assert_eq!(markers[1].0, "rollout");
         assert!(markers[1].1.contains("1 log chunk(s)"));
+    }
+
+    #[test]
+    fn log_loss_bookkeeping_and_batches_are_bounded() {
+        let mut queue = Queue::new(2, false);
+        for i in 0..10 {
+            queue.push(AgentMessage {
+                body: Some(agent_message::Body::Worker(WorkerRelay {
+                    role_id: i.to_string(),
+                    ..WorkerRelay::default()
+                })),
+                ..AgentMessage::default()
+            });
+        }
+        assert_eq!(queue.lost.len(), 2);
+        assert_eq!(queue.unattributed, 6);
+        assert_eq!(queue.take().len(), 2);
+        assert_eq!(queue.take().len(), 2);
+        let rest = queue.take();
+        assert_eq!(rest.len(), 1);
+        let (role, msg) = log_of(&rest[0]);
+        assert!(role.is_empty());
+        assert!(msg.contains("6 log chunk(s)"));
+        assert!(queue.take().is_empty());
     }
 
     struct Count(std::sync::atomic::AtomicUsize);

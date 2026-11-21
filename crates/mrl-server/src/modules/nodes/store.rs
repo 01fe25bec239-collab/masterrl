@@ -69,8 +69,7 @@ fn pool_view(r: &sqlx::postgres::PgRow) -> Result<PoolView, sqlx::Error> {
     })
 }
 
-const POOL_COLS: &str =
-    "id, name, provider_kind, flags, created_at, extract(epoch from attempt_lease_ttl)::int AS ttl";
+const POOL_COLS: &str = "id, org_id, name, provider_kind, flags, created_at, extract(epoch from attempt_lease_ttl)::int AS ttl";
 
 /// Creates a pool. `Ok(None)` when the name is taken.
 pub async fn create_pool(
@@ -103,7 +102,7 @@ pub async fn list_pools(
     org: Option<Uuid>,
     after: Option<Uuid>,
     limit: usize,
-) -> Result<Vec<PoolView>, NodesError> {
+) -> Result<Vec<(PoolView, Option<Uuid>)>, NodesError> {
     // Platform pools (no org) and the caller's own org's pools only.
     let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {POOL_COLS} FROM compute_pools
@@ -115,10 +114,12 @@ pub async fn list_pools(
     .bind(org)
     .fetch_all(db.pool())
     .await?;
-    Ok(rows.iter().map(pool_view).collect::<Result<_, _>>()?)
+    Ok(rows
+        .iter()
+        .map(|row| Ok((pool_view(row)?, row.try_get("org_id")?)))
+        .collect::<Result<_, sqlx::Error>>()?)
 }
 
-/// True when the pool exists.
 /// The org that owns `pool` (`Some(None)`: a platform pool; `None`: no such pool).
 pub async fn pool_org(db: &Db, pool: Uuid) -> Result<Option<Option<Uuid>>, NodesError> {
     Ok(
@@ -394,13 +395,19 @@ pub async fn enroll(
                     .is_some_and(|k| k == key_sha);
                 let node: Option<Uuid> = row.try_get("used_by_node_id")?;
                 if let (true, false, Some(node)) = (same_key, expired, node) {
-                    let status: Option<String> = sqlx::query_scalar(
-                        "SELECT status FROM compute_nodes WHERE id = $1 FOR UPDATE",
+                    let recoverable: Option<bool> = sqlx::query_scalar(
+                        "SELECT status = 'ENROLLING' AND session_epoch = 0 FROM compute_nodes WHERE id = $1 FOR UPDATE",
                     )
                     .bind(node)
                     .fetch_optional(&mut **tx)
                     .await?;
-                    if status.as_deref() == Some("ENROLLING") {
+                    if recoverable == Some(true) && sqlx::query_scalar::<_, bool>(
+                        "SELECT count(*) > 0 AND bool_and(revoked_at IS NULL) AND bool_or(not_after > now())
+                         FROM (SELECT revoked_at, not_after FROM node_certificates WHERE node_id = $1 FOR SHARE) AS certs",
+                    )
+                    .bind(node)
+                    .fetch_one(&mut **tx)
+                    .await? {
                         let cert = match ca.issue_node(&req.csr_der, node, lifetime) {
                             Ok(c) => c,
                             Err(e) => return Ok(Err(e)),
@@ -612,6 +619,36 @@ pub async fn revoke_all(tx: &mut Tx, node: Uuid, reason: &str) -> Result<(), Nod
 
 // ---------- sessions ----------
 
+/// Serializes lossy sink effects with ownership changes without locking out CONTROL writes.
+pub(crate) async fn lock_lane_epoch(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    node: Uuid,
+    shared: bool,
+) -> Result<(), sqlx::Error> {
+    let sql = if shared {
+        "SELECT pg_advisory_xact_lock_shared(hashtextextended('mrl:lane:' || $1::uuid::text, 0))"
+    } else {
+        "SELECT pg_advisory_xact_lock(hashtextextended('mrl:lane:' || $1::uuid::text, 0))"
+    };
+    sqlx::query(sql).bind(node).execute(&mut **tx).await?;
+    Ok(())
+}
+
+/// Checks the active epoch while the caller holds the lane epoch lock.
+pub(crate) async fn holds_lane(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    node: Uuid,
+    epoch: i64,
+) -> Result<bool, NodesError> {
+    let current: Option<i64> = sqlx::query_scalar(
+        "SELECT session_epoch FROM compute_nodes WHERE id = $1 AND session_holder IS NOT NULL",
+    )
+    .bind(node)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(current == Some(epoch))
+}
+
 /// A new CONTROL session for the machine certificate `cert_sha256`: bumps `session_epoch`,
 /// records who holds it; OFFLINE → ONLINE. Returns `(epoch, control_rx_seq)`.
 ///
@@ -637,6 +674,7 @@ pub async fn open_control(
             let (sha, holder, hello, transport) =
                 (sha.clone(), holder.clone(), hello.clone(), transport.clone());
             Box::pin(async move {
+                lock_lane_epoch(tx, node, false).await?;
                 sqlx::query("SELECT 1 FROM compute_nodes WHERE id = $1 FOR UPDATE")
                     .bind(node)
                     .execute(&mut **tx)
@@ -688,7 +726,8 @@ pub async fn open_control(
 
 /// Ends every session of `node` on every replica, like a takeover does: `session_epoch` moves
 /// on, so each stream's next fenced step (ack, message, claim, telemetry) finds itself stale,
-/// and the wake-up makes each holder check at once. For decommission, in its transaction.
+/// and the wake-up makes each holder check at once. The caller takes the exclusive lane
+/// epoch lock before locking the node row.
 pub async fn end_sessions(tx: &mut Tx, node: Uuid) -> Result<(), NodesError> {
     sqlx::query(
         "UPDATE compute_nodes SET session_epoch = session_epoch + 1, session_holder = NULL WHERE id = $1",
@@ -726,6 +765,7 @@ pub async fn session_epoch(db: &Db, node: Uuid) -> Result<i64, NodesError> {
 pub async fn close_control(db: &Db, node: Uuid, epoch: i64) -> Result<(), NodesError> {
     db.transaction(move |tx| {
         Box::pin(async move {
+            lock_lane_epoch(tx, node, false).await?;
             let r = sqlx::query(
                 "UPDATE compute_nodes SET session_holder = NULL WHERE id = $1 AND session_epoch = $2",
             )
@@ -786,20 +826,14 @@ pub async fn accept(tx: &mut Tx, node: Uuid, epoch: i64, seq: u64) -> Result<Acc
     Ok(Accept::New)
 }
 
-/// True when `epoch` is the node's session right now (no lock kept).
-pub async fn is_current(db: &Db, node: Uuid, epoch: i64) -> Result<bool, NodesError> {
-    let current: Option<i64> =
-        sqlx::query_scalar("SELECT session_epoch FROM compute_nodes WHERE id = $1")
-            .bind(node)
-            .fetch_optional(db.pool())
-            .await?;
-    Ok(current == Some(epoch))
-}
-
 /// True when `epoch` is still the node's session; locks the row (shared) until `tx` ends.
-pub async fn holds(tx: &mut Tx, node: Uuid, epoch: i64) -> Result<bool, NodesError> {
+pub async fn holds(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    node: Uuid,
+    epoch: i64,
+) -> Result<bool, NodesError> {
     let current: Option<i64> =
-        sqlx::query_scalar("SELECT session_epoch FROM compute_nodes WHERE id = $1 FOR SHARE")
+        sqlx::query_scalar("SELECT session_epoch FROM compute_nodes WHERE id = $1 AND session_holder IS NOT NULL FOR SHARE")
             .bind(node)
             .fetch_optional(&mut **tx)
             .await?;
@@ -932,8 +966,8 @@ pub async fn inventory(tx: &mut Tx, node: Uuid, inv: &pb::Inventory) -> Result<(
 /// Latest-wins node telemetry and per-GPU readings. A reading older than the stored one is
 /// ignored (two writers, e.g. across a reconnect, can't move a reading back in time). GPU
 /// health follows the reading: OK, DEGRADED at `hot_c` or above, FAILED for a present GPU the
-/// reading leaves out (lost). Only the node's current session (`epoch`) writes. `Ok(true)`
-/// when this reading was saved (a sink gets only those).
+/// reading leaves out (lost). Only the current session writes. Returns the saved observation
+/// time when the reading was accepted.
 pub async fn telemetry(
     db: &Db,
     node: Uuid,
@@ -941,7 +975,7 @@ pub async fn telemetry(
     t: &pb::NodeTelemetry,
     hot_c: u32,
     max_ahead: time::Duration,
-) -> Result<bool, NodesError> {
+) -> Result<Option<OffsetDateTime>, NodesError> {
     let at = t
         .time
         .as_ref()
@@ -956,6 +990,9 @@ pub async fn telemetry(
     // caught up: past `max_ahead` it counts as taken now.
     let now = OffsetDateTime::now_utc();
     let at = if at > now + max_ahead { now } else { at };
+    let at = at
+        .replace_nanosecond(at.nanosecond() / 1_000 * 1_000)
+        .map_err(|e| NodesError::Protocol(e.to_string()))?;
     let doc = json!({
         "ram_used_bytes": t.ram_used_bytes, "swap_used_bytes": t.swap_used_bytes,
         "disk_free_bytes": t.disk_free_bytes, "memory_pressure": t.memory_pressure,
@@ -964,7 +1001,7 @@ pub async fn telemetry(
     let mut tx = db.begin().await?;
     let fresh = sqlx::query(
         "UPDATE compute_nodes SET telemetry = $2, telemetry_at = $3
-         WHERE id = $1 AND session_epoch = $4 AND (telemetry_at IS NULL OR telemetry_at < $3)",
+         WHERE id = $1 AND session_epoch = $4 AND session_holder IS NOT NULL AND (telemetry_at IS NULL OR telemetry_at < $3)",
     )
     .bind(node)
     .bind(doc)
@@ -975,7 +1012,7 @@ pub async fn telemetry(
     if fresh.rows_affected() == 0 {
         // An older (or repeated) reading, or one from a session that was taken over (the node
         // row stays locked until commit, so a takeover can't slip in between): keep what is there.
-        return Ok(false);
+        return Ok(None);
     }
     let mut seen = Vec::new();
     for g in &t.gpus {
@@ -1022,7 +1059,7 @@ pub async fn telemetry(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(true)
+    Ok(Some(at))
 }
 
 /// Journals a CONTROL message no sink takes yet (`node_events.kind = control_unrouted`).
@@ -1313,9 +1350,41 @@ pub async fn fail_unsendable(db: &Db, id: Uuid, size: usize) -> Result<(), Nodes
     Ok(())
 }
 
+/// Whether this session should send its ordered drain fence.
+pub(crate) async fn draining(db: &Db, node: Uuid, epoch: i64) -> Result<bool, NodesError> {
+    Ok(sqlx::query_scalar(
+        "SELECT status = 'DRAINING' FROM compute_nodes WHERE id = $1 AND session_epoch = $2",
+    )
+    .bind(node)
+    .bind(epoch)
+    .fetch_optional(db.pool())
+    .await?
+    .unwrap_or(false))
+}
+
+/// The agent has processed the fence behind all previously sent work starts. Require a
+/// fresh heartbeat after this acknowledgement, which carries the actual running count.
+pub(crate) async fn acknowledge_drain(
+    tx: &mut Tx,
+    node: Uuid,
+    epoch: i64,
+) -> Result<(), NodesError> {
+    sqlx::query(
+        "UPDATE compute_nodes SET drain_ack_epoch = $2, running_reported_at = NULL
+         WHERE id = $1 AND status = 'DRAINING' AND session_epoch = $2
+           AND drain_ack_epoch IS DISTINCT FROM $2",
+    )
+    .bind(node)
+    .bind(epoch)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Why a draining node can't be removed yet, if it can't: a work start still in flight
-/// (pending, sent or received), or no heartbeat since the drain and since the last finished
-/// work start that shows no running attempts. Reads with the node row locked by the caller.
+/// (pending, sent or received), or a missing drain fence and subsequent empty heartbeat.
+/// A node that never opened a session and never received work needs no acknowledgement.
+/// Reads with the node row locked by the caller.
 pub async fn decommission_blocker(tx: &mut Tx, node: Uuid) -> Result<Option<String>, NodesError> {
     let in_flight: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM agent_commands
@@ -1331,10 +1400,15 @@ pub async fn decommission_blocker(tx: &mut Tx, node: Uuid) -> Result<Option<Stri
         )));
     }
     let settled: bool = sqlx::query_scalar(
-        "SELECT n.running_attempts = 0 AND n.running_reported_at IS NOT NULL
-                AND n.running_reported_at > COALESCE(n.drained_at, '-infinity')
-                AND n.running_reported_at > COALESCE((SELECT max(c.updated_at) FROM agent_commands c
-                     WHERE c.node_id = n.id AND c.kind = ANY($2) AND c.state = 'COMPLETED'), '-infinity')
+        "SELECT n.running_attempts = 0 AND (
+                (n.session_epoch = 0 AND NOT EXISTS (
+                    SELECT 1 FROM agent_commands c WHERE c.node_id = n.id
+                      AND c.kind = ANY($2) AND c.sent_at IS NOT NULL))
+                OR (n.drain_ack_epoch IS NOT DISTINCT FROM n.session_epoch
+                    AND n.running_reported_at IS NOT NULL
+                    AND n.running_reported_at > COALESCE(n.drained_at, '-infinity')
+                    AND n.running_reported_at > COALESCE((SELECT max(c.updated_at) FROM agent_commands c
+                        WHERE c.node_id = n.id AND c.kind = ANY($2) AND c.state = 'COMPLETED'), '-infinity')))
          FROM compute_nodes n WHERE n.id = $1",
     )
     .bind(node)
@@ -1342,7 +1416,7 @@ pub async fn decommission_blocker(tx: &mut Tx, node: Uuid) -> Result<Option<Stri
     .fetch_one(&mut **tx)
     .await?;
     Ok((!settled).then(|| {
-        "the machine has not yet reported, after the drain, that nothing runs on it; wait for its next heartbeat".to_owned()
+        "the machine has not yet acknowledged the drain and sent a heartbeat showing no running work".to_owned()
     }))
 }
 
@@ -1430,30 +1504,20 @@ pub async fn leases(
         // ponytail: lease = "launched here at this epoch and not cancelled"; P17 may refine with attempt state.
         // A cancellation counts for its own fencing epoch only (one without an epoch: for the
         // launches sent before it), so a relaunch at a newer epoch gets its lease.
-        let ok: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM agent_commands l WHERE l.node_id = $1 AND l.kind = 'LaunchAttempt'
-                    AND l.attempt_id = $2 AND l.epoch = $3 AND l.state IN ('SENT','RECEIVED','COMPLETED')
-                    AND NOT EXISTS (SELECT 1 FROM agent_commands c WHERE c.node_id = $1
-                        AND c.kind = 'CancelAttempt' AND c.attempt_id = $2 AND c.state = 'COMPLETED'
-                        AND (c.epoch = $3 OR (c.epoch IS NULL AND c.seq > l.seq))))",
+        let renewed = sqlx::query(
+            "UPDATE agent_commands l SET updated_at = now()
+             WHERE l.node_id = $1 AND l.kind = 'LaunchAttempt' AND l.attempt_id = $2
+               AND l.epoch = $3 AND l.state IN ('SENT','RECEIVED','COMPLETED')
+               AND NOT EXISTS (SELECT 1 FROM agent_commands c WHERE c.node_id = l.node_id
+                    AND c.kind = 'CancelAttempt' AND c.attempt_id = l.attempt_id AND c.state = 'COMPLETED'
+                    AND (c.epoch = l.epoch OR (c.epoch IS NULL AND c.seq > l.seq)))",
         )
         .bind(node)
         .bind(attempt.as_uuid())
         .bind(i64::try_from(a.fencing_epoch).unwrap_or(i64::MAX))
-        .fetch_one(db.pool())
+        .execute(db.pool())
         .await?;
-        if ok {
-            // A running attempt keeps the launch that proves it alive: retention keys on
-            // `updated_at`, so a launch renewed here is never deleted while it runs.
-            sqlx::query(
-                "UPDATE agent_commands SET updated_at = now() WHERE node_id = $1 AND kind = 'LaunchAttempt'
-                   AND attempt_id = $2 AND epoch = $3 AND state = 'COMPLETED' AND updated_at < now() - interval '1 day'",
-            )
-            .bind(node)
-            .bind(attempt.as_uuid())
-            .bind(i64::try_from(a.fencing_epoch).unwrap_or(i64::MAX))
-            .execute(db.pool())
-            .await?;
+        if renewed.rows_affected() > 0 {
             out.push(pb::AttemptLease {
                 attempt: Some(a.clone()),
                 duration_s: ttl,

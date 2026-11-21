@@ -47,6 +47,10 @@ pub const HELLO_TIMEOUT: Duration = Duration::from_secs(30);
 /// How often a CONTROL stream looks for commands without a wake-up.
 pub const COMMAND_POLL: Duration = Duration::from_secs(2);
 
+// A seq-zero Drain with this id is a gateway fence on CONTROL. A normal Drain has a
+// positive command seq and follows the command handler path.
+const DRAIN_FENCE: &str = "gateway-drain-fence";
+
 /// Runs one stream to its end. Errors are sent to the agent as the stream's status.
 pub async fn run(
     gw: Arc<Gateway>,
@@ -55,14 +59,10 @@ pub async fn run(
     out: Outbound,
     shutdown: CancellationToken,
 ) {
-    // Shutdown ends the stream even while it waits to send.
-    let driven = tokio::select! {
-        r = drive(&gw, &peer, &mut inbound, &out, &shutdown) => r,
-        () = shutdown.cancelled() => Ok(()),
-    };
-    if let Err(status) = driven {
+    if let Err(status) = drive(&gw, &peer, &mut inbound, &out, &shutdown).await {
         tracing::info!(code = ?status.code(), message = status.message(), "gateway stream closed");
-        let _ = out.send(Err(status)).await;
+        // A full channel must not keep the connection alive after its send deadline.
+        let _ = out.try_send(Err(status));
     }
 }
 
@@ -147,17 +147,22 @@ async fn drive(
     out: &Outbound,
     shutdown: &CancellationToken,
 ) -> Result<(), Status> {
-    let first = tokio::time::timeout(HELLO_TIMEOUT, inbound.next())
-        .await
-        .map_err(|_| Status::deadline_exceeded("the agent sent no hello within 30 s"))?
-        .ok_or_else(|| Status::cancelled("the agent closed the stream before its hello"))??;
+    let first = tokio::select! {
+        () = shutdown.cancelled() => return Ok(()),
+        first = tokio::time::timeout(HELLO_TIMEOUT, inbound.next()) => first,
+    }
+    .map_err(|_| Status::deadline_exceeded("the agent sent no hello within 30 s"))?
+    .ok_or_else(|| Status::cancelled("the agent closed the stream before its hello"))??;
     match (&peer.cert_sha256, first.body) {
         (None, Some(agent_message::Body::Enroll(req))) => {
             let result = enroll(gw, &req).await;
             send(out, core_message::Body::EnrollResult(result), 0, 0).await?;
             // Keep the stream open until the agent has the result and closes its side, so
             // the answer is never cut off when the connection is torn down (core-dials).
-            let _ = tokio::time::timeout(Duration::from_secs(10), inbound.next()).await;
+            tokio::select! {
+                () = shutdown.cancelled() => {}
+                _ = tokio::time::timeout(Duration::from_secs(10), inbound.next()) => {}
+            }
             Ok(())
         }
         (None, _) => Err(Status::unauthenticated(
@@ -204,7 +209,7 @@ async fn enroll(gw: &Arc<Gateway>, req: &EnrollRequest) -> EnrollResult {
             return EnrollResult {
                 failure: Some(failure(&e)),
                 ..EnrollResult::default()
-            }
+            };
         }
     };
     match store::enroll(&gw.db, pki.clone(), &gw.config, req).await {
@@ -342,14 +347,15 @@ impl Lossy {
             node,
             epoch,
         };
+        let telemetry_owner = owner();
         let (tx, mut rx) = watch::channel::<Option<AgentMessage>>(None);
         let gw2 = gw.clone();
         let s = session.clone();
         tokio::spawn(async move {
             while rx.changed().await.is_ok() && !s.is_cancelled() {
                 let msg = rx.borrow_and_update().clone();
-                let Some(msg) = msg else { continue };
-                let Some(agent_message::Body::Telemetry(t)) = &msg.body else {
+                let Some(mut msg) = msg else { continue };
+                let Some(agent_message::Body::Telemetry(t)) = &mut msg.body else {
                     continue;
                 };
                 let ahead = time::Duration::seconds(
@@ -359,8 +365,8 @@ impl Lossy {
                 match store::telemetry(&gw2.db, node, epoch, t, gw2.config.gpu_hot_celsius, ahead)
                     .await
                 {
-                    Ok(true) => {}
-                    Ok(false) => continue,
+                    Ok(Some(at)) => t.time = Some(ts(at)),
+                    Ok(None) => continue,
                     Err(e) => {
                         tracing::debug!(code = e.code(), error = %e, "telemetry not saved");
                         continue;
@@ -379,9 +385,7 @@ impl Lossy {
                         dropped_before: 0,
                         message: msg,
                     };
-                    if let Err(e) = sink.deliver(item).await {
-                        tracing::debug!(error = %e, "telemetry sink failed");
-                    }
+                    telemetry_owner.deliver(&s, sink.as_ref(), item).await;
                 }
             }
         });
@@ -451,6 +455,7 @@ async fn record(
     epoch: i64,
     msg: &AgentMessage,
     route: Route,
+    drain_offered: bool,
 ) -> Result<Accept, NodesError> {
     let msg = msg.clone();
     let to_db = |e: NodesError| match e {
@@ -476,6 +481,13 @@ async fn record(
                     }
                     Some(agent_message::Body::Inventory(inv)) => {
                         store::inventory(tx, node, inv).await.map_err(to_db)?
+                    }
+                    Some(agent_message::Body::CommandResult(r))
+                        if r.command_id == DRAIN_FENCE && drain_offered && r.accepted =>
+                    {
+                        store::acknowledge_drain(tx, node, epoch)
+                            .await
+                            .map_err(to_db)?
                     }
                     Some(agent_message::Body::CommandResult(r)) => {
                         store::command_result(tx, node, r).await.map_err(to_db)?
@@ -562,7 +574,7 @@ async fn renew(
             return RenewCertificateResult {
                 failure: Some(failure(&e)),
                 ..Default::default()
-            }
+            };
         }
     };
     match store::renew(
@@ -622,7 +634,7 @@ async fn control(
     let mut rx_seq = rx.max(0) as u64;
     tracing::info!(node = %NodeId::from_uuid(node), epoch, "machine connected");
     // Every exit from here on (errors included) goes through the cleanup below.
-    let result = async {
+    let run = async {
         if superseded.is_cancelled() {
             return Err(taken_over());
         }
@@ -634,28 +646,36 @@ async fn control(
         gw.revoked_locally(&retired);
         send(out, hello(gw, Lane::Control, rx_seq + 1), 0, rx_seq).await?;
         let resume = h.resume_from_seq.max(1);
-        if !store::commands_received(&gw.db, node, epoch, resume - 1).await.map_err(unavailable)? {
+        if !store::commands_received(&gw.db, node, epoch, resume - 1)
+            .await
+            .map_err(unavailable)?
+        {
             return Err(taken_over());
         }
         let mut sent_upto = resume - 1;
+        let mut drain_offered = false;
         let mut acked = 0u64;
         let lossy = Lossy::start(gw, node, epoch, Lane::Control, &superseded);
         let mut poll = tokio::time::interval(COMMAND_POLL);
-        let mut recheck = tokio::time::interval(Duration::from_secs(gw.config.revocation_check_seconds));
+        let mut recheck =
+            tokio::time::interval(Duration::from_secs(gw.config.revocation_check_seconds));
         recheck.tick().await;
         loop {
             tokio::select! {
                 biased;
-                () = shutdown.cancelled() => return Ok(()),
-                () = revoked.cancelled() => {
-                    return Err(denied(NodesError::Certificate("this machine's certificates were revoked".into())));
-                }
-                () = superseded.cancelled() => {
-                    return Err(Status::aborted(NodesError::Protocol("a newer connection from this machine took over".into()).explain()));
-                }
                 _ = recheck.tick() => still_valid(gw, sha).await?,
+                _ = poll.tick() => {
+                    if !drain_offered && store::draining(&gw.db, node, epoch).await.map_err(unavailable)? {
+                        let fence = mrl_proto::agent::v1::Command {
+                            command_id: DRAIN_FENCE.to_owned(),
+                            kind: Some(mrl_proto::agent::v1::command::Kind::Drain(Default::default())),
+                        };
+                        send(out, core_message::Body::Command(fence), 0, rx_seq).await?;
+                        drain_offered = true;
+                    }
+                    sent_upto = send_commands(gw, node, epoch, sent_upto, rx_seq, out).await?;
+                }
                 () = wake.notified() => sent_upto = send_commands(gw, node, epoch, sent_upto, rx_seq, out).await?,
-                _ = poll.tick() => sent_upto = send_commands(gw, node, epoch, sent_upto, rx_seq, out).await?,
                 m = inbound.next() => {
                     let Some(Ok(m)) = m else { return Ok(()) };
                     if m.ack_seq > acked {
@@ -673,7 +693,7 @@ async fn control(
                     }
                     let lane = LaneKind::of(&m);
                     let route = if lane == LaneKind::Control { route_of(gw, node, &m) } else { Route::None };
-                    let accepted = record(gw, node, epoch, &m, route).await.map_err(unavailable)?;
+                    let accepted = record(gw, node, epoch, &m, route, drain_offered).await.map_err(unavailable)?;
                     if accepted == Accept::Stale {
                         return Err(taken_over());
                     }
@@ -698,8 +718,14 @@ async fn control(
                 }
             }
         }
-    }
-    .await;
+    };
+    let result = tokio::select! {
+        biased;
+        () = shutdown.cancelled() => Ok(()),
+        () = revoked.cancelled() => Err(denied(NodesError::Certificate("this machine's certificates were revoked".into()))),
+        () = superseded.cancelled() => Err(taken_over()),
+        result = run => result,
+    };
     gw.sessions.close_control(node, epoch);
     if let Err(e) = store::close_control(&gw.db, node, epoch).await {
         tracing::debug!(code = e.code(), error = %e, "could not record the disconnect");
