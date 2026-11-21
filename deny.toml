@@ -14,6 +14,8 @@ ignore = [
     { id = "RUSTSEC-2026-0370", reason = "zbus_names (via keyring on Linux): unmaintained, merged into zbus 6; not a vulnerability" },
     { id = "RUSTSEC-2026-0371", reason = "zvariant (via keyring on Linux): unmaintained, merged into zbus 6; not a vulnerability" },
     { id = "RUSTSEC-2026-0372", reason = "zvariant_derive (via keyring on Linux): unmaintained, merged into zbus 6; not a vulnerability" },
+    { id = "RUSTSEC-2026-0543", reason = "chrono (via object_store): unmaintained notice, not a vulnerability; remove when object_store drops it" },
+    { id = "RUSTSEC-2026-0542", reason = "humantime (via object_store): unmaintained notice, not a vulnerability; remove when object_store drops it" },
 ]
 
 [licenses]
