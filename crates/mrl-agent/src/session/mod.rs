@@ -9,7 +9,8 @@
 //!   not acked; inventory; heartbeats; commands are written to the [`crate::journal`] *before* they
 //!   are acked (RECEIVED), run once by their [`CommandHandler`], and answered with a
 //!   `CommandResult` through the spool. A command with no handler is answered FAILED
-//!   `unsupported_command`. The certificate is renewed at 2/3 of its lifetime.
+//!   `unsupported_command`, except a kind a service announced ([`Link::expect`]): it waits up
+//!   to [`HANDLER_WAIT`] for that service to register. The certificate is renewed at 2/3 of its lifetime.
 //! - TELEMETRY: node telemetry from the hardware backends every `telemetry_interval_secs`
 //!   (latest wins, never spooled) plus relayed worker metrics (bounded, decimated on overflow).
 //! - BULK: relayed log chunks (bounded; on overflow a marker chunk says how many were dropped).
@@ -55,6 +56,9 @@ use tokio_util::sync::CancellationToken;
 pub const PROTOCOL_VERSION: &str = "mrl.agent.v1";
 /// Largest message on a session.
 pub const MAX_MESSAGE_BYTES: usize = 4 << 20;
+
+/// How long a command of an announced kind waits for its service to register its handler.
+pub const HANDLER_WAIT: Duration = Duration::from_secs(60);
 const KEEPALIVE: Duration = Duration::from_secs(20);
 
 /// `[gateway]` in `agent.toml`. Enrollment writes the server or listen address to the identity;
@@ -369,9 +373,14 @@ pub struct Link {
     metrics_wake: Notify,
     logs_wake: Notify,
     handlers: RwLock<HashMap<&'static str, Arc<dyn CommandHandler>>>,
+    /// Kinds a service will register a handler for (announced before any service starts).
+    expected: RwLock<std::collections::HashSet<&'static str>>,
+    registered: Notify,
     leases: broadcast::Sender<LeaseGrant>,
     reconcile: broadcast::Sender<ReconcileResult>,
     running: Mutex<Vec<AttemptRef>>,
+    /// Send times of recent heartbeats (seq, monotonic time just before sending), for leases.
+    heartbeats: Mutex<VecDeque<(u64, std::time::Instant)>>,
     work_starts: Mutex<WorkStarts>,
     reporting: Mutex<()>,
     data_seq: Mutex<DataSeq>,
@@ -475,9 +484,12 @@ impl Link {
             metrics_wake: Notify::new(),
             logs_wake: Notify::new(),
             handlers: RwLock::default(),
+            expected: RwLock::default(),
+            registered: Notify::new(),
             leases: broadcast::channel(64).0,
             reconcile: broadcast::channel(16).0,
             running: Mutex::default(),
+            heartbeats: Mutex::default(),
             work_starts: Mutex::default(),
             reporting: Mutex::default(),
             data_seq: Mutex::new(data_seq),
@@ -554,6 +566,32 @@ impl Link {
         if let Ok(mut h) = self.handlers.write() {
             h.insert(kind, handler);
         }
+        self.registered.notify_waiters();
+    }
+
+    /// Announces command kinds a service will register handlers for. Called before services
+    /// start (`run_agent`), so a command delivered before its service is up waits for it.
+    pub fn expect(&self, kinds: &[&'static str]) {
+        if let Ok(mut e) = self.expected.write() {
+            e.extend(kinds.iter().copied());
+        }
+    }
+
+    /// The handler for `kind`; for an announced kind, waits up to [`HANDLER_WAIT`] for it.
+    async fn handler(&self, kind: &str) -> Option<Arc<dyn CommandHandler>> {
+        let deadline = tokio::time::Instant::now() + HANDLER_WAIT;
+        loop {
+            let registered = self.registered.notified();
+            tokio::pin!(registered);
+            registered.as_mut().enable();
+            if let Some(h) = self.handlers.read().ok().and_then(|h| h.get(kind).cloned()) {
+                return Some(h);
+            }
+            let expected = self.expected.read().is_ok_and(|e| e.contains(kind));
+            if !expected || tokio::time::timeout_at(deadline, registered).await.is_err() {
+                return None;
+            }
+        }
     }
 
     /// Sends a CONTROL message durably (spooled until the core acks it). Returns its seq.
@@ -602,6 +640,17 @@ impl Link {
     /// Lease grants from the core (answers to heartbeats).
     pub fn leases(&self) -> broadcast::Receiver<LeaseGrant> {
         self.leases.subscribe()
+    }
+
+    /// When heartbeat `seq` was sent (taken just before sending, never later), so a LeaseGrant's
+    /// deadline counts from it. `None` once it is older than the last 64 heartbeats.
+    pub fn heartbeat_sent(&self, seq: u64) -> Option<std::time::Instant> {
+        self.heartbeats
+            .lock()
+            .ok()?
+            .iter()
+            .find(|(s, _)| *s == seq)
+            .map(|(_, at)| *at)
     }
 
     /// Reconciliation results from the core.
@@ -771,11 +820,15 @@ impl Link {
         let generation = self.generation.load(std::sync::atomic::Ordering::SeqCst);
         drop(starts);
         drop(journal);
-        let handler = self.handlers.read().ok().and_then(|h| h.get(kind).cloned());
         let link = self.clone();
         tokio::spawn(async move {
             let _activity = activity;
             let id = cmd.command_id.clone();
+            let handler = if refused {
+                None
+            } else {
+                link.handler(kind).await
+            };
             let outcome = match (refused, handler) {
                 (true, _) => Err(Failure {
                     class: FailureClass::InfraTransient as i32,
@@ -1241,7 +1294,13 @@ async fn control_lane(
                     drain_pending = false;
                 }
                 let running = l.link.running.lock().map(|r| r.clone()).unwrap_or_default();
-                flush(l, &out, &mut last, Some(agent_message::Body::Heartbeat(Heartbeat { time: now_ts(), running }))).await?;
+                flush(l, &out, &mut last, None).await?;
+                let at = std::time::Instant::now();
+                let seq = flush(l, &out, &mut last, Some(agent_message::Body::Heartbeat(Heartbeat { time: now_ts(), running }))).await?;
+                if let Ok(mut h) = l.link.heartbeats.lock() {
+                    if h.len() == 64 { h.pop_front(); }
+                    h.push_back((seq, at));
+                }
             }
             () = &mut renew, if pending_key.is_none() => {
                 let (key, csr) = crate::enroll::new_key()?;
@@ -1835,6 +1894,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_command_of_an_announced_kind_waits_for_its_handler() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = Arc::new(Link::open(dir.path(), &GatewaySettings::default()).unwrap());
+        link.expect(&["Probe"]);
+        let waiting = tokio::spawn({
+            let link = link.clone();
+            async move { link.handler("Probe").await.is_some() }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !waiting.is_finished(),
+            "answered before the handler was registered"
+        );
+        link.register(
+            "Probe",
+            Arc::new(Count(std::sync::atomic::AtomicUsize::new(0))),
+        );
+        assert!(tokio::time::timeout(Duration::from_secs(5), waiting)
+            .await
+            .unwrap()
+            .unwrap());
+        // A kind no service announced is answered at once.
+        let other = tokio::time::timeout(Duration::from_secs(1), link.handler("Drain")).await;
+        assert!(other.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn a_result_waits_for_spool_space_and_the_command_runs_once() {
         let dir = tempfile::tempdir().unwrap();
         let g = GatewaySettings {
@@ -2309,5 +2395,80 @@ mod tests {
             status_error(&tonic::Status::unavailable("x")).code(),
             codes::UNREACHABLE
         );
+    }
+
+    #[tokio::test]
+    async fn each_heartbeat_keeps_its_send_time_for_the_last_64() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::AgentConfig {
+            state_dir: dir.path().join("state"),
+            ..crate::config::AgentConfig::default()
+        };
+        let ctx = Arc::new(AgentContext::with_hw(cfg, Vec::new()).unwrap());
+        let id_dir = crate::enroll::identity_dir(ctx.state.root());
+        std::fs::create_dir_all(&id_dir).unwrap();
+        // A 30-day certificate issued now (a far-off end overflows `SystemTime` on Windows).
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let identity = serde_json::json!({
+            "link": {"node_id": "node_1", "server": null, "listen": null, "transport": "direct",
+                     "installation_id": "i", "issued_at": now, "not_after": now + 30 * 86_400},
+            "cert": "00", "ca": "00", "key": "00",
+        });
+        std::fs::write(
+            id_dir.join(crate::enroll::IDENTITY_FILE),
+            identity.to_string(),
+        )
+        .unwrap();
+        let id = Identity::load(ctx.state.root()).unwrap().unwrap();
+        let link = Arc::new(Link::open(ctx.state.root(), &ctx.config.gateway).unwrap());
+        let l = LaneCtx {
+            ctx,
+            link: link.clone(),
+            id,
+            transport: TransportKind::Direct,
+        };
+        let (core_tx, core_rx) = mpsc::channel::<Result<CoreMessage, tonic::Status>>(8);
+        let inbound: CoreIn = Box::pin(ReceiverStream::new(core_rx));
+        let (out, mut sent) = mpsc::channel(256);
+        core_tx
+            .send(Ok(CoreMessage {
+                body: Some(core_message::Body::Hello(CoreHello {
+                    heartbeat_interval_s: 1,
+                    resume_from_seq: 1,
+                    ..CoreHello::default()
+                })),
+                ..CoreMessage::default()
+            }))
+            .await
+            .unwrap();
+        // 64 earlier heartbeats; the tick's heartbeat pushes the oldest out.
+        link.heartbeats
+            .lock()
+            .unwrap()
+            .extend((1_000..1_064).map(|s| (s, std::time::Instant::now())));
+        let stop = CancellationToken::new();
+        let lane = tokio::spawn({
+            let stop = stop.clone();
+            async move { control_lane(&l, inbound, out, stop).await }
+        });
+        let seq = loop {
+            let m = sent.recv().await.expect("the lane keeps running");
+            if matches!(m.body, Some(agent_message::Body::Heartbeat(_))) {
+                break m.seq;
+            }
+        };
+        stop.cancel();
+        assert_eq!(lane.await.unwrap().unwrap(), Outcome::Stopped);
+        let at = link.heartbeat_sent(seq).expect("send time kept");
+        assert!(at <= std::time::Instant::now());
+        assert!(
+            link.heartbeat_sent(1_000).is_none(),
+            "older than 64 heartbeats"
+        );
+        assert!(link.heartbeat_sent(1_001).is_some());
+        assert!(link.heartbeat_sent(1_063).is_some());
     }
 }

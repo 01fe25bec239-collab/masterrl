@@ -19,6 +19,7 @@ pub mod files;
 pub mod local;
 pub mod record;
 pub mod runner;
+pub mod service;
 pub mod spec;
 
 pub use error::AttemptError;
@@ -599,12 +600,13 @@ impl Attempts {
             .values()
             .map(|l| l.control.clone())
             .collect();
-        for c in controls {
+        futures::future::join_all(controls.into_iter().map(|c| async move {
             let (tx, rx) = oneshot::channel();
             if c.send(Control::Detach(tx)).await.is_ok() {
                 let _ = rx.await;
             }
-        }
+        }))
+        .await;
     }
 
     /// Remembers the highest fencing epoch seen for the record's job.
@@ -619,7 +621,15 @@ impl Attempts {
     /// others lost, and reports attempts that ended earlier with their saved outcome. Returns
     /// the status of each (for the reconcile report).
     pub async fn readopt(self: &Arc<Self>) -> Vec<AttemptStatus> {
-        let statuses = self.readopt_where(|_| true).await;
+        self.readopt_all(true).await
+    }
+
+    async fn readopt_for_session(self: &Arc<Self>) -> Vec<AttemptStatus> {
+        self.readopt_all(false).await
+    }
+
+    async fn readopt_all(self: &Arc<Self>, emit_snapshot: bool) -> Vec<AttemptStatus> {
+        let statuses = self.readopt_records(|_| true, emit_snapshot).await;
         if let Ok(entries) = std::fs::read_dir(self.probe_dir()) {
             for entry in entries
                 .flatten()
@@ -674,6 +684,14 @@ impl Attempts {
     pub async fn readopt_where(
         self: &Arc<Self>,
         wanted: impl Fn(&str) -> bool,
+    ) -> Vec<AttemptStatus> {
+        self.readopt_records(wanted, true).await
+    }
+
+    async fn readopt_records(
+        self: &Arc<Self>,
+        wanted: impl Fn(&str) -> bool,
+        emit_snapshot: bool,
     ) -> Vec<AttemptStatus> {
         let jobs = self.shared.ctx.state.root().join("jobs");
         let Ok(rd) = std::fs::read_dir(&jobs) else {
@@ -767,10 +785,14 @@ impl Attempts {
                 drop(claim);
                 st
             };
-            post(
-                &self.shared.events,
-                vec![(AttemptEvent::Status(status.clone()), None)],
-            );
+            // The session sends this snapshot in its reconcile report. A separate status
+            // could land after a newer transition from the re-adopted runner.
+            if emit_snapshot {
+                post(
+                    &self.shared.events,
+                    vec![(AttemptEvent::Status(status.clone()), None)],
+                );
+            }
             out.push(status);
         }
         out

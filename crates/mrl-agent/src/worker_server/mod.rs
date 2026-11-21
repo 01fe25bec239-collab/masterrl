@@ -38,8 +38,10 @@ use crate::AgentError;
 pub const PROTOCOL_VERSIONS: &[&str] = &["1.0"];
 /// Heartbeat interval asked of workers, seconds.
 pub const HEARTBEAT_INTERVAL_S: u32 = 5;
-/// Largest message the agent accepts, bytes.
-pub const MAX_MESSAGE_BYTES: u32 = 8 << 20;
+/// Largest message the agent accepts, bytes: the gateway's limit
+/// ([`crate::session::MAX_MESSAGE_BYTES`]) minus room for the relay around it, so every worker
+/// message the agent takes can also be sent on to the core.
+pub const MAX_MESSAGE_BYTES: u32 = (4 << 20) - (64 << 10);
 /// Longest the agent waits to hand one message to a worker whose queue is full. A worker that
 /// stops reading for this long is disconnected, so a send never holds up lease expiry or a
 /// cancel for longer.
@@ -529,6 +531,32 @@ impl WorkerServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_worker_message_always_fits_a_gateway_message() {
+        use mrl_proto::agent::v1::{agent_message, AgentMessage, WorkerRelay};
+        // The relay around an empty worker message, with generous ids and the largest header.
+        let around = prost::Message::encoded_len(&AgentMessage {
+            seq: u64::MAX,
+            ack_seq: u64::MAX,
+            sent_at: Some(prost_types::Timestamp {
+                seconds: i64::MIN,
+                nanos: i32::MIN,
+            }),
+            body: Some(agent_message::Body::Worker(WorkerRelay {
+                attempt: Some(mrl_proto::common::v1::AttemptRef {
+                    job_id: "j".repeat(1024),
+                    attempt_id: "a".repeat(1024),
+                    fencing_epoch: u64::MAX,
+                }),
+                role_id: "r".repeat(1024),
+                message: Some(Default::default()),
+            })),
+        });
+        // + the worker message itself and the longer length prefixes it needs.
+        let worst = around + MAX_MESSAGE_BYTES as usize + 2 * 10;
+        assert!(worst <= crate::session::MAX_MESSAGE_BYTES, "{worst}");
+    }
 
     #[test]
     fn version_negotiation() {

@@ -14,6 +14,10 @@ use crate::{AgentContext, Result};
 pub trait AgentService: Send + Sync {
     /// Short name for logs, like `gateway`.
     fn name(&self) -> &'static str;
+    /// Command kinds this service registers handlers for (see `Link::expect`).
+    fn command_kinds(&self) -> &'static [&'static str] {
+        &[]
+    }
     /// Runs until `shutdown` is cancelled. Returning an error stops the whole agent.
     async fn run(&self, ctx: Arc<AgentContext>, shutdown: CancellationToken) -> Result<()>;
 }
@@ -25,6 +29,7 @@ pub fn services() -> Vec<Box<dyn AgentService>> {
         // <mrl:register P18> P18 services go right below this line.
         Box::new(crate::session::GatewayService::new()),
         // <mrl:register P20> P20 services go right below this line.
+        Box::new(crate::attempts::service::AttemptsService::new()),
         Box::new(crate::janitor::JanitorService),
         Box::new(crate::doctor::DoctorService),
         // </mrl:register>

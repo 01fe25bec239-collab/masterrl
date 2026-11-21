@@ -64,6 +64,9 @@ pub enum AttemptError {
     /// The machine is draining and takes no new attempts.
     #[error("this machine is not taking new attempts: {0}")]
     Draining(String),
+    /// The agent is stopping and takes no more commands.
+    #[error("the agent is stopping and did not run the command; try again once the machine is back online")]
+    Stopping,
     /// A lower-level agent error (state folder, executor, sandbox, cache, transfers).
     #[error(transparent)]
     Agent(#[from] AgentError),
@@ -122,6 +125,7 @@ impl AttemptError {
             Self::Socket { .. } => "MRL-NODE-203",
             Self::State { .. } => "MRL-STATE-204",
             Self::Draining(_) => "MRL-NODE-206",
+            Self::Stopping => "MRL-NODE-207",
             Self::Agent(e) => e.code(),
         }
     }
@@ -141,7 +145,9 @@ impl AttemptError {
             | Self::EnvInstall { .. }
             | Self::UvMissing(_)
             | Self::DockerMissing(_) => FailureClass::DependencyEnv,
-            Self::Agent(AgentError::CacheFull { .. }) => FailureClass::InfraTransient,
+            Self::Agent(AgentError::CacheFull { .. }) | Self::Stopping => {
+                FailureClass::InfraTransient
+            }
             Self::Agent(AgentError::SandboxUnavailable(_)) => FailureClass::DependencyEnv,
             Self::Agent(
                 AgentError::Transfer { .. }

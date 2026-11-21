@@ -1682,6 +1682,15 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                     'for example before an update.',
              'what_to_do': {'steps': ['Wait until the machine is back in service, or pick another '
                                       'machine.']}},
+            {'code': 'MRL-NODE-207',
+             'title': 'The agent was stopping and did not run the command.',
+             'why': 'The agent on this machine was shutting down, for example for a restart or an '
+                    'update. Training that was already running keeps running and is picked up '
+                    'again when the agent is back.',
+             'what_to_do': {'steps': ['Wait for the machine to come back online, then try the '
+                                      'action again.',
+                                      'If the machine stays offline, start the agent with '
+                                      '`mrl-agent run` or restart its service.']}},
             {'code': 'MRL-PERM-001',
              'title': "Your role doesn't allow this action.",
              'why': 'Each project role can do a set list of things. This action needs a different '

@@ -654,6 +654,10 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         code(ErrorFamily::Node, 206),
         "This machine is not taking new training runs right now.",
     ),
+    (
+        code(ErrorFamily::Node, 207),
+        "The agent was stopping and did not run the command.",
+    ),
     // <mrl:errors P21> rows for P21 go right below this line.
     // <mrl:errors P22> rows for P22 go right below this line.
     // <mrl:errors P23> rows for P23 go right below this line.

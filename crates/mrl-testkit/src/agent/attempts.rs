@@ -1146,6 +1146,19 @@ mod runner_tests {
             .unwrap()
             .unwrap();
         assert_eq!(d.phase, AttemptPhase::SelfFenced as i32);
+        // The connection can recover after the runner exits. Free the slot and make
+        // sure the saved terminal status still reaches the forwarder.
+        let events = fx.unread.as_mut().unwrap();
+        assert!(matches!(
+            events.recv().await.unwrap().saved(),
+            AttemptEvent::Relay { .. }
+        ));
+        let terminal = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("terminal status survived the full queue")
+            .unwrap()
+            .saved();
+        assert!(matches!(terminal, AttemptEvent::Status(s) if s.phase == d.phase));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2003,6 +2016,45 @@ mod runner_tests {
         assert!(got.lock().unwrap().is_empty());
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn detach_interrupts_a_finished_workers_upload_drain() {
+        let (base, got) = slow_sink(Duration::from_secs(30)).await;
+        let mut fx =
+            RunnerFixture::readopt(spec("att_drainstop", serde_json::json!({})), |_| {}).await;
+        let path = "w.bin";
+        std::fs::write(fx.staging().join(path), b"weights").unwrap();
+        let (saved, accepted) = tokio::sync::oneshot::channel();
+        fx.control
+            .send(Control::Acked {
+                inner: Box::new(Control::Upload {
+                    command_id: "up-stop".into(),
+                    checkpoint_id: String::new(),
+                    targets: vec![target(&base, path, &sha_hex(b"weights"), 7)],
+                }),
+                saved,
+            })
+            .await
+            .unwrap();
+        assert!(accepted.await.unwrap());
+        fx.end_workers();
+        // A launch-time detach would return None and leave the upload in the record.
+        // Give the runner's process watcher one tick to enter its drain.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let (done, detached) = tokio::sync::oneshot::channel();
+        fx.control.send(Control::Detach(done)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), detached)
+            .await
+            .expect("detach waited on the upload")
+            .unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(5), &mut fx.task)
+            .await
+            .expect("the runner did not finish after detaching")
+            .unwrap()
+            .is_some());
+        assert!(fx.saved().adhoc_uploads.is_empty());
+        assert!(got.lock().unwrap().is_empty());
+    }
+
     /// Two commands for one checkpoint before the worker asks to commit: the first is answered
     /// as replaced, the second owns the upload and gets its result.
     #[tokio::test(flavor = "multi_thread")]
@@ -2040,5 +2092,508 @@ mod runner_tests {
         assert_eq!(second.command_id, "up-b");
         assert!(second.failure.is_none(), "{second:?}");
         assert_eq!(got.lock().unwrap().len(), 1);
+    }
+}
+
+/// `mrl-agent run` wiring (attempts ↔ gateway session) end to end: a real gateway on a test
+/// database, an in-process agent running every registered service, and the FakeEngine.
+#[cfg(all(test, unix))]
+mod session_wiring {
+    use std::collections::BTreeMap;
+    use std::str::FromStr;
+
+    use mrl_agent::registry::AgentService;
+    use mrl_agent::session::Link;
+    use mrl_domain::ids::{AttemptId, NodeId};
+    use mrl_proto::agent::v1::agent_message::Body as Msg;
+    use mrl_proto::agent::v1::command::Kind;
+    use mrl_proto::agent::v1::{
+        AgentMessage, AttemptPhase, AttemptStatus, CancelAttempt, LaunchAttempt, ProbeResult,
+        RoleLaunch,
+    };
+    use mrl_proto::common::v1::AttemptRef;
+    use mrl_server::modules::nodes::commands::{CommandKind, CommandSender, NewCommand};
+    use mrl_server::modules::nodes::lanes::{LaneItem, LaneKind, LaneRouter, LaneSink, SinkError};
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    use super::*;
+    use crate::agent::gateway::{fast_config, GatewayHarness, TestAgent};
+    use crate::pg::TestDb;
+    use crate::seams::InMemorySecretStore;
+
+    const WAIT: Duration = Duration::from_secs(240);
+
+    /// Every CONTROL message the core handed to sinks, deduped on seq (at-least-once).
+    #[derive(Default)]
+    struct Control(Mutex<BTreeMap<u64, AgentMessage>>);
+
+    #[async_trait::async_trait]
+    impl LaneSink for Control {
+        fn name(&self) -> &'static str {
+            "control"
+        }
+        fn lanes(&self) -> &'static [LaneKind] {
+            &[LaneKind::Control]
+        }
+        async fn deliver(&self, item: LaneItem) -> Result<(), SinkError> {
+            self.0.lock().unwrap().insert(item.seq, item.message);
+            Ok(())
+        }
+    }
+
+    impl Control {
+        fn all(&self) -> Vec<(u64, Msg)> {
+            let m = self.0.lock().unwrap();
+            m.iter()
+                .filter_map(|(s, m)| m.body.clone().map(|b| (*s, b)))
+                .collect()
+        }
+
+        fn statuses(&self, attempt: &str) -> Vec<(u64, AttemptStatus)> {
+            self.all()
+                .into_iter()
+                .filter_map(|(seq, b)| match b {
+                    Msg::AttemptStatus(s)
+                        if s.attempt.as_ref().is_some_and(|a| a.attempt_id == attempt) =>
+                    {
+                        Some((seq, s))
+                    }
+                    _ => None,
+                })
+                .collect()
+        }
+
+        async fn until(&self, what: &str, f: impl Fn(&[(u64, Msg)]) -> bool) {
+            tokio::time::timeout(WAIT, async {
+                while !f(&self.all()) {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}: {:?}", self.all()));
+        }
+
+        async fn until_phase(&self, attempt: &str, phase: AttemptPhase) {
+            self.until(&format!("{attempt} {phase:?}"), |_| {
+                self.statuses(attempt)
+                    .iter()
+                    .any(|(_, s)| s.phase == phase as i32)
+            })
+            .await;
+        }
+    }
+
+    /// The agent daemon: every registered service, as `mrl-agent run` runs them.
+    struct Daemon {
+        stop: CancellationToken,
+        task: tokio::task::JoinHandle<mrl_agent::Result<()>>,
+    }
+
+    impl Daemon {
+        fn start(ctx: &Arc<mrl_agent::AgentContext>) -> Self {
+            Self::with(ctx, mrl_agent::registry::services())
+        }
+
+        fn with(ctx: &Arc<mrl_agent::AgentContext>, services: Vec<Box<dyn AgentService>>) -> Self {
+            let stop = CancellationToken::new();
+            let (ctx, s) = (Arc::clone(ctx), stop.clone());
+            let task = tokio::spawn(async move { mrl_agent::run_agent(ctx, services, s).await });
+            Self { stop, task }
+        }
+
+        /// Stops it like SIGTERM does and checks it exited cleanly.
+        async fn stop(self) {
+            self.stop.cancel();
+            match tokio::time::timeout(Duration::from_secs(60), self.task).await {
+                Ok(Ok(Ok(()))) => {}
+                other => panic!("the agent did not stop cleanly: {other:?}"),
+            }
+        }
+    }
+
+    struct Setup {
+        gw: GatewayHarness,
+        agent: TestAgent,
+        node: NodeId,
+        control: Arc<Control>,
+        sender: CommandSender,
+    }
+
+    async fn setup(tune: impl FnOnce(&mut mrl_agent::config::AgentConfig)) -> Setup {
+        let router = LaneRouter::new();
+        let control = Arc::new(Control::default());
+        router.register(control.clone());
+        let gw = GatewayHarness::start_with(
+            TestDb::new().await,
+            fast_config(),
+            Arc::new(InMemorySecretStore::default()),
+            router,
+        )
+        .await;
+        let agent = TestAgent::new(1, tune);
+        let node = agent
+            .enroll(&gw, &gw.token(json!({})).await)
+            .await
+            .unwrap_or_else(|e| panic!("enroll: {}", e.explain()));
+        let sender = CommandSender::new(
+            &gw.gw,
+            &[CommandKind::LaunchAttempt, CommandKind::CancelAttempt],
+        );
+        Setup {
+            gw,
+            agent,
+            node: NodeId::from_str(&node).unwrap(),
+            control,
+            sender,
+        }
+    }
+
+    async fn state_of(gw: &GatewayHarness, id: uuid::Uuid) -> String {
+        sqlx::query_scalar("SELECT state FROM agent_commands WHERE id = $1")
+            .bind(id)
+            .fetch_one(gw.db.pool())
+            .await
+            .unwrap()
+    }
+
+    async fn wait_state(gw: &GatewayHarness, id: uuid::Uuid, want: &str) {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let state = state_of(gw, id).await;
+            if state == want {
+                return;
+            }
+            // A final state other than the one wanted won't change any more.
+            assert!(
+                tokio::time::Instant::now() < deadline
+                    && !["COMPLETED", "FAILED", "EXPIRED", "SUPERSEDED"].contains(&state.as_str()),
+                "command never reached {want}: {state}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// True when uv is here; SKIPPED (or a failure when required) otherwise.
+    fn uv_ready(test: &str) -> bool {
+        if mrl_agent::envs::which("uv").is_some() {
+            return true;
+        }
+        assert!(
+            std::env::var("MRL_TEST_ATTEMPTS_REQUIRED").is_err(),
+            "{test}: uv is required (MRL_TEST_ATTEMPTS_REQUIRED=1) but not on PATH"
+        );
+        eprintln!("SKIPPED {test}: uv is not installed");
+        false
+    }
+
+    /// A runtime the core can name in a LaunchAttempt: a small locked project in
+    /// `<state>/runtimes/` that depends on the repo's mrl-runtime (FakeEngine). Its ref.
+    fn fake_runtime(ctx: &mrl_agent::AgentContext) -> String {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let runtime = std::fs::canonicalize(repo.join("python/mrl-runtime")).unwrap();
+        let build = ctx.state.root().join("runtimes").join("build");
+        std::fs::create_dir_all(&build).unwrap();
+        std::fs::write(
+            build.join("pyproject.toml"),
+            format!(
+                "[project]\nname = \"fake-env\"\nversion = \"0\"\nrequires-python = \">=3.12,<3.13\"\n\
+                 dependencies = [\"mrl-runtime\"]\n\n[tool.uv.sources]\nmrl-runtime = {{ path = {:?} }}\n",
+                runtime.display().to_string()
+            ),
+        )
+        .unwrap();
+        let out = std::process::Command::new("uv")
+            .arg("lock")
+            .current_dir(&build)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "uv lock: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let lock = std::fs::read(build.join("uv.lock")).unwrap();
+        let rt = format!("uv:sha256:{}", mrl_storage::sha256_hex(&lock));
+        std::fs::rename(&build, build.with_file_name(rt.replace(':', "-"))).unwrap();
+        rt
+    }
+
+    fn attempt_ref(attempt: AttemptId, epoch: u64) -> AttemptRef {
+        AttemptRef {
+            job_id: "job_t".into(),
+            attempt_id: attempt.to_string(),
+            fencing_epoch: epoch,
+        }
+    }
+
+    fn launch(attempt: AttemptId, runtime_ref: &str, engine: serde_json::Value) -> NewCommand {
+        let job_spec = json!({
+            "run_id": "run_t", "job_kind": "TRAIN", "algorithm": "x-fake.steps",
+            "common": {"seed": 7}, "engine": engine, "switch": {},
+            "base_model_sha256": "0".repeat(64)
+        });
+        NewCommand::new(Kind::LaunchAttempt(LaunchAttempt {
+            attempt: Some(attempt_ref(attempt, 1)),
+            engine_name: "fake".into(),
+            job_spec_json: job_spec.to_string(),
+            roles: vec![RoleLaunch {
+                role_id: "trainer".into(),
+                kind: "trainer".into(),
+                primary: true,
+                count: 1,
+                runtime_ref: runtime_ref.into(),
+                ..RoleLaunch::default()
+            }],
+            lease_duration_s: 90,
+            ..LaunchAttempt::default()
+        }))
+        .attempt(attempt, 1)
+    }
+
+    fn cancel(attempt: AttemptId) -> NewCommand {
+        NewCommand::new(Kind::CancelAttempt(CancelAttempt {
+            attempt: Some(attempt_ref(attempt, 1)),
+            request_id: "stop-1".into(),
+            grace_s: 5,
+            reason: "test".into(),
+        }))
+        .attempt(attempt, 1)
+    }
+
+    fn phases(s: &[(u64, AttemptStatus)]) -> Vec<i32> {
+        s.iter().map(|(_, s)| s.phase).collect()
+    }
+
+    /// A LaunchAttempt from the core runs the attempt; its statuses reach the core in order and
+    /// once each; a CancelAttempt ends it.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL and uv (just test-integration)"]
+    async fn a_launch_over_the_session_runs_and_a_cancel_ends_it() {
+        if !uv_ready("a_launch_over_the_session_runs_and_a_cancel_ends_it") {
+            return;
+        }
+        let s = setup(|_| {}).await;
+        let rt = fake_runtime(&s.agent.ctx);
+        let daemon = Daemon::start(&s.agent.ctx);
+        let attempt = AttemptId::new();
+        let id = attempt.to_string();
+        let l = s
+            .sender
+            .send(
+                s.node,
+                launch(attempt, &rt, json!({"steps": 600, "step_seconds": 0.2})),
+            )
+            .await
+            .unwrap();
+        wait_state(&s.gw, l.id, "COMPLETED").await;
+        s.control.until_phase(&id, AttemptPhase::Running).await;
+
+        let c = s.sender.send(s.node, cancel(attempt)).await.unwrap();
+        wait_state(&s.gw, c.id, "COMPLETED").await;
+        s.control.until_phase(&id, AttemptPhase::Exited).await;
+        let statuses = s.control.statuses(&id);
+        let ended = statuses.last().unwrap().1.clone();
+        assert_eq!(
+            ended.exit_kind,
+            mrl_proto::worker::v1::ExitKind::Cancelled as i32,
+            "{ended:?}"
+        );
+        // In order (seq and phase) and no status twice.
+        let ph = phases(&statuses);
+        assert!(ph.windows(2).all(|w| w[0] <= w[1]), "{ph:?}");
+        for (i, a) in statuses.iter().enumerate() {
+            assert!(
+                statuses[i + 1..].iter().all(|b| b.1 != a.1),
+                "status sent twice: {statuses:?}"
+            );
+        }
+        daemon.stop().await;
+    }
+
+    /// A restarted agent re-adopts the running attempt, and its first ReconcileReport after the
+    /// restart lists it as running; the core can still cancel it.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL and uv (just test-integration)"]
+    async fn a_restarted_agent_reports_the_readopted_attempt_first() {
+        if !uv_ready("a_restarted_agent_reports_the_readopted_attempt_first") {
+            return;
+        }
+        let s = setup(|_| {}).await;
+        let rt = fake_runtime(&s.agent.ctx);
+        let daemon = Daemon::start(&s.agent.ctx);
+        let attempt = AttemptId::new();
+        let id = attempt.to_string();
+        let l = s
+            .sender
+            .send(
+                s.node,
+                launch(attempt, &rt, json!({"steps": 600, "step_seconds": 0.2})),
+            )
+            .await
+            .unwrap();
+        wait_state(&s.gw, l.id, "COMPLETED").await;
+        s.control.until_phase(&id, AttemptPhase::Running).await;
+        daemon.stop().await;
+        let before = s.control.all().last().map_or(0, |(seq, _)| *seq);
+
+        let daemon = Daemon::start(&s.agent.ctx);
+        s.control
+            .until("a reconcile report after the restart", |all| {
+                all.iter()
+                    .any(|(seq, b)| *seq > before && matches!(b, Msg::Reconcile(_)))
+            })
+            .await;
+        let first = s
+            .control
+            .all()
+            .into_iter()
+            .find_map(|(seq, b)| match b {
+                Msg::Reconcile(r) if seq > before => Some(r),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            first
+                .attempts
+                .iter()
+                .any(|st| st.attempt.as_ref().is_some_and(|a| a.attempt_id == id)
+                    && st.phase == AttemptPhase::Running as i32),
+            "{first:?}"
+        );
+        // Still running under the new agent: the core's cancel reaches it.
+        let c = s.sender.send(s.node, cancel(attempt)).await.unwrap();
+        wait_state(&s.gw, c.id, "COMPLETED").await;
+        s.control.until_phase(&id, AttemptPhase::Exited).await;
+        assert!(
+            s.control
+                .statuses(&id)
+                .iter()
+                .all(|(seq, status)| *seq <= before || status.time.is_some()),
+            "the re-adoption snapshot belongs in the reconcile report only"
+        );
+        daemon.stop().await;
+    }
+
+    /// Every lease grant renews the attempt's lease, counted from the heartbeat it answers.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL and uv (just test-integration)"]
+    async fn lease_grants_renew_the_attempts_lease() {
+        if !uv_ready("lease_grants_renew_the_attempts_lease") {
+            return;
+        }
+        let s = setup(|_| {}).await;
+        let rt = fake_runtime(&s.agent.ctx);
+        let daemon = Daemon::start(&s.agent.ctx);
+        let attempt = AttemptId::new();
+        let id = attempt.to_string();
+        let l = s
+            .sender
+            .send(
+                s.node,
+                launch(attempt, &rt, json!({"steps": 600, "step_seconds": 0.2})),
+            )
+            .await
+            .unwrap();
+        wait_state(&s.gw, l.id, "COMPLETED").await;
+        s.control.until_phase(&id, AttemptPhase::Running).await;
+        let job = s.agent.ctx.state.job_dir(&id);
+        let saved = || {
+            mrl_agent::attempts::record::AttemptRecord::load(&job)
+                .unwrap()
+                .unwrap()
+        };
+        let renewed = |after: u64| async move {
+            let deadline = tokio::time::Instant::now() + WAIT;
+            loop {
+                let r = saved();
+                if r.lease_heartbeat_seq > after {
+                    return r;
+                }
+                assert!(tokio::time::Instant::now() < deadline, "no lease renewal");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        };
+        let first = renewed(0).await;
+        let again = renewed(first.lease_heartbeat_seq).await;
+        // The pool grants 90 s; the deadline counts from the heartbeat, never later.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let hard = again.lease_hard_deadline_unix_ms.unwrap();
+        assert!(
+            hard <= now_ms + 90_000 && hard > now_ms + 80_000,
+            "{hard} vs {now_ms}"
+        );
+        assert!(again.lease_deadline_unix_ms.unwrap() < hard);
+        let c = s.sender.send(s.node, cancel(attempt)).await.unwrap();
+        wait_state(&s.gw, c.id, "COMPLETED").await;
+        daemon.stop().await;
+    }
+
+    /// An event the link can't spool (full spool) is not marked saved, so its effect is not
+    /// undone; it is spooled again once there is room, and reaches the core once.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn an_event_the_spool_refuses_is_kept_and_sent_again() {
+        let s = setup(|c| c.gateway.spool_max_entries = 2).await;
+        let ctx = Arc::clone(&s.agent.ctx);
+        // A probe result saved before a restart: its file goes only once the event is saved.
+        let probes = ctx.state.root().join("probes");
+        std::fs::create_dir_all(&probes).unwrap();
+        let file = probes.join("saved.probe");
+        let probe = ProbeResult {
+            request_id: "r-saved".into(),
+            ..ProbeResult::default()
+        };
+        std::fs::write(&file, prost::Message::encode_to_vec(&probe)).unwrap();
+        // One message waits in the spool; the reconcile report takes the last place.
+        let link = Link::of(&ctx).unwrap();
+        link.send_control(Msg::AttemptStatus(AttemptStatus::default()))
+            .unwrap();
+
+        let attempts = Daemon::with(
+            &ctx,
+            vec![Box::new(
+                mrl_agent::attempts::service::AttemptsService::new(),
+            )],
+        );
+        let deadline = tokio::time::Instant::now() + WAIT;
+        while link.spooled() < 2 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no reconcile report"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            file.exists(),
+            "the probe result was marked saved without being spooled"
+        );
+        assert_eq!(link.spooled(), 2);
+
+        // The core acks the spool: the kept event goes in, reaches the core, then counts saved.
+        let gateway = Daemon::with(
+            &ctx,
+            vec![Box::new(mrl_agent::session::GatewayService::new())],
+        );
+        let probes_seen = |all: &[(u64, Msg)]| {
+            all.iter()
+                .filter(|(_, b)| matches!(b, Msg::ProbeResult(p) if p.request_id == "r-saved"))
+                .count()
+        };
+        s.control
+            .until("the probe result", |all| probes_seen(all) == 1)
+            .await;
+        while file.exists() {
+            assert!(tokio::time::Instant::now() < deadline, "never marked saved");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(probes_seen(&s.control.all()), 1, "sent once");
+        attempts.stop().await;
+        gateway.stop().await;
     }
 }
