@@ -19,14 +19,11 @@ keyring = { workspace = true }
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "json", "blocking"] }
 rpassword = "=7.5.5"
 serde_json = { workspace = true }
-uuid = { workspace = true }
+uuid = { workspace = true, features = ["v4"] }
 
 # <mrl:deps P17> P17 dependencies go right below this line.
-reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "blocking"] }
 serde = { workspace = true }
-serde_json = { workspace = true }
 toml = "=1.2.0"
-uuid = { workspace = true, features = ["v4"] }
 
 [dev-dependencies]
 async-trait = "=0.1.92"

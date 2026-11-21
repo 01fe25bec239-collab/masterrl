@@ -908,6 +908,31 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': 'Someone revoked the token, or it reached its end date.',
              'what_to_do': {'steps': ['Create a new token in Settings.',
                                       'Update the tool that uses the old token.']}},
+            {'code': 'MRL-AUTH-160',
+             'title': 'Your sign-in has expired.',
+             'why': "The sign-in service no longer accepts this computer's session. Your local "
+                    'work keeps running; only setup sync and teams need a fresh sign-in.',
+             'what_to_do': {'steps': ['Sign in again from Settings, or run `mrl login`.',
+                                      'Then repeat what you were doing, like `mrl sync push`.']}},
+            {'code': 'MRL-AUTH-161',
+             'title': 'The sign-in did not finish.',
+             'why': 'The sign-in took longer than 10 minutes, was used twice, or the sign-in '
+                    'service refused it.',
+             'what_to_do': {'steps': ['Start the sign-in again and finish it in the browser within '
+                                      '10 minutes.',
+                                      'If it keeps failing, close other sign-in tabs and try once '
+                                      'more.']}},
+            {'code': 'MRL-AUTH-162',
+             'title': "Sign-in isn't set up in this app.",
+             'why': 'This app has no address for the sign-in service. Local work does not need it.',
+             'what_to_do': {'steps': ['Keep working offline, or ask whoever runs this app to set '
+                                      '`auth.supabase_url` and `auth.supabase_anon_key`.']}},
+            {'code': 'MRL-AUTH-163',
+             'title': 'This app is signed in to a different account.',
+             'why': 'One computer links to one account at a time. Another account is signed in '
+                    'right now.',
+             'what_to_do': {'steps': ['Sign out first with `mrl logout` or in Settings.',
+                                      'Then sign in with the account you want.']}},
             {'code': 'MRL-AUTH-170',
              'title': 'The `mrl` command has no access token yet.',
              'why': 'The command signs in to the server with a personal access token. None is '
@@ -1070,6 +1095,13 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': 'Other changes to the same items kept getting in the way, so the server '
                     'stopped trying.',
              'what_to_do': {'steps': ['Try again in a few seconds.']}},
+            {'code': 'MRL-CONFLICT-160',
+             'title': 'This short name is already used here.',
+             'why': 'Each org, workspace and project needs its own short name for addresses. '
+                    'Another one at this level already uses it.',
+             'what_to_do': {'steps': ['Pick a different short name, like `vision-lab-2`.',
+                                      'To use the existing one instead, find it in the list at '
+                                      'this level.']}},
             {'code': 'MRL-CONFLICT-170',
              'title': 'The job changed while the app was updating it.',
              'why': 'Something else changed the job a moment ago. The app stopped so it would not '
@@ -1238,6 +1270,35 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'what_to_do': {'steps': ['Update the app on this machine, then start the run again.',
                                       "If that doesn't help, install a version of the engine made "
                                       'for your app version.']}},
+            {'code': 'MRL-ENV-160',
+             'title': 'This computer has no keychain service.',
+             'why': 'The app keeps secrets in your system keychain. This computer has none '
+                    'running, so secrets go to an encrypted file instead.',
+             'what_to_do': {'steps': ["You can keep working. Anyone who can read the app's data "
+                                      'folder could read these secrets.'],
+                            'linux': ['Install and start a Secret Service keyring, like the '
+                                      '`gnome-keyring` package, then restart the app.']}},
+            {'code': 'MRL-ENV-161',
+             'title': "The app could not use this computer's keychain.",
+             'why': 'The keychain is locked, or it refused the app access.',
+             'what_to_do': {'steps': ['Unlock your keychain, then try again.'],
+                            'macos': ['Open Keychain Access and allow MasterRL when it asks.'],
+                            'windows': ['Open Credential Manager and check that it works.'],
+                            'linux': ['Unlock your login keyring, for example with the `seahorse` '
+                                      'app.']}},
+            {'code': 'MRL-ENV-162',
+             'title': 'The keychain request was cancelled.',
+             'why': 'The keychain asked to let MasterRL use its secrets, and that request was '
+                    'cancelled.',
+             'what_to_do': {'steps': ['Start the app again and choose Allow (or Always Allow) when '
+                                      'the keychain asks.',
+                                      'On a development machine, set `backend = "file"` under '
+                                      '`[keychain]` in the settings file. Secrets then stay in an '
+                                      'encrypted file.',
+                                      'After that switch, allow one more keychain read. The app '
+                                      'copies the database password into the file then.',
+                                      'Sign-in and sync keys do not move, so sign in again after '
+                                      'the change.']}},
             {'code': 'MRL-ENV-170',
              'title': 'The `mrl` command could not reach the server.',
              'why': 'Nothing answered at the server address the command uses, or the connection '
@@ -1423,6 +1484,12 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': 'Each machine stores model files and checkpoints for the job.',
              'what_to_do': {'steps': ['Free up space on the machine named in Details.',
                                       'Keep about 10–50 GB free on each machine.']}},
+            {'code': 'MRL-LINK-160',
+             'title': 'The app could not reach the sign-in service.',
+             'why': 'This computer is offline, or the sign-in service did not answer. Local work '
+                    'keeps running.',
+             'what_to_do': {'steps': ['Check your internet connection, then try again.',
+                                      'Your setup stays on this computer until you can sync it.']}},
             {'code': 'MRL-MODEL-001',
              'title': "The app did not load this model's files, to keep your computer safe.",
              'why': 'The weights use the pickle format, which can run hidden code. The app allows '
@@ -1522,6 +1589,12 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': 'The server has no endpoint at this path.',
              'what_to_do': {'steps': ['Check the path against the reference at '
                                       '`/api-docs/openapi.json`.']}},
+            {'code': 'MRL-RES-160',
+             'title': 'There is no saved setup to restore.',
+             'why': 'This account has no saved setup yet, or not the copy you asked for.',
+             'what_to_do': {'steps': ['Run `mrl sync status` to see the saved copies.',
+                                      'On the computer that has your setup, run `mrl sync push` '
+                                      'first.']}},
             {'code': 'MRL-RWD-140',
              'title': 'The reward policy has a problem.',
              'why': "A field in the policy is missing, has a value the app doesn't accept, or "
@@ -1594,6 +1667,19 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                                       'If you started the service by hand, use a listen address '
                                       'like `unix:/tmp/reward.sock`.',
                                       'For local testing only, add `--allow-network`.']}},
+            {'code': 'MRL-STATE-160',
+             'title': "Setup sync isn't turned on yet.",
+             'why': 'Sync needs a passphrase first. The app locks your setup with it before it '
+                    'leaves this computer.',
+             'what_to_do': {'steps': ['Run `mrl sync setup` or turn on sync in Settings.',
+                                      'Save the recovery key it shows in a safe place.']}},
+            {'code': 'MRL-STATE-161',
+             'title': 'Setup sync runs on your own computer.',
+             'why': 'A team server is shared, so it does not hold your personal sign-in or sync '
+                    'keys.',
+             'what_to_do': {'steps': ['Turn on setup sync in the MasterRL app on your own '
+                                      'computer.',
+                                      'Use the team server for team projects only.']}},
             {'code': 'MRL-STATE-170',
              'title': "This job can't take that step right now.",
              'why': 'A job moves through set steps, like queued, running and finished. The step '
@@ -1791,6 +1877,14 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                                       'the task needs.',
                                       'If a script started the job, fix the input named in '
                                       'Details.']}},
+            {'code': 'MRL-VAL-160',
+             'title': "This passphrase or recovery key doesn't open your saved setup.",
+             'why': "The saved setup is locked with your sync passphrase. The app can't read it "
+                    'with a different one.',
+             'what_to_do': {'steps': ['Check for typing mistakes and the right letter case.',
+                                      'Use the recovery key you saved when you turned on sync.',
+                                      'Without either one, nobody can open the saved setup. Set up '
+                                      'this computer again by hand.']}},
             {'code': 'NODE_LOST',
              'title': 'The app lost contact with a machine in this run.',
              'why': 'The machine may have shut down, gone to sleep or dropped off the network.',

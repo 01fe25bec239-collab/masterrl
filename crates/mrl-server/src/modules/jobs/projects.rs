@@ -34,9 +34,9 @@ pub struct Projects(Option<Arc<dyn ProjectDirectory>>);
 impl Projects {
     /// The directory this build registers.
     pub fn registered(db: &Db) -> Self {
-        let _ = db;
         let found: Vec<Arc<dyn ProjectDirectory>> = vec![
             // <mrl:project-directory> P16's lookup goes right below this line.
+            Arc::new(crate::modules::tenancy::Directory(db.clone())),
         ];
         Self(found.into_iter().next())
     }

@@ -49,6 +49,66 @@ class AttemptPage(TypedDict):
     """Pass as `cursor` for the next page; `null` on the last page."""
 
 
+class AuditRecord(TypedDict):
+    """One audit record."""
+
+    action: str
+    """What, like `auth.manage_tokens`."""
+
+    actor: str
+    """Who."""
+
+    at: str
+    """When."""
+
+    details: dict[str, Any]
+    """Extra facts (never secret values)."""
+
+    id: str
+    """Record id."""
+
+    org: NotRequired[str | None]
+    """Org."""
+
+    outcome: str
+    """`success`, `denied` or `failed`."""
+
+    project: NotRequired[str | None]
+    """Project."""
+
+    target: str
+    """On what."""
+
+    trace_id: str
+    """Trace id."""
+
+
+class AuditRecordPage(TypedDict):
+    """One page of results."""
+
+    items: list[AuditRecord]
+    """The items on this page."""
+
+    next_cursor: NotRequired[str | None]
+    """Pass as `cursor` for the next page; `null` on the last page."""
+
+
+class CallbackRequest(TypedDict):
+    """Finish a sign-in with the code from the callback."""
+
+    code: str
+    """`code` from the callback query."""
+
+    flow_id: str
+    """`flow` from the callback query."""
+
+    issue_token: NotRequired[bool]
+    """Also make an access token (for the CLI)."""
+
+    token_name: NotRequired[str | None]
+    """Name for that token."""
+
+
 class CheckResult(TypedDict):
     """One readiness check result."""
 
@@ -60,6 +120,32 @@ class CheckResult(TypedDict):
 
     status: str
     """`ready` or `not_ready`."""
+
+
+class CopyInfo(TypedDict):
+    """A saved copy (metadata only)."""
+
+    at: str
+    """When it was pushed."""
+
+    version: int
+    """Version."""
+
+
+class CreateToken(TypedDict):
+    """Make an access token."""
+
+    days: NotRequired[int | None]
+    """Lifetime, 1-365 days (default from `auth.token_days`)."""
+
+    name: str
+    """A name you recognize, 1-100 characters."""
+
+    project_id: NotRequired[str | None]
+    """Limit the token to one project (`prj_…`)."""
+
+    scopes: list[str]
+    """`["*"]`, or areas like `["runs:write", "datasets:read"]`."""
 
 
 class Experiment(TypedDict):
@@ -232,6 +318,57 @@ class JobPatch(TypedDict):
     """New priority, -1000 to 1000. Higher runs first."""
 
 
+class LoginRequest(TypedDict):
+    """Start a sign-in."""
+
+    provider: str
+    """`google` or `github`."""
+
+    redirect_uri: str
+    """`masterrl://auth/callback`, or a loopback address like `http://127.0.0.1:53111/callback`."""
+
+
+class LoginStarted(TypedDict):
+    """Open `authorize_url` in the system browser."""
+
+    authorize_url: str
+    """The address to open."""
+
+    flow_id: str
+    """Pass back with the code; also in the callback query as `flow`."""
+
+
+class Machine(TypedDict):
+    """One connected machine."""
+
+    address: str
+    """Host name or address."""
+
+    name: str
+    """Name shown in the app."""
+
+    transport: Transport
+    """How to reach it."""
+
+
+class Me(TypedDict):
+    """The caller."""
+
+    principal_kind: str
+    """`local_owner`, `user` or `service`."""
+
+    roles: list[RoleInfo]
+    """Roles."""
+
+    sign_in: SignInState
+    """This install's Supabase sign-in (solo mode)."""
+
+    token_id: NotRequired[str | None]
+    """`tok_…` when the caller uses an access token."""
+
+    user: NotRequired[dict[str, Any]]
+
+
 class NewExperiment(TypedDict):
     """`POST /projects/{prj}/experiments` body."""
 
@@ -243,6 +380,61 @@ class NewExperiment(TypedDict):
 
     tags: NotRequired[list[str]]
     """Up to 50 labels."""
+
+
+class NewItem(TypedDict):
+    """A new org, workspace or project."""
+
+    name: str
+    """Display name, 1-100 characters."""
+
+    slug: str
+    """Short name used in addresses: 1-63 lower-case letters, digits and `-`, starting with a letter or digit."""
+
+
+class NewToken(TypedDict):
+    """A token, shown once."""
+
+    expires_at: str
+    """Expiry."""
+
+    id: str
+    """`tok_…`."""
+
+    scopes: list[str]
+    """Scopes."""
+
+    token: str
+    """`mrl_pat_…`. Store it now; it is never shown again."""
+
+
+class Org(TypedDict):
+    """An org."""
+
+    created_at: str
+    """Created."""
+
+    id: str
+    """`org_…`."""
+
+    kind: str
+    """`personal` or `team`."""
+
+    name: str
+    """Name."""
+
+    slug: str
+    """Slug, unique on this core."""
+
+
+class OrgPage(TypedDict):
+    """One page of results."""
+
+    items: list[Org]
+    """The items on this page."""
+
+    next_cursor: NotRequired[str | None]
+    """Pass as `cursor` for the next page; `null` on the last page."""
 
 
 class Problem(TypedDict):
@@ -273,6 +465,58 @@ class Problem(TypedDict):
     """`https://docs.masterrl.dev/errors/<code>`."""
 
 
+class Project(TypedDict):
+    """A project."""
+
+    created_at: str
+    """Created."""
+
+    id: str
+    """`prj_…`."""
+
+    name: str
+    """Name."""
+
+    org_id: str
+    """`org_…`."""
+
+    slug: str
+    """Slug, unique in the workspace."""
+
+    workspace_id: str
+    """`ws_…`."""
+
+
+class ProjectPage(TypedDict):
+    """One page of results."""
+
+    items: list[Project]
+    """The items on this page."""
+
+    next_cursor: NotRequired[str | None]
+    """Pass as `cursor` for the next page; `null` on the last page."""
+
+
+class PushRequest(TypedDict):
+    """`POST /sync/push` body (optional)."""
+
+    op_id: NotRequired[str | None]
+    """A UUID the client keeps for one push and sends again on every retry. The saved"""
+
+
+class Pushed(TypedDict):
+    """A copy was saved."""
+
+    at: str
+    """When."""
+
+    copies: int
+    """Copies kept now (at most 5)."""
+
+    version: int
+    """Its version."""
+
+
 class Readiness(TypedDict):
     """`/readyz` body."""
 
@@ -297,6 +541,48 @@ class Rejection(TypedDict):
 
     path: NotRequired[str | None]
     """JSON Pointer into the submission, like `/algorithm_id`."""
+
+
+class RestoreRequest(TypedDict):
+    """Restore a saved setup. Give the passphrase or the recovery key."""
+
+    passphrase: NotRequired[str | None]
+    """The sync passphrase."""
+
+    recovery_key: NotRequired[str | None]
+    """The recovery key shown at setup."""
+
+    version: NotRequired[int | None]
+    """An older copy; the newest when absent."""
+
+
+class Restored(TypedDict):
+    """The setup was restored on this install."""
+
+    at: str
+    """When it was pushed."""
+
+    profile: SetupProfile
+    """The setup now on this install."""
+
+    version: int
+    """The copy used."""
+
+
+class RoleInfo(TypedDict):
+    """One role a person holds."""
+
+    org: str
+    """`org_…`."""
+
+    role: str
+    """Role name."""
+
+    scope_id: str
+    """The scope's id."""
+
+    scope_kind: str
+    """`org`, `workspace` or `project`."""
 
 
 class Run(TypedDict):
@@ -451,6 +737,100 @@ class RunSubmission(TypedDict):
     """Random seeds; the server picks `{"global": n}` when absent."""
 
 
+class SessionStarted(TypedDict):
+    """A renderer session started; the cookie is in `Set-Cookie`."""
+
+    csrf_token: str
+    """Send as `x-csrf-token` on requests from another origin."""
+
+    expires_at: str
+    """When the session ends at the latest."""
+
+
+class SetupDone(TypedDict):
+    """Setup sync is on."""
+
+    recovery_key: str
+    """Shown once. It opens your saved setup if you forget the passphrase."""
+
+
+class SetupProfile(TypedDict):
+    """`setup-profile/v1`."""
+
+    machines: NotRequired[list[Machine]]
+    """Connected machines."""
+
+    preferences: NotRequired[dict[str, Any]]
+    """App preferences."""
+
+    schema: str
+    """Always `setup-profile/v1`."""
+
+    team_memberships: NotRequired[list[TeamMembership]]
+    """Teams."""
+
+    ui: NotRequired[dict[str, Any]]
+    """UI settings."""
+
+
+class SetupRequest(TypedDict):
+    """Turn on setup sync."""
+
+    passphrase: str
+    """At least 12 characters. A forgotten passphrase (and recovery key) means the setup cannot be restored."""
+
+
+SignInState = Literal["not_configured", "signed_out", "active", "expired"]
+"""Where this install's sign-in stands."""
+
+
+class SignedIn(TypedDict):
+    """The sign-in finished."""
+
+    token: NotRequired[dict[str, Any]]
+
+    user: UserInfo
+    """Who signed in."""
+
+
+class SyncStatus(TypedDict):
+    """Where setup sync stands."""
+
+    copies: NotRequired[list[CopyInfo] | None]
+    """Saved copies, newest first (when signed in and online)."""
+
+    copies_unavailable: NotRequired[str | None]
+    """Why `copies` is missing."""
+
+    last_push_at: NotRequired[str | None]
+    """Last push."""
+
+    last_pushed_version: NotRequired[int | None]
+    """Version of the last push."""
+
+    last_restore_at: NotRequired[str | None]
+    """Last restore."""
+
+    set_up: bool
+    """A sync passphrase is set on this install."""
+
+    sign_in: SignInState
+    """This install's sign-in."""
+
+
+class TeamMembership(TypedDict):
+    """A team this person belongs to."""
+
+    address: str
+    """Address of the team core."""
+
+    name: str
+    """Team name."""
+
+    role: NotRequired[str | None]
+    """The person's role there."""
+
+
 class TimelineEntry(TypedDict):
     """One timeline entry: an outbox event of the run's job or one of its attempts."""
 
@@ -483,10 +863,108 @@ class TimelineEntryPage(TypedDict):
     """Pass as `cursor` for the next page; `null` on the last page."""
 
 
+class TokenInfo(TypedDict):
+    """A token as listed (never the token itself)."""
+
+    expires_at: str
+    """Expiry."""
+
+    id: str
+    """`tok_…`."""
+
+    last_used_at: NotRequired[str | None]
+    """Last use (to the minute)."""
+
+    name: str
+    """Name."""
+
+    prefix: str
+    """First characters, like `mrl_pat_AbCd`."""
+
+    scopes: list[str]
+    """Scopes."""
+
+
+class TokenInfoPage(TypedDict):
+    """One page of results."""
+
+    items: list[TokenInfo]
+    """The items on this page."""
+
+    next_cursor: NotRequired[str | None]
+    """Pass as `cursor` for the next page; `null` on the last page."""
+
+
+class Transport(TypedDict):
+    """How the app reaches a machine. Only these typed settings: keys and passwords stay in the"""
+
+    key_ref: NotRequired[str | None]
+    """Name of the keychain secret that holds the key (never the key itself)."""
+
+    kind: str
+    """`lan`, `ssh`, `tailscale` or `cloudflare_tunnel`."""
+
+    port: NotRequired[int | None]
+    """Port, when not the default."""
+
+    user: NotRequired[str | None]
+    """Login name (SSH)."""
+
+
+class UserInfo(TypedDict):
+    """A person."""
+
+    avatar_url: NotRequired[str | None]
+    """Avatar."""
+
+    display_name: str
+    """Name."""
+
+    email: NotRequired[str | None]
+    """Email."""
+
+    id: str
+    """`usr_…`."""
+
+
+class Workspace(TypedDict):
+    """A workspace."""
+
+    created_at: str
+    """Created."""
+
+    id: str
+    """`ws_…`."""
+
+    name: str
+    """Name."""
+
+    org_id: str
+    """`org_…`."""
+
+    slug: str
+    """Slug, unique in the org."""
+
+
+class WorkspacePage(TypedDict):
+    """One page of results."""
+
+    items: list[Workspace]
+    """The items on this page."""
+
+    next_cursor: NotRequired[str | None]
+    """Pass as `cursor` for the next page; `null` on the last page."""
+
+
 __all__ = [
     "Attempt",
     "AttemptPage",
+    "AuditRecord",
+    "AuditRecordPage",
+    "CallbackRequest",
     "CheckResult",
+    "CopyInfo",
+    "CreateToken",
     "Experiment",
     "ExperimentPage",
     "ExperimentPatch",
@@ -495,15 +973,44 @@ __all__ = [
     "Job",
     "JobPage",
     "JobPatch",
+    "LoginRequest",
+    "LoginStarted",
+    "Machine",
+    "Me",
     "NewExperiment",
+    "NewItem",
+    "NewToken",
+    "Org",
+    "OrgPage",
     "Problem",
+    "Project",
+    "ProjectPage",
+    "PushRequest",
+    "Pushed",
     "Readiness",
     "Rejection",
+    "RestoreRequest",
+    "Restored",
+    "RoleInfo",
     "Run",
     "RunConfig",
     "RunKind",
     "RunPage",
     "RunSubmission",
+    "SessionStarted",
+    "SetupDone",
+    "SetupProfile",
+    "SetupRequest",
+    "SignInState",
+    "SignedIn",
+    "SyncStatus",
+    "TeamMembership",
     "TimelineEntry",
     "TimelineEntryPage",
+    "TokenInfo",
+    "TokenInfoPage",
+    "Transport",
+    "UserInfo",
+    "Workspace",
+    "WorkspacePage",
 ]

@@ -81,10 +81,9 @@ pub async fn authorize_cancel(
 
 /// Records a successful action on something in `org`/`project`, inside the change's
 /// transaction `tx` and before it commits: if the record can't be written, the change rolls
-/// back. `_tx` is that transaction: P16 adds `AuditSink::record_in(tx, …)`, which stores
-/// the record in it, and at merge this call becomes `record_in(_tx, event)`.
+/// back. `tx` is that transaction; P16's `AuditSink::record_in` stores the record in it.
 pub async fn audit(
-    _tx: &mut crate::db::Tx,
+    tx: &mut crate::db::Tx,
     state: &AppState,
     ctx: &RequestContext,
     (org, project): (Uuid, Uuid),
@@ -101,7 +100,7 @@ pub async fn audit(
         outcome: AuditOutcome::Success,
         trace_id: ctx.trace_id.clone(),
     };
-    state.seams.audit.record(event).await?;
+    state.seams.audit.record_in(tx, event).await?;
     Ok(())
 }
 

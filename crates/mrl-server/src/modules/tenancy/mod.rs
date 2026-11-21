@@ -545,3 +545,20 @@ impl Authorizer for Rbac {
         Ok(self.decide(ctx, action, resource).await?)
     }
 }
+
+/// P17's [`ProjectDirectory`](crate::modules::jobs::projects::ProjectDirectory): the org
+/// that owns a live (not deleted) project, the same rule [`Rbac`] uses.
+pub struct Directory(pub crate::db::Db);
+
+#[async_trait::async_trait]
+impl crate::modules::jobs::projects::ProjectDirectory for Directory {
+    async fn owner(&self, project: ProjectId) -> Result<Option<OrgId>, crate::seams::SeamError> {
+        let org: Option<Uuid> =
+            sqlx::query_scalar("SELECT org_id FROM projects WHERE id = $1 AND deleted_at IS NULL")
+                .bind(project.as_uuid())
+                .fetch_optional(self.0.pool())
+                .await
+                .map_err(DbError::from)?;
+        Ok(org.map(OrgId::from_uuid))
+    }
+}

@@ -54,7 +54,6 @@ mrl-domain = { path = "../mrl-domain" }
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "json", "query"] }
 
 # <mrl:deps P17> P17 dependencies go right below this line.
-mrl-domain = { path = "../mrl-domain" }
 
 # <mrl:deps P18> P18 dependencies go right below this line.
 
