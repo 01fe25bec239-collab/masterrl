@@ -1146,6 +1146,19 @@ mod runner_tests {
             .unwrap()
             .unwrap();
         assert_eq!(d.phase, AttemptPhase::SelfFenced as i32);
+        // The connection can recover after the runner exits. Free the slot and make
+        // sure the saved terminal status still reaches the forwarder.
+        let events = fx.unread.as_mut().unwrap();
+        assert!(matches!(
+            events.recv().await.unwrap().saved(),
+            AttemptEvent::Relay { .. }
+        ));
+        let terminal = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("terminal status survived the full queue")
+            .unwrap()
+            .saved();
+        assert!(matches!(terminal, AttemptEvent::Status(s) if s.phase == d.phase));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2003,6 +2016,45 @@ mod runner_tests {
         assert!(got.lock().unwrap().is_empty());
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn detach_interrupts_a_finished_workers_upload_drain() {
+        let (base, got) = slow_sink(Duration::from_secs(30)).await;
+        let mut fx =
+            RunnerFixture::readopt(spec("att_drainstop", serde_json::json!({})), |_| {}).await;
+        let path = "w.bin";
+        std::fs::write(fx.staging().join(path), b"weights").unwrap();
+        let (saved, accepted) = tokio::sync::oneshot::channel();
+        fx.control
+            .send(Control::Acked {
+                inner: Box::new(Control::Upload {
+                    command_id: "up-stop".into(),
+                    checkpoint_id: String::new(),
+                    targets: vec![target(&base, path, &sha_hex(b"weights"), 7)],
+                }),
+                saved,
+            })
+            .await
+            .unwrap();
+        assert!(accepted.await.unwrap());
+        fx.end_workers();
+        // A launch-time detach would return None and leave the upload in the record.
+        // Give the runner's process watcher one tick to enter its drain.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let (done, detached) = tokio::sync::oneshot::channel();
+        fx.control.send(Control::Detach(done)).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), detached)
+            .await
+            .expect("detach waited on the upload")
+            .unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(5), &mut fx.task)
+            .await
+            .expect("the runner did not finish after detaching")
+            .unwrap()
+            .is_some());
+        assert!(fx.saved().adhoc_uploads.is_empty());
+        assert!(got.lock().unwrap().is_empty());
+    }
+
     /// Two commands for one checkpoint before the worker asks to commit: the first is answered
     /// as replaced, the second owns the upload and gets its result.
     #[tokio::test(flavor = "multi_thread")]
@@ -2413,6 +2465,13 @@ mod session_wiring {
         let c = s.sender.send(s.node, cancel(attempt)).await.unwrap();
         wait_state(&s.gw, c.id, "COMPLETED").await;
         s.control.until_phase(&id, AttemptPhase::Exited).await;
+        assert!(
+            s.control
+                .statuses(&id)
+                .iter()
+                .all(|(seq, status)| *seq <= before || status.time.is_some()),
+            "the re-adoption snapshot belongs in the reconcile report only"
+        );
         daemon.stop().await;
     }
 

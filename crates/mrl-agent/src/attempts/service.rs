@@ -15,10 +15,10 @@
 //! - Stop: no new commands, running ones get [`STOP_WAIT`], then [`Attempts::detach_all`]
 //!   leaves the workers running for the next agent (systemd `KillMode=process`).
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::stream::{FuturesUnordered, StreamExt};
 use mrl_proto::agent::v1::{agent_message, Command, Lane, LeaseGrant, ReconcileReport};
 use mrl_proto::common::v1::{AttemptRef, Failure, FailureClass};
 use tokio::sync::{broadcast, RwLock};
@@ -46,10 +46,12 @@ pub const KINDS: &[&str] = &[
 
 /// How long a stopping agent waits for commands already running before it detaches.
 pub const STOP_WAIT: Duration = Duration::from_secs(10);
-/// How long a stopping agent waits for its attempts to detach.
-const DETACH_WAIT: Duration = Duration::from_secs(30);
-/// How often the running list in heartbeats is refreshed (besides after commands and events).
+/// A single shutdown budget, below the installed service's 30-second timeout.
+const SHUTDOWN_WAIT: Duration = Duration::from_secs(25);
+/// How often the running list in heartbeats is refreshed between commands.
 const PUBLISH_EVERY: Duration = Duration::from_secs(1);
+/// Bounds the queued work from grants a runner can't accept promptly.
+const LEASE_WAIT: Duration = Duration::from_secs(1);
 
 /// The attempt runtime as an agent service (registered in `registry.rs`).
 #[derive(Debug, Default)]
@@ -69,7 +71,7 @@ struct Wiring {
     /// Held for writing until start-up is done, and again while stopping; each command holds
     /// it for reading while it runs.
     gate: Arc<RwLock<()>>,
-    stopping: AtomicBool,
+    shutdown: CancellationToken,
     publishing: Mutex<()>,
 }
 
@@ -88,7 +90,7 @@ impl CommandHandler for Handler {
     async fn handle(&self, command: Command) -> Result<(), Failure> {
         let w = &self.0;
         let _running = w.gate.read().await;
-        if w.stopping.load(Ordering::SeqCst) {
+        if w.shutdown.is_cancelled() {
             return Err(AttemptError::Stopping.to_failure());
         }
         let result = w.attempts.handle(&command).await;
@@ -169,12 +171,14 @@ async fn forward(link: &Link, envelope: Envelope, stop: &CancellationToken) {
         Lane::Telemetry | Lane::Bulk => {
             let lane = envelope.event().lane();
             // Lossy lanes by design: queued is as saved as these get.
-            if let AttemptEvent::Relay { relay, .. } = envelope.saved() {
+            let (event, receipt) = envelope.into_parts();
+            if let AttemptEvent::Relay { relay, .. } = event {
                 if lane == Lane::Telemetry {
                     link.send_metrics(relay);
                 } else {
                     link.send_logs(relay);
                 }
+                receipt.saved();
             }
         }
         Lane::Control | Lane::Unspecified => {
@@ -197,14 +201,10 @@ async fn forward_events(link: &Link, mut events: AttemptEvents, stop: Cancellati
 }
 
 /// Renews the leases of one grant, counted from the send time of the heartbeat it answers.
-async fn renew(w: &Wiring, grant: LeaseGrant) {
-    // Unknown send time (older than the last heartbeats kept): no safe deadline, so skipped.
-    let Some(sent) = w.link.heartbeat_sent(grant.heartbeat_seq) else {
-        return;
-    };
-    for lease in grant.leases {
+async fn renew(w: &Wiring, grant: LeaseGrant, sent: std::time::Instant) {
+    futures::future::join_all(grant.leases.into_iter().map(|lease| async move {
         if let Some(attempt) = lease.attempt.as_ref() {
-            // An attempt that ended or is not ours any more has nothing to renew.
+            // A runner finishing or blocked on its own work must not hold up other grants.
             let _ = w
                 .attempts
                 .renew_lease(
@@ -216,7 +216,8 @@ async fn renew(w: &Wiring, grant: LeaseGrant) {
                 )
                 .await;
         }
-    }
+    }))
+    .await;
 }
 
 async fn renew_leases(
@@ -225,17 +226,23 @@ async fn renew_leases(
     stop: CancellationToken,
 ) {
     let mut publish = tokio::time::interval(PUBLISH_EVERY);
+    let mut pending = FuturesUnordered::new();
     loop {
         tokio::select! {
+            biased;
             () = stop.cancelled() => return,
+            _ = publish.tick() => w.publish(),
+            Some(_) = pending.next() => {}
             g = grants.recv() => match g {
-                Ok(g) => renew(w, g).await,
+                Ok(g) => {
+                    if let Some(sent) = w.link.heartbeat_sent(g.heartbeat_seq) {
+                        pending.push(tokio::time::timeout(LEASE_WAIT, renew(w, g, sent)));
+                    }
+                }
                 // Missed grants are older; the next one renews from a newer heartbeat.
                 Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(broadcast::error::RecvError::Closed) => return,
             },
-            // Attempts that ended leave the heartbeat.
-            _ = publish.tick() => w.publish(),
         }
     }
 }
@@ -247,7 +254,7 @@ impl crate::registry::AgentService for AttemptsService {
     }
 
     async fn run(&self, ctx: Arc<AgentContext>, shutdown: CancellationToken) -> crate::Result<()> {
-        // Everything up to the first `.await` runs before any command or heartbeat can use it.
+        // Register every handler before re-adoption yields.
         let link = Link::of(&ctx)?;
         let (tx, events) = attempt_events(1024);
         let attempts = Attempts::new(Arc::clone(&ctx), tx, None)
@@ -260,7 +267,7 @@ impl crate::registry::AgentService for AttemptsService {
             attempts: Arc::clone(&attempts),
             link: Arc::clone(&link),
             gate,
-            stopping: AtomicBool::new(false),
+            shutdown: shutdown.clone(),
             publishing: Mutex::new(()),
         });
         for kind in KINDS {
@@ -271,35 +278,42 @@ impl crate::registry::AgentService for AttemptsService {
         // so an early heartbeat never reports this machine idle.
         link.set_running(unfinished(&ctx));
 
-        let statuses = attempts.readopt().await;
-        w.publish();
         let stop = CancellationToken::new();
-        let report = agent_message::Body::Reconcile(ReconcileReport {
-            attempts: statuses,
-            deployments: Vec::new(),
+        let statuses = tokio::select! {
+            biased;
+            () = shutdown.cancelled() => None,
+            statuses = attempts.readopt_for_session() => Some(statuses),
+        };
+        w.publish();
+
+        let mut leases = tokio::spawn({
+            let stop = stop.clone();
+            let w = w.clone();
+            async move { renew_leases(&w, grants, stop).await }
         });
-        tokio::select! {
-            _ = spool(&link, &report, "the reconcile report", &stop) => {}
-            () = shutdown.cancelled() => {}
+        if let Some(statuses) = statuses {
+            let report = agent_message::Body::Reconcile(ReconcileReport {
+                attempts: statuses,
+                deployments: Vec::new(),
+            });
+            tokio::select! {
+                biased;
+                () = shutdown.cancelled() => {}
+                _ = spool(&link, &report, "the reconcile report", &stop) => {}
+            }
         }
         drop(starting);
-
-        let (lw, el) = (Arc::clone(&w), Arc::clone(&link));
-        let leases = tokio::spawn({
+        let mut forwarding = tokio::spawn({
             let stop = stop.clone();
-            async move { renew_leases(&lw, grants, stop).await }
-        });
-        let forwarding = tokio::spawn({
-            let stop = stop.clone();
-            async move { forward_events(&el, events, stop).await }
+            async move { forward_events(&link, events, stop).await }
         });
 
         shutdown.cancelled().await;
-        w.stopping.store(true, Ordering::SeqCst);
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_WAIT;
         // Commands still running get a moment to finish; later ones are refused.
         let _ = tokio::time::timeout(STOP_WAIT, w.gate.write()).await;
         // Events keep flowing while the attempts detach; workers keep running.
-        if tokio::time::timeout(DETACH_WAIT, attempts.detach_all())
+        if tokio::time::timeout_at(deadline, attempts.detach_all())
             .await
             .is_err()
         {
@@ -308,8 +322,15 @@ impl crate::registry::AgentService for AttemptsService {
             );
         }
         stop.cancel();
-        let _ = leases.await;
-        let _ = forwarding.await;
+        if tokio::time::timeout_at(deadline, async {
+            let _ = tokio::join!(&mut leases, &mut forwarding);
+        })
+        .await
+        .is_err()
+        {
+            leases.abort();
+            forwarding.abort();
+        }
         Ok(())
     }
 }
@@ -318,6 +339,69 @@ impl crate::registry::AgentService for AttemptsService {
 mod tests {
     use super::*;
     use mrl_proto::agent::v1::command::Kind;
+    use mrl_proto::agent::v1::AttemptLease;
+
+    #[tokio::test]
+    async fn one_stuck_runner_does_not_delay_another_lease() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::config::AgentConfig {
+            state_dir: dir.path().to_path_buf(),
+            ..Default::default()
+        };
+        let ctx = Arc::new(AgentContext::with_hw(config, Vec::new()).unwrap());
+        let (events, _reader) = attempt_events(1);
+        let w = Wiring {
+            link: Link::of(&ctx).unwrap(),
+            attempts: Attempts::new(ctx, events, None).unwrap(),
+            gate: Arc::new(RwLock::new(())),
+            shutdown: CancellationToken::new(),
+            publishing: Mutex::new(()),
+        };
+        let runner = |id: &str| {
+            let (control, rx) = tokio::sync::mpsc::channel(1);
+            let attempt = AttemptRef {
+                job_id: "job_test".into(),
+                attempt_id: id.into(),
+                fencing_epoch: 1,
+            };
+            super::super::lock(&w.attempts.live).insert(
+                id.into(),
+                super::super::Live {
+                    attempt: attempt.clone(),
+                    control,
+                },
+            );
+            (
+                AttemptLease {
+                    attempt: Some(attempt),
+                    duration_s: 90,
+                    kill_budget_s: 22,
+                },
+                rx,
+            )
+        };
+        let (stuck, _unread) = runner("att_stuck");
+        let (healthy, mut inbox) = runner("att_healthy");
+        let sent = std::time::Instant::now() - Duration::from_secs(5);
+        let grant = LeaseGrant {
+            heartbeat_seq: 7,
+            leases: vec![stuck, healthy],
+        };
+        tokio::select! {
+            () = renew(&w, grant, sent) => panic!("stuck runner answered"),
+            msg = inbox.recv() => {
+                let Some(super::super::runner::Control::Acked { inner, .. }) = msg else {
+                    panic!("the healthy runner did not get a renewal");
+                };
+                assert!(matches!(
+                    *inner,
+                    super::super::runner::Control::Lease { heartbeat_seq: 7, heartbeat_sent, .. }
+                        if heartbeat_sent == sent
+                ));
+            }
+            () = tokio::time::sleep(Duration::from_secs(2)) => panic!("renewal waited on the stuck runner"),
+        }
+    }
 
     #[test]
     fn every_attempt_command_kind_is_registered() {
