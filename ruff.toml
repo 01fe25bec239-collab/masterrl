@@ -14,6 +14,7 @@ extend-select = ["PLW1514"]
 known-first-party = ["mrl_runtime", "mrl_rewards", "mrl_sdk", "mrl_adapter_trl", "mrl_adapter_lmeval", "mrl_adapter_mlx"]
 
 [lint.per-file-ignores]
+"python/mrl-sdk/src/mrl_sdk/_generated/**" = ["E501"]  # generated from the OpenAPI docs
 # Standalone stdlib tools (run with `uv run --script` / `python -m unittest`) use unittest style by design.
 "tools/audit/**" = ["PT"]
 "tools/traceability/**" = ["PT"]

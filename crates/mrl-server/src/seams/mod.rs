@@ -228,8 +228,16 @@ pub struct AuditEvent {
 /// Where audit records go.
 #[async_trait]
 pub trait AuditSink: Send + Sync {
-    /// Stores one record.
+    /// Stores one record that stands alone (a refusal, a failed attempt).
     async fn record(&self, event: AuditEvent) -> Result<(), SeamError>;
+
+    /// Stores one record inside the caller's transaction `tx`, so it commits or rolls back
+    /// with the change it describes. Use this for successful changes. Sinks without a
+    /// database (logs, tests) record it as [`AuditSink::record`] does.
+    async fn record_in(&self, tx: &mut crate::db::Tx, event: AuditEvent) -> Result<(), SeamError> {
+        let _ = tx;
+        self.record(event).await
+    }
 }
 
 /// A response kept for idempotent replay.
@@ -374,8 +382,9 @@ impl Seams {
         SeamsBuilder::default()
     }
 
-    /// The seams production uses for `mode`. Team mode has no identity provider yet (P16),
-    /// so `build(Mode::Team)` on this fails with MRL-INTERNAL-004.
+    /// The database-free base seams for `mode`. `main` adds the production ones on top
+    /// (P16: `CoreAuthenticator`, `Rbac`, `PgAuditSink`, `SupabaseIdentity`, the keychain);
+    /// without an identity provider, `build(Mode::Team)` fails with MRL-INTERNAL-004.
     pub fn production(mode: Mode, launch_secret: &str) -> SeamsBuilder {
         let ids: Arc<dyn IdGenerator> = Arc::new(UuidV7Ids);
         let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -460,6 +469,16 @@ impl SeamsBuilder {
     /// Sets the secret store.
     pub fn secrets(mut self, v: impl SecretStore + 'static) -> Self {
         self.secrets = Some(Arc::new(v));
+        self
+    }
+    /// Sets the identity provider from a shared handle.
+    pub fn identity_arc(mut self, v: Arc<dyn IdentityProvider>) -> Self {
+        self.identity = Some(v);
+        self
+    }
+    /// Sets the secret store from a shared handle.
+    pub fn secrets_arc(mut self, v: Arc<dyn SecretStore>) -> Self {
+        self.secrets = Some(v);
         self
     }
 

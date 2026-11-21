@@ -53,7 +53,8 @@ pub struct AgentConfig {
     /// Transfer client settings.
     pub transfer: TransferConfig,
     // <mrl:config P18> P18 settings fields go right below this line.
-
+    /// Link to the core (`[gateway]`).
+    pub gateway: crate::session::GatewaySettings,
     // <mrl:config P20> P20 settings fields go right below this line.
 }
 
@@ -68,7 +69,7 @@ impl Default for AgentConfig {
             exec: ExecConfig::default(),
             transfer: TransferConfig::default(),
             // <mrl:config-default P18> P18 defaults go right below this line.
-
+            gateway: crate::session::GatewaySettings::default(),
             // <mrl:config-default P20> P20 defaults go right below this line.
         }
     }

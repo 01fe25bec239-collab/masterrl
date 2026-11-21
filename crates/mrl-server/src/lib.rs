@@ -15,6 +15,8 @@ pub mod seams;
 pub mod telemetry;
 
 // <mrl:lib P18> P18 `pub mod` lines go right below this line.
+pub mod grpc;
+pub mod transports;
 
 pub use app::{App, AppState, Running, ServerModule, Task};
 pub use config::{Config, Mode, Role};

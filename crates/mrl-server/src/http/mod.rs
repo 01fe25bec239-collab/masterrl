@@ -53,9 +53,16 @@ pub fn api_router(state: AppState, modules: &[Box<dyn ServerModule>], solo: bool
         protected = protected.merge(m.routes());
     }
     if protected.has_routes() {
+        let owned_paths: std::collections::HashSet<&'static str> = modules
+            .iter()
+            .flat_map(|module| module.handler_idempotency_paths().iter().copied())
+            .collect();
         protected = protected
             .route_layer(from_fn(render_problems))
             .route_layer(from_fn_with_state(state.clone(), idempotency::middleware))
+            .route_layer(axum::Extension(idempotency::HandlerOwned(Arc::new(
+                owned_paths,
+            ))))
             .route_layer(from_fn_with_state(state.clone(), rate_limit::middleware));
         if !solo {
             protected = protected.route_layer(from_fn_with_state(state.clone(), authenticate));
