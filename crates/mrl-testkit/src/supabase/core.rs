@@ -62,12 +62,35 @@ pub struct CoreServer {
 struct Keychain {
     inner: Arc<InMemorySecretStore>,
     fail: std::sync::Mutex<Option<(String, String)>>,
+    pause: std::sync::Mutex<Option<(String, Arc<PauseRead>)>>,
+}
+
+/// A gate after one test keychain read, for interleaving a restore with a push.
+#[derive(Default)]
+pub struct PauseRead {
+    /// Fires after the key was read.
+    pub read: tokio::sync::Notify,
+    /// Continues the blocked reader.
+    pub resume: tokio::sync::Notify,
 }
 
 #[async_trait::async_trait]
 impl SecretStore for Keychain {
     async fn get(&self, name: &str) -> Result<Option<Secret>, SeamError> {
-        self.inner.get(name).await
+        let secret = self.inner.get(name).await?;
+        let paused = {
+            let mut pause = self.pause.lock().unwrap_or_else(|p| p.into_inner());
+            if pause.as_ref().is_some_and(|(key, _)| key == name) {
+                pause.take().map(|(_, gate)| gate)
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = paused {
+            gate.read.notify_one();
+            gate.resume.notified().await;
+        }
+        Ok(secret)
     }
     async fn set(&self, name: &str, value: Secret) -> Result<(), SeamError> {
         let failing = {
@@ -126,13 +149,20 @@ impl CoreServer {
         let keychain = Arc::new(Keychain {
             inner: secrets.clone(),
             fail: std::sync::Mutex::new(None),
+            pause: std::sync::Mutex::new(None),
         });
         let store: Arc<dyn SecretStore> = keychain.clone();
+        let app_db = if config.database.max_connections == crate::pg::test_config().max_connections
+        {
+            db.db().clone()
+        } else {
+            db.replica_with(&config.database)
+        };
         let seams =
-            mrl_server::modules::auth::production_seams(&config, db.db(), store, TEST_SECRET)
+            mrl_server::modules::auth::production_seams(&config, &app_db, store, TEST_SECRET)
                 .await?
                 .build(config.server.mode)?;
-        let modules = registry::modules(db.db(), &config);
+        let modules = registry::modules(&app_db, &config);
         let server = TestServer::start(config.clone(), seams, modules).await?;
         Ok(Self {
             server,
@@ -147,6 +177,17 @@ impl CoreServer {
     pub fn fail_next_write(&self, name: &str, detail: &str) {
         *self.keychain.fail.lock().unwrap_or_else(|p| p.into_inner()) =
             Some((name.to_owned(), detail.to_owned()));
+    }
+
+    /// Pauses the next read of a key immediately after fetching its value.
+    pub fn pause_next_read(&self, key: String) -> Arc<PauseRead> {
+        let gate = Arc::new(PauseRead::default());
+        *self
+            .keychain
+            .pause
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some((key, gate.clone()));
+        gate
     }
 
     /// Stops the server and closes its connections, so dropping the database is quick.

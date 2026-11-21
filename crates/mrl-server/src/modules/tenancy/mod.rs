@@ -196,6 +196,8 @@ pub const PLATFORM: &str = "platform";
 /// Resource kind of setup sync (the person's own setup profile and sync keys). Tokens bound
 /// to an org or a project are refused it.
 pub const SETUP_PROFILE: &str = "setup_profile";
+/// Unscoped account views. Token rows are filtered separately by their own grants.
+pub const TOKEN_LIST: &str = "token_list";
 
 /// Whether `user` holds the platform grant (`users.platform_admin`).
 pub async fn is_platform_admin(db: &Db, user: UserId) -> Result<bool, DbError> {
@@ -236,12 +238,20 @@ pub async fn is_active(db: &Db, user: UserId) -> Result<bool, DbError> {
 
 /// The org a user acts in by default: the oldest org they hold a role in.
 pub async fn primary_org(db: &Db, user: UserId) -> Result<Option<OrgId>, DbError> {
+    primary_org_with(db.pool(), user).await
+}
+
+/// Resolves the default org using an existing transaction connection or the pool.
+pub async fn primary_org_with<'e>(
+    executor: impl sqlx::PgExecutor<'e>,
+    user: UserId,
+) -> Result<Option<OrgId>, DbError> {
     let org: Option<Uuid> = sqlx::query_scalar(
         "SELECT org_id FROM role_bindings WHERE principal_kind = 'user' AND principal_id = $1 \
          ORDER BY created_at, org_id LIMIT 1",
     )
     .bind(user.as_uuid())
-    .fetch_optional(db.pool())
+    .fetch_optional(executor)
     .await?;
     Ok(org.map(OrgId::from_uuid))
 }
@@ -486,15 +496,15 @@ impl Rbac {
                     .and_then(|w| WorkspaceId::from_str(w).ok())
             })
             .flatten();
-        // Actions on your own account (like your tokens) count every role you hold in the
-        // org, whatever its scope: a researcher on one project still manages their tokens.
-        let held = if resource.kind == "account" {
+        let held = if resource.kind == TOKEN_LIST
+            && action == Action::AuthManageTokens
+            && project.is_none()
+            && ctx.principal.kind == PrincipalKind::User
+        {
             let names: Vec<String> = sqlx::query_scalar(
-                "SELECT DISTINCT role FROM role_bindings \
-                 WHERE principal_kind = 'user' AND principal_id = $1 AND org_id = $2",
+                "SELECT DISTINCT role FROM role_bindings WHERE principal_kind = 'user' AND principal_id = $1",
             )
             .bind(user.as_uuid())
-            .bind(org.as_uuid())
             .fetch_all(self.db.pool())
             .await?;
             names.iter().filter_map(|n| role_from_str(n)).collect()

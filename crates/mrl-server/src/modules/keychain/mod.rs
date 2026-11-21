@@ -287,10 +287,11 @@ impl SecretStore for KeychainStore {
             Backend::Os => {
                 let (service, name) = (self.service.clone(), name.to_owned());
                 blocking(move || {
-                    for i in 0..os_parts(&service, &name)? {
-                        os_remove(&service, &part_name(&name, i))?;
-                    }
-                    os_remove(&service, &name)
+                    let _guard = os_lock()?;
+                    let old = os_manifest(&service, &name)?;
+                    os_remove(&service, &name)?;
+                    retire_parts(&service, &name, old);
+                    Ok(())
                 })
                 .await
             }
@@ -305,8 +306,42 @@ const ENTRY_CHARS: usize = 600;
 /// What the main entry of a split value holds, followed by the number of parts.
 const SPLIT: &str = "mrl-split/v1:";
 
-fn part_name(name: &str, i: usize) -> String {
-    format!("{name}.part{i}")
+const VERSIONED_SPLIT: &str = "mrl-split/v2:";
+static OS_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn os_lock() -> Result<std::sync::MutexGuard<'static, ()>, SeamError> {
+    OS_LOCK
+        .lock()
+        .map_err(|_| SeamError::new("secrets", "the keychain operation was interrupted"))
+}
+
+struct Parts {
+    generation: Option<uuid::Uuid>,
+    count: usize,
+}
+
+impl Parts {
+    fn from_head(head: &str) -> Option<Self> {
+        if let Some(v) = head.strip_prefix(VERSIONED_SPLIT) {
+            let (generation, count) = v.split_once(':')?;
+            return Some(Self {
+                generation: Some(uuid::Uuid::parse_str(generation).ok()?),
+                count: count.parse().ok()?,
+            });
+        }
+        Some(Self {
+            generation: None,
+            count: head.strip_prefix(SPLIT)?.parse().ok()?,
+        })
+    }
+
+    fn name(&self, name: &str, i: usize) -> String {
+        match self.generation {
+            // '/' is outside the public SecretStore name alphabet.
+            Some(generation) => format!("{name}/{generation}/{i}"),
+            None => format!("{name}.part{i}"),
+        }
+    }
 }
 
 fn os_read(service: &str, name: &str) -> Result<Option<String>, SeamError> {
@@ -334,56 +369,72 @@ fn os_remove(service: &str, name: &str) -> Result<(), SeamError> {
     }
 }
 
-/// How many parts the value under `name` is split into (0: one entry, or none).
-fn os_parts(service: &str, name: &str) -> Result<usize, SeamError> {
+fn os_manifest(service: &str, name: &str) -> Result<Option<Parts>, SeamError> {
     Ok(os_read(service, name)?
-        .and_then(|head| head.strip_prefix(SPLIT)?.parse().ok())
-        .unwrap_or(0))
+        .as_deref()
+        .and_then(Parts::from_head))
+}
+
+fn retire_parts(service: &str, name: &str, parts: Option<Parts>) {
+    if let Some(parts) = parts {
+        for i in 0..parts.count {
+            if let Err(e) = os_remove(service, &parts.name(name, i)) {
+                tracing::warn!(error = %e, "could not retire an unused keychain entry");
+            }
+        }
+    }
 }
 
 fn os_get(service: &str, name: &str) -> Result<Option<String>, SeamError> {
+    let _guard = os_lock()?;
     let Some(head) = os_read(service, name)? else {
         return Ok(None);
     };
-    let Some(count) = head.strip_prefix(SPLIT) else {
+    let Some(parts) = Parts::from_head(&head) else {
         return Ok(Some(head));
     };
-    let damaged = || {
-        SeamError::new(
-            "secrets",
-            format!("{KEYCHAIN_FAILED}: a saved secret is damaged (a part is missing)"),
-        )
-    };
-    let count: usize = count.parse().map_err(|_| damaged())?;
     let mut value = String::new();
-    for i in 0..count {
-        value.push_str(&os_read(service, &part_name(name, i))?.ok_or_else(damaged)?);
+    for i in 0..parts.count {
+        let chunk = os_read(service, &parts.name(name, i))?.ok_or_else(|| {
+            SeamError::new(
+                "secrets",
+                format!("{KEYCHAIN_FAILED}: a saved secret is missing a part"),
+            )
+        })?;
+        value.push_str(&chunk);
     }
     Ok(Some(value))
 }
 
-/// Saves `value`, split into parts when it is long. Parts are written before the entry that
-/// names them, and parts a longer earlier value left are removed after.
 fn os_put(service: &str, name: &str, value: &str) -> Result<(), SeamError> {
-    let before = os_parts(service, name)?;
+    let _guard = os_lock()?;
+    let old = os_manifest(service, name)?;
     let chars: Vec<char> = value.chars().collect();
-    let parts: Vec<String> = if chars.len() <= ENTRY_CHARS && !value.starts_with(SPLIT) {
+    if chars.len() <= ENTRY_CHARS
+        && !value.starts_with(SPLIT)
+        && !value.starts_with(VERSIONED_SPLIT)
+    {
         os_write(service, name, value)?;
-        Vec::new()
     } else {
-        let parts: Vec<String> = chars
-            .chunks(ENTRY_CHARS)
-            .map(|c| c.iter().collect())
-            .collect();
-        for (i, part) in parts.iter().enumerate() {
-            os_write(service, &part_name(name, i), part)?;
+        let generation = uuid::Uuid::new_v4();
+        let parts = Parts {
+            generation: Some(generation),
+            count: chars.len().div_ceil(ENTRY_CHARS),
+        };
+        for (i, part) in chars.chunks(ENTRY_CHARS).enumerate() {
+            os_write(
+                service,
+                &parts.name(name, i),
+                &part.iter().collect::<String>(),
+            )?;
         }
-        os_write(service, name, &format!("{SPLIT}{}", parts.len()))?;
-        parts
-    };
-    for i in parts.len()..before {
-        os_remove(service, &part_name(name, i))?;
+        os_write(
+            service,
+            name,
+            &format!("{VERSIONED_SPLIT}{generation}:{}", parts.count),
+        )?;
     }
+    retire_parts(service, name, old);
     Ok(())
 }
 
@@ -747,6 +798,40 @@ mod tests {
                 .expose(),
             session
         );
+        if !store.uses_fallback() {
+            // A process stopped midway through staging a new generation leaves the old
+            // manifest live. Public names resembling legacy chunks stay independent.
+            let staged = Parts {
+                generation: Some(uuid::Uuid::new_v4()),
+                count: 2,
+            };
+            let first = staged.name("auth.supabase_session", 0);
+            os_write(&service, &first, "an incomplete generation").unwrap();
+            store
+                .set("auth.supabase_session.part0", Secret::new("independent"))
+                .await
+                .unwrap();
+            assert_eq!(
+                store
+                    .get("auth.supabase_session")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expose(),
+                session
+            );
+            os_remove(&service, &first).unwrap();
+            assert_eq!(
+                store
+                    .get("auth.supabase_session.part0")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .expose(),
+                "independent"
+            );
+            store.delete("auth.supabase_session.part0").await.unwrap();
+        }
         store
             .set("auth.supabase_session", Secret::new("short"))
             .await

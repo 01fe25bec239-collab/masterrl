@@ -148,9 +148,15 @@ impl Client {
             )
         })?;
         let status = res.status();
-        let text = res.text().unwrap_or_default();
+        if status.as_u16() == 204 {
+            return Ok(Value::Null);
+        }
+        let text = res
+            .text()
+            .map_err(|_| "could not read the core's reply".to_owned())?;
         if status.is_success() {
-            return Ok(serde_json::from_str(&text).unwrap_or(Value::Null));
+            return serde_json::from_str(&text)
+                .map_err(|_| "could not read the core's reply".to_owned());
         }
         Err(problem_text(
             status.as_u16(),
@@ -370,13 +376,7 @@ fn answer(mut stream: TcpStream) -> Result<Option<Callback>, String> {
     let (page, result) = match (
         q.get("flow"),
         q.get("code"),
-        // Only the error code; the description is free text from the address bar.
-        q.get("error").map(|e| {
-            e.chars()
-                .filter(|c| c.is_ascii_lowercase() || *c == '_')
-                .take(64)
-                .collect::<String>()
-        }),
+        q.get("error").or_else(|| q.get("error_description")),
     ) {
         (Some(f), Some(c), None) => (
             "You are signed in. You can close this tab and go back to the terminal.",
@@ -384,9 +384,11 @@ fn answer(mut stream: TcpStream) -> Result<Option<Callback>, String> {
         ),
         (_, _, Some(e)) => (
             "The sign-in did not finish. Go back to the terminal for details.",
-            Err(format!(
-                "MRL-AUTH-161: the sign-in service refused the sign-in ({e})"
-            )),
+            Err(if e == "access_denied" {
+                "MRL-AUTH-161: access_denied (the sign-in was declined)".to_owned()
+            } else {
+                "MRL-AUTH-161: the sign-in service refused the sign-in".to_owned()
+            }),
         ),
         _ => (
             "The sign-in did not finish. Go back to the terminal for details.",

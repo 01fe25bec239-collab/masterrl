@@ -3377,6 +3377,37 @@ async fn audit_rows_written_before_their_month_partition_survive_a_restart() {
 
 #[tokio::test]
 #[ignore = "needs DATABASE_URL"]
+async fn partition_attachment_waits_for_the_first_uncommitted_audit_row() {
+    let db = TestDb::new().await;
+    let mut writer = db.db().begin().await.unwrap();
+    sqlx::query("INSERT INTO audit_events (id, at, actor, action, target, outcome) VALUES (gen_random_uuid(), '2091-03-04T00:00:00Z', 'actor', 'change', 'target', 'success')")
+        .execute(&mut *writer).await.unwrap();
+    let pool = db.pool().clone();
+    let attach = tokio::spawn(async move {
+        sqlx::query("SELECT audit_ensure_partition('2091-03-01'::date)")
+            .execute(&pool)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let waiting: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE NOT granted AND relation = 'audit_events_default'::regclass)",
+            ).fetch_one(db.pool()).await.unwrap();
+            if waiting { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    writer.commit().await.unwrap();
+    attach.await.unwrap().unwrap();
+    let moved: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events_2091_03")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(moved, 1);
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
 async fn a_scoped_token_stays_inside_its_org_and_project_for_account_actions() {
     let sb = MockSupabase::start().await;
     let core = CoreServer::start(Mode::Team, &sb, TestDb::new().await, Arc::default()).await;
@@ -3455,6 +3486,25 @@ async fn a_scoped_token_stays_inside_its_org_and_project_for_account_actions() {
         .map(|r| r["org"].as_str().unwrap())
         .collect();
     assert_eq!(orgs, vec![lab.to_string().as_str()], "{me}");
+    // Losing write access in this project is not offset by a write role on a sibling.
+    let sibling_in_lab = ProjectId::new();
+    core.db.seed(&format!(
+        "INSERT INTO projects (id, org_id, workspace_id, slug, name) VALUES ('{}', '{}', '{}', 'sibling', 'Sibling');
+         UPDATE role_bindings SET role = 'viewer' WHERE org_id = '{}' AND principal_id = '{}';",
+        sibling_in_lab.as_uuid(), lab.as_uuid(), wl.as_uuid(), lab.as_uuid(), c.as_uuid(),
+    )).await;
+    grant(
+        &core,
+        lab,
+        c,
+        Role::Researcher,
+        Scope::Project(sibling_in_lab),
+    )
+    .await;
+    let now_forbidden = core
+        .call(Method::GET, "/api/v1/auth/tokens", &a, None)
+        .await;
+    assert_eq!(now_forbidden.status, 403, "{}", now_forbidden.text());
     // Self-revocation still works.
     let own = core
         .call(
@@ -3470,6 +3520,15 @@ async fn a_scoped_token_stays_inside_its_org_and_project_for_account_actions() {
     grant(&core, lab, d, Role::Researcher, Scope::Project(pa)).await;
     let made = make(Auth::Bearer(dave.clone()), pa).await;
     assert_eq!(made.status, 201, "{}", made.text());
+    let org_wide = core
+        .call(
+            Method::POST,
+            "/api/v1/auth/tokens",
+            &Auth::Bearer(dave.clone()),
+            Some(json!({"name":"too broad","scopes":["*"]})),
+        )
+        .await;
+    assert_eq!(org_wide.status, 404, "{}", org_wide.text());
     let elsewhere = make(Auth::Bearer(dave), pb).await;
     assert_eq!(elsewhere.status, 404, "{}", elsewhere.text());
     core.stop().await;
@@ -3532,12 +3591,19 @@ async fn a_retried_push_whose_reply_was_lost_takes_one_slot() {
     core.db
         .seed("UPDATE sync_state SET last_pushed_version = 100")
         .await;
-    assert_eq!(send(op).await.status, 200);
+    assert_eq!(send(op.clone()).await.status, 200);
     let status = core
         .call(Method::GET, "/api/v1/sync/status", &Auth::Launch, None)
         .await
         .json();
     assert_eq!(status["last_pushed_version"], 100, "{status}");
+    for _ in 0..5 {
+        assert_eq!(push(&core).await.status, 200);
+    }
+    let before = kept_versions(&sb);
+    let replay = send(op).await;
+    assert_eq!(replay.json()["version"], 6, "{}", replay.text());
+    assert_eq!(kept_versions(&sb), before);
     let bad = send(json!({"op_id": "not-a-uuid"})).await;
     assert_eq!(bad.status, 422, "{}", bad.text());
     core.stop().await;
@@ -3626,6 +3692,64 @@ async fn pushes_overlapping_a_key_rotation_never_see_sync_as_off() {
             assert_eq!(r.status, 200, "{}", r.text());
         }
     }
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_push_snapshots_the_profile_and_key_before_a_concurrent_restore() {
+    let sb = MockSupabase::start().await;
+    let core = sync_ready(&sb).await;
+    assert_eq!(push(&core).await.status, 200);
+    let other_pass = "a different sync passphrase";
+    let second = core
+        .call(
+            Method::POST,
+            "/api/v1/sync/setup",
+            &Auth::Launch,
+            Some(json!({"passphrase": other_pass})),
+        )
+        .await;
+    assert_eq!(second.status, 200, "{}", second.text());
+    let updated = core
+        .call(
+            Method::PUT,
+            "/api/v1/sync/profile",
+            &Auth::Launch,
+            Some(json!({"schema":"setup-profile/v1", "preferences":{"theme":"dark"}})),
+        )
+        .await;
+    assert_eq!(updated.status, 200, "{}", updated.text());
+    let active: String = sqlx::query_scalar("SELECT key_ref FROM sync_state")
+        .fetch_one(core.db.pool())
+        .await
+        .unwrap();
+    let gate = core.pause_next_read(active);
+    let restore = |version: i64, passphrase: &'static str| {
+        let core = &core;
+        async move {
+            core.call(
+                Method::POST,
+                "/api/v1/sync/restore",
+                &Auth::Launch,
+                Some(json!({"version": version, "passphrase": passphrase})),
+            )
+            .await
+        }
+    };
+    let (pushed, restored) = tokio::join!(push(&core), async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), gate.read.notified())
+            .await
+            .unwrap();
+        let restored = restore(1, PASSPHRASE).await;
+        gate.resume.notify_one();
+        restored
+    });
+    assert_eq!(restored.status, 200, "{}", restored.text());
+    assert_eq!(pushed.status, 200, "{}", pushed.text());
+    let latest = restore(2, other_pass).await;
+    assert_eq!(latest.status, 200, "{}", latest.text());
+    assert_eq!(latest.json()["profile"]["preferences"]["theme"], "dark");
     core.stop().await;
 }
 
@@ -3733,6 +3857,71 @@ async fn credentials_in_keys_or_inside_longer_text_never_reach_storage_or_backup
 
 #[tokio::test]
 #[ignore = "needs DATABASE_URL"]
+async fn sign_in_uses_one_database_connection_in_both_modes() {
+    let sb = MockSupabase::start().await;
+    for mode in [Mode::Solo, Mode::Team] {
+        let mut settings = config(mode, &sb);
+        settings.server.roles = vec![mrl_server::config::Role::Api];
+        settings.database.max_connections = 1;
+        settings.database.acquire_timeout_seconds = 2;
+        let core = CoreServer::try_start(settings, TestDb::new().await, Arc::default())
+            .await
+            .unwrap();
+        let auth = if mode == Mode::Solo {
+            Auth::Launch
+        } else {
+            Auth::None
+        };
+        let response = core.sign_in(&sb, &auth, true).await;
+        assert_eq!(response.status, 200, "{mode:?}: {}", response.text());
+        core.stop().await;
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_pending_sign_in_is_published_only_if_its_transaction_committed() {
+    use mrl_server::modules::auth::signin::{PENDING_SECRET, SESSION_SECRET};
+    let sb = MockSupabase::start().await;
+    let core = solo(&sb).await;
+    assert_eq!(core.sign_in(&sb, &Auth::Launch, false).await.status, 200);
+    let raw = core.secrets.get(SESSION_SECRET).await.unwrap().unwrap();
+    let session: Value = serde_json::from_str(raw.expose()).unwrap();
+    core.secrets.delete(SESSION_SECRET).await.unwrap();
+
+    let stage = |id: uuid::Uuid| {
+        let store = core.secrets.clone();
+        let pending = json!({"operation": id.to_string(), "session": session});
+        async move {
+            store
+                .set(PENDING_SECRET, Secret::new(pending.to_string()))
+                .await
+                .unwrap()
+        }
+    };
+    let state = || async {
+        core.call(Method::GET, "/api/v1/auth/me", &Auth::Launch, None)
+            .await
+            .json()["sign_in"]
+            .clone()
+    };
+    stage(uuid::Uuid::new_v4()).await;
+    assert_eq!(state().await, "signed_out");
+    let committed: uuid::Uuid =
+        sqlx::query_scalar("SELECT signin_operation FROM users WHERE is_local_owner")
+            .fetch_one(core.db.pool())
+            .await
+            .unwrap();
+    stage(committed).await;
+    assert_eq!(state().await, "active");
+    assert!(core.secrets.get(PENDING_SECRET).await.unwrap().is_none());
+    let recovered = core.secrets.get(SESSION_SECRET).await.unwrap().unwrap();
+    assert_eq!(recovered.expose(), raw.expose());
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
 async fn sign_in_and_sign_out_never_stop_half_way() {
     let sb = MockSupabase::start().await;
     let core = solo(&sb).await;
@@ -3747,7 +3936,7 @@ async fn sign_in_and_sign_out_never_stop_half_way() {
     };
     // The keychain prompt is cancelled while the session is saved: nothing is left behind.
     core.fail_next_write(
-        "auth.supabase_session",
+        "auth.supabase_pending",
         "MRL-ENV-162: the keychain request was cancelled, so the app could not save a secret",
     );
     let refused = core.sign_in(&sb, &Auth::Launch, true).await;
@@ -3842,7 +4031,11 @@ async fn a_solo_owners_token_reads_the_whole_audit_log() {
     };
     let by_owner = read(Auth::Launch).await;
     assert!(by_owner > 0);
-    assert_eq!(read(token).await, by_owner, "the owner's token sees what the owner sees");
+    assert_eq!(
+        read(token).await,
+        by_owner,
+        "the owner's token sees what the owner sees"
+    );
     core.stop().await;
 }
 
@@ -3854,7 +4047,9 @@ async fn a_token_held_to_a_project_never_reaches_setup_sync() {
     let post = |path: String, body: Value| {
         let core = &core;
         async move {
-            let r = core.call(Method::POST, &path, &Auth::Launch, Some(body)).await;
+            let r = core
+                .call(Method::POST, &path, &Auth::Launch, Some(body))
+                .await;
             assert_eq!(r.status, 201, "{}", r.text());
             r.json()
         }
@@ -3888,9 +4083,17 @@ async fn a_token_held_to_a_project_never_reaches_setup_sync() {
     for (method, path, body) in [
         (Method::GET, "/api/v1/sync/profile", None),
         (Method::PUT, "/api/v1/sync/profile", Some(profile())),
-        (Method::POST, "/api/v1/sync/setup", Some(json!({"passphrase": PASSPHRASE}))),
+        (
+            Method::POST,
+            "/api/v1/sync/setup",
+            Some(json!({"passphrase": PASSPHRASE})),
+        ),
         (Method::POST, "/api/v1/sync/push", None),
-        (Method::POST, "/api/v1/sync/restore", Some(json!({"passphrase": PASSPHRASE}))),
+        (
+            Method::POST,
+            "/api/v1/sync/restore",
+            Some(json!({"passphrase": PASSPHRASE})),
+        ),
         (Method::GET, "/api/v1/sync/status", None),
     ] {
         assert_eq!(
@@ -3899,7 +4102,25 @@ async fn a_token_held_to_a_project_never_reaches_setup_sync() {
             "{method} {path}"
         );
     }
-    assert_eq!(call(Method::GET, "/api/v1/sync/profile", &unbound, None).await, 200);
-    assert_eq!(call(Method::GET, "/api/v1/sync/status", &unbound, None).await, 200);
+    assert_eq!(
+        call(Method::GET, "/api/v1/sync/profile", &unbound, None).await,
+        200
+    );
+    assert_eq!(
+        call(Method::GET, "/api/v1/sync/status", &unbound, None).await,
+        200
+    );
+    assert_eq!(
+        call(Method::POST, "/api/v1/auth/logout", &bound, None).await,
+        204
+    );
+    assert_eq!(
+        call(Method::GET, "/api/v1/auth/me", &bound, None).await,
+        401
+    );
+    let local = core
+        .call(Method::GET, "/api/v1/auth/me", &Auth::Launch, None)
+        .await;
+    assert_eq!(local.json()["sign_in"], "active");
     core.stop().await;
 }
