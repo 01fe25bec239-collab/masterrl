@@ -7,7 +7,9 @@ use crate::pg::TestDb;
 use crate::seams::InMemorySecretStore;
 use crate::server::TestResponse;
 use axum::http::Method;
-use mrl_domain::ids::{DatasetVersionId, ModelVersionId, OrgId, ProjectId, UserId, WorkspaceId};
+use mrl_domain::ids::{
+    DatasetVersionId, ModelVersionId, NodeId, OrgId, PoolId, ProjectId, UserId, WorkspaceId,
+};
 use mrl_domain::rbac::{allowed, Action, Role};
 use mrl_server::config::Mode;
 use mrl_server::modules::auth::supabase::{JwtVerifier, Supabase};
@@ -17,6 +19,7 @@ use mrl_server::seams::{
     Resource, Secret, SecretStore,
 };
 use serde_json::{json, Value};
+use std::str::FromStr;
 use std::sync::Arc;
 
 const PASSPHRASE: &str = "correct horse battery staple";
@@ -487,7 +490,18 @@ async fn every_route_answers_by_role_in_team_mode() {
     ];
     let public = ["/api/v1/auth/login", "/api/v1/auth/callback"];
     let sb = MockSupabase::start().await;
-    let core = CoreServer::start(Mode::Team, &sb, TestDb::new().await, Arc::default()).await;
+    // Every role calls every route in one org, past the default rate limits.
+    let mut cfg = config(Mode::Team, &sb);
+    let bucket = mrl_server::config::BucketConfig {
+        per_second: 1000,
+        burst: 5000,
+    };
+    cfg.server.rate_limit.principal = bucket;
+    cfg.server.rate_limit.org = bucket;
+    let core = match CoreServer::try_start(cfg, TestDb::new().await, Arc::default()).await {
+        Ok(c) => c,
+        Err(e) => panic!("test core did not start: {}", e.explain()),
+    };
     let (org, ws) = (OrgId::new(), WorkspaceId::new());
     core.db
         .seed(&format!(
@@ -548,7 +562,7 @@ async fn every_route_answers_by_role_in_team_mode() {
         .call_with(
             Method::POST,
             &format!("/api/v1/projects/{prj}/runs"),
-            &Auth::Bearer(seed_jwt),
+            &Auth::Bearer(seed_jwt.clone()),
             Some(submission.clone()),
             &[("idempotency-key", "rbac-seed")],
         )
@@ -557,6 +571,26 @@ async fn every_route_answers_by_role_in_team_mode() {
     let seeded = seeded.json();
     let field = |k: &str| seeded[k].as_str().unwrap().to_owned();
     let (run, job, exp) = (field("id"), field("job_id"), field("experiment_id"));
+    // Compute (P18): a pool made over the API and one machine in it (no agent connected).
+    let pool = core
+        .call(
+            Method::POST,
+            "/api/v1/pools",
+            &Auth::Bearer(seed_jwt),
+            Some(json!({"name": "seed-pool"})),
+        )
+        .await;
+    assert_eq!(pool.status, 201, "{}", pool.text());
+    let pool = pool.json()["id"].as_str().unwrap().to_owned();
+    let node = NodeId::new();
+    core.db
+        .seed(&format!(
+            "INSERT INTO compute_nodes (id, pool_id, hostname, lifecycle, status)
+             VALUES ('{n}', '{p}', 'rbac-host', 'STATIC', 'ONLINE');",
+            n = node.as_uuid(),
+            p = PoolId::from_str(&pool).unwrap().as_uuid()
+        ))
+        .await;
     let mut routes: Vec<(Method, String, Action, Option<Value>)> = base
         .iter()
         .map(|(m, p, a, b)| (m.clone(), (*p).to_owned(), *a, b.clone()))
@@ -651,6 +685,44 @@ async fn every_route_answers_by_role_in_team_mode() {
             None,
         ),
     ]);
+    // Compute (P18): pools, enrollment tokens and machines.
+    let manage = |m: Method, p: String, body: Option<Value>| (m, p, Action::ComputeManage, body);
+    routes.extend([
+        (
+            Method::GET,
+            "/api/v1/pools".to_owned(),
+            Action::ComputeRead,
+            None,
+        ),
+        manage(
+            Method::POST,
+            "/api/v1/pools".to_owned(),
+            Some(json!({"name": "rbac-pool"})),
+        ),
+        manage(
+            Method::POST,
+            format!("/api/v1/pools/{pool}/enrollment-tokens"),
+            Some(json!({})),
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/pools/{pool}/nodes"),
+            Action::ComputeRead,
+            None,
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/nodes/{node}"),
+            Action::ComputeRead,
+            None,
+        ),
+        manage(Method::POST, format!("/api/v1/nodes/{node}:drain"), None),
+        manage(
+            Method::POST,
+            format!("/api/v1/nodes/{node}:decommission"),
+            None,
+        ),
+    ]);
     // A run submission needs an Idempotency-Key (keys are per person).
     let key_for = |method: &Method, path: &str| -> &'static [(&'static str, &'static str)] {
         if *method == Method::POST && path.ends_with("/runs") {
@@ -698,6 +770,9 @@ async fn every_route_answers_by_role_in_team_mode() {
             // The run is REJECTED (no engine yet), so its job can't change any more.
             ("POST", p) if p.ends_with(":cancel") => &[409],
             ("PATCH", p) if p.contains("/jobs/") => &[409],
+            ("POST", "/api/v1/pools") => &[201, 409, 422],
+            ("POST", p) if p.ends_with("/enrollment-tokens") => &[201],
+            ("POST", p) if p.ends_with(":drain") || p.ends_with(":decommission") => &[200, 422],
             ("GET", _) => &[200],
             _ => &[],
         }

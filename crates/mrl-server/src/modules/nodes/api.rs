@@ -160,7 +160,7 @@ pub struct CreatePool {
 /// `POST /pools/{pool}/enrollment-tokens`.
 #[derive(Debug, Clone, Default, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields)]
-pub struct CreateToken {
+pub struct CreateEnrollmentToken {
     /// How long the token works, 60 s – 7 days (default 1 hour).
     #[serde(default)]
     pub ttl_seconds: Option<u32>,
@@ -198,7 +198,7 @@ pub struct TokenCreated {
 #[derive(OpenApi)]
 #[openapi(
     paths(list_pools, create_pool, list_nodes, create_token, get_node, drain, decommission),
-    components(schemas(PoolView, NodeView, GpuView, NodeDetail, CreatePool, CreateToken, TokenCreated,
+    components(schemas(PoolView, NodeView, GpuView, NodeDetail, CreatePool, CreateEnrollmentToken, TokenCreated,
         Lifecycle, Endpoint, Page<PoolView>, Page<NodeView>)),
     tags((name = "compute", description = "Pools, machines and their GPUs."))
 )]
@@ -434,7 +434,7 @@ fn new_token(ca_sha256: &str) -> String {
     format!("mrlj_{}_{ca_sha256}", hex(&secret))
 }
 
-#[utoipa::path(post, path = "/pools/{pool}/enrollment-tokens", tag = "compute", request_body = CreateToken,
+#[utoipa::path(post, path = "/pools/{pool}/enrollment-tokens", tag = "compute", operation_id = "create_enrollment_token", request_body = CreateEnrollmentToken,
     params(("pool" = String, Path, description = "`pool_…`")),
     responses((status = 201, description = "The token (shown once).", body = TokenCreated),
               (status = 404, description = "No such pool.", body = crate::error::Problem),
@@ -445,7 +445,7 @@ async fn create_token(
     ctx: RequestContext,
     headers: axum::http::HeaderMap,
     Path(pool): Path<String>,
-    Json(body): Json<CreateToken>,
+    Json(body): Json<CreateEnrollmentToken>,
 ) -> Result<(StatusCode, Json<TokenCreated>), ApiError> {
     let pool_uuid = pool_id(&pool)?;
     authorize_pool(&s, &gw, &ctx, "compute.manage", pool_uuid).await?;
