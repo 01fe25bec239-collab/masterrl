@@ -3977,6 +3977,7 @@ async fn upload_actions_recover_and_unpublished_parts_stay_hidden() {
         .call(Method::GET, &format!("/api/v1/uploads/{up}"), A, None)
         .await;
     assert_eq!(r.json()["parts_received"], json!([]));
+    assert_eq!(e.db.count("upload_parts").await, 0);
 
     let complete = format!("/api/v1/uploads/{up}:complete");
     assert_eq!(
@@ -3990,10 +3991,12 @@ async fn upload_actions_recover_and_unpublished_parts_stay_hidden() {
             .status,
         200
     );
+    assert_eq!(e.db.count("upload_parts").await, 1);
     let first = e.call(Method::POST, &complete, A, None).await;
     let retry = e.call(Method::POST, &complete, A, None).await;
     assert_eq!((first.status, retry.status), (200, 200));
     assert_eq!(first.json(), retry.json());
+    assert_eq!(e.db.count("upload_parts").await, 0);
 
     let up = new().await;
     let abort = format!("/api/v1/uploads/{up}:abort");

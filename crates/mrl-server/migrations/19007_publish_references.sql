@@ -1,5 +1,10 @@
 -- A staged part becomes visible only when the open upload records its key.
-ALTER TABLE uploads ADD COLUMN part_keys jsonb NOT NULL DEFAULT '{}';
+CREATE TABLE upload_parts (
+    upload_id uuid NOT NULL REFERENCES uploads (id) ON DELETE CASCADE,
+    part bigint NOT NULL CHECK (part >= 0),
+    object_key text NOT NULL,
+    PRIMARY KEY (upload_id, part)
+);
 
 -- A rotation keeps one candidate or retired reference until it can delete it.
 ALTER TABLE secrets_metadata ADD COLUMN rotation_ref text;

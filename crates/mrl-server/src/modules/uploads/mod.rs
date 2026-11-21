@@ -277,11 +277,15 @@ async fn received(
     store: &Store,
     row: &Row,
 ) -> Result<BTreeMap<u64, (String, u64)>, Error> {
-    let keys: sqlx::types::Json<BTreeMap<u64, String>> =
-        sqlx::query_scalar("SELECT part_keys FROM uploads WHERE id = $1")
-            .bind(row.id)
-            .fetch_one(db.pool())
-            .await?;
+    let keys: BTreeMap<u64, String> = sqlx::query_as::<_, (i64, String)>(
+        "SELECT part, object_key FROM upload_parts WHERE upload_id = $1",
+    )
+    .bind(row.id)
+    .fetch_all(db.pool())
+    .await?
+    .into_iter()
+    .filter_map(|(n, key)| u64::try_from(n).ok().map(|n| (n, key)))
+    .collect();
     let prefix = store.keys().upload_parts(&row.key())?;
     let objects = store.list(&prefix).await?;
     let mut parts = BTreeMap::new();
@@ -313,6 +317,14 @@ async fn lock_upload(tx: &mut crate::db::Tx, id: Uuid) -> Result<Row, Error> {
     .fetch_one(&mut **tx)
     .await
     .map_err(Error::from)
+}
+
+async fn clear_part_refs(tx: &mut crate::db::Tx, id: Uuid) -> Result<(), Error> {
+    sqlx::query("DELETE FROM upload_parts WHERE upload_id = $1")
+        .bind(id)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 /// Deletes a closed upload's parts. The upload's new state is already committed, so a
@@ -384,11 +396,13 @@ impl PartTarget {
         let mut tx = store.db().pool().begin().await?;
         let row = lock_upload(&mut tx, self.row.id).await?;
         let updated = sqlx::query(
-            "UPDATE uploads SET part_keys = jsonb_set(part_keys, ARRAY[$2], to_jsonb($3::text))
-             WHERE id = $1 AND state = 'OPEN' AND expires_at > clock_timestamp()",
+            "INSERT INTO upload_parts (upload_id, part, object_key)
+             SELECT id, $2, $3 FROM uploads
+             WHERE id = $1 AND state = 'OPEN' AND expires_at > clock_timestamp()
+             ON CONFLICT (upload_id, part) DO UPDATE SET object_key = EXCLUDED.object_key",
         )
         .bind(row.id)
-        .bind(self.n.to_string())
+        .bind(i64::try_from(self.n).map_err(|_| field("/n", "The part number is out of range."))?)
         .bind(&key)
         .execute(&mut *tx)
         .await?
@@ -713,6 +727,7 @@ async fn abort_upload(
         None if row.state == "ABORTED" => row,
         None => return Err(closed(&row)),
     };
+    clear_part_refs(&mut tx, stopped.id).await?;
     tx.commit().await?;
     match store.org_store(org).await {
         Ok(st) => tidy(&st, &stopped.key()).await,
@@ -783,6 +798,7 @@ async fn complete_upload(
         None if row.state == "COMPLETED" => row,
         None => return Err(closed(&row)),
     };
+    clear_part_refs(&mut tx, completed.id).await?;
     tx.commit().await?;
     tidy(&st, &completed.key()).await;
     Ok(completed.into_upload(Vec::new()))
@@ -921,14 +937,18 @@ pub async fn sweep(store: &ArtifactStore) -> Result<Swept, Error> {
 pub async fn sweep_at(store: &ArtifactStore, now: OffsetDateTime) -> Result<Swept, Error> {
     let pool = store.db().pool();
     let cutoff = now - time::Duration::hours(24);
-    let expired = sqlx::query(
-        "UPDATE uploads SET state = 'EXPIRED', finished_at = now()
-         WHERE state = 'OPEN' AND expires_at < $1",
+    let expired: i64 = sqlx::query_scalar(
+        "WITH expired AS (
+             UPDATE uploads SET state = 'EXPIRED', finished_at = now()
+             WHERE state = 'OPEN' AND expires_at < $1 RETURNING id
+         ), removed AS (
+             DELETE FROM upload_parts USING expired WHERE upload_parts.upload_id = expired.id
+         )
+         SELECT count(*) FROM expired",
     )
     .bind(now)
-    .execute(pool)
-    .await?
-    .rows_affected();
+    .fetch_one(pool)
+    .await?;
     let stale_artifacts = sqlx::query(
         "UPDATE artifacts SET state = 'FAILED' WHERE state = 'PENDING' AND created_at < $1",
     )
@@ -1008,7 +1028,7 @@ pub async fn sweep_at(store: &ArtifactStore, now: OffsetDateTime) -> Result<Swep
         .await
         .unwrap_or(0);
     Ok(Swept {
-        expired,
+        expired: u64::try_from(expired).unwrap_or_default(),
         objects,
         stale_artifacts,
         blobs,
