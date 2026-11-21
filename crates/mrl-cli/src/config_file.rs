@@ -66,6 +66,7 @@ impl CliConfig {
         path: &std::path::Path,
         change: impl FnOnce(&mut Self),
     ) -> Result<PathBuf, String> {
+        let path = config_target(path)?;
         let shown = path.display();
         let dir = path.parent().unwrap_or(std::path::Path::new("."));
         std::fs::create_dir_all(dir).map_err(|e| format!("can't create {}: {e}", dir.display()))?;
@@ -82,16 +83,21 @@ impl CliConfig {
         // Held until `lock` is dropped at the end of this function.
         lock.lock()
             .map_err(|e| format!("can't lock {shown}: {e}"))?;
-        let mut cfg = Self::load_from(path)?;
+        let mut cfg = Self::load_from(&path)?;
         change(&mut cfg);
         let text = toml::to_string(&cfg).map_err(|e| format!("can't write settings: {e}"))?;
-        let tmp = dir.join(format!("{name}.{}.tmp", std::process::id()));
-        let written = write_private(&tmp, &text).and_then(|()| std::fs::rename(&tmp, path));
-        if let Err(e) = written {
+        let tmp = dir.join(format!("{name}.{}.tmp", uuid::Uuid::new_v4()));
+        let mut file = create_private(&tmp).map_err(|e| format!("can't write {shown}: {e}"))?;
+        use std::io::Write;
+        let written = file
+            .write_all(text.as_bytes())
+            .and_then(|()| file.sync_all());
+        drop(file);
+        if let Err(e) = written.and_then(|()| std::fs::rename(&tmp, &path)) {
             let _ = std::fs::remove_file(&tmp);
             return Err(format!("can't write {shown}: {e}"));
         }
-        Ok(path.to_path_buf())
+        Ok(path)
     }
 
     /// The server address after `MRL_SERVER`.
@@ -110,33 +116,40 @@ impl CliConfig {
     }
 }
 
+// Resolve the final link before locking and replacing the file. Relative links are
+// relative to their containing directory, including when the target is missing.
+fn config_target(path: &std::path::Path) -> Result<PathBuf, String> {
+    use std::io::ErrorKind;
+
+    let mut target = path.to_path_buf();
+    for _ in 0..40 {
+        match std::fs::symlink_metadata(&target) {
+            Ok(m) if m.is_symlink() => {
+                let next = std::fs::read_link(&target)
+                    .map_err(|e| format!("can't follow {}: {e}", target.display()))?;
+                target.set_file_name(next);
+            }
+            Ok(_) => return Ok(target),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(target),
+            Err(e) => return Err(format!("can't open {}: {e}", target.display())),
+        }
+    }
+    Err(format!("too many settings links at {}", path.display()))
+}
+
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|v| !v.trim().is_empty())
 }
 
-#[cfg(unix)]
-fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
-    use std::io::Write;
-    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)?;
-    // A leftover file may have wider permissions; narrow them too.
-    f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-    f.write_all(text.as_bytes())?;
-    f.sync_all()
-}
-
-#[cfg(not(unix))]
-fn write_private(path: &std::path::Path, text: &str) -> std::io::Result<()> {
-    // ponytail: on Windows the file inherits the user profile's ACL; move the token to the OS keychain (P16) for more.
-    use std::io::Write;
-    let mut f = std::fs::File::create(path)?;
-    f.write_all(text.as_bytes())?;
-    f.sync_all()
+fn create_private(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
 }
 
 #[cfg(test)]
@@ -154,6 +167,29 @@ mod tests {
         assert!(!text.contains("project"));
         assert_eq!(toml::from_str::<CliConfig>(&text).unwrap(), c);
         assert!(toml::from_str::<CliConfig>("bogus = 1").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn settings_link_and_target_stay_in_sync() {
+        let dir = std::env::temp_dir().join(format!("mrl-cli-link-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&dir).unwrap();
+        let target = dir.join("settings.toml");
+        let link = dir.join("link.toml");
+        std::os::unix::fs::symlink("settings.toml", &link).unwrap();
+
+        CliConfig::update_at(&link, |c| c.project = Some("prj_example".into())).unwrap();
+        CliConfig::update_at(&target, |c| c.server = Some("http://localhost".into())).unwrap();
+
+        assert_eq!(
+            std::fs::read_link(&link).unwrap(),
+            PathBuf::from("settings.toml")
+        );
+        let cfg = CliConfig::load_from(&link).unwrap();
+        assert_eq!(cfg.project.as_deref(), Some("prj_example"));
+        assert_eq!(cfg.server.as_deref(), Some("http://localhost"));
+        assert!(!dir.join("link.toml.lock").exists());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

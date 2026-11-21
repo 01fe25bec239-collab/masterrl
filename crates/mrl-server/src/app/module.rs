@@ -60,6 +60,11 @@ pub trait ServerModule: Send + Sync {
         Router::new()
     }
 
+    /// POST route patterns relative to `/api/v1` whose handlers own durable idempotency.
+    fn handler_idempotency_paths(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Routes that need no sign-in (like a login endpoint), mounted under `/api/v1`.
     fn public_routes(&self) -> Router<AppState> {
         Router::new()

@@ -162,9 +162,29 @@ pub enum Validation {
     Rejected(Vec<Rejection>),
 }
 
-/// The outcome of the verifier chain.
+/// A verifier decision tied to the job snapshot the chain inspected.
+#[derive(Debug, Clone)]
+pub struct Completion {
+    snapshot: (Uuid, Uuid, i64, i64),
+    outcome: CompletionOutcome,
+}
+
+impl Completion {
+    fn new(job: &JobRow, outcome: CompletionOutcome) -> Self {
+        Self {
+            snapshot: (job.org_id, job.id, job.state_version, job.epoch),
+            outcome,
+        }
+    }
+
+    pub(super) fn for_job(self, job: &JobRow) -> Option<CompletionOutcome> {
+        (self.snapshot == (job.org_id, job.id, job.state_version, job.epoch))
+            .then_some(self.outcome)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Completion {
+pub(super) enum CompletionOutcome {
     /// Complete the job.
     Verified,
     /// Fail it with VERIFICATION_FAILED.
@@ -248,18 +268,21 @@ impl Chains {
             match v.verify(job).await? {
                 Verification::Abstain => {}
                 Verification::Verified => verified = true,
-                Verification::Failed(r) => return Ok(Completion::Failed(r)),
+                Verification::Failed(r) => {
+                    return Ok(Completion::new(job, CompletionOutcome::Failed(r)))
+                }
                 Verification::RetryLater(why) => retry = Some(why),
             }
         }
-        Ok(match (retry, verified) {
-            (Some(why), _) => Completion::RetryLater(why),
-            (None, true) => Completion::Verified,
-            (None, false) => Completion::Failed(Rejection::failure(
+        let outcome = match (retry, verified) {
+            (Some(why), _) => CompletionOutcome::RetryLater(why),
+            (None, true) => CompletionOutcome::Verified,
+            (None, false) => CompletionOutcome::Failed(Rejection::failure(
                 FailureCode::class_only(FailureClass::VerificationFailed),
                 "No checker is registered to confirm this job's results, so it can't be marked complete.",
             )),
-        })
+        };
+        Ok(Completion::new(job, outcome))
     }
 
     /// Runs every resolver in order, starting from the submitted config.
@@ -409,7 +432,7 @@ mod tests {
     #[tokio::test]
     async fn verifier_chain_rules() {
         let none = Chains::new(vec![], vec![], vec![]);
-        let Completion::Failed(r) = none.verify(&job()).await.unwrap() else {
+        let CompletionOutcome::Failed(r) = none.verify(&job()).await.unwrap().outcome else {
             panic!("no verifier must fail");
         };
         assert_eq!(r.code, "VERIFICATION_FAILED");
@@ -421,19 +444,24 @@ mod tests {
         )));
         let c = |v: Vec<Arc<dyn CompletionVerifier>>| Chains::new(vec![], v, vec![]);
         assert_eq!(
-            c(vec![ok.clone()]).verify(&job()).await.unwrap(),
-            Completion::Verified
+            c(vec![ok.clone()]).verify(&job()).await.unwrap().outcome,
+            CompletionOutcome::Verified
         );
         assert_eq!(
             c(vec![ok.clone(), retry.clone()])
                 .verify(&job())
                 .await
-                .unwrap(),
-            Completion::RetryLater("storage down".into())
+                .unwrap()
+                .outcome,
+            CompletionOutcome::RetryLater("storage down".into())
         );
         assert!(matches!(
-            c(vec![retry, fail, ok]).verify(&job()).await.unwrap(),
-            Completion::Failed(_)
+            c(vec![retry, fail, ok])
+                .verify(&job())
+                .await
+                .unwrap()
+                .outcome,
+            CompletionOutcome::Failed(_)
         ));
     }
 

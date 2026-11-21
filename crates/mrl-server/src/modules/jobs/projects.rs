@@ -9,7 +9,7 @@
 //! without a directory) move to their project's org once a directory can say which.
 //! Projects linked by a parent run move together in one transaction; a local experiment
 //! whose name the org already uses gets a fixed new name, keeping its id and metadata, and
-//! a local run whose submit key its creator already used in the org gets a fixed new key.
+//! a local run whose key conflicts keeps its original request replayable.
 
 use super::error::JobsError;
 use super::scope;
@@ -84,28 +84,25 @@ impl RehomeLocalRows {
         sqlx::query("SET CONSTRAINTS ALL DEFERRED")
             .execute(&mut *tx)
             .await?;
+        // Keep candidate names free until the move commits, even with an active replica.
+        sqlx::query("LOCK TABLE experiments IN SHARE ROW EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await?;
+        Self::rename_dup_experiments(&mut tx, org, projects).await?;
         for sql in [
-            // A local experiment whose name the org already uses in the project (like a
-            // `default` made once per credential) keeps its id, runs and metadata and gets
-            // a fixed new name: `<name> (local <last 8 hex of its id>)`, within 200 chars.
-            "UPDATE experiments dup \
-                SET name = left(dup.name, 183) || ' (local ' || right(replace(dup.id::text, '-', ''), 8) || ')', \
-                    version = dup.version + 1, updated_at = now() \
-               FROM experiments keep \
-              WHERE dup.org_id = $3 AND dup.project_id = ANY($2) AND keep.org_id = $1 \
-                AND keep.project_id = dup.project_id AND keep.name = dup.name",
             "UPDATE experiments SET org_id = $1 WHERE org_id = $3 AND project_id = ANY($2)",
-            // Likewise a local run whose submit key its creator already used in the org gets
-            // the same `(local …)` suffix on its key; the plain key keeps meaning the org's run.
+            // Job transitions lock the job before mirroring the run.
+            "UPDATE jobs SET org_id = $1 WHERE org_id = $3 AND project_id = ANY($2)",
+            // Reserve an internal key (spaces are invalid on the wire). Keep the original
+            // key and fingerprint so either accepted request can still be replayed.
             "UPDATE runs dup \
-                SET submit_key = dup.submit_key || ' (local ' || right(replace(dup.id::text, '-', ''), 8) || ')' \
+                SET legacy_submit_key = dup.submit_key, submit_key = 'legacy ' || dup.id::text \
                FROM runs keep \
               WHERE dup.org_id = $3 AND dup.project_id = ANY($2) AND keep.org_id = $1 \
                 AND keep.created_by = dup.created_by AND keep.submit_key = dup.submit_key",
             "UPDATE runs SET org_id = $1 WHERE org_id = $3 AND project_id = ANY($2)",
             "UPDATE run_configs SET org_id = $1 WHERE org_id = $3 \
                AND run_id IN (SELECT id FROM runs WHERE project_id = ANY($2))",
-            "UPDATE jobs SET org_id = $1 WHERE org_id = $3 AND project_id = ANY($2)",
             "UPDATE job_attempts SET org_id = $1 WHERE org_id = $3 \
                AND job_id IN (SELECT id FROM jobs WHERE project_id = ANY($2))",
             "UPDATE attempt_placements SET org_id = $1 WHERE org_id = $3 AND attempt_id IN \
@@ -127,6 +124,53 @@ impl RehomeLocalRows {
                 .await?;
         }
         tx.commit().await
+    }
+
+    async fn rename_dup_experiments(
+        tx: &mut crate::Tx,
+        org: Uuid,
+        projects: &[Uuid],
+    ) -> Result<(), sqlx::Error> {
+        let nil = Uuid::nil();
+        let duplicates: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+            "SELECT dup.id, dup.project_id, dup.name FROM experiments dup \
+             JOIN experiments keep ON keep.org_id = $1 AND keep.project_id = dup.project_id \
+               AND keep.name = dup.name \
+             WHERE dup.org_id = $2 AND dup.project_id = ANY($3) ORDER BY dup.id",
+        )
+        .bind(org)
+        .bind(nil)
+        .bind(projects)
+        .fetch_all(&mut **tx)
+        .await?;
+        for (id, project, name) in duplicates {
+            let id_text = id.simple().to_string();
+            for n in 0u64.. {
+                let suffix = if n == 0 {
+                    format!(" (local {})", &id_text[24..])
+                } else {
+                    format!(" (local {id_text}-{n})")
+                };
+                let prefix: String = name.chars().take(200 - suffix.len()).collect();
+                let candidate = format!("{prefix}{suffix}");
+                let updated = sqlx::query(
+                    "UPDATE experiments SET name = $1, version = version + 1, updated_at = now() \
+                     WHERE id = $2 AND NOT EXISTS (SELECT 1 FROM experiments \
+                       WHERE org_id IN ($3, $4) AND project_id = $5 AND name = $1)",
+                )
+                .bind(candidate)
+                .bind(id)
+                .bind(nil)
+                .bind(org)
+                .bind(project)
+                .execute(&mut **tx)
+                .await?;
+                if updated.rows_affected() == 1 {
+                    break;
+                }
+            }
+        }
+        Ok(())
     }
 }
 

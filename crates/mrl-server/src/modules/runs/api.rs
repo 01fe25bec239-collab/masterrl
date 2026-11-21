@@ -3,7 +3,7 @@
 use super::experiments::{get_or_create, project_scope, DEFAULT_EXPERIMENT};
 use crate::app::AppState;
 use crate::error::{ApiError, ErrorCode, FieldError};
-use crate::http::idempotency::IDEMPOTENCY_KEY;
+use crate::http::idempotency::{IDEMPOTENCY_KEY, REPLAYED};
 use crate::http::pagination::{Page, PageQuery};
 use crate::modules::jobs::model::reason;
 use crate::modules::jobs::scope::{self, resource};
@@ -406,16 +406,20 @@ async fn find_by_key(
     org: Uuid,
     created_by: &str,
     key: &str,
+    fingerprint: &[u8],
 ) -> Result<Option<RunRow>, JobsError> {
     Ok(sqlx::query_as::<_, RunRow>(concat!(
         "SELECT ",
         run_cols!(),
         " FROM runs r JOIN jobs j ON j.run_id = r.id \
-         WHERE r.org_id = $1 AND r.created_by = $2 AND r.submit_key = $3"
+         WHERE r.org_id = $1 AND r.created_by = $2 AND (r.submit_key = $3 \
+           OR (r.legacy_submit_key = $3 AND r.submit_fingerprint = $4)) \
+         ORDER BY (r.submit_fingerprint = $4) DESC, (r.submit_key = $3) DESC LIMIT 1"
     ))
     .bind(org)
     .bind(created_by)
     .bind(key)
+    .bind(fingerprint)
     .fetch_optional(db.pool())
     .await?)
 }
@@ -454,7 +458,11 @@ fn replay(row: &RunRow, fingerprint: &[u8]) -> Result<Response, JobsError> {
         )
         .into());
     }
-    Ok(created(row))
+    let mut response = created(row);
+    response
+        .headers_mut()
+        .insert(REPLAYED, HeaderValue::from_static("true"));
+    Ok(response)
 }
 
 /// `POST /projects/{prj}/runs`. Needs `Idempotency-Key`.
@@ -505,7 +513,7 @@ pub async fn submit(
         .finalize()
         .to_vec();
     let who = ctx.principal.id.clone();
-    if let Some(existing) = find_by_key(&db, org, &who, &key).await? {
+    if let Some(existing) = find_by_key(&db, org, &who, &key, &fingerprint).await? {
         return replay(&existing, &fingerprint);
     }
 
@@ -613,7 +621,7 @@ pub async fn submit(
         if e.is_unique_violation("runs_org_id_created_by_submit_key_key") {
             // A concurrent request with this key won; answer with its run.
             drop(tx);
-            let existing = find_by_key(&db, org, &who, &key)
+            let existing = find_by_key(&db, org, &who, &key, &fingerprint)
                 .await?
                 .ok_or_else(|| JobsError::changed("run"))?;
             return replay(&existing, &fingerprint);

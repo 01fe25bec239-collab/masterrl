@@ -74,6 +74,10 @@ impl ServerModule for RunsModule {
         "runs"
     }
 
+    fn handler_idempotency_paths(&self) -> &'static [&'static str] {
+        &["/projects/{prj}/runs"]
+    }
+
     fn routes(&self) -> Router<AppState> {
         Router::new()
             .route(

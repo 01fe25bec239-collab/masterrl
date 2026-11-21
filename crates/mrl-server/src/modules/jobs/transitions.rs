@@ -5,7 +5,7 @@
 //! outbox event, all in the caller's transaction. The outbox rows are the timeline.
 //! A lost compare-and-set is reported (MRL-CONFLICT-170), never retried here.
 
-use super::chains::Completion;
+use super::chains::{Completion, CompletionOutcome};
 use super::error::JobsError;
 use super::model::{reason, AttemptRow, JobRow};
 use crate::db::Tx;
@@ -351,21 +351,24 @@ impl JobTransitions {
         verdict: Completion,
     ) -> Result<JobRow, JobsError> {
         Job::can_transition(row.job_state()?, JobEvent::Complete)?;
-        match verdict {
-            Completion::Verified => {
+        match verdict
+            .for_job(row)
+            .ok_or_else(|| JobsError::changed("job"))?
+        {
+            CompletionOutcome::Verified => {
                 let extra = Extra::keep(row);
                 let change = JobChange::default();
                 let by = Owner::ArtifactsVerifier;
                 Self::step(tx, row, JobEvent::Complete, by, change, extra).await
             }
-            Completion::Failed(problem) => {
+            CompletionOutcome::Failed(problem) => {
                 let change = JobChange {
                     reason: Some(reason(std::slice::from_ref(&problem))),
                     failure: Some(FailureCode::class_only(FailureClass::VerificationFailed)),
                 };
                 Self::apply(tx, row, JobEvent::Fail, Owner::Jobs, change).await
             }
-            Completion::RetryLater(why) => {
+            CompletionOutcome::RetryLater(why) => {
                 let failure = FailureCode::class_only(FailureClass::InfraTransient);
                 Self::fail_or_retry(tx, row, failure, &why).await
             }

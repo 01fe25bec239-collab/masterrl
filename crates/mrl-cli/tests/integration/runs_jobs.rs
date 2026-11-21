@@ -209,10 +209,12 @@ async fn submit_needs_a_key_and_replays_durably() {
     assert_eq!(res.json()["code"], "MRL-IDEM-170");
     assert_eq!(res.headers["content-type"], "application/problem+json");
 
-    let first = e.submit("res", "same", &body).await;
-    assert_eq!(first.status, 201);
-    let again = e.submit("res", "same", &body).await;
-    assert_eq!(again.status, 201);
+    let (first, again) = tokio::join!(
+        e.submit("res", "same", &body),
+        e.submit("res", "same", &body)
+    );
+    assert_eq!(first.status, 201, "{}", first.text());
+    assert_eq!(again.status, 201, "{}", again.text());
     assert_eq!(again.json()["id"], first.json()["id"]);
     assert_eq!(e.db.count("runs").await, 1);
     let other = e.submit("res", "same", &submission("different")).await;
@@ -1715,6 +1717,22 @@ async fn legacy_rows_move_keeping_experiments_lineage_and_events() {
         &json!({"name": "sweep", "description": "org"}),
     )
     .await;
+    let id = local_sweep["id"]
+        .as_str()
+        .unwrap()
+        .parse::<mrl_domain::ids::ExperimentId>()
+        .unwrap();
+    let id_hex = id.as_uuid().simple().to_string();
+    let occupied = format!("sweep (local {})", &id_hex[24..]);
+    post(&old, "pat", exps(p), None, &json!({"name": occupied})).await;
+    post(
+        &old,
+        "solo",
+        exps(p),
+        None,
+        &json!({"name": format!("sweep (local {id_hex}-1)") }),
+    )
+    .await;
     let parent = post(&old, "solo", runs(q), Some("c"), &submission("parent")).await;
     let mut child = submission("child");
     child["parent_run_id"] = parent["id"].clone();
@@ -1781,10 +1799,10 @@ async fn legacy_rows_move_keeping_experiments_lineage_and_events() {
             local_sweep["id"].as_str().unwrap()
         ))
         .await;
-        let suffix = local_sweep["id"].as_str().unwrap();
-        assert!(
-            local["name"].as_str().unwrap().starts_with("sweep (local "),
-            "{start}: {local}"
+        assert_eq!(
+            local["name"],
+            format!("sweep (local {id_hex}-2)"),
+            "{start}"
         );
         assert_eq!(
             (&local["description"], &local["tags"]),
@@ -1807,7 +1825,7 @@ async fn legacy_rows_move_keeping_experiments_lineage_and_events() {
             .iter()
             .map(|e| e["name"].clone())
             .collect();
-        assert_eq!(names.len(), 4, "{start}: {names:?} ({suffix})");
+        assert_eq!(names.len(), 6, "{start}: {names:?}");
         // Lineage survives.
         let got = get(format!("/api/v1/runs/{}", child["id"].as_str().unwrap())).await;
         assert_eq!(got["parent_run_id"], parent["id"], "{start}");
@@ -1860,7 +1878,8 @@ async fn legacy_runs_move_when_the_org_already_used_their_submit_key() {
         &Harness::default(),
     )
     .await;
-    let local = submit(&old, p, submission("local")).await;
+    let local_body = submission("local");
+    let local = submit(&old, p, local_body.clone()).await;
     old.shutdown().await.unwrap();
     // The directory knows only Q: P stays, and `nightly` is used again in the org.
     let harness = Harness::default();
@@ -1881,9 +1900,38 @@ async fn legacy_runs_move_when_the_org_already_used_their_submit_key() {
     let path = format!("/api/v1/runs/{}", local["id"].as_str().unwrap());
     let res = call(&srv, Method::GET, &path, "solo", None, None).await;
     assert_eq!(res.status, 200, "{}", res.text());
-    // The key still means the org's run.
-    let again = submit(&srv, q, body).await;
-    assert_eq!(again["id"], theirs["id"]);
+    srv.shutdown().await.unwrap();
+    // Both requests remain replayable on the same server after another restart.
+    let srv = runs_server_with(db.db(), accepting_chains(), &solo, vec![], &harness).await;
+    assert_eq!(submit(&srv, q, body).await["id"], theirs["id"]);
+    assert_eq!(submit(&srv, p, local_body.clone()).await["id"], local["id"]);
+    let path = format!("/api/v1/projects/{p}/runs");
+    let changed = call(
+        &srv,
+        Method::POST,
+        &path,
+        "solo",
+        Some("nightly"),
+        Some(&submission("changed")),
+    )
+    .await;
+    assert_eq!(changed.status, 422);
+    harness
+        .rules
+        .lock()
+        .unwrap()
+        .hidden
+        .insert(("usr_local".into(), p.to_string()));
+    let hidden = call(
+        &srv,
+        Method::POST,
+        &path,
+        "solo",
+        Some("nightly"),
+        Some(&local_body),
+    )
+    .await;
+    assert_eq!(hidden.status, 404);
     srv.shutdown().await.unwrap();
 }
 
@@ -1957,6 +2005,32 @@ async fn stale_launches_add_nothing() {
     assert_eq!(attempts_and_events(&e, row.id).await, (1, 1));
 }
 
+async fn backend_pid(tx: &mut mrl_server::Tx) -> i32 {
+    sqlx::query_scalar("SELECT pg_backend_pid()")
+        .fetch_one(&mut **tx)
+        .await
+        .unwrap()
+}
+
+async fn wait_for_blocker(db: &TestDb, waiter: i32, blocker: i32) {
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar("SELECT $1 = ANY(pg_blocking_pids($2))")
+                .bind(blocker)
+                .bind(waiter)
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+            if blocked {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the competing transaction must wait on the expected blocker");
+}
+
 #[tokio::test]
 #[ignore = "needs DATABASE_URL"]
 async fn job_and_attempt_locks_never_deadlock() {
@@ -1964,57 +2038,54 @@ async fn job_and_attempt_locks_never_deadlock() {
     let org = e.org.as_uuid();
     let job = allocating(&e, "locks").await;
     let mut tx = e.db.db().begin().await.unwrap();
-    let (_, att) = JobTransitions::launch(&mut tx, &job, None).await.unwrap();
+    let (_, attempt) = JobTransitions::launch(&mut tx, &job, None).await.unwrap();
     tx.commit().await.unwrap();
-    // A locks the job, waits, then works on the attempt. B starts meanwhile from the attempt.
-    let a = async {
-        let mut tx = e.db.db().begin().await.unwrap();
-        JobTransitions::lock(&mut tx, org, job.id)
+
+    let mut a = e.db.db().begin().await.unwrap();
+    JobTransitions::lock(&mut a, org, job.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let blocker = backend_pid(&mut a).await;
+    let mut b = e.db.db().begin().await.unwrap();
+    let waiter = backend_pid(&mut b).await;
+    let id = attempt.id;
+    let mut competing = tokio::spawn(async move {
+        let attempt = JobTransitions::lock_attempt(&mut b, org, id)
             .await
             .unwrap()
             .unwrap();
-        sqlx::query("SELECT pg_sleep(0.3)")
-            .execute(&mut *tx)
-            .await
-            .unwrap();
-        let att = JobTransitions::lock_attempt(&mut tx, org, att.id)
-            .await
-            .unwrap()
-            .unwrap();
-        let r = JobTransitions::apply_attempt(
-            &mut tx,
-            &att,
-            JobAttemptEvent::Acknowledge,
-            AttemptChange::default(),
-        )
-        .await;
-        tx.commit().await.unwrap();
-        r
-    };
-    let b = async {
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        let mut tx = e.db.db().begin().await.unwrap();
-        let att = JobTransitions::lock_attempt(&mut tx, org, att.id)
-            .await
-            .unwrap()
-            .unwrap();
-        let r = JobTransitions::apply_attempt(
-            &mut tx,
-            &att,
+        let killed = JobTransitions::apply_attempt(
+            &mut b,
+            &attempt,
             JobAttemptEvent::Kill,
             AttemptChange::default(),
         )
-        .await;
-        tx.commit().await.unwrap();
-        r
-    };
-    let (ra, rb) = tokio::join!(a, b);
-    assert_eq!(ra.unwrap().state, "LAUNCHING");
-    assert_eq!(
-        rb.unwrap().state,
-        "KILLED",
-        "B waited for A instead of deadlocking"
-    );
+        .await
+        .unwrap();
+        b.commit().await.unwrap();
+        killed
+    });
+    tokio::select! {
+        () = wait_for_blocker(&e.db, waiter, blocker) => {}
+        result = &mut competing => panic!("attempt writer bypassed the job lock: {result:?}"),
+    }
+
+    let attempt = JobTransitions::lock_attempt(&mut a, org, id)
+        .await
+        .unwrap()
+        .unwrap();
+    let acknowledged = JobTransitions::apply_attempt(
+        &mut a,
+        &attempt,
+        JobAttemptEvent::Acknowledge,
+        AttemptChange::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(acknowledged.state, "LAUNCHING");
+    a.commit().await.unwrap();
+    assert_eq!(competing.await.unwrap().state, "KILLED");
 }
 
 /// A verifier that reads the database through `pool`, like a real one would.
@@ -2090,36 +2161,89 @@ async fn a_database_verifier_works_on_one_connection() {
 
 #[tokio::test]
 #[ignore = "needs DATABASE_URL"]
-async fn submits_racing_renames_of_default_never_fail() {
+async fn completion_verdict_only_applies_to_its_job_snapshot() {
     let e = env(true).await;
-    for i in 0..10 {
-        let key = format!("race-{i}");
-        let body = submission(&key);
-        let submit = e.submit("res", &key, &body);
-        let rename = async {
-            let exps = e
-                .get(
-                    "res",
-                    &format!("/api/v1/projects/{}/experiments", e.project),
-                )
-                .await
-                .json();
-            let default = exps["items"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .find(|x| x["name"] == "default")
-                .cloned();
-            if let Some(d) = default {
-                let path = format!("/api/v1/experiments/{}", d["id"].as_str().unwrap());
-                let body = json!({"name": format!("renamed-{i}")});
-                let res = call(&e.srv, Method::PATCH, &path, "res", None, Some(&body)).await;
-                assert!(res.status == 200 || res.status == 409, "{}", res.text());
-            }
-        };
-        let (res, ()) = tokio::join!(submit, rename);
-        assert_eq!(res.status, 201, "round {i}: {}", res.text());
+    let org = e.org.as_uuid();
+    let first = allocating(&e, "first").await;
+    let second = allocating(&e, "second").await;
+    for id in [first.id, second.id] {
+        force_job(&e.db, id, "FINALIZING").await;
     }
+    let mut tx = e.db.db().begin().await.unwrap();
+    let first = JobTransitions::lock(&mut tx, org, first.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let second = JobTransitions::lock(&mut tx, org, second.id)
+        .await
+        .unwrap()
+        .unwrap();
+    tx.commit().await.unwrap();
+    let verdict = accepting_chains().verify(&first).await.unwrap();
+
+    let mut tx = e.db.db().begin().await.unwrap();
+    let other = JobTransitions::verify_completion(&mut tx, &second, verdict.clone()).await;
+    assert_eq!(other.unwrap_err().code(), "MRL-CONFLICT-170");
+    for field in ["state_version", "epoch"] {
+        let mut different = first.clone();
+        match field {
+            "state_version" => different.state_version += 1,
+            _ => different.epoch += 1,
+        }
+        let stale = JobTransitions::verify_completion(&mut tx, &different, verdict.clone()).await;
+        assert_eq!(stale.unwrap_err().code(), "MRL-CONFLICT-170", "{field}");
+    }
+    let done = JobTransitions::verify_completion(&mut tx, &first, verdict)
+        .await
+        .unwrap();
+    assert_eq!(done.state, "COMPLETED");
+    tx.commit().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn finding_the_default_experiment_blocks_a_rename_until_commit() {
+    use mrl_server::modules::runs::experiments::get_or_create;
+
+    let e = env(true).await;
+    let org = e.org.as_uuid();
+    let project = e.project.as_uuid();
+    assert_eq!(
+        e.submit("res", "default", &submission("first"))
+            .await
+            .status,
+        201
+    );
+    let mut a = e.db.db().begin().await.unwrap();
+    let default = get_or_create(&mut a, org, project, "default", "usr_res")
+        .await
+        .unwrap();
+    let blocker = backend_pid(&mut a).await;
+    let mut b = e.db.db().begin().await.unwrap();
+    let waiter = backend_pid(&mut b).await;
+    let mut rename = tokio::spawn(async move {
+        sqlx::query("UPDATE experiments SET name = 'renamed' WHERE id = $1")
+            .bind(default)
+            .execute(&mut *b)
+            .await
+            .unwrap();
+        b.commit().await.unwrap();
+    });
+    tokio::select! {
+        () = wait_for_blocker(&e.db, waiter, blocker) => {}
+        result = &mut rename => panic!("rename bypassed the submit transaction: {result:?}"),
+    }
+    a.commit().await.unwrap();
+    rename.await.unwrap();
+
+    let next = e.submit("res", "after-rename", &submission("second")).await;
+    assert_eq!(next.status, 201, "{}", next.text());
+    let next_id = next.json()["experiment_id"]
+        .as_str()
+        .unwrap()
+        .parse::<mrl_domain::ids::ExperimentId>()
+        .unwrap();
+    assert_ne!(next_id.as_uuid(), default);
 }
 
 #[tokio::test]

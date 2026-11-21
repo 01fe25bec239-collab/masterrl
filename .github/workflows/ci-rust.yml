@@ -22,7 +22,8 @@ jobs:
   rust:
     name: rust (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # Release builds on hosted macOS/Windows runners can pass 15 minutes as the workspace grows.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
