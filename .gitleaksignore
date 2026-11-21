@@ -3,3 +3,5 @@
 10766ef6bbd5183bbc2092b98a2a0acac85c6ffc:crates/mrl-server/src/modules/sync/crypto.rs:generic-api-key:1
 # P16 mrl-cli auth test used a fake token literal (later built at run time). No secret.
 55ce4190fc3a47e9e80970e73bed2b4211e735ab:crates/mrl-cli/src/auth/mod.rs:generic-api-key:563
+# P16 sync test used a fake Authorization header (later built at run time). No secret.
+259152a0f77ece44acb7084f720ee9473d14c01d:crates/mrl-server/src/modules/sync/mod.rs:curl-auth-header:1320
