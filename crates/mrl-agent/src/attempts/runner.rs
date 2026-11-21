@@ -402,7 +402,7 @@ impl Runner {
                     let _ = w.stop.send(StopMsg::Kill).await;
                 }
                 match early {
-                    Early::Failed(e) => Some(self.fail_early(e).await),
+                    Early::Failed(e) => Some(self.fail_early(e, &mut control).await),
                     Early::Detached => {
                         self.save();
                         None
@@ -414,7 +414,7 @@ impl Runner {
                             exit_code: -1,
                             failure: None,
                         };
-                        Some(self.finish_with(d).await)
+                        Some(self.finish_with(d, &mut control).await)
                     }
                     Early::Cancelled | Early::Fenced => {
                         let ev = ExitEvidence {
@@ -423,7 +423,7 @@ impl Runner {
                             agent_stopped: true,
                             ..ExitEvidence::default()
                         };
-                        Some(self.finish_with(decide(&ev)).await)
+                        Some(self.finish_with(decide(&ev), &mut control).await)
                     }
                 }
             }
@@ -431,10 +431,10 @@ impl Runner {
     }
 
     /// Re-attaches to live workers after an agent restart.
-    pub async fn readopt(mut self, control: mpsc::Receiver<Control>) -> Option<ExitDecision> {
+    pub async fn readopt(mut self, mut control: mpsc::Receiver<Control>) -> Option<ExitDecision> {
         self.gpu_uuids = self.lookup_gpus();
         if let Err(e) = self.start_server().await {
-            return Some(self.fail_early(e).await);
+            return Some(self.fail_early(e, &mut control).await);
         }
         for w in self.rec.workers.clone() {
             let handle = spawn_watch(w.role_id.clone(), w.identity.clone(), self.exits_tx.clone());
@@ -588,8 +588,15 @@ impl Runner {
         };
         let ev = AttemptEvent::Status(status);
         if decision.is_some() {
-            // The final status: bounded, the saved outcome is reported again on reconnect.
-            let _ = tokio::time::timeout(Duration::from_secs(10), self.emit(ev)).await;
+            // An outage can fill the queue until after the attempt's deadline. Keep the
+            // terminal status waiting for room without holding up runner cleanup.
+            let (receipt, _) = oneshot::channel();
+            let envelope = super::Envelope { event: ev, receipt };
+            if let Err(mpsc::error::TrySendError::Full(envelope)) =
+                self.sh.events.try_send(envelope)
+            {
+                super::post(&self.sh.events, vec![(envelope.event, None)]);
+            }
         } else {
             let _ = self.emit(ev).await;
         }
@@ -909,14 +916,18 @@ impl Runner {
         Ok(())
     }
 
-    async fn fail_early(&mut self, e: AttemptError) -> ExitDecision {
+    async fn fail_early(
+        &mut self,
+        e: AttemptError,
+        control: &mut mpsc::Receiver<Control>,
+    ) -> ExitDecision {
         let decision = ExitDecision {
             phase: AttemptPhase::Exited as i32,
             exit_kind: mrl_proto::worker::v1::ExitKind::Failed as i32,
             exit_code: -1,
             failure: Some(e.to_failure()),
         };
-        self.finish_with(decision).await
+        self.finish_with(decision, control).await
     }
 
     async fn main_loop(&mut self, mut control: mpsc::Receiver<Control>) -> Option<ExitDecision> {
@@ -978,7 +989,7 @@ impl Runner {
         while let Ok(inb) = self.inbound_rx.try_recv() {
             self.on_inbound(inb).await;
         }
-        Some(self.finish().await)
+        Some(self.finish(&mut control).await)
     }
 
     async fn stop_all(&mut self) {
@@ -996,6 +1007,8 @@ impl Runner {
     }
 
     async fn detach(&mut self) {
+        // The next runner resumes these uploads from the saved record.
+        self.abort_transfers().await;
         for w in self.workers.values() {
             let _ = w.stop.send(StopMsg::Detach).await;
         }
@@ -1963,7 +1976,7 @@ impl Runner {
         self.workers.is_empty()
     }
 
-    async fn finish(&mut self) -> ExitDecision {
+    async fn finish(&mut self, control: &mut mpsc::Receiver<Control>) -> ExitDecision {
         let p = self.primary_exit.take();
         let ev = ExitEvidence {
             report: self.report.clone(),
@@ -1981,7 +1994,7 @@ impl Runner {
             readopted: p.as_ref().is_some_and(|p| p.readopted),
             agent_stopped: self.agent_stopped,
         };
-        self.finish_with(decide(&ev)).await
+        self.finish_with(decide(&ev), control).await
     }
 
     async fn abort_transfers(&mut self) {
@@ -1996,11 +2009,16 @@ impl Runner {
         }
     }
 
-    async fn finish_with(&mut self, decision: ExitDecision) -> ExitDecision {
+    async fn finish_with(
+        &mut self,
+        decision: ExitDecision,
+        control: &mut mpsc::Receiver<Control>,
+    ) -> ExitDecision {
         // Uploads still running get to finish (not after a self-fence), so their commands get
         // their real result; every command still without one is then answered as failed.
         let drain_limit = Instant::now() + UPLOAD_DRAIN;
         let until = drain_limit.min(self.lease.unwrap_or(drain_limit));
+        let mut detached = None;
         while !(self.in_flight.is_empty() && self.adhoc.is_empty()) && !self.self_fenced {
             for (_, done) in std::mem::take(&mut self.unsaved) {
                 self.on_upload(done).await;
@@ -2008,9 +2026,16 @@ impl Runner {
             if self.in_flight.is_empty() && self.adhoc.is_empty() {
                 break;
             }
-            match tokio::time::timeout_at(until, self.uploads_rx.recv()).await {
-                Ok(Some(u)) => self.on_upload(u).await,
-                _ => break,
+            tokio::select! {
+                () = tokio::time::sleep_until(until) => break,
+                Some(command) = control.recv() => {
+                    if let Control::Detach(done) = command {
+                        self.stop_passed = Some(Instant::now());
+                        detached = Some(done);
+                        break;
+                    }
+                }
+                Some(upload) = self.uploads_rx.recv() => self.on_upload(upload).await,
             }
         }
         // Transfers still running are stopped and joined before anything is reported or
@@ -2049,6 +2074,9 @@ impl Runner {
         self.rec.exit = Some(decision.clone());
         self.save();
         self.status(Some(&decision)).await;
+        if let Some(done) = detached {
+            let _ = done.send(());
+        }
         let report =
             crate::janitor::release(&self.sh.ctx, &self.sh.envs, &self.rec, &self.gpu_uuids).await;
         let line = serde_json::to_string(&report).unwrap_or_default();
