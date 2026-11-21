@@ -2512,6 +2512,16 @@ mod session_wiring {
         std::fs::write(&settings, toml::to_string(&s.agent.ctx.config).unwrap()).unwrap();
         let config = settings.to_str().unwrap();
         sh(&[&bin, "--config", config, "service", "install"]);
+        // Removed again even when an assert fails, so a failed run leaves no service behind.
+        struct Installed(String, String);
+        impl Drop for Installed {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new(&self.0)
+                    .args(["--config", &self.1, "service", "uninstall"])
+                    .status();
+            }
+        }
+        let _installed = Installed(bin.clone(), config.to_owned());
         let unit = sh(&["systemctl", "--user", "cat", "mrl-agent.service"]);
         assert!(unit.contains("KillMode=process"), "{unit}");
 
@@ -2608,7 +2618,6 @@ mod session_wiring {
             mrl_proto::worker::v1::ExitKind::Cancelled as i32,
             "{ended:?}"
         );
-        sh(&[&bin, "--config", config, "service", "uninstall"]);
     }
 
     /// Every lease grant renews the attempt's lease, counted from the heartbeat it answers.
