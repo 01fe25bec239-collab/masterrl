@@ -50,6 +50,8 @@ pub const KEEP: usize = 5;
 pub const WRONG_PASSPHRASE: &str = "MRL-VAL-160";
 /// Code: setup sync is not set up on this install.
 pub const NOT_SET_UP: &str = "MRL-STATE-160";
+/// Code: setup sync is personal, so a team (shared) core refuses it.
+pub const ON_TEAM_CORE: &str = "MRL-STATE-161";
 /// Code: there is no saved copy to restore.
 pub const NOTHING_SAVED: &str = "MRL-RES-160";
 /// Shortest passphrase.
@@ -156,17 +158,48 @@ const SECRET_PREFIXES: [&str; 6] = [
     "github_pat_",
 ];
 
-/// True for text shaped like a credential: a known token prefix, an `Authorization` value
+/// True for text that holds something shaped like a credential, anywhere in it: a word with
+/// a known token prefix (`hf_…`, `mrl_pat_…`), a PEM block, an `Authorization` value
 /// (`Bearer …`, `Basic …`), or an address with a user name or password in it.
 fn secret_shaped(s: &str) -> bool {
     let t = s.trim_start();
     let lower = t.to_ascii_lowercase();
-    SECRET_PREFIXES.iter().any(|p| t.starts_with(p))
+    let token_word = t
+        .split(|c: char| !(c.is_ascii_alphanumeric() || "_-.".contains(c)))
+        // Real tokens run long after the prefix; names like `hf_token_ref` do not.
+        .any(|w| {
+            SECRET_PREFIXES
+                .iter()
+                .any(|p| w.starts_with(p) && w.len() >= p.len() + 12 && !w.ends_with("_ref"))
+        });
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    let bearer = words
+        .windows(2)
+        .any(|w| w[0] == "bearer" && w[1].len() >= 8);
+    token_word
+        || t.contains("-----BEGIN")
+        || bearer
         || ["bearer ", "basic ", "token ", "digest "]
             .iter()
             .any(|p| lower.starts_with(p))
-        || reqwest::Url::parse(t).is_ok_and(|u| !u.username().is_empty() || u.password().is_some())
+        || t.split_whitespace().any(|w| {
+            reqwest::Url::parse(w).is_ok_and(|u| !u.username().is_empty() || u.password().is_some())
+        })
         || (t.contains('@') && t.contains(':') && t.contains("//"))
+}
+
+/// A JSON pointer segment for key `k` that never repeats a credential: keys shaped like one
+/// (or unusual ones) show as `*`.
+fn safe_segment(k: &str) -> String {
+    let plain = (1..=64).contains(&k.len())
+        && k.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-.".contains(&b))
+        && !secret_shaped(k);
+    if plain {
+        k.to_owned()
+    } else {
+        "*".to_owned()
+    }
 }
 
 /// The JSON pointer of the first thing in `v` that looks like a secret: a key named like one
@@ -174,11 +207,12 @@ fn secret_shaped(s: &str) -> bool {
 pub fn find_secret(v: &Value, path: &str) -> Option<String> {
     match v {
         Value::Object(m) => m.iter().find_map(|(k, v)| {
-            let p = format!("{path}/{k}");
+            let p = format!("{path}/{}", safe_segment(k));
             let lower = k.to_ascii_lowercase();
             let named = SECRET_WORDS.iter().any(|w| lower.contains(w)) && !lower.ends_with("_ref");
-            // Any non-empty value under a secret-like name is refused, whatever its type.
-            if named && !v.is_null() {
+            // A key shaped like a credential is refused; so is any non-empty value under a
+            // secret-like name, whatever its type.
+            if secret_shaped(k) || (named && !v.is_null()) {
                 Some(p)
             } else {
                 find_secret(v, &p)
@@ -392,6 +426,7 @@ async fn push_copy(
     sb: &Supabase,
     access: &Access,
     blob: &Envelope,
+    op: uuid::Uuid,
 ) -> Result<PushAnswer, SupabaseError> {
     supabase::json(
         sb.request(
@@ -399,19 +434,24 @@ async fn push_copy(
             &format!("/rest/v1/rpc/{PUSH_FUNCTION}"),
         )
         .bearer_auth(access.token.expose())
-        .json(&serde_json::json!({ "p_blob": blob })),
+        .json(&serde_json::json!({ "p_blob": blob, "p_op": op.to_string() })),
     )
     .await
 }
 
+/// A sync-service failure as a fixed message: the service's own text (which may repeat what
+/// was sent) goes only to the log as its status and code.
 fn remote_error(e: SupabaseError) -> Fail {
-    match e {
-        SupabaseError::Offline(_) => Coded::new(
+    let offline = || {
+        Coded::new(
             crate::modules::auth::supabase::OFFLINE,
             StatusCode::SERVICE_UNAVAILABLE,
-            format!("{e}."),
+            "The sync service did not answer; try again in a moment.",
         )
-        .into(),
+        .into()
+    };
+    match e {
+        SupabaseError::Offline(_) => offline(),
         SupabaseError::Refused {
             status: 401 | 403, ..
         } => Coded::new(
@@ -420,9 +460,19 @@ fn remote_error(e: SupabaseError) -> Fail {
             "The sign-in service refused this session; sign in again.",
         )
         .into(),
-        other => ApiError::new(
+        // A 5xx may have saved the copy before failing: the client retries with its op_id.
+        SupabaseError::Refused { status, .. } if status >= 500 => offline(),
+        SupabaseError::Refused { status, code, .. } => {
+            tracing::warn!(status, code = %code, "the sync service refused a request");
+            ApiError::new(
+                ErrorCode::Unavailable,
+                format!("The sync service refused the request (HTTP {status})."),
+            )
+            .into()
+        }
+        _ => ApiError::new(
             ErrorCode::Unavailable,
-            format!("The saved setup could not be reached: {other}."),
+            "The sync service sent an answer the app could not read.",
         )
         .into(),
     }
@@ -493,7 +543,7 @@ impl ServerModule for SyncModule {
 #[derive(OpenApi)]
 #[openapi(
     paths(get_profile, put_profile, setup, push, restore, status),
-    components(schemas(SetupProfile, Machine, Transport, TeamMembership, SetupRequest, SetupDone, Pushed, RestoreRequest, Restored, SyncStatus, CopyInfo)),
+    components(schemas(SetupProfile, Machine, Transport, TeamMembership, SetupRequest, SetupDone, PushRequest, Pushed, RestoreRequest, Restored, SyncStatus, CopyInfo)),
     tags((name = "sync", description = "Encrypted setup sync."))
 )]
 struct SyncDoc;
@@ -503,11 +553,17 @@ struct Caller {
     secrets: Arc<dyn SecretStore>,
 }
 
-async fn caller(
-    state: &AppState,
-    shared: &Shared,
-    ctx: &RequestContext,
-) -> Result<Caller, ApiError> {
+async fn caller(state: &AppState, shared: &Shared, ctx: &RequestContext) -> Result<Caller, Fail> {
+    // Setup sync is per device: the member's own (solo) core holds their sign-in and keys.
+    // A shared team core refuses it before any key material is made.
+    if state.config.server.mode == Mode::Team {
+        return Err(Coded::new(
+            ON_TEAM_CORE,
+            StatusCode::CONFLICT,
+            "Setup sync runs in the MasterRL app on your own computer, not on a team server.",
+        )
+        .into());
+    }
     state
         .authorize(ctx, "auth.session", &Resource::kind("setup_profile"))
         .await?;
@@ -590,12 +646,17 @@ async fn load_profile(db: &Db, user: UserId) -> Result<SetupProfile, ApiError> {
             .map_err(|e| db_error(e.into()))?;
     match raw {
         None => Ok(SetupProfile::default()),
-        Some(v) => read_saved(v).map_err(|e| {
-            ApiError::new(
-                ErrorCode::Internal,
-                format!("the saved setup could not be read: {e}"),
-            )
-        }),
+        Some(v) => {
+            let profile = read_saved(v).map_err(|_| {
+                ApiError::new(
+                    ErrorCode::Internal,
+                    "The saved setup could not be read; save it again with PUT /sync/profile.",
+                )
+            })?;
+            // A profile saved under older rules is checked again before it is shown or pushed.
+            check(&profile)?;
+            Ok(profile)
+        }
     }
 }
 
@@ -615,21 +676,39 @@ async fn put_profile(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
     ctx: RequestContext,
-    Json(profile): Json<SetupProfile>,
+    crate::modules::auth::problem::Body(profile): crate::modules::auth::problem::Body<SetupProfile>,
 ) -> Result<Json<SetupProfile>, Fail> {
     let c = caller(&state, &shared, &ctx).await?;
     check(&profile)?;
     let value = serde_json::to_value(&profile)
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
+    let event = audit::event(
+        state.seams.clock.now(),
+        &ctx.principal.id,
+        ctx.org.as_deref(),
+        "auth.session",
+        &c.user.to_string(),
+        AuditOutcome::Success,
+        &ctx.trace_id,
+    );
+    let mut tx = shared.db.begin().await.map_err(db_error)?;
     sqlx::query(
         "INSERT INTO setup_profiles (user_id, profile) VALUES ($1, $2) \
          ON CONFLICT (user_id) DO UPDATE SET profile = EXCLUDED.profile, updated_at = now()",
     )
     .bind(c.user.as_uuid())
     .bind(value)
-    .execute(shared.db.pool())
+    .execute(&mut *tx)
     .await
     .map_err(|e| db_error(e.into()))?;
+    audit::write(
+        &mut tx,
+        &event,
+        &serde_json::json!({ "step": "profile_saved" }),
+    )
+    .await
+    .map_err(db_error)?;
+    commit(tx).await?;
     Ok(Json(profile))
 }
 
@@ -661,7 +740,7 @@ async fn setup(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
     crate::modules::auth::Caller(ctx): crate::modules::auth::Caller,
-    Json(req): Json<SetupRequest>,
+    crate::modules::auth::problem::Body(req): crate::modules::auth::problem::Body<SetupRequest>,
 ) -> Result<Json<SetupDone>, Fail> {
     let c = caller(&state, &shared, &ctx).await?;
     if req.passphrase.chars().count() < MIN_PASSPHRASE {
@@ -707,7 +786,15 @@ async fn setup(
         commit(tx).await
     }
     .await;
-    settle_key(c.secrets.as_ref(), committed, &staged, previous).await?;
+    settle_key(
+        &shared.db,
+        c.secrets.as_ref(),
+        c.user,
+        committed,
+        &staged,
+        previous,
+    )
+    .await?;
     Ok(Json(SetupDone {
         recovery_key: crypto::recovery_key(&key),
     }))
@@ -756,8 +843,15 @@ async fn stage_key(
 
 /// After the transaction that names `staged`: on success the previous key goes, on failure
 /// the staged one does, so the active key always matches the stored KDF settings.
-async fn settle_key(
+/// Finishes a key change after its transaction: on success the previous key goes; on a
+/// failure the staged key goes, but only once the database confirms it is not the active
+/// one. A commit can succeed even when its reply is lost, so an error alone proves nothing;
+/// when the database cannot be asked, the staged key is kept (an unused key is harmless, a
+/// deleted active key loses sync).
+pub async fn settle_key(
+    db: &Db,
     secrets: &dyn SecretStore,
+    user: UserId,
     committed: Result<(), ApiError>,
     staged: &str,
     previous: Option<String>,
@@ -767,38 +861,99 @@ async fn settle_key(
             tracing::warn!(error = %e, "could not delete an unused sync key from the keychain");
         }
     };
-    match committed {
-        Ok(()) => {
-            if let Some(old) = previous.filter(|o| o != staged) {
-                drop_quietly(old).await;
-            }
+    let drop_previous = |previous: Option<String>| async move {
+        if let Some(old) = previous.filter(|o| o != staged) {
+            drop_quietly(old).await;
+        }
+    };
+    let Err(e) = committed else {
+        drop_previous(previous).await;
+        return Ok(());
+    };
+    match active_key(db, user).await {
+        Ok(Some((active, _))) if active == staged => {
+            tracing::info!("the key change was saved although its reply was lost");
+            drop_previous(previous).await;
             Ok(())
         }
-        Err(e) => {
+        Ok(_) => {
             drop_quietly(staged.to_owned()).await;
             Err(e)
         }
+        Err(_) => Err(e),
     }
 }
 
-#[utoipa::path(post, path = "/sync/push", tag = "sync",
+/// The active key and its KDF settings. Read again when a setup or restore retired the key
+/// between reading its name and reading the keychain, so a push never sees sync as off
+/// in the middle of a rotation.
+async fn current_key(
+    db: &Db,
+    secrets: &dyn SecretStore,
+    user: UserId,
+) -> Result<Option<([u8; crypto::KEY_LEN], Value)>, ApiError> {
+    for _ in 0..3 {
+        let Some((key_ref, kdf)) = active_key(db, user).await? else {
+            return Ok(None);
+        };
+        if let Some(k) = secrets
+            .get(&key_ref)
+            .await?
+            .and_then(|k| crypto::key_from_hex(k.expose()))
+        {
+            return Ok(Some((k, kdf)));
+        }
+        if active_key(db, user).await?.map(|(r, _)| r).as_deref() == Some(key_ref.as_str()) {
+            return Ok(None);
+        }
+    }
+    Ok(None)
+}
+
+/// `POST /sync/push` body (optional).
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct PushRequest {
+    /// A UUID the client keeps for one push and sends again on every retry. The saved
+    /// history gains one copy per operation, however often it is retried.
+    #[serde(default)]
+    pub op_id: Option<String>,
+}
+
+#[utoipa::path(post, path = "/sync/push", tag = "sync", request_body(content = Option<PushRequest>, description = "Optional: `{\"op_id\": \"<uuid>\"}`, the same on retries."),
     responses((status = 200, body = Pushed), (status = 401, body = crate::error::Problem), (status = 503, body = crate::error::Problem)))]
 async fn push(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
     ctx: RequestContext,
+    body: axum::body::Bytes,
 ) -> Result<Json<Pushed>, Fail> {
     let c = caller(&state, &shared, &ctx).await?;
-    let sb = online(&shared)?;
-    let Some((key_ref, kdf)) = active_key(&shared.db, c.user).await? else {
-        return Err(not_set_up());
+    let req: PushRequest = if body.iter().all(u8::is_ascii_whitespace) {
+        PushRequest::default()
+    } else {
+        serde_json::from_slice(&body).map_err(|_| {
+            Fail::from(ApiError::validation(vec![FieldError::new(
+                "/op_id",
+                ErrorCode::FieldValue,
+                "the body may hold only op_id, a UUID",
+                "Send {} or {\"op_id\": \"<uuid>\"}.",
+            )]))
+        })?
     };
-    let key = c
-        .secrets
-        .get(&key_ref)
-        .await?
-        .and_then(|k| crypto::key_from_hex(k.expose()));
-    let Some(key) = key else {
+    let op = match req.op_id.as_deref() {
+        Some(o) => uuid::Uuid::parse_str(o).map_err(|_| {
+            Fail::from(ApiError::validation(vec![FieldError::new(
+                "/op_id",
+                ErrorCode::FieldValue,
+                "op_id must be a UUID",
+                "Make one UUID per push and send it again on retries.",
+            )]))
+        })?,
+        None => uuid::Uuid::now_v7(),
+    };
+    let sb = online(&shared)?;
+    let Some((key, kdf)) = current_key(&shared.db, c.secrets.as_ref(), c.user).await? else {
         return Err(not_set_up());
     };
     let kdf: KdfParams = serde_json::from_value(kdf)
@@ -815,7 +970,9 @@ async fn push(
         kdf,
         sealed: STANDARD.encode(sealed),
     };
-    let pushed = push_copy(sb, &access, &blob).await.map_err(remote_error)?;
+    let pushed = push_copy(sb, &access, &blob, op)
+        .await
+        .map_err(remote_error)?;
     let (version, now) = (pushed.version, state.seams.clock.now());
     let event = audit::event(
         now,
@@ -828,7 +985,9 @@ async fn push(
     );
     let mut tx = shared.db.begin().await.map_err(db_error)?;
     sqlx::query(
-        "UPDATE sync_state SET last_push_at = now(), last_pushed_version = $2 WHERE user_id = $1",
+        // Overlapping pushes may answer out of order: never move back to an older copy.
+        "UPDATE sync_state SET last_push_at = GREATEST(last_push_at, now()), \
+           last_pushed_version = GREATEST(last_pushed_version, $2) WHERE user_id = $1",
     )
     .bind(c.user.as_uuid())
     .bind(version)
@@ -892,7 +1051,7 @@ async fn restore(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
     crate::modules::auth::Caller(ctx): crate::modules::auth::Caller,
-    Json(req): Json<RestoreRequest>,
+    crate::modules::auth::problem::Body(req): crate::modules::auth::problem::Body<RestoreRequest>,
 ) -> Result<Json<Restored>, Fail> {
     let c = caller(&state, &shared, &ctx).await?;
     let sb = online(&shared)?;
@@ -940,10 +1099,10 @@ async fn restore(
     let plain = crypto::open(&key, &aad(access.user.id), &sealed).map_err(|_| wrong_key())?;
     let profile = serde_json::from_slice(&plain)
         .and_then(read_saved)
-        .map_err(|e| {
+        .map_err(|_| {
             ApiError::new(
                 ErrorCode::FieldValue,
-                format!("The saved setup could not be read: {e}."),
+                "The saved copy could not be read as a setup profile.",
             )
         })?;
     check(&profile)?;
@@ -1010,7 +1169,15 @@ async fn restore(
         commit(tx).await
     }
     .await;
-    settle_key(c.secrets.as_ref(), committed, &staged, previous).await?;
+    settle_key(
+        &shared.db,
+        c.secrets.as_ref(),
+        c.user,
+        committed,
+        &staged,
+        previous,
+    )
+    .await?;
     Ok(Json(Restored {
         version: copy.version,
         at: copy.at,
@@ -1063,10 +1230,9 @@ async fn status(
             .fetch_optional(shared.db.pool())
             .await
             .map_err(|e| db_error(e.into()))?;
-    let set_up = match active_key(&shared.db, c.user).await? {
-        Some((key_ref, _)) => c.secrets.get(&key_ref).await?.is_some(),
-        None => false,
-    };
+    let set_up = current_key(&shared.db, c.secrets.as_ref(), c.user)
+        .await?
+        .is_some();
     let si = sign_in(&state, &shared);
     let sign_in_state = si.state().await?;
     let (copies, copies_unavailable) = match (&shared.supabase, sign_in_state) {
@@ -1122,7 +1288,10 @@ mod tests {
                 serde_json::json!({"ui": {"note": "-----BEGIN OPENSSH PRIVATE KEY-----"}}),
                 "/ui/note",
             ),
-            (serde_json::json!({"m": [{"o": "mrl_pat_abc"}]}), "/m/0/o"),
+            (
+                serde_json::json!({"m": [{"o": "mrl_pat_abcdefghijklmnop"}]}),
+                "/m/0/o",
+            ),
             (
                 serde_json::json!({"ui": {"header": "Bearer abc.def"}}),
                 "/ui/header",
@@ -1142,6 +1311,18 @@ mod tests {
             (
                 serde_json::json!({"ui": {"password": ["x"]}}),
                 "/ui/password",
+            ),
+            (
+                serde_json::json!({"preferences": {"note": "my hub token is hf_AbCdEf0123456789xyzQW, keep it"}}),
+                "/preferences/note",
+            ),
+            (
+                serde_json::json!({"ui": {"cmd": "curl -H 'Authorization: Bearer eyJabc.def.ghi' x"}}),
+                "/ui/cmd",
+            ),
+            (
+                serde_json::json!({"ui": {"hf_AbCdEf0123456789xyzQW": true}}),
+                "/ui/*",
             ),
         ] {
             assert_eq!(find_secret(&bad, "").as_deref(), Some(path));

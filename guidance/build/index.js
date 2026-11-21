@@ -2513,7 +2513,8 @@ export const catalog = deepFreeze({
         "steps": [
           "Start the app again and choose Allow (or Always Allow) when the keychain asks.",
           "On a development machine, set `backend = \"file\"` under `[keychain]` in the settings file. Secrets then stay in an encrypted file.",
-          "Secrets do not move between the two places, so sign in again after the change."
+          "After that switch, allow one more keychain read. The app copies the database password into the file then.",
+          "Sign-in and sync keys do not move, so sign in again after the change."
         ]
       }
     },
@@ -3149,6 +3150,17 @@ export const catalog = deepFreeze({
         "steps": [
           "Run `mrl sync setup` or turn on sync in Settings.",
           "Save the recovery key it shows in a safe place."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STATE-161",
+      "title": "Setup sync runs on your own computer.",
+      "why": "A team server is shared, so it does not hold your personal sign-in or sync keys.",
+      "what_to_do": {
+        "steps": [
+          "Turn on setup sync in the MasterRL app on your own computer.",
+          "Use the team server for team projects only."
         ]
       }
     },

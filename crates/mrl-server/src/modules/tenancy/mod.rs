@@ -164,6 +164,14 @@ pub async fn link_local_owner(
 
 /// The user for a Supabase account (team mode), made on first sight with no roles.
 pub async fn upsert_supabase_user(db: &Db, profile: &Profile) -> Result<UserId, DbError> {
+    let mut tx = db.begin().await?;
+    let user = upsert_supabase_user_in(&mut tx, profile).await?;
+    tx.commit().await.map_err(DbError::from)?;
+    Ok(user)
+}
+
+/// [`upsert_supabase_user`] inside `tx`, so it commits with the sign-in's audit row.
+pub async fn upsert_supabase_user_in(tx: &mut Tx, profile: &Profile) -> Result<UserId, DbError> {
     let id: Uuid = sqlx::query_scalar(
         "INSERT INTO users (id, supabase_user_id, email, display_name, avatar_url) \
          VALUES ($1, $2, $3, $4, $5) \
@@ -176,7 +184,7 @@ pub async fn upsert_supabase_user(db: &Db, profile: &Profile) -> Result<UserId, 
     .bind(&profile.email)
     .bind(&profile.display_name)
     .bind(&profile.avatar_url)
-    .fetch_one(db.pool())
+    .fetch_one(&mut **tx)
     .await?;
     Ok(UserId::from_uuid(id))
 }
@@ -352,11 +360,14 @@ impl Rbac {
         action: Action,
         resource: &Resource,
     ) -> Result<Decision, DbError> {
-        let named_org = resource
-            .org
-            .as_deref()
-            .or(ctx.org.as_deref())
-            .and_then(|o| OrgId::from_str(o).ok());
+        // A named org that is not an org id names nothing: it looks missing.
+        let named_org = match resource.org.as_deref().or(ctx.org.as_deref()) {
+            None => None,
+            Some(o) => match OrgId::from_str(o) {
+                Ok(o) => Some(o),
+                Err(_) => return Ok(Decision::Hide),
+            },
+        };
         // A named project must exist and sit in the named org, before any Allow path (the
         // solo owner's included); otherwise it looks missing, like another org's.
         let (project, project_org) = match resource.project.as_deref().or(ctx.project.as_deref()) {
@@ -365,11 +376,12 @@ impl Rbac {
                 let Ok(p) = ProjectId::from_str(raw) else {
                     return Ok(Decision::Hide);
                 };
-                let org: Option<Uuid> =
-                    sqlx::query_scalar("SELECT org_id FROM projects WHERE id = $1")
-                        .bind(p.as_uuid())
-                        .fetch_optional(self.db.pool())
-                        .await?;
+                let org: Option<Uuid> = sqlx::query_scalar(
+                    "SELECT org_id FROM projects WHERE id = $1 AND deleted_at IS NULL",
+                )
+                .bind(p.as_uuid())
+                .fetch_optional(self.db.pool())
+                .await?;
                 let Some(org) = org.map(OrgId::from_uuid) else {
                     return Ok(Decision::Hide);
                 };
@@ -465,7 +477,21 @@ impl Rbac {
                     .and_then(|w| WorkspaceId::from_str(w).ok())
             })
             .flatten();
-        let held = roles(&self.db, user, org, project, workspace).await?;
+        // Actions on your own account (like your tokens) count every role you hold in the
+        // org, whatever its scope: a researcher on one project still manages their tokens.
+        let held = if resource.kind == "account" {
+            let names: Vec<String> = sqlx::query_scalar(
+                "SELECT DISTINCT role FROM role_bindings \
+                 WHERE principal_kind = 'user' AND principal_id = $1 AND org_id = $2",
+            )
+            .bind(user.as_uuid())
+            .bind(org.as_uuid())
+            .fetch_all(self.db.pool())
+            .await?;
+            names.iter().filter_map(|n| role_from_str(n)).collect()
+        } else {
+            roles(&self.db, user, org, project, workspace).await?
+        };
         // No role over this resource (another org, or a project they are not on): 404.
         if held.is_empty() {
             return Ok(Decision::Hide);

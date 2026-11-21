@@ -561,6 +561,20 @@ async fn every_route_answers_by_role_in_team_mode() {
             assert!(listed, "{method} {path} has no row in the role table");
         }
     }
+    // What an allowed call answers. Sync is personal, so a team core refuses it (409
+    // MRL-STATE-161); taken slugs are 409; the token id below does not exist (404).
+    let expected = |method: &Method, path: &str| -> &'static [u16] {
+        match (method.as_str(), path) {
+            (_, p) if p.starts_with("/api/v1/sync/") => &[409],
+            ("POST", "/api/v1/auth/session") | ("POST", "/api/v1/auth/tokens") => &[201],
+            ("DELETE", "/api/v1/auth/session") => &[204],
+            ("DELETE", p) if p.starts_with("/api/v1/auth/tokens/") => &[404],
+            ("POST", p) if p.ends_with("/workspaces") => &[409],
+            ("POST", p) if p.ends_with("/projects") => &[201, 409],
+            ("GET", _) => &[200],
+            _ => &[],
+        }
+    };
     for role in Role::ALL.into_iter().filter(|r| r.is_human()) {
         let person = MockUser::new(&format!("{role}@example.com"), role.as_str());
         let jwt = sb.access_token(&person, 600);
@@ -601,13 +615,24 @@ async fn every_route_answers_by_role_in_team_mode() {
             let refused = r.status == 403 && r.json()["code"] == "MRL-PERM-001";
             // Creating orgs needs the platform grant, which no org role gives.
             let platform = *method == Method::POST && path == "/api/v1/orgs";
+            let want_refused = platform || !allowed(role, *action);
             assert_eq!(
                 refused,
-                platform || !allowed(role, *action),
+                want_refused,
                 "{role}: {method} {path} answered {} {}",
                 r.status,
                 r.text()
             );
+            // Allowed routes do their work (or answer the documented outcome), not just
+            // "anything but 403".
+            if !want_refused {
+                assert!(
+                    expected(method, path).contains(&r.status),
+                    "{role}: {method} {path} answered {} {}",
+                    r.status,
+                    r.text()
+                );
+            }
         }
         let out = core
             .call(
@@ -618,7 +643,129 @@ async fn every_route_answers_by_role_in_team_mode() {
             )
             .await;
         assert_eq!(out.status == 403, !allowed(role, Action::AuthSession));
+        if allowed(role, Action::AuthSession) {
+            assert_eq!(out.status, 204, "{role}: logout answered {}", out.text());
+        }
     }
+    let token = |jwt: String, body: Value| {
+        let core = &core;
+        async move {
+            let r = core
+                .call(
+                    Method::POST,
+                    "/api/v1/auth/tokens",
+                    &Auth::Bearer(jwt),
+                    Some(body),
+                )
+                .await;
+            assert_eq!(r.status, 201, "{}", r.text());
+            r.json()["token"].as_str().unwrap().to_owned()
+        }
+    };
+    // A `runs:read` token of an owner: everything outside that scope is refused.
+    let (owner_jwt, owner) = member(&core, &sb, "pat-owner").await;
+    grant(&core, org, owner, Role::Owner, Scope::Org).await;
+    let scopes = vec!["runs:read".to_owned()];
+    let narrow = token(owner_jwt, json!({"name": "narrow", "scopes": scopes})).await;
+    for (method, path, action, body) in &routes {
+        if *method == Method::POST && path == "/api/v1/auth/logout" {
+            continue;
+        }
+        let r = core
+            .call(
+                method.clone(),
+                path,
+                &Auth::Bearer(narrow.clone()),
+                body.clone(),
+            )
+            .await;
+        if path.starts_with("/api/v1/sync/") {
+            assert_eq!(r.status, 409, "narrow token: {method} {path}: {}", r.text());
+            continue;
+        }
+        let refused = r.status == 403 && r.json()["code"] == "MRL-PERM-001";
+        let platform = *method == Method::POST && path == "/api/v1/orgs";
+        let want = platform
+            || !mrl_server::modules::auth::credentials::scopes_allow(&scopes, *action)
+            || !allowed(Role::Owner, *action);
+        assert_eq!(
+            refused,
+            want,
+            "narrow token: {method} {path} answered {} {}",
+            r.status,
+            r.text()
+        );
+    }
+    // A researcher bound to one project, and a token bound to that project.
+    let prj = ProjectId::new();
+    core.db
+        .seed(&format!(
+            "INSERT INTO projects (id, org_id, workspace_id, slug, name) VALUES ('{}', '{}', '{}', 'one', 'One');",
+            prj.as_uuid(),
+            org.as_uuid(),
+            ws.as_uuid()
+        ))
+        .await;
+    let (rjwt, researcher) = member(&core, &sb, "pat-researcher").await;
+    grant(
+        &core,
+        org,
+        researcher,
+        Role::Researcher,
+        Scope::Project(prj),
+    )
+    .await;
+    let own = core
+        .call(
+            Method::GET,
+            "/api/v1/auth/tokens",
+            &Auth::Bearer(rjwt.clone()),
+            None,
+        )
+        .await;
+    assert_eq!(
+        own.status,
+        200,
+        "own tokens, with only a project role: {}",
+        own.text()
+    );
+    let bound = token(
+        rjwt,
+        json!({"name": "one", "scopes": ["*"], "project_id": prj.to_string()}),
+    )
+    .await;
+    for (method, path, want) in [
+        (Method::GET, "/api/v1/auth/me".to_owned(), 200),
+        (Method::GET, "/api/v1/auth/tokens".to_owned(), 200),
+        (Method::GET, "/api/v1/orgs".to_owned(), 403),
+        (Method::GET, "/api/v1/audit".to_owned(), 403),
+        (Method::GET, format!("/api/v1/orgs/{org}/workspaces"), 403),
+        (
+            Method::POST,
+            format!("/api/v1/workspaces/{ws}/projects"),
+            403,
+        ),
+    ] {
+        let body = (method == Method::POST).then(|| json!({"slug": "other", "name": "Other"}));
+        let r = core
+            .call(method.clone(), &path, &Auth::Bearer(bound.clone()), body)
+            .await;
+        assert_eq!(
+            r.status,
+            want,
+            "project token: {method} {path}: {}",
+            r.text()
+        );
+    }
+    let child = core
+        .call(
+            Method::POST,
+            "/api/v1/auth/tokens",
+            &Auth::Bearer(bound),
+            Some(json!({"name": "child", "scopes": ["runs:read"]})),
+        )
+        .await;
+    assert_eq!(child.status, 201, "{}", child.text());
     core.stop().await;
 }
 
@@ -1142,6 +1289,41 @@ async fn secrets_never_reach_the_database_logs_or_sync_payload() {
         )
         .await;
     assert_eq!(refused.status, 422, "a secret-shaped value is refused");
+    assert!(!refused.text().contains(canary));
+    // Bodies the API cannot take are refused without repeating them (field names, values,
+    // broken JSON), in the answer or the log.
+    let mut unknown = p.clone();
+    unknown[canary] = json!(1);
+    let raw_bodies = [
+        unknown.to_string(),
+        json!({"passphrase": 7, "x": canary}).to_string(),
+        format!(r#"{{"passphrase": "{canary}"#),
+    ];
+    for (path, body) in [
+        ("/api/v1/sync/profile", &raw_bodies[0]),
+        ("/api/v1/sync/setup", &raw_bodies[1]),
+        ("/api/v1/sync/restore", &raw_bodies[2]),
+    ] {
+        let method = if path.ends_with("profile") {
+            Method::PUT
+        } else {
+            Method::POST
+        };
+        let r = core
+            .server
+            .request(
+                method,
+                path,
+                &[
+                    ("content-type", "application/json"),
+                    ("x-mrl-launch-secret", crate::server::TEST_SECRET),
+                ],
+                axum::body::Body::from(body.clone()),
+            )
+            .await;
+        assert!(r.status >= 400 && r.status < 500, "{path}: {}", r.text());
+        assert!(!r.text().contains(canary), "{path}: {}", r.text());
+    }
     // A secret-like name is refused whatever its value's type.
     for (key, value) in [
         ("password", json!(["p16-secret-canary"])),
@@ -1934,8 +2116,8 @@ async fn a_failing_audit_write_rolls_back_the_change_it_records() {
         core.call(Method::GET, "/api/v1/auth/me", &Auth::Launch, None)
             .await
             .json()["sign_in"],
-        "active",
-        "and the sign-in is kept"
+        "signed_out",
+        "the Supabase session ends first; running logout again finishes the rest"
     );
     assert_eq!(
         core.call(
@@ -2550,6 +2732,14 @@ async fn a_viewer_login_token_can_revoke_itself() {
         .call(Method::GET, "/api/v1/auth/me", &Auth::Bearer(token), None)
         .await;
     assert_eq!(after.status, 401, "{}", after.text());
+    // Team sign-ins are audited in the member's org, so /audit shows them.
+    let orgs: Vec<Option<String>> = sqlx::query_scalar(
+        "SELECT org_id FROM audit_events WHERE details->>'step' = 'signed_in' ORDER BY at",
+    )
+    .fetch_all(core.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(orgs.last(), Some(&Some(lab.to_string())), "{orgs:?}");
     core.stop().await;
 }
 
@@ -2794,6 +2984,32 @@ async fn a_named_project_must_exist_in_the_named_org() {
             "solo owner, {project}"
         );
     }
+    // A soft-deleted project and a malformed named org also look missing, to the solo
+    // owner too.
+    db.seed(&format!(
+        "UPDATE projects SET deleted_at = now() WHERE id = '{}'",
+        pa.as_uuid()
+    ))
+    .await;
+    let bad_org = Resource {
+        org: Some("org_not-an-id".to_owned()),
+        project: Some(pb.to_string()),
+        ..Resource::kind("run")
+    };
+    for (rbac, who) in [(&team, &org_owner), (&solo, &ctx(Principal::local_owner()))] {
+        assert_eq!(
+            rbac.authorize(who, "runs.submit", &on(pa.to_string()))
+                .await
+                .unwrap(),
+            Decision::Hide,
+            "deleted project"
+        );
+        assert_eq!(
+            rbac.authorize(who, "runs.submit", &bad_org).await.unwrap(),
+            Decision::Hide,
+            "malformed org"
+        );
+    }
     db.pool().close().await;
 }
 
@@ -2902,31 +3118,34 @@ async fn a_team_core_never_syncs_with_the_former_solo_owners_session() {
     let history = sb.stored_rows();
     let core = core.restart(config(Mode::Team, &sb)).await;
     let (bob, _) = member(&core, &sb, "bob").await;
-    let set_up = core
-        .call(
+    // Setup sync is personal: a team core refuses all of it, before any key is made.
+    for (method, path, body) in [
+        (
             Method::POST,
             "/api/v1/sync/setup",
-            &Auth::Bearer(bob.clone()),
             Some(json!({"passphrase": PASSPHRASE})),
-        )
-        .await;
-    assert_eq!(set_up.status, 200, "{}", set_up.text());
-    for (method, path) in [
-        (Method::POST, "/api/v1/sync/push"),
-        (Method::POST, "/api/v1/sync/restore"),
+        ),
+        (Method::POST, "/api/v1/sync/push", None),
+        (
+            Method::POST,
+            "/api/v1/sync/restore",
+            Some(json!({"passphrase": PASSPHRASE})),
+        ),
+        (Method::GET, "/api/v1/sync/status", None),
+        (Method::GET, "/api/v1/sync/profile", None),
     ] {
-        let body = (path.ends_with("restore")).then(|| json!({"passphrase": PASSPHRASE}));
         let r = core
             .call(method, path, &Auth::Bearer(bob.clone()), body)
             .await;
         assert_eq!(r.status, 409, "{path}: {}", r.text());
-        assert_eq!(r.json()["code"], "MRL-AUTH-163");
+        assert_eq!(r.json()["code"], "MRL-STATE-161", "{path}");
+        assert!(!r.text().contains("recovery_key"), "{path}");
     }
-    let status = core
-        .call(Method::GET, "/api/v1/sync/status", &Auth::Bearer(bob), None)
-        .await;
-    assert_eq!(status.status, 200, "{}", status.text());
-    assert!(status.json()["copies"].is_null(), "{}", status.text());
+    assert_eq!(
+        core.db.count("sync_state").await,
+        1,
+        "only the former owner's"
+    );
     assert_eq!(
         sb.stored_rows(),
         history,
@@ -3093,5 +3312,507 @@ async fn a_database_made_by_3791ab7_takes_later_migrations_and_keeps_its_data() 
             .is_empty()
     );
     fresh.pool().close().await;
+    db.pool().close().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn audit_rows_written_before_their_month_partition_survive_a_restart() {
+    let sb = MockSupabase::start().await;
+    let core = solo(&sb).await;
+    // The month partition is missing (the background role was down past the last one made).
+    let month: String = sqlx::query_scalar("SELECT 'audit_events_' || to_char(now(), 'YYYY_MM')")
+        .fetch_one(core.db.pool())
+        .await
+        .unwrap();
+    core.db
+        .seed(&format!(
+            "DELETE FROM idempotency_keys; ALTER TABLE audit_events DETACH PARTITION {month}; DROP TABLE {month};"
+        ))
+        .await;
+    // An audited change lands in the default partition.
+    let made = core
+        .call(
+            Method::POST,
+            "/api/v1/auth/tokens",
+            &Auth::Launch,
+            Some(json!({"name": "while down", "scopes": ["*"]})),
+        )
+        .await;
+    assert_eq!(made.status, 201, "{}", made.text());
+    let in_default: i64 = sqlx::query_scalar("SELECT count(*) FROM audit_events_default")
+        .fetch_one(core.db.pool())
+        .await
+        .unwrap();
+    assert!(in_default >= 1);
+    let total = core.db.count("audit_events").await;
+    // The restart makes this month's partition and keeps every row.
+    let config = core.config.clone();
+    let core = core.restart(config).await;
+    assert_eq!(core.db.count("audit_events").await, total);
+    let left: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events_default WHERE at >= date_trunc('month', now())",
+    )
+    .fetch_one(core.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(left, 0, "moved into the month partition");
+    let in_month: i64 =
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT count(*) FROM {month}")))
+            .fetch_one(core.db.pool())
+            .await
+            .unwrap();
+    assert!(in_month >= 1);
+    // Still read-only after the move.
+    let changed = sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {month}")))
+        .execute(core.db.pool())
+        .await;
+    assert!(changed.is_err());
+    let changed = sqlx::query("DELETE FROM audit_events_default")
+        .execute(core.db.pool())
+        .await;
+    assert!(changed.is_err() || changed.unwrap().rows_affected() == 0);
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_scoped_token_stays_inside_its_org_and_project_for_account_actions() {
+    let sb = MockSupabase::start().await;
+    let core = CoreServer::start(Mode::Team, &sb, TestDb::new().await, Arc::default()).await;
+    let (lab, rival, wl, wr) = (
+        OrgId::new(),
+        OrgId::new(),
+        WorkspaceId::new(),
+        WorkspaceId::new(),
+    );
+    let (pa, pb) = (ProjectId::new(), ProjectId::new());
+    core.db
+        .seed(&format!(
+            "INSERT INTO organizations (id, slug, name, kind) VALUES ('{a}', 'lab', 'Lab', 'team'), ('{b}', 'rival', 'Rival', 'team');
+             INSERT INTO workspaces (id, org_id, slug, name) VALUES ('{wa}', '{a}', 'main', 'Main'), ('{wb}', '{b}', 'main', 'Main');
+             INSERT INTO projects (id, org_id, workspace_id, slug, name) VALUES ('{pa}', '{a}', '{wa}', 'p', 'P'), ('{pb}', '{b}', '{wb}', 'p', 'P');",
+            a = lab.as_uuid(), b = rival.as_uuid(), wa = wl.as_uuid(), wb = wr.as_uuid(),
+            pa = pa.as_uuid(), pb = pb.as_uuid()
+        ))
+        .await;
+    let (carol, c) = member(&core, &sb, "carol").await;
+    grant(&core, lab, c, Role::Maintainer, Scope::Org).await;
+    grant(&core, rival, c, Role::Maintainer, Scope::Org).await;
+    let make = |auth: Auth, project: ProjectId| {
+        let core = &core;
+        async move {
+            core.call(
+                Method::POST,
+                "/api/v1/auth/tokens",
+                &auth,
+                Some(json!({"name": "t", "scopes": ["*"], "project_id": project.to_string()})),
+            )
+            .await
+        }
+    };
+    let ta = make(Auth::Bearer(carol.clone()), pa).await;
+    assert_eq!(ta.status, 201, "{}", ta.text());
+    let tb = make(Auth::Bearer(carol.clone()), pb).await;
+    assert_eq!(tb.status, 201, "{}", tb.text());
+    let (ta_id, ta_token) = (
+        ta.json()["id"].as_str().unwrap().to_owned(),
+        ta.json()["token"].as_str().unwrap().to_owned(),
+    );
+    let tb_id = tb.json()["id"].as_str().unwrap().to_owned();
+    let a = Auth::Bearer(ta_token.clone());
+    // The list shows only the token's own project.
+    let listed = core
+        .call(Method::GET, "/api/v1/auth/tokens", &a, None)
+        .await;
+    assert_eq!(listed.status, 200, "{}", listed.text());
+    let ids: Vec<String> = listed.json()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert_eq!(ids, vec![ta_id.clone()]);
+    // It cannot revoke the sibling in the other org.
+    let sibling = core
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/auth/tokens/{tb_id}"),
+            &a,
+            None,
+        )
+        .await;
+    assert_eq!(sibling.status, 404, "{}", sibling.text());
+    // /auth/me shows only bindings inside the grant.
+    let me = core
+        .call(Method::GET, "/api/v1/auth/me", &a, None)
+        .await
+        .json();
+    let orgs: Vec<&str> = me["roles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["org"].as_str().unwrap())
+        .collect();
+    assert_eq!(orgs, vec![lab.to_string().as_str()], "{me}");
+    // Self-revocation still works.
+    let own = core
+        .call(
+            Method::DELETE,
+            &format!("/api/v1/auth/tokens/{ta_id}"),
+            &a,
+            None,
+        )
+        .await;
+    assert_eq!(own.status, 204, "{}", own.text());
+    // A researcher bound to one project only may make tokens for that project.
+    let (dave, d) = member(&core, &sb, "dave").await;
+    grant(&core, lab, d, Role::Researcher, Scope::Project(pa)).await;
+    let made = make(Auth::Bearer(dave.clone()), pa).await;
+    assert_eq!(made.status, 201, "{}", made.text());
+    let elsewhere = make(Auth::Bearer(dave), pb).await;
+    assert_eq!(elsewhere.status, 404, "{}", elsewhere.text());
+    core.stop().await;
+}
+
+async fn sync_ready(sb: &MockSupabase) -> CoreServer {
+    let core = solo(sb).await;
+    assert_eq!(core.sign_in(sb, &Auth::Launch, false).await.status, 200);
+    let setup = core
+        .call(
+            Method::POST,
+            "/api/v1/sync/setup",
+            &Auth::Launch,
+            Some(json!({"passphrase": PASSPHRASE})),
+        )
+        .await;
+    assert_eq!(setup.status, 200, "{}", setup.text());
+    core
+}
+
+fn kept_versions(sb: &MockSupabase) -> Vec<i64> {
+    sb.stored_rows()
+        .as_object()
+        .and_then(|rows| rows.values().next().cloned())
+        .and_then(|c| c.as_array().cloned())
+        .unwrap_or_default()
+        .iter()
+        .map(|c| c["version"].as_i64().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_retried_push_whose_reply_was_lost_takes_one_slot() {
+    let sb = MockSupabase::start().await;
+    let core = sync_ready(&sb).await;
+    for _ in 0..5 {
+        assert_eq!(push(&core).await.status, 200);
+    }
+    assert_eq!(kept_versions(&sb), vec![5, 4, 3, 2, 1]);
+    let op = json!({"op_id": uuid::Uuid::now_v7().to_string()});
+    let send = |body: Value| {
+        let core = &core;
+        async move {
+            core.call(Method::POST, "/api/v1/sync/push", &Auth::Launch, Some(body))
+                .await
+        }
+    };
+    // Saved, but the reply never came back.
+    sb.lose_push_replies(1);
+    let lost = send(op.clone()).await;
+    assert_eq!(lost.status, 503, "{}", lost.text());
+    assert_eq!(lost.json()["code"], "MRL-LINK-160");
+    // The retry with the same op id answers the saved copy; only one older copy went.
+    let retry = send(op.clone()).await;
+    assert_eq!(retry.status, 200, "{}", retry.text());
+    assert_eq!(retry.json()["version"], 6);
+    assert_eq!(kept_versions(&sb), vec![6, 5, 4, 3, 2]);
+    // Status never goes back to an older copy, whatever order replies come in.
+    core.db
+        .seed("UPDATE sync_state SET last_pushed_version = 100")
+        .await;
+    assert_eq!(send(op).await.status, 200);
+    let status = core
+        .call(Method::GET, "/api/v1/sync/status", &Auth::Launch, None)
+        .await
+        .json();
+    assert_eq!(status["last_pushed_version"], 100, "{status}");
+    let bad = send(json!({"op_id": "not-a-uuid"})).await;
+    assert_eq!(bad.status, 422, "{}", bad.text());
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_key_change_whose_commit_reply_was_lost_keeps_the_active_key() {
+    let sb = MockSupabase::start().await;
+    let core = sync_ready(&sb).await;
+    let owner: uuid::Uuid = sqlx::query_scalar("SELECT id FROM users WHERE is_local_owner")
+        .fetch_one(core.db.pool())
+        .await
+        .unwrap();
+    let owner = UserId::from_uuid(owner);
+    let active: String = sqlx::query_scalar("SELECT key_ref FROM sync_state")
+        .fetch_one(core.db.pool())
+        .await
+        .unwrap();
+    let key = core.secrets.get(&active).await.unwrap().unwrap();
+    let lost = || {
+        mrl_server::error::ApiError::new(
+            mrl_server::error::ErrorCode::Unavailable,
+            "the commit reply was lost",
+        )
+    };
+    // The commit landed (the row names the staged key) but its reply was lost.
+    core.secrets
+        .set("sync.key.landed", Secret::new(key.expose()))
+        .await
+        .unwrap();
+    core.db
+        .seed("UPDATE sync_state SET key_ref = 'sync.key.landed'")
+        .await;
+    mrl_server::modules::sync::settle_key(
+        core.db.db(),
+        core.secrets.as_ref(),
+        owner,
+        Err(lost()),
+        "sync.key.landed",
+        Some(active.clone()),
+    )
+    .await
+    .unwrap();
+    assert!(core.secrets.get("sync.key.landed").await.unwrap().is_some());
+    assert!(
+        core.secrets.get(&active).await.unwrap().is_none(),
+        "old key retired"
+    );
+    assert_eq!(push(&core).await.status, 200, "sync still works");
+    // A change that really rolled back drops only its staged key.
+    core.secrets
+        .set("sync.key.rolled", Secret::new(key.expose()))
+        .await
+        .unwrap();
+    let failed = mrl_server::modules::sync::settle_key(
+        core.db.db(),
+        core.secrets.as_ref(),
+        owner,
+        Err(lost()),
+        "sync.key.rolled",
+        Some("sync.key.landed".to_owned()),
+    )
+    .await;
+    assert!(failed.is_err());
+    assert!(core.secrets.get("sync.key.rolled").await.unwrap().is_none());
+    assert!(core.secrets.get("sync.key.landed").await.unwrap().is_some());
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn pushes_overlapping_a_key_rotation_never_see_sync_as_off() {
+    let sb = MockSupabase::start().await;
+    let core = sync_ready(&sb).await;
+    for _ in 0..6 {
+        let rotate = core.call(
+            Method::POST,
+            "/api/v1/sync/setup",
+            &Auth::Launch,
+            Some(json!({"passphrase": PASSPHRASE})),
+        );
+        let (a, b, c) = tokio::join!(push(&core), rotate, push(&core));
+        assert_eq!(b.status, 200, "{}", b.text());
+        for r in [a, c] {
+            assert_eq!(r.status, 200, "{}", r.text());
+        }
+    }
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn credentials_in_keys_or_inside_longer_text_never_reach_storage_or_backups() {
+    use base64::Engine as _;
+    let sb = MockSupabase::start().await;
+    let core = sync_ready(&sb).await;
+    let canary = "hf_CANARYembedded8f3e1c9a";
+    let put = |profile: Value| {
+        let core = &core;
+        async move {
+            core.call(
+                Method::PUT,
+                "/api/v1/sync/profile",
+                &Auth::Launch,
+                Some(profile),
+            )
+            .await
+        }
+    };
+    let with_ui = |ui: Value| {
+        let mut p = profile();
+        p["ui"] = ui;
+        p
+    };
+    for bad in [
+        with_ui(json!({"note": format!("my hub token is {canary}, keep it")})),
+        with_ui(json!({ canary: true })),
+        with_ui(json!({"nested": {"deeper": [format!("Bearer {canary}")]}})),
+    ] {
+        let r = put(bad).await;
+        assert_eq!(r.status, 422, "{}", r.text());
+        assert!(
+            !r.text().contains(canary),
+            "the refusal repeats nothing: {}",
+            r.text()
+        );
+    }
+    let stored: Option<Value> = sqlx::query_scalar("SELECT profile FROM setup_profiles")
+        .fetch_optional(core.db.pool())
+        .await
+        .unwrap();
+    assert!(!stored.unwrap_or_default().to_string().contains(canary));
+    // A profile saved under older rules is checked again on load and push.
+    core.db
+        .seed(&format!(
+            "INSERT INTO setup_profiles (user_id, profile) SELECT id, '{}'::jsonb FROM users WHERE is_local_owner \
+             ON CONFLICT (user_id) DO UPDATE SET profile = EXCLUDED.profile",
+            with_ui(json!({"note": format!("old {canary}")}))
+        ))
+        .await;
+    for r in [
+        core.call(Method::GET, "/api/v1/sync/profile", &Auth::Launch, None)
+            .await,
+        push(&core).await,
+    ] {
+        assert_eq!(r.status, 422, "{}", r.text());
+        assert!(!r.text().contains(canary));
+    }
+    assert!(!sb.stored_rows().to_string().contains(canary));
+    // A backup holding one (made elsewhere) is refused on restore and not saved here.
+    let (key_ref, kdf): (String, Value) = sqlx::query_as("SELECT key_ref, kdf FROM sync_state")
+        .fetch_one(core.db.pool())
+        .await
+        .unwrap();
+    let hex = core.secrets.get(&key_ref).await.unwrap().unwrap();
+    let key = mrl_server::modules::sync::crypto::key_from_hex(hex.expose()).unwrap();
+    let aad = format!("mrl-sync/v1:{}", sb.user().id);
+    let plain = with_ui(json!({"note": format!("restored {canary}")})).to_string();
+    let sealed =
+        mrl_server::modules::sync::crypto::seal(&key, aad.as_bytes(), plain.as_bytes()).unwrap();
+    let blob = json!({
+        "format": "mrl-sync/v1",
+        "kdf": kdf,
+        "sealed": base64::engine::general_purpose::STANDARD.encode(sealed),
+    });
+    let sent = reqwest::Client::new()
+        .post(format!("{}/rest/v1/rpc/push_setup_copy", sb.url()))
+        .header("apikey", sb.auth_config().supabase_anon_key.unwrap())
+        .bearer_auth(sb.access_token(&sb.user(), 600))
+        .json(&json!({ "p_blob": blob }))
+        .send()
+        .await
+        .unwrap();
+    assert!(sent.status().is_success());
+    let restored = core
+        .call(
+            Method::POST,
+            "/api/v1/sync/restore",
+            &Auth::Launch,
+            Some(json!({"passphrase": PASSPHRASE})),
+        )
+        .await;
+    assert_eq!(restored.status, 422, "{}", restored.text());
+    assert!(!restored.text().contains(canary));
+    let stored: Value = sqlx::query_scalar("SELECT profile FROM setup_profiles")
+        .fetch_one(core.db.pool())
+        .await
+        .unwrap();
+    assert!(!stored.to_string().contains("restored hf_"), "{stored}");
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn sign_in_and_sign_out_never_stop_half_way() {
+    let sb = MockSupabase::start().await;
+    let core = solo(&sb).await;
+    let signed_in = || async {
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM audit_events WHERE details->>'step' = 'signed_in'",
+        )
+        .fetch_one(core.db.pool())
+        .await
+        .unwrap();
+        n
+    };
+    // The keychain prompt is cancelled while the session is saved: nothing is left behind.
+    core.fail_next_write(
+        "auth.supabase_session",
+        "MRL-ENV-162: the keychain request was cancelled, so the app could not save a secret",
+    );
+    let refused = core.sign_in(&sb, &Auth::Launch, true).await;
+    assert_eq!(refused.status, 503, "{}", refused.text());
+    assert_eq!(refused.json()["code"], "MRL-ENV-162");
+    assert_eq!(core.db.count("api_tokens").await, 0, "no token issued");
+    assert_eq!(signed_in().await, 0, "no success audited");
+    let linked: Option<uuid::Uuid> =
+        sqlx::query_scalar("SELECT supabase_user_id FROM users WHERE is_local_owner")
+            .fetch_one(core.db.pool())
+            .await
+            .unwrap();
+    assert!(linked.is_none(), "the owner is not linked");
+    // Trying again works.
+    let done = core.sign_in(&sb, &Auth::Launch, true).await;
+    assert_eq!(done.status, 200, "{}", done.text());
+    let pat = done.json()["token"]["token"].as_str().unwrap().to_owned();
+    // Sign-out whose database step fails has already ended the Supabase session, and
+    // running it again finishes the rest.
+    break_audit(&core).await;
+    let failed = core
+        .call(
+            Method::POST,
+            "/api/v1/auth/logout",
+            &Auth::LaunchAndBearer(pat.clone()),
+            None,
+        )
+        .await;
+    assert!(failed.status >= 500, "{}", failed.text());
+    let me = core
+        .call(Method::GET, "/api/v1/auth/me", &Auth::Launch, None)
+        .await
+        .json();
+    assert_eq!(me["sign_in"], "signed_out");
+    mend_audit(&core).await;
+    let again = core
+        .call(
+            Method::POST,
+            "/api/v1/auth/logout",
+            &Auth::LaunchAndBearer(pat.clone()),
+            None,
+        )
+        .await;
+    assert_eq!(again.status, 204, "{}", again.text());
+    let after = core
+        .call(Method::GET, "/api/v1/auth/me", &Auth::Bearer(pat), None)
+        .await;
+    assert_eq!(after.status, 401, "the token is revoked");
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_cold_key_cache_backs_off_while_the_sign_in_service_is_down() {
+    let sb = MockSupabase::start().await;
+    let db = TestDb::new().await;
+    sb.set_offline(true);
+    let v = JwtVerifier::new(
+        Supabase::from_config(&sb.auth_config()).unwrap(),
+        db.db().clone(),
+    );
+    let token = sb.access_token(&sb.user(), 300);
+    for _ in 0..5 {
+        assert!(v.verify(&token).await.unwrap().is_none());
+    }
+    assert_eq!(sb.jwks_requests(), 1, "one failed fetch, then backoff");
     db.pool().close().await;
 }

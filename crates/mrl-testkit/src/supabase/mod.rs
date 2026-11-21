@@ -68,6 +68,8 @@ struct Mock {
     offline: AtomicBool,
     access_ttl: AtomicI64,
     refresh_limited: AtomicU32,
+    lost_push_replies: AtomicU32,
+    jwks_requests: AtomicU32,
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -133,6 +135,8 @@ impl MockSupabase {
             offline: AtomicBool::new(false),
             access_ttl: AtomicI64::new(3600),
             refresh_limited: AtomicU32::new(0),
+            lost_push_replies: AtomicU32::new(0),
+            jwks_requests: AtomicU32::new(0),
         });
         let app = Router::new()
             .route("/auth/v1/authorize", get(authorize))
@@ -182,6 +186,16 @@ impl MockSupabase {
     /// The next `n` refreshes answer 429 (rate limited) and leave the refresh token valid.
     pub fn rate_limit_refreshes(&self, n: u32) {
         self.mock.refresh_limited.store(n, Ordering::SeqCst);
+    }
+
+    /// How many times the JWKS was asked for (answered or not).
+    pub fn jwks_requests(&self) -> u32 {
+        self.mock.jwks_requests.load(Ordering::SeqCst)
+    }
+
+    /// The next `n` pushes are saved but answer 503, as if the reply were lost on the way.
+    pub fn lose_push_replies(&self, n: u32) {
+        self.mock.lost_push_replies.store(n, Ordering::SeqCst);
     }
 
     /// Lifetime of new access tokens, in seconds (negative: already expired).
@@ -408,6 +422,7 @@ async fn logout(State(m): State<Arc<Mock>>, h: HeaderMap) -> Response {
 }
 
 async fn jwks(State(m): State<Arc<Mock>>, h: HeaderMap) -> Response {
+    m.jwks_requests.fetch_add(1, Ordering::SeqCst);
     if let Some(r) = gate(&m, &h) {
         return r;
     }
@@ -445,8 +460,9 @@ async fn read_rows(
     Json(out).into_response()
 }
 
-/// `public.push_setup_copy(p_blob)`: like the SQL function in the P16 handoff, one lock
-/// per call allocates the next version, prepends the copy and keeps the 5 newest.
+/// `public.push_setup_copy(p_blob, p_op)`: like the SQL function in the P16 handoff, one lock
+/// per call allocates the next version, prepends the copy and keeps the 5 newest. A copy
+/// already saved with `p_op` is answered again instead of adding another.
 async fn push_copy(State(m): State<Arc<Mock>>, h: HeaderMap, Json(body): Json<Value>) -> Response {
     if let Some(r) = gate(&m, &h) {
         return r;
@@ -461,7 +477,17 @@ async fn push_copy(State(m): State<Arc<Mock>>, h: HeaderMap, Json(body): Json<Va
     let Some(blob) = body.get("p_blob").cloned() else {
         return error(StatusCode::BAD_REQUEST, "PGRST202", "function needs p_blob");
     };
+    let op = body.get("p_op").cloned().unwrap_or(Value::Null);
     let mut rows = lock(&m.rows);
+    let saved = rows
+        .get(&sub)
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(hit) = saved.iter().find(|c| !op.is_null() && c["op"] == op) {
+        return Json(json!({ "version": hit["version"], "at": hit["at"], "copies": saved.len() }))
+            .into_response();
+    }
     let mut versions = lock(&m.versions);
     let version = versions.get(&sub).copied().unwrap_or(0) + 1;
     versions.insert(sub.clone(), version);
@@ -473,10 +499,24 @@ async fn push_copy(State(m): State<Arc<Mock>>, h: HeaderMap, Json(body): Json<Va
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    copies.insert(0, json!({ "version": version, "at": at, "blob": blob }));
+    copies.insert(
+        0,
+        json!({ "version": version, "at": at, "blob": blob, "op": op }),
+    );
     copies.truncate(5);
     let kept = copies.len();
     rows.insert(sub, Value::Array(copies));
+    let lost = m
+        .lost_push_replies
+        .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+        .is_ok();
+    if lost {
+        return error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "PGRST000",
+            "connection lost",
+        );
+    }
     Json(json!({ "version": version, "at": at, "copies": kept })).into_response()
 }
 

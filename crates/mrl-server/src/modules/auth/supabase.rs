@@ -33,13 +33,12 @@ pub enum SupabaseError {
     /// No network, DNS, timeout or a 5xx.
     #[error("{OFFLINE}: the app could not reach the sign-in service ({0})")]
     Offline(String),
-    /// Supabase answered no (bad code, revoked refresh token, …).
-    #[error("the sign-in service refused the request ({status}): {message}")]
+    /// Supabase answered no (bad code, revoked refresh token, …). Its free-text reason is
+    /// not kept: it can repeat what was sent, so errors and logs show only status and code.
+    #[error("the sign-in service refused the request (HTTP {status} {code})")]
     Refused {
         /// HTTP status.
         status: u16,
-        /// Supabase's reason.
-        message: String,
         /// Supabase's error code, like `refresh_token_not_found` (empty if none).
         code: String,
     },
@@ -229,23 +228,19 @@ pub async fn send(req: reqwest::RequestBuilder) -> Result<reqwest::Response, Sup
         )));
     }
     let body: Value = res.json().await.unwrap_or(Value::Null);
-    let message = ["error_description", "msg", "message", "error"]
-        .iter()
-        .find_map(|k| body.get(*k).and_then(Value::as_str))
-        .unwrap_or("no reason given")
-        .chars()
-        .take(200)
-        .collect();
+    // Machine codes only (like `refresh_token_not_found`); anything else is dropped.
     let code = ["error_code", "error"]
         .iter()
         .find_map(|k| body.get(*k).and_then(Value::as_str))
+        .filter(|c| {
+            (1..=64).contains(&c.len())
+                && c.bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+        })
         .unwrap_or_default()
-        .chars()
-        .take(80)
-        .collect();
+        .to_owned();
     Err(SupabaseError::Refused {
         status: status.as_u16(),
-        message,
         code,
     })
 }
@@ -381,8 +376,17 @@ impl JwtVerifier {
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "could not fetch the sign-in keys; using the cached ones");
-                    if let Some(c) = cache.as_mut() {
-                        c.tried_at = now;
+                    // Back off even with no keys yet, so queued checks do not each wait for
+                    // another failing fetch.
+                    match cache.as_mut() {
+                        Some(c) => c.tried_at = now,
+                        None => {
+                            *cache = Some(Cached {
+                                keys: Vec::new(),
+                                fetched_at: OffsetDateTime::UNIX_EPOCH,
+                                tried_at: now,
+                            })
+                        }
                     }
                 }
             }

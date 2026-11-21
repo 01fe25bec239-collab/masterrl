@@ -2561,7 +2561,8 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Start the app again and choose Allow (or Always Allow) when the keychain asks."),
                     Value::Str("On a development machine, set `backend = \"file\"` under `[keychain]` in the settings file. Secrets then stay in an encrypted file."),
-                    Value::Str("Secrets do not move between the two places, so sign in again after the change."),
+                    Value::Str("After that switch, allow one more keychain read. The app copies the database password into the file then."),
+                    Value::Str("Sign-in and sync keys do not move, so sign in again after the change."),
                 ])),
             ])),
         ]),
@@ -3197,6 +3198,17 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Run `mrl sync setup` or turn on sync in Settings."),
                     Value::Str("Save the recovery key it shows in a safe place."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STATE-161")),
+            ("title", Value::Str("Setup sync runs on your own computer.")),
+            ("why", Value::Str("A team server is shared, so it does not hold your personal sign-in or sync keys.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Turn on setup sync in the MasterRL app on your own computer."),
+                    Value::Str("Use the team server for team projects only."),
                 ])),
             ])),
         ]),

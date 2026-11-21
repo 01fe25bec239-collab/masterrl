@@ -201,7 +201,9 @@ fn keychain_error(what: &str, e: &keyring::Error) -> SeamError {
             format!(
                 "{KEYCHAIN_CANCELLED}: the keychain request was cancelled, so the app could not {what}. \
                  Start it again and choose Allow when the keychain asks, or set backend = \"file\" \
-                 under [keychain] in the settings file to keep secrets in an encrypted file"
+                 under [keychain] in the settings file to keep secrets in an encrypted file. After \
+                 that switch the bundled database's password is copied from the keychain once, so \
+                 allow that one read; sign-in and sync keys are not copied (sign in again)"
             ),
         );
     }
@@ -262,16 +264,7 @@ impl SecretStore for KeychainStore {
             Backend::File(v) => v.get(name).await,
             Backend::Os => {
                 let (service, name) = (self.service.clone(), name.to_owned());
-                blocking(move || {
-                    let entry = keyring::Entry::new(&service, &name)
-                        .map_err(|e| keychain_error("open the keychain", &e))?;
-                    match entry.get_password() {
-                        Ok(v) => Ok(Some(Secret::new(v))),
-                        Err(keyring::Error::NoEntry) => Ok(None),
-                        Err(e) => Err(keychain_error("read a secret", &e)),
-                    }
-                })
-                .await
+                blocking(move || Ok(os_get(&service, &name)?.map(Secret::new))).await
             }
         }
     }
@@ -282,12 +275,7 @@ impl SecretStore for KeychainStore {
             Backend::File(v) => v.set(name, Some(value)).await,
             Backend::Os => {
                 let (service, name) = (self.service.clone(), name.to_owned());
-                blocking(move || {
-                    keyring::Entry::new(&service, &name)
-                        .and_then(|e| e.set_password(value.expose()))
-                        .map_err(|e| keychain_error("save a secret", &e))
-                })
-                .await
+                blocking(move || os_put(&service, &name, value.expose())).await
             }
         }
     }
@@ -299,17 +287,104 @@ impl SecretStore for KeychainStore {
             Backend::Os => {
                 let (service, name) = (self.service.clone(), name.to_owned());
                 blocking(move || {
-                    let entry = keyring::Entry::new(&service, &name)
-                        .map_err(|e| keychain_error("open the keychain", &e))?;
-                    match entry.delete_credential() {
-                        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-                        Err(e) => Err(keychain_error("delete a secret", &e)),
+                    for i in 0..os_parts(&service, &name)? {
+                        os_remove(&service, &part_name(&name, i))?;
                     }
+                    os_remove(&service, &name)
                 })
                 .await
             }
         }
     }
+}
+
+/// Longest value kept in one OS keychain entry. Windows Credential Manager holds at most
+/// 2,560 bytes (UTF-16) per credential; 600 characters stay under that even when each takes
+/// two UTF-16 units. Longer values (a Supabase session is several KiB) are split.
+const ENTRY_CHARS: usize = 600;
+/// What the main entry of a split value holds, followed by the number of parts.
+const SPLIT: &str = "mrl-split/v1:";
+
+fn part_name(name: &str, i: usize) -> String {
+    format!("{name}.part{i}")
+}
+
+fn os_read(service: &str, name: &str) -> Result<Option<String>, SeamError> {
+    let entry =
+        keyring::Entry::new(service, name).map_err(|e| keychain_error("open the keychain", &e))?;
+    match entry.get_password() {
+        Ok(v) => Ok(Some(v)),
+        Err(keyring::Error::NoEntry) => Ok(None),
+        Err(e) => Err(keychain_error("read a secret", &e)),
+    }
+}
+
+fn os_write(service: &str, name: &str, value: &str) -> Result<(), SeamError> {
+    keyring::Entry::new(service, name)
+        .and_then(|e| e.set_password(value))
+        .map_err(|e| keychain_error("save a secret", &e))
+}
+
+fn os_remove(service: &str, name: &str) -> Result<(), SeamError> {
+    let entry =
+        keyring::Entry::new(service, name).map_err(|e| keychain_error("open the keychain", &e))?;
+    match entry.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(keychain_error("delete a secret", &e)),
+    }
+}
+
+/// How many parts the value under `name` is split into (0: one entry, or none).
+fn os_parts(service: &str, name: &str) -> Result<usize, SeamError> {
+    Ok(os_read(service, name)?
+        .and_then(|head| head.strip_prefix(SPLIT)?.parse().ok())
+        .unwrap_or(0))
+}
+
+fn os_get(service: &str, name: &str) -> Result<Option<String>, SeamError> {
+    let Some(head) = os_read(service, name)? else {
+        return Ok(None);
+    };
+    let Some(count) = head.strip_prefix(SPLIT) else {
+        return Ok(Some(head));
+    };
+    let damaged = || {
+        SeamError::new(
+            "secrets",
+            format!("{KEYCHAIN_FAILED}: a saved secret is damaged (a part is missing)"),
+        )
+    };
+    let count: usize = count.parse().map_err(|_| damaged())?;
+    let mut value = String::new();
+    for i in 0..count {
+        value.push_str(&os_read(service, &part_name(name, i))?.ok_or_else(damaged)?);
+    }
+    Ok(Some(value))
+}
+
+/// Saves `value`, split into parts when it is long. Parts are written before the entry that
+/// names them, and parts a longer earlier value left are removed after.
+fn os_put(service: &str, name: &str, value: &str) -> Result<(), SeamError> {
+    let before = os_parts(service, name)?;
+    let chars: Vec<char> = value.chars().collect();
+    let parts: Vec<String> = if chars.len() <= ENTRY_CHARS && !value.starts_with(SPLIT) {
+        os_write(service, name, value)?;
+        Vec::new()
+    } else {
+        let parts: Vec<String> = chars
+            .chunks(ENTRY_CHARS)
+            .map(|c| c.iter().collect())
+            .collect();
+        for (i, part) in parts.iter().enumerate() {
+            os_write(service, &part_name(name, i), part)?;
+        }
+        os_write(service, name, &format!("{SPLIT}{}", parts.len()))?;
+        parts
+    };
+    for i in parts.len()..before {
+        os_remove(service, &part_name(name, i))?;
+    }
+    Ok(())
 }
 
 /// The fallback: every secret of a service in one file, sealed with a key kept in a second
@@ -647,6 +722,50 @@ mod tests {
             );
         }
         round_trip(&store).await;
+        // A realistic Supabase session (several KiB, with non-ASCII names) round-trips too,
+        // and shrinking it leaves no stale parts behind.
+        let session = serde_json::json!({
+            "access_token": format!("eyJ{}", "a".repeat(1400)),
+            "refresh_token": "r".repeat(40),
+            "expires_at": 1_900_000_000,
+            "user": {"id": uuid::Uuid::new_v4().to_string(), "email": "zoë@example.com",
+                     "display_name": "Zoë Ñúñez 🧪".repeat(40), "avatar_url": format!("https://example.com/{}", "p".repeat(300))},
+            "issuer": "https://abcd.supabase.co/auth/v1",
+        })
+        .to_string();
+        assert!(session.len() > 2_560);
+        store
+            .set("auth.supabase_session", Secret::new(session.clone()))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get("auth.supabase_session")
+                .await
+                .unwrap()
+                .unwrap()
+                .expose(),
+            session
+        );
+        store
+            .set("auth.supabase_session", Secret::new("short"))
+            .await
+            .unwrap();
+        assert_eq!(
+            store
+                .get("auth.supabase_session")
+                .await
+                .unwrap()
+                .unwrap()
+                .expose(),
+            "short"
+        );
+        store
+            .set("auth.supabase_session", Secret::new(session.clone()))
+            .await
+            .unwrap();
+        store.delete("auth.supabase_session").await.unwrap();
+        assert!(store.get("auth.supabase_session").await.unwrap().is_none());
         let vault = dir.path().join(format!("{service}.vault"));
         let key = dir.path().join(format!("{service}.vault-key"));
         assert!(

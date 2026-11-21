@@ -1274,8 +1274,10 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                                       'On a development machine, set `backend = "file"` under '
                                       '`[keychain]` in the settings file. Secrets then stay in an '
                                       'encrypted file.',
-                                      'Secrets do not move between the two places, so sign in '
-                                      'again after the change.']}},
+                                      'After that switch, allow one more keychain read. The app '
+                                      'copies the database password into the file then.',
+                                      'Sign-in and sync keys do not move, so sign in again after '
+                                      'the change.']}},
             {'code': 'MRL-IDEM-001',
              'title': 'This request is already running.',
              'why': 'A request with the same request key started earlier and has not finished.',
@@ -1634,6 +1636,13 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                     'leaves this computer.',
              'what_to_do': {'steps': ['Run `mrl sync setup` or turn on sync in Settings.',
                                       'Save the recovery key it shows in a safe place.']}},
+            {'code': 'MRL-STATE-161',
+             'title': 'Setup sync runs on your own computer.',
+             'why': 'A team server is shared, so it does not hold your personal sign-in or sync '
+                    'keys.',
+             'what_to_do': {'steps': ['Turn on setup sync in the MasterRL app on your own '
+                                      'computer.',
+                                      'Use the team server for team projects only.']}},
             {'code': 'MRL-STORE-001',
              'title': 'The app refused a storage path.',
              'why': "The path points outside your workspace's storage area, or it has a part the "

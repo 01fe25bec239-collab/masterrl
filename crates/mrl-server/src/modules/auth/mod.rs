@@ -128,6 +128,20 @@ struct Shared {
     verifier: Option<JwtVerifier>,
     flows: Flows,
     pepper: tokio::sync::OnceCell<[u8; 32]>,
+    /// Bounds sign-in work open to anyone (login and callback need no credentials in team
+    /// mode, and each callback calls Supabase).
+    anonymous: tokio::sync::Semaphore,
+}
+
+/// Login and callback requests served at once; more get 429 with Retry-After.
+const ANONYMOUS_AT_ONCE: usize = 32;
+
+fn busy() -> ApiError {
+    ApiError::new(
+        ErrorCode::RateLimited,
+        "The server is busy with other sign-ins; try again in a moment.",
+    )
+    .retry_after(1)
 }
 
 impl Shared {
@@ -315,6 +329,7 @@ impl AuthModule {
                 secure_cookie: config.server.mode == Mode::Team && config.server.tls.is_some(),
                 flows: Flows::default(),
                 pepper: tokio::sync::OnceCell::new(),
+                anonymous: tokio::sync::Semaphore::new(ANONYMOUS_AT_ONCE),
             }),
         }
     }
@@ -480,8 +495,9 @@ fn field(path: &str, message: impl Into<String>) -> ApiError {
     responses((status = 200, body = LoginStarted), (status = 422, body = crate::error::Problem), (status = 503, body = crate::error::Problem)))]
 async fn login(
     Extension(shared): Extension<Arc<Shared>>,
-    Json(req): Json<LoginRequest>,
+    crate::modules::auth::problem::Body(req): crate::modules::auth::problem::Body<LoginRequest>,
 ) -> Result<Json<LoginStarted>, Fail> {
+    let _permit = shared.anonymous.try_acquire().map_err(|_| busy())?;
     let supabase = shared.supabase.as_ref().ok_or_else(not_set_up)?;
     if !matches!(req.provider.as_str(), "google" | "github") {
         return Err(field("/provider", "provider must be google or github").into());
@@ -508,9 +524,10 @@ async fn callback(
     Extension(shared): Extension<Arc<Shared>>,
     Extension(meta): Extension<RequestMeta>,
     headers: HeaderMap,
-    Json(req): Json<CallbackRequest>,
+    crate::modules::auth::problem::Body(req): crate::modules::auth::problem::Body<CallbackRequest>,
 ) -> Result<Json<SignedIn>, Fail> {
     no_replay(&headers)?;
+    let _permit = shared.anonymous.try_acquire().map_err(|_| busy())?;
     let (supabase, verifier) = match (&shared.supabase, &shared.verifier) {
         (Some(s), Some(v)) => (s, v),
         _ => return Err(not_set_up()),
@@ -546,6 +563,7 @@ async fn callback(
         Mode::Solo => Some(signin::hold_session().await),
         Mode::Team => None,
     };
+    let mut tx = db.begin().await.map_err(db_error)?;
     let user = match shared.mode {
         Mode::Solo => {
             let owner = tenancy::ensure_local_owner(db).await.map_err(db_error)?;
@@ -566,7 +584,8 @@ async fn callback(
             }
             owner
         }
-        Mode::Team => tenancy::upsert_supabase_user(db, &profile)
+        // In the sign-in's transaction, so the user and its audit row commit together.
+        Mode::Team => tenancy::upsert_supabase_user_in(&mut tx, &profile)
             .await
             .map_err(db_error)?,
     };
@@ -596,7 +615,6 @@ async fn callback(
     };
     let actor = user.to_string();
     let at = state.seams.clock.now();
-    let mut tx = db.begin().await.map_err(db_error)?;
     if shared.mode == Mode::Solo {
         tenancy::link_local_owner(&mut tx, user, &profile)
             .await
@@ -606,10 +624,11 @@ async fn callback(
         Some(p) => Some(credentials::issue_token(&mut tx, p, &token_req).await?),
         None => None,
     };
+    let org_text = org.map(|o| o.to_string());
     let event = audit::event(
         at,
         &actor,
-        None,
+        org_text.as_deref(),
         "auth.session",
         &actor,
         AuditOutcome::Success,
@@ -619,10 +638,25 @@ async fn callback(
     audit::write(&mut tx, &event, &details)
         .await
         .map_err(db_error)?;
-    commit(tx).await?;
-    // The keychain is not transactional: keep the Supabase session once the link is saved.
-    if let Some(held) = &held {
-        shared.sign_in(&state).keep(held, &tokens).await?;
+    // The keychain is not transactional. Write it before the commit: if it fails (a cancelled
+    // prompt), the transaction rolls back and no link, token or audit row is left. If the
+    // commit then fails, the previous keychain session is put back.
+    let previous = match &held {
+        Some(h) => {
+            let sign_in = shared.sign_in(&state);
+            let previous = sign_in.snapshot(h).await?;
+            sign_in.keep(h, &tokens).await?;
+            Some(previous)
+        }
+        None => None,
+    };
+    if let Err(e) = commit(tx).await {
+        if let (Some(h), Some(previous)) = (&held, previous) {
+            if let Err(re) = shared.sign_in(&state).put_back(h, previous).await {
+                tracing::warn!(error = %re, "could not put the previous sign-in back in the keychain");
+            }
+        }
+        return Err(e.into());
     }
     drop(held);
     Ok(Json(SignedIn {
@@ -696,11 +730,19 @@ async fn me(
                     .fetch_optional(db.pool())
                     .await
                     .map_err(|e| db_error(e.into()))?;
+            // A token sees only the bindings inside its org and project.
+            let (org, project) = token_bounds(&shared, &ctx).await?;
             let roles: Vec<(Uuid, String, String, Uuid)> = sqlx::query_as(
                 "SELECT org_id, role, scope_kind, scope_id FROM role_bindings \
-                 WHERE principal_kind = 'user' AND principal_id = $1 ORDER BY created_at",
+                 WHERE principal_kind = 'user' AND principal_id = $1 \
+                   AND ($2::uuid IS NULL OR org_id = $2) \
+                   AND ($3::uuid IS NULL OR scope_kind = 'org' OR scope_id = $3 \
+                        OR scope_id = (SELECT workspace_id FROM projects WHERE id = $3)) \
+                 ORDER BY created_at",
             )
             .bind(u.as_uuid())
+            .bind(org.map(|o| o.as_uuid()))
+            .bind(project.map(|p| p.as_uuid()))
             .fetch_all(db.pool())
             .await
             .map_err(|e| db_error(e.into()))?;
@@ -795,6 +837,11 @@ async fn logout(
             revoke.extend(TokenId::from_str(&p.id).ok());
         }
     }
+    // The Supabase session goes first: the keychain is not transactional, and a sign-out that
+    // stops after this step is finished by running it again (revoking is idempotent).
+    if shared.mode == Mode::Solo {
+        shared.sign_in(&state).sign_out().await?;
+    }
     let mut tx = db.begin().await.map_err(db_error)?;
     for id in &revoke {
         sqlx::query(
@@ -818,10 +865,6 @@ async fn logout(
     )
     .await?;
     commit(tx).await?;
-    // The keychain is not transactional: forget the Supabase session once the rest is done.
-    if shared.mode == Mode::Solo {
-        shared.sign_in(&state).sign_out().await?;
-    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -925,6 +968,32 @@ async fn authorize_self_shared(
     state
         .authorize(ctx, action, &Resource::kind("account"))
         .await?;
+    acting(shared, ctx).await
+}
+
+/// The org and project a token caller is held to; `(None, None)` for people. Account-wide
+/// lists and changes stay inside these bounds.
+async fn token_bounds(
+    shared: &Shared,
+    ctx: &RequestContext,
+) -> Result<(Option<OrgId>, Option<ProjectId>), ApiError> {
+    if ctx.principal.kind != PrincipalKind::Service {
+        return Ok((None, None));
+    }
+    let grant = credentials::token_grant(&shared.db, &ctx.principal.id)
+        .await
+        .map_err(db_error)?
+        .ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::Unauthenticated,
+                "This access token no longer works.",
+            )
+        })?;
+    Ok((grant.org, grant.project))
+}
+
+/// The person behind `ctx`, with no permission check.
+async fn acting(shared: &Shared, ctx: &RequestContext) -> Result<UserId, ApiError> {
     tenancy::acting_user(&shared.db, &ctx.principal)
         .await
         .map_err(db_error)?
@@ -975,6 +1044,7 @@ async fn list_tokens(
     axum::extract::Query(q): axum::extract::Query<crate::http::pagination::PageQuery>,
 ) -> Result<Json<Page<TokenInfo>>, Fail> {
     let user = authorize_self_shared(&state, &shared, &ctx, "auth.manage_tokens").await?;
+    let (bound_org, bound_project) = token_bounds(&shared, &ctx).await?;
     let page = q.resolve()?;
     let bad_cursor = || {
         ApiError::new(
@@ -990,11 +1060,14 @@ async fn list_tokens(
     let rows: Vec<TokenRow> = sqlx::query_as(
         "SELECT id, name, token_prefix, scopes, expires_at, last_used_at FROM api_tokens \
          WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now() AND ($2::uuid IS NULL OR id < $2) \
+           AND ($4::uuid IS NULL OR org_id = $4) AND ($5::uuid IS NULL OR project_id = $5) \
          ORDER BY id DESC LIMIT $3",
     )
     .bind(user.as_uuid())
     .bind(after)
     .bind(i64::try_from(page.fetch()).unwrap_or(201))
+    .bind(bound_org.map(|o| o.as_uuid()))
+    .bind(bound_project.map(|p| p.as_uuid()))
     .fetch_all(shared.db.pool())
     .await
     .map_err(|e| db_error(e.into()))?;
@@ -1040,9 +1113,11 @@ async fn create_token(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
     Caller(ctx): Caller,
-    Json(req): Json<CreateToken>,
+    crate::modules::auth::problem::Body(req): crate::modules::auth::problem::Body<CreateToken>,
 ) -> Result<(StatusCode, Json<NewToken>), Fail> {
-    let user = authorize_self_shared(&state, &shared, &ctx, "auth.manage_tokens").await?;
+    // Authorized below: on the project when one is named (a project-only researcher may
+    // make tokens for it), else account-wide.
+    let user = acting(&shared, &ctx).await?;
     let name = req.name.trim();
     if name.is_empty() || name.chars().count() > 100 {
         return Err(field("/name", "name must have 1–100 characters").into());
@@ -1123,6 +1198,10 @@ async fn create_token(
         state
             .authorize(&ctx, "auth.manage_tokens", &on_project)
             .await?;
+    } else {
+        state
+            .authorize(&ctx, "auth.manage_tokens", &Resource::kind("account"))
+            .await?;
     }
     let pepper = shared.pepper(&state).await?;
     let token_req = credentials::TokenRequest {
@@ -1180,13 +1259,24 @@ async fn revoke_token(
     } else {
         authorize_self_shared(&state, &shared, &ctx, "auth.manage_tokens").await?
     };
+    // A token revokes only credentials inside its own org and project (itself always).
+    let (bound_org, bound_project) = if ctx.principal.id == id {
+        (None, None)
+    } else {
+        token_bounds(&shared, &ctx).await?
+    };
     let missing = || ApiError::new(ErrorCode::NotFound, "No token with this id exists.");
     let token = TokenId::from_str(&id).map_err(|_| missing())?;
     let at = state.seams.clock.now();
     let mut tx = shared.db.begin().await.map_err(db_error)?;
-    let n = sqlx::query("UPDATE api_tokens SET revoked_at = now() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL")
+    let n = sqlx::query(
+        "UPDATE api_tokens SET revoked_at = now() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL \
+           AND ($3::uuid IS NULL OR org_id = $3) AND ($4::uuid IS NULL OR project_id = $4)",
+    )
         .bind(token.as_uuid())
         .bind(user.as_uuid())
+        .bind(bound_org.map(|o| o.as_uuid()))
+        .bind(bound_project.map(|p| p.as_uuid()))
         .execute(&mut *tx)
         .await
         .map_err(|e| db_error(e.into()))?

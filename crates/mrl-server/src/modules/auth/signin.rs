@@ -25,6 +25,8 @@ pub const NOT_SET_UP: &str = "MRL-AUTH-162";
 pub const OTHER_ACCOUNT: &str = "MRL-AUTH-163";
 /// How long a started sign-in stays open.
 const FLOW_TTL: Duration = Duration::from_secs(600);
+/// Most sign-ins open at once; more are refused (429) until some finish or expire.
+pub const MAX_FLOWS: usize = 1_000;
 /// Refresh when the access token has less than this left.
 const REFRESH_MARGIN: i64 = 60;
 
@@ -158,6 +160,28 @@ impl SignIn {
         self.store_tokens(t).await
     }
 
+    /// The stored session as it is now (raw), to put back if a sign-in does not finish.
+    pub async fn snapshot(&self, held: &SessionHeld) -> Result<Option<Secret>, SignInError> {
+        let _ = held;
+        let (_, store) = self.parts()?;
+        store.get(SESSION_SECRET).await.map_err(store_err)
+    }
+
+    /// Puts a [`SignIn::snapshot`] back (`None`: no session).
+    pub async fn put_back(
+        &self,
+        held: &SessionHeld,
+        raw: Option<Secret>,
+    ) -> Result<(), SignInError> {
+        let _ = held;
+        let (_, store) = self.parts()?;
+        match raw {
+            Some(v) => store.set(SESSION_SECRET, v).await,
+            None => store.delete(SESSION_SECRET).await,
+        }
+        .map_err(store_err)
+    }
+
     async fn store_tokens(&self, t: &TokenSet) -> Result<(), SignInError> {
         let (supabase, _) = self.parts()?;
         self.save(&Stored {
@@ -269,8 +293,9 @@ pub struct Flow {
 pub struct Flows(Mutex<HashMap<String, Flow>>);
 
 impl Flows {
-    /// A new flow: its id and the PKCE challenge for the authorize URL.
-    pub fn start(&self) -> Result<(String, String), SeamError> {
+    /// A new flow: its id and the PKCE challenge for the authorize URL. Refused (429) while
+    /// [`MAX_FLOWS`] are open.
+    pub fn start(&self) -> Result<(String, String), crate::error::ApiError> {
         let rnd = |n| -> Result<String, SeamError> {
             let b = crypto::random::<32>().map_err(|e| SeamError::new("auth", e.to_string()))?;
             Ok(URL_SAFE_NO_PAD.encode(&b[..n]))
@@ -282,6 +307,13 @@ impl Flows {
             .lock()
             .map_err(|_| SeamError::new("auth", "flow lock poisoned"))?;
         map.retain(|_, f| f.started.elapsed() < FLOW_TTL);
+        if map.len() >= MAX_FLOWS {
+            return Err(crate::error::ApiError::new(
+                crate::error::ErrorCode::RateLimited,
+                "Too many sign-ins are open right now; try again in a minute.",
+            )
+            .retry_after(60));
+        }
         map.insert(
             id.clone(),
             Flow {
@@ -362,6 +394,12 @@ mod tests {
         );
         assert!(flows.take(&id).is_none(), "second use");
         assert!(flows.take("unknown").is_none());
+        // Open sign-ins are bounded.
+        let many = Flows::default();
+        for _ in 0..MAX_FLOWS {
+            many.start().unwrap();
+        }
+        assert!(many.start().is_err());
         assert_eq!(
             with_flow("http://127.0.0.1:5/cb", "f1"),
             "http://127.0.0.1:5/cb?flow=f1"

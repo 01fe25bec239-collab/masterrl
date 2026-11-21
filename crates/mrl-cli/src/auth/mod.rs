@@ -30,6 +30,12 @@ pub trait Credentials {
 pub struct Keyring;
 
 fn keychain_error(e: &keyring::Error) -> String {
+    let lower = e.to_string().to_ascii_lowercase();
+    if lower.contains("cancel") || lower.contains("dismissed") {
+        return "MRL-ENV-162: the keychain request was cancelled, so the CLI could not keep its access token. \
+                Run the command again and choose Allow (or Always Allow) when the keychain asks"
+            .to_owned();
+    }
     format!("MRL-ENV-161: the CLI could not use this computer's keychain ({e})")
 }
 
@@ -178,10 +184,9 @@ pub fn is_loopback(server: &str) -> bool {
 /// A core address is an origin only; plain `http://` is allowed only on loopback, because
 /// tokens and sync passphrases travel in it.
 fn check_server(server: &str) -> Result<(), String> {
+    // The address is never repeated: a mistyped one may hold a user name or password.
     let u = reqwest::Url::parse(server).map_err(|_| {
-        format!(
-            "{server:?} is not a server address; it must start with https:// (or http://127.0.0.1)"
-        )
+        "that is not a server address; it must start with https:// (or http://127.0.0.1)".to_owned()
     })?;
     let origin_only = u.username().is_empty()
         && u.password().is_none()
@@ -189,17 +194,22 @@ fn check_server(server: &str) -> Result<(), String> {
         && u.query().is_none()
         && u.fragment().is_none();
     if !origin_only {
-        return Err(format!(
-            "{server:?} must be only the core's address, like https://lab.example:8443"
-        ));
+        return Err(
+            "the server address must be only the core's address (no user name, password, path or query), like https://lab.example:8443"
+                .to_owned(),
+        );
     }
     match u.scheme() {
         "https" => Ok(()),
         "http" if is_loopback(server) => Ok(()),
-        "http" => Err(format!(
-            "{server:?} uses plain http://, which would send your token unencrypted; use https:// for a core on another computer"
-        )),
-        _ => Err(format!("{server:?} must start with https:// (or http://127.0.0.1 for this computer)")),
+        "http" => Err(
+            "the server address uses plain http://, which would send your token unencrypted; use https:// for a core on another computer"
+                .to_owned(),
+        ),
+        _ => Err(
+            "the server address must start with https:// (or http://127.0.0.1 for this computer)"
+                .to_owned(),
+        ),
     }
 }
 
@@ -360,7 +370,13 @@ fn answer(mut stream: TcpStream) -> Result<Option<Callback>, String> {
     let (page, result) = match (
         q.get("flow"),
         q.get("code"),
-        q.get("error_description").or(q.get("error")),
+        // Only the error code; the description is free text from the address bar.
+        q.get("error").map(|e| {
+            e.chars()
+                .filter(|c| c.is_ascii_lowercase() || *c == '_')
+                .take(64)
+                .collect::<String>()
+        }),
     ) {
         (Some(f), Some(c), None) => (
             "You are signed in. You can close this tab and go back to the terminal.",
@@ -368,7 +384,9 @@ fn answer(mut stream: TcpStream) -> Result<Option<Callback>, String> {
         ),
         (_, _, Some(e)) => (
             "The sign-in did not finish. Go back to the terminal for details.",
-            Err(format!("MRL-AUTH-161: the sign-in service said: {e}")),
+            Err(format!(
+                "MRL-AUTH-161: the sign-in service refused the sign-in ({e})"
+            )),
         ),
         _ => (
             "The sign-in did not finish. Go back to the terminal for details.",
@@ -440,18 +458,31 @@ pub fn login(
     Ok(())
 }
 
-/// `mrl logout`: ends the sign-in on the core and forgets the token here.
+/// True when the core refused the saved token itself (signed out or revoked already).
+fn token_already_dead(problem: &str) -> bool {
+    problem.contains("(MRL-AUTH-001)")
+}
+
+/// `mrl logout`: ends the sign-in on the core, then forgets the token here.
 pub fn logout(args: &LogoutArgs, store: &dyn Credentials) -> Result<(), String> {
     let client = Client::connect(args.server.as_deref(), store)?;
-    let result = client.post("/auth/logout", &json!({}));
-    store.delete(&token_key(&client.server))?;
-    match result {
-        Ok(_) => println!("Signed out."),
-        Err(e) => println!(
-            "Forgot the token on this computer. The core did not confirm the sign-out:\n  {e}"
-        ),
+    match client.post("/auth/logout", &json!({})) {
+        Ok(_) => {
+            store.delete(&token_key(&client.server))?;
+            println!("Signed out.");
+            Ok(())
+        }
+        // The core no longer accepts the token: nothing is left to end there.
+        Err(e) if token_already_dead(&e) => {
+            store.delete(&token_key(&client.server))?;
+            println!("Signed out (the core had already ended this sign-in).");
+            Ok(())
+        }
+        // Keep the token, so the sign-out can be finished once the core answers.
+        Err(e) => Err(format!(
+            "the core did not confirm the sign-out, so the token stays on this computer; run `mrl logout` again when the core is reachable:\n  {e}"
+        )),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -459,6 +490,24 @@ pub(crate) mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::collections::HashMap;
+
+    #[test]
+    fn logout_keeps_the_token_until_the_core_confirms() {
+        let store = Memory::default();
+        let server = "http://127.0.0.1:9";
+        store
+            .set(&token_key(server), &format!("mrl_pat_{}", "t".repeat(43)))
+            .unwrap();
+        store.set(SERVER_KEY, server).unwrap();
+        let args = LogoutArgs {
+            server: Some(server.to_owned()),
+        };
+        let e = logout(&args, &store).unwrap_err();
+        assert!(e.contains("stays on this computer"), "{e}");
+        assert!(store.get(&token_key(server)).unwrap().is_some(), "kept");
+        assert!(token_already_dead("Sign in first. (MRL-AUTH-001)"));
+        assert!(!token_already_dead("could not reach the core"));
+    }
 
     /// Credentials in memory.
     #[derive(Default)]
@@ -517,9 +566,21 @@ pub(crate) mod tests {
         let err =
             wait_for_callback(&listener, Instant::now() + Duration::from_secs(10)).unwrap_err();
         assert!(
-            err.contains("User said no") && err.contains("MRL-AUTH-161"),
+            err.contains("access_denied") && err.contains("MRL-AUTH-161"),
             "{err}"
         );
+        assert!(
+            !err.contains("User said no"),
+            "free text is not repeated: {err}"
+        );
+        for bad in [
+            "https://ada:hunter2@lab.example",
+            "http://ada:hunter2@lab.example",
+            "ftp://hunter2",
+        ] {
+            let e = check_server(bad).unwrap_err();
+            assert!(!e.contains("hunter2"), "{e}");
+        }
         browser.join().unwrap();
         let err = wait_for_callback(&listener, Instant::now()).unwrap_err();
         assert!(err.contains("within 5 minutes"));

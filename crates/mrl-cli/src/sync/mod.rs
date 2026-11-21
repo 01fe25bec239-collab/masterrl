@@ -81,7 +81,7 @@ pub fn run(args: &SyncArgs, store: &dyn Credentials) -> Result<(), String> {
             println!("Run `mrl sync push` to save your setup.");
         }
         SyncCommand::Push => {
-            let done = client.post("/sync/push", &json!({}))?;
+            let done = push_once(&|body| client.post("/sync/push", body))?;
             println!(
                 "Saved copy {} of your setup ({} kept).",
                 done["version"], done["copies"]
@@ -104,6 +104,24 @@ pub fn run(args: &SyncArgs, store: &dyn Credentials) -> Result<(), String> {
         SyncCommand::Status => println!("{}", status_text(&client.get("/sync/status")?)),
     }
     Ok(())
+}
+
+/// One push, retried up to twice when the core or the sync service did not answer. Every try
+/// carries the same `op_id`, so a push the service saved before its reply was lost is not
+/// saved a second time (which would push an older copy out of the 5 kept).
+fn push_once(post: &dyn Fn(&Value) -> Result<Value, String>) -> Result<Value, String> {
+    let body = json!({ "op_id": uuid::Uuid::now_v7().to_string() });
+    let transient = |e: &str| e.contains("MRL-LINK-160") || e.contains("could not reach the core");
+    let mut tries = 0;
+    loop {
+        match post(&body) {
+            Err(e) if transient(&e) && tries < 2 => {
+                tries += 1;
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+            other => return other,
+        }
+    }
 }
 
 fn restored_text(done: &Value) -> String {
@@ -168,6 +186,32 @@ fn status_text(s: &Value) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_retried_push_sends_the_same_op_id() {
+        let seen = std::cell::RefCell::new(Vec::new());
+        let post = |b: &Value| {
+            seen.borrow_mut()
+                .push(b["op_id"].as_str().unwrap().to_owned());
+            if seen.borrow().len() < 3 {
+                Err("MRL-LINK-160: the sync service did not answer".to_owned())
+            } else {
+                Ok(json!({"version": 6, "copies": 5}))
+            }
+        };
+        assert_eq!(push_once(&post).unwrap()["version"], 6);
+        let ids = seen.into_inner();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().all(|i| i == &ids[0]));
+        // Other failures are not retried.
+        let calls = std::cell::Cell::new(0);
+        let refuse = |_: &Value| {
+            calls.set(calls.get() + 1);
+            Err("MRL-STATE-160: not set up".to_owned())
+        };
+        assert!(push_once(&refuse).is_err());
+        assert_eq!(calls.get(), 1);
+    }
 
     #[test]
     fn restore_and_status_read_plainly() {

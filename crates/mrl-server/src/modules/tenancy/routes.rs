@@ -301,7 +301,7 @@ async fn create_org(
     State(state): State<AppState>,
     Extension(db): Extension<Db>,
     ctx: RequestContext,
-    Json(item): Json<NewItem>,
+    crate::modules::auth::problem::Body(item): crate::modules::auth::problem::Body<NewItem>,
 ) -> Result<Response, Fail> {
     state
         .authorize(&ctx, "admin.manage", &Resource::kind(super::PLATFORM))
@@ -423,7 +423,7 @@ async fn create_workspace(
     Extension(db): Extension<Db>,
     ctx: RequestContext,
     Path(org): Path<String>,
-    Json(item): Json<NewItem>,
+    crate::modules::auth::problem::Body(item): crate::modules::auth::problem::Body<NewItem>,
 ) -> Result<Response, Fail> {
     let org = find_org(&db, &org).await?;
     let resource = Resource {
@@ -546,7 +546,7 @@ async fn create_project(
     Extension(db): Extension<Db>,
     ctx: RequestContext,
     Path(ws): Path<String>,
-    Json(item): Json<NewItem>,
+    crate::modules::auth::problem::Body(item): crate::modules::auth::problem::Body<NewItem>,
 ) -> Result<Response, Fail> {
     let (ws, org) = find_workspace(&db, &ws).await?;
     state

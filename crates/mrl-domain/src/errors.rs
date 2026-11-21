@@ -536,6 +536,10 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         code(ErrorFamily::State, 160),
         "Setup sync isn't turned on yet.",
     ),
+    (
+        code(ErrorFamily::State, 161),
+        "Setup sync runs on your own computer.",
+    ),
     (code(Res, 160), "There is no saved setup to restore."),
     (code(Env, 160), "This computer has no keychain service."),
     (

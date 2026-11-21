@@ -372,6 +372,14 @@ paths:
       tags:
       - sync
       operationId: push
+      requestBody:
+        description: 'Optional: `{"op_id": "<uuid>"}`, the same on retries.'
+        content:
+          application/json:
+            schema:
+              oneOf:
+              - $ref: '#/components/schemas/PushRequest'
+              - type: 'null'
       responses:
         '200':
           content:
@@ -1157,6 +1165,18 @@ components:
         workspace_id:
           type: string
           description: '`ws_…`.'
+    PushRequest:
+      type: object
+      description: '`POST /sync/push` body (optional).'
+      properties:
+        op_id:
+          type:
+          - string
+          - 'null'
+          description: |-
+            A UUID the client keeps for one push and sends again on every retry. The saved
+            history gains one copy per operation, however often it is retried.
+      additionalProperties: false
     Pushed:
       type: object
       description: A copy was saved.

@@ -153,6 +153,43 @@ impl IntoResponse for Fail {
     }
 }
 
+/// A JSON request body, like `axum::Json`, whose rejection says only what kind of problem
+/// the body has. axum's own text can quote parts of the body (a passphrase, a token, a key
+/// shaped like one), and P07's renderer would put it in the problem's `detail`.
+pub struct Body<T>(pub T);
+
+impl<T, S> axum::extract::FromRequest<S> for Body<T>
+where
+    T: serde::de::DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = Fail;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Fail> {
+        match axum::Json::<T>::from_request(req, state).await {
+            Ok(axum::Json(v)) => Ok(Body(v)),
+            Err(r) => {
+                let status = r.status();
+                let (code, detail) = match status {
+                    StatusCode::UNPROCESSABLE_ENTITY => (
+                        ErrorCode::Validation,
+                        "The request body has a field that is missing, not allowed here, or of the wrong type; check it against the API reference.",
+                    ),
+                    StatusCode::UNSUPPORTED_MEDIA_TYPE => (
+                        ErrorCode::for_status(status),
+                        "Send the body as JSON, with Content-Type: application/json.",
+                    ),
+                    StatusCode::PAYLOAD_TOO_LARGE => {
+                        (ErrorCode::BodyTooLarge, "The request body is too large.")
+                    }
+                    _ => (ErrorCode::for_status(status), "The request body is not valid JSON."),
+                };
+                Err(ApiError::new(code, detail).into())
+            }
+        }
+    }
+}
+
 /// Layer for P16's routers: renders [`Coded`] errors as problem documents.
 pub async fn render(req: Request, next: Next) -> Response {
     // Under `/api/v1` the router strips the prefix; the original path keeps it.
@@ -215,6 +252,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn body_rejections_never_repeat_the_body() {
+        #[derive(serde::Deserialize, Debug)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct Wanted {
+            name: String,
+        }
+        let app = axum::Router::new()
+            .route(
+                "/x",
+                axum::routing::post(|Body(_): Body<Wanted>| async { StatusCode::NO_CONTENT }),
+            )
+            .layer(axum::middleware::from_fn(render));
+        let canary = "hf_CANARYbody8f3e1c9a77";
+        for body in [
+            format!(r#"{{"name": "a", "{canary}": 1}}"#),
+            format!(r#"{{"name": 7, "x": "{canary}"}}"#),
+            format!(r#"{{"name": "{canary}"#),
+        ] {
+            let res = app
+                .clone()
+                .oneshot(
+                    axum::http::Request::post("/x")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert!(res.status().is_client_error());
+            let text = axum::body::to_bytes(res.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            let text = String::from_utf8_lossy(&text);
+            assert!(!text.contains(canary), "{text}");
+        }
+    }
+
+    #[tokio::test]
     async fn a_cancelled_keychain_prompt_keeps_its_code_over_http() {
         use crate::modules::auth::signin::SignInError;
         let cancelled = format!(
@@ -249,6 +325,7 @@ mod tests {
             "MRL-LINK-160",
             "MRL-VAL-160",
             "MRL-STATE-160",
+            "MRL-STATE-161",
             "MRL-RES-160",
             "MRL-ENV-160",
             "MRL-ENV-161",

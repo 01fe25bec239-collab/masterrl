@@ -15,7 +15,7 @@ use crate::server::{TestResponse, TestServer, TEST_SECRET};
 use axum::body::Body;
 use axum::http::Method;
 use mrl_server::config::{Config, Mode};
-use mrl_server::seams::{SecretStore, LAUNCH_SECRET_HEADER};
+use mrl_server::seams::{SeamError, Secret, SecretStore, LAUNCH_SECRET_HEADER};
 use mrl_server::{registry, ServerError};
 use serde_json::Value;
 use std::net::{Ipv4Addr, SocketAddr};
@@ -53,6 +53,41 @@ pub struct CoreServer {
     pub secrets: Arc<InMemorySecretStore>,
     /// Its settings.
     pub config: Config,
+    /// What the server writes secrets through (the store above, plus a failure switch).
+    keychain: Arc<Keychain>,
+}
+
+/// The test keychain: `secrets` plus one switch that makes the next write of a name fail,
+/// like a cancelled keychain prompt.
+struct Keychain {
+    inner: Arc<InMemorySecretStore>,
+    fail: std::sync::Mutex<Option<(String, String)>>,
+}
+
+#[async_trait::async_trait]
+impl SecretStore for Keychain {
+    async fn get(&self, name: &str) -> Result<Option<Secret>, SeamError> {
+        self.inner.get(name).await
+    }
+    async fn set(&self, name: &str, value: Secret) -> Result<(), SeamError> {
+        let failing = {
+            let mut fail = self.fail.lock().unwrap_or_else(|p| p.into_inner());
+            match fail.take() {
+                Some((n, detail)) if n == name => Some(detail),
+                other => {
+                    *fail = other;
+                    None
+                }
+            }
+        };
+        match failing {
+            Some(detail) => Err(SeamError::new("secrets", detail)),
+            None => self.inner.set(name, value).await,
+        }
+    }
+    async fn delete(&self, name: &str) -> Result<(), SeamError> {
+        self.inner.delete(name).await
+    }
 }
 
 /// Settings for a test core in `mode` that signs in through `sb`.
@@ -88,7 +123,11 @@ impl CoreServer {
         db: TestDb,
         secrets: Arc<InMemorySecretStore>,
     ) -> Result<Self, ServerError> {
-        let store: Arc<dyn SecretStore> = secrets.clone();
+        let keychain = Arc::new(Keychain {
+            inner: secrets.clone(),
+            fail: std::sync::Mutex::new(None),
+        });
+        let store: Arc<dyn SecretStore> = keychain.clone();
         let seams =
             mrl_server::modules::auth::production_seams(&config, db.db(), store, TEST_SECRET)
                 .await?
@@ -100,7 +139,14 @@ impl CoreServer {
             db,
             secrets,
             config,
+            keychain,
         })
+    }
+
+    /// The next write of secret `name` fails with `detail` (like `MRL-ENV-162: …`).
+    pub fn fail_next_write(&self, name: &str, detail: &str) {
+        *self.keychain.fail.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((name.to_owned(), detail.to_owned()));
     }
 
     /// Stops the server and closes its connections, so dropping the database is quick.

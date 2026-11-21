@@ -2099,6 +2099,7 @@ dependencies = [
  "reqwest",
  "rpassword",
  "serde_json",
+ "uuid",
 ]
 
 [[package]]
