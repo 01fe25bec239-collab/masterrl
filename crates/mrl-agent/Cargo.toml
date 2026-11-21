@@ -34,14 +34,11 @@ rcgen = { workspace = true }
 sha2 = { workspace = true }
 tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
 webpki = { package = "rustls-webpki", version = "=0.103.17", default-features = false, features = ["ring", "std"] }
-tokio-stream = "=0.1.19"
+tokio-stream = { version = "=0.1.19", features = ["net", "io-util"] }
 hyper-util = { version = "=0.1.21", features = ["tokio"] }
 
 # <mrl:deps P20> P20 dependencies go right below this line.
 getrandom = "=0.3.4"
-prost = { workspace = true }
-tokio-stream = { version = "=0.1.19", features = ["net", "io-util"] }
-tonic = { workspace = true }
 
 [target.'cfg(unix)'.dependencies.rustix]
 version = "=1.1.6"

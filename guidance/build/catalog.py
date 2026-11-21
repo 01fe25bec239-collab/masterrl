@@ -908,6 +908,40 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': 'Someone revoked the token, or it reached its end date.',
              'what_to_do': {'steps': ['Create a new token in Settings.',
                                       'Update the tool that uses the old token.']}},
+            {'code': 'MRL-AUTH-160',
+             'title': 'Your sign-in has expired.',
+             'why': "The sign-in service no longer accepts this computer's session. Your local "
+                    'work keeps running; only setup sync and teams need a fresh sign-in.',
+             'what_to_do': {'steps': ['Sign in again from Settings, or run `mrl login`.',
+                                      'Then repeat what you were doing, like `mrl sync push`.']}},
+            {'code': 'MRL-AUTH-161',
+             'title': 'The sign-in did not finish.',
+             'why': 'The sign-in took longer than 10 minutes, was used twice, or the sign-in '
+                    'service refused it.',
+             'what_to_do': {'steps': ['Start the sign-in again and finish it in the browser within '
+                                      '10 minutes.',
+                                      'If it keeps failing, close other sign-in tabs and try once '
+                                      'more.']}},
+            {'code': 'MRL-AUTH-162',
+             'title': "Sign-in isn't set up in this app.",
+             'why': 'This app has no address for the sign-in service. Local work does not need it.',
+             'what_to_do': {'steps': ['Keep working offline, or ask whoever runs this app to set '
+                                      '`auth.supabase_url` and `auth.supabase_anon_key`.']}},
+            {'code': 'MRL-AUTH-163',
+             'title': 'This app is signed in to a different account.',
+             'why': 'One computer links to one account at a time. Another account is signed in '
+                    'right now.',
+             'what_to_do': {'steps': ['Sign out first with `mrl logout` or in Settings.',
+                                      'Then sign in with the account you want.']}},
+            {'code': 'MRL-AUTH-170',
+             'title': 'The `mrl` command has no access token yet.',
+             'why': 'The command signs in to the server with a personal access token. None is '
+                    'saved on this computer, and `MRL_TOKEN` is not set.',
+             'what_to_do': {'steps': ['Create a personal access token in the app under your '
+                                      'profile.',
+                                      'Run `mrl config set-token` and paste the token when asked.',
+                                      'Or set the `MRL_TOKEN` environment variable for this '
+                                      'terminal.']}},
             {'code': 'MRL-CAP-001',
              'title': 'No engine here supports this method.',
              'why': "The training engines on this machine can't run the method you picked.",
@@ -1061,6 +1095,41 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': 'Other changes to the same items kept getting in the way, so the server '
                     'stopped trying.',
              'what_to_do': {'steps': ['Try again in a few seconds.']}},
+            {'code': 'MRL-CONFLICT-160',
+             'title': 'This short name is already used here.',
+             'why': 'Each org, workspace and project needs its own short name for addresses. '
+                    'Another one at this level already uses it.',
+             'what_to_do': {'steps': ['Pick a different short name, like `vision-lab-2`.',
+                                      'To use the existing one instead, find it in the list at '
+                                      'this level.']}},
+            {'code': 'MRL-CONFLICT-170',
+             'title': 'The job changed while the app was updating it.',
+             'why': 'Something else changed the job a moment ago. The app stopped so it would not '
+                    'overwrite that change.',
+             'what_to_do': {'steps': ['Refresh to see the latest state.',
+                                      'Try again if the change still makes sense.']}},
+            {'code': 'MRL-CONFLICT-171',
+             'title': 'An experiment with this name already exists in this project.',
+             'why': 'Experiment names are unique inside a project, so lists and links stay clear.',
+             'what_to_do': {'steps': ['Pick another name.',
+                                      'Or add your runs to the experiment that already has this '
+                                      'name.']}},
+            {'code': 'MRL-CONFLICT-190',
+             'title': 'This name is already used here.',
+             'why': 'Another artifact or secret in this place already has this name.',
+             'what_to_do': {'steps': ['Pick a different name, then try again.',
+                                      'To replace the old one, delete it first.']}},
+            {'code': 'MRL-CONFLICT-191',
+             'title': 'This upload is already finished.',
+             'why': 'The upload was completed, cancelled, or it expired after 24 hours. It takes '
+                    'no more changes.',
+             'what_to_do': {'steps': ['Start a new upload for the file.']}},
+            {'code': 'MRL-CONFLICT-192',
+             'title': 'This secret is being deleted.',
+             'why': "Someone started deleting this secret, so its value can't be changed or read "
+                    'any more. A delete that stopped halfway leaves it in this state.',
+             'what_to_do': {'steps': ['Delete the secret again to finish.',
+                                      'Then create a new secret if you still need one.']}},
             {'code': 'MRL-DATA-001',
              'title': 'Your dataset did not pass its checks.',
              'why': "Some rows are empty, are missing fields, or don't match the chosen format.",
@@ -1217,6 +1286,54 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'what_to_do': {'steps': ['Update the app on this machine, then start the run again.',
                                       "If that doesn't help, install a version of the engine made "
                                       'for your app version.']}},
+            {'code': 'MRL-ENV-160',
+             'title': 'This computer has no keychain service.',
+             'why': 'The app keeps secrets in your system keychain. This computer has none '
+                    'running, so secrets go to an encrypted file instead.',
+             'what_to_do': {'steps': ["You can keep working. Anyone who can read the app's data "
+                                      'folder could read these secrets.'],
+                            'linux': ['Install and start a Secret Service keyring, like the '
+                                      '`gnome-keyring` package, then restart the app.']}},
+            {'code': 'MRL-ENV-161',
+             'title': "The app could not use this computer's keychain.",
+             'why': 'The keychain is locked, or it refused the app access.',
+             'what_to_do': {'steps': ['Unlock your keychain, then try again.'],
+                            'macos': ['Open Keychain Access and allow MasterRL when it asks.'],
+                            'windows': ['Open Credential Manager and check that it works.'],
+                            'linux': ['Unlock your login keyring, for example with the `seahorse` '
+                                      'app.']}},
+            {'code': 'MRL-ENV-162',
+             'title': 'The keychain request was cancelled.',
+             'why': 'The keychain asked to let MasterRL use its secrets, and that request was '
+                    'cancelled.',
+             'what_to_do': {'steps': ['Start the app again and choose Allow (or Always Allow) when '
+                                      'the keychain asks.',
+                                      'On a development machine, set `backend = "file"` under '
+                                      '`[keychain]` in the settings file. Secrets then stay in an '
+                                      'encrypted file.',
+                                      'After that switch, allow one more keychain read. The app '
+                                      'copies the database password into the file then.',
+                                      'Sign-in and sync keys do not move, so sign in again after '
+                                      'the change.']}},
+            {'code': 'MRL-ENV-170',
+             'title': 'The `mrl` command could not reach the server.',
+             'why': 'Nothing answered at the server address the command uses, or the connection '
+                    'broke.',
+             'what_to_do': {'steps': ['Check the address with `mrl config show`.',
+                                      'Make sure the server or the desktop app is running.',
+                                      'Change the address with `mrl config set-server '
+                                      '<address>`.']}},
+            {'code': 'MRL-ENV-190',
+             'title': 'This server has no place to keep secret values.',
+             'why': "The server was started without a secret store, so it can't save or read "
+                    'secret values. A team server also needs it to sign download and upload links '
+                    'that every server copy accepts.',
+             'what_to_do': {'steps': ['Start the server from the desktop app, which keeps secrets '
+                                      "in your computer's keychain.",
+                                      'On a solo server, you can also use a secret read from an '
+                                      'environment variable.',
+                                      'On a team server, ask your admin to set up the shared '
+                                      'secret store.']}},
             {'code': 'MRL-ENV-201',
              'title': "The training environment's lock file doesn't match its fingerprint.",
              'why': 'The file that lists the exact package versions changed after the engine was '
@@ -1246,6 +1363,14 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': 'The `Idempotency-Key` header must be 1 to 255 visible characters.',
              'what_to_do': {'steps': ['Send a shorter key, such as a random one made for this '
                                       'request.']}},
+            {'code': 'MRL-IDEM-170',
+             'title': 'Submitting a run needs a request key.',
+             'why': 'The `Idempotency-Key` header lets the app spot a repeated submit, so a retry '
+                    'never starts a second run.',
+             'what_to_do': {'steps': ['Send an `Idempotency-Key` header with a new random value '
+                                      'for each new run.',
+                                      'The `mrl` command and the Python package add this header '
+                                      'for you.']}},
             {'code': 'MRL-INTERNAL-001',
              'title': 'The server hit a problem it did not expect.',
              'why': 'Something inside the server went wrong while handling the request.',
@@ -1400,6 +1525,36 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': 'Each machine stores model files and checkpoints for the job.',
              'what_to_do': {'steps': ['Free up space on the machine named in Details.',
                                       'Keep about 10–50 GB free on each machine.']}},
+            {'code': 'MRL-LINK-160',
+             'title': 'The app could not reach the sign-in service.',
+             'why': 'This computer is offline, or the sign-in service did not answer. Local work '
+                    'keeps running.',
+             'what_to_do': {'steps': ['Check your internet connection, then try again.',
+                                      'Your setup stays on this computer until you can sync it.']}},
+            {'code': 'MRL-LINK-184',
+             'title': "The app and this machine can't reach each other.",
+             'why': 'The address may be wrong, the other side may not be running, or a network '
+                    'rule may block it.',
+             'what_to_do': {'steps': ['Read the failing step in Details.',
+                                      'Check that the agent and the app are both running.',
+                                      'Run `mrl-agent connection-test` on the machine for a '
+                                      'step-by-step check.']}},
+            {'code': 'MRL-LINK-185',
+             'title': "Confirm this machine's key before the first connection.",
+             'why': 'This is the first remote sign-in (`ssh`) to this machine. The app checks its '
+                    'key so nobody can pretend to be it.',
+             'what_to_do': {'steps': ['On the machine, run `ssh-keygen -lf '
+                                      '/etc/ssh/ssh_host_ed25519_key.pub`.',
+                                      'Confirm in the app only if the fingerprint matches the one '
+                                      'in Details.']}},
+            {'code': 'MRL-LINK-186',
+             'title': "This machine's sign-in key changed.",
+             'why': 'The key differs from the one you confirmed. Someone may be intercepting the '
+                    'connection, or the machine was reinstalled.',
+             'what_to_do': {'steps': ["Don't connect until you know why the key changed.",
+                                      'If the machine was reinstalled, remove its old entry from '
+                                      "the app's known hosts file named in Details.",
+                                      'Connect again and confirm the new key.']}},
             {'code': 'MRL-MODEL-001',
              'title': "The app did not load this model's files, to keep your computer safe.",
              'why': 'The weights use the pickle format, which can run hidden code. The app allows '
@@ -1464,6 +1619,56 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                                       'Run `mrl-agent service install` again.',
                                       'If it still fails, start the agent by hand with `mrl-agent '
                                       'run`.']}},
+            {'code': 'MRL-NODE-180',
+             'title': "The join token can't be used.",
+             'why': 'Each token adds one machine and works for a short time. This one is unknown, '
+                    'used or expired.',
+             'what_to_do': {'steps': ['In the app, open Machines and create a new join token.',
+                                      'Run the enroll command again with the new token.']}},
+            {'code': 'MRL-NODE-181',
+             'title': "The app did not accept this machine's certificate.",
+             'why': 'The certificate was revoked, has expired, or belongs to another machine. The '
+                    'machine may also have been removed.',
+             'what_to_do': {'steps': ['Read the reason in Details.',
+                                      'If the machine was removed by mistake, create a new join '
+                                      'token and enroll it again.',
+                                      'Run `mrl-agent enroll --force` with the new token on that '
+                                      'machine.']}},
+            {'code': 'MRL-NODE-182',
+             'title': 'This machine has not joined the app yet.',
+             'why': 'The agent needs its own certificate before it can connect, and it has none '
+                    'yet.',
+             'what_to_do': {'steps': ['In the app, open Machines and create a join token.',
+                                      'On this machine, run the enroll command the app shows.']}},
+            {'code': 'MRL-NODE-183',
+             'title': "The app's certificate authority can't be used.",
+             'why': 'The app keeps a private key to sign machine certificates. It could not read '
+                    'or save that key.',
+             'what_to_do': {'steps': ["Check that the app's data folder is on a disk with free "
+                                      'space.',
+                                      'Make sure your account can write to the folder named in '
+                                      'Details.',
+                                      'Restart the app.']}},
+            {'code': 'MRL-NODE-187',
+             'title': 'The app did not send this command to the machine.',
+             'why': "The machine is draining or was removed, or this version can't send that kind "
+                    'of command yet.',
+             'what_to_do': {'steps': ["Check the machine's status in the app.",
+                                      'Pick another machine, or bring this one back before trying '
+                                      'again.']}},
+            {'code': 'MRL-NODE-188',
+             'title': 'This machine has too many messages waiting for the app.',
+             'why': 'The app has been out of reach for a long time. The agent keeps important '
+                    'messages until the app has them.',
+             'what_to_do': {'steps': ['Reconnect this machine to the app; the waiting messages are '
+                                      'sent then.',
+                                      'To keep more while offline, raise `gateway.spool_max_bytes` '
+                                      'in the agent settings.']}},
+            {'code': 'MRL-NODE-189',
+             'title': "The app and the agent don't understand each other.",
+             'why': "They may run versions that don't match, or a message was damaged on the way.",
+             'what_to_do': {'steps': ['Update the agent and the app to the same version.',
+                                      'Connect again.']}},
             {'code': 'MRL-NODE-203',
              'title': 'The agent could not open the connection to the training worker.',
              'why': 'The agent talks to the training worker through a local socket file. It could '
@@ -1488,6 +1693,13 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': 'Annotators can open only the tasks assigned to them.',
              'what_to_do': {'steps': ['Pick a task from your own list.',
                                       'Ask a maintainer to assign this task to you.']}},
+            {'code': 'MRL-PERM-190',
+             'title': "This secret can't be used for this.",
+             'why': "The secret's settings list the uses it allows, and this use is not one of "
+                    'them.',
+             'what_to_do': {'steps': ["Add this use to the secret's allowed uses, if your team "
+                                      'agrees.',
+                                      'Or pick a secret made for this use.']}},
             {'code': 'MRL-QUOTA-001',
              'title': 'Your team reached its limit on jobs or GPUs.',
              'why': 'Your org limits how many jobs and GPUs a project can use at once.',
@@ -1512,6 +1724,19 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'why': 'The server has no endpoint at this path.',
              'what_to_do': {'steps': ['Check the path against the reference at '
                                       '`/api-docs/openapi.json`.']}},
+            {'code': 'MRL-RES-160',
+             'title': 'There is no saved setup to restore.',
+             'why': 'This account has no saved setup yet, or not the copy you asked for.',
+             'what_to_do': {'steps': ['Run `mrl sync status` to see the saved copies.',
+                                      'On the computer that has your setup, run `mrl sync push` '
+                                      'first.']}},
+            {'code': 'MRL-RES-190',
+             'title': 'This secret has no value yet.',
+             'why': 'The secret exists, but nobody saved its value. Or its environment variable is '
+                    'not set on the server.',
+             'what_to_do': {'steps': ["Save the secret's value in the app, then try again.",
+                                      'For a secret read from an environment variable, set that '
+                                      'variable and restart the server.']}},
             {'code': 'MRL-RWD-140',
              'title': 'The reward policy has a problem.',
              'why': "A field in the policy is missing, has a value the app doesn't accept, or "
@@ -1584,6 +1809,26 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                                       'If you started the service by hand, use a listen address '
                                       'like `unix:/tmp/reward.sock`.',
                                       'For local testing only, add `--allow-network`.']}},
+            {'code': 'MRL-STATE-160',
+             'title': "Setup sync isn't turned on yet.",
+             'why': 'Sync needs a passphrase first. The app locks your setup with it before it '
+                    'leaves this computer.',
+             'what_to_do': {'steps': ['Run `mrl sync setup` or turn on sync in Settings.',
+                                      'Save the recovery key it shows in a safe place.']}},
+            {'code': 'MRL-STATE-161',
+             'title': 'Setup sync runs on your own computer.',
+             'why': 'A team server is shared, so it does not hold your personal sign-in or sync '
+                    'keys.',
+             'what_to_do': {'steps': ['Turn on setup sync in the MasterRL app on your own '
+                                      'computer.',
+                                      'Use the team server for team projects only.']}},
+            {'code': 'MRL-STATE-170',
+             'title': "This job can't take that step right now.",
+             'why': 'A job moves through set steps, like queued, running and finished. The step '
+                    "you asked for doesn't fit the step the job is in now.",
+             'what_to_do': {'steps': ["Refresh to see the job's current state.",
+                                      'A finished job never changes again. To try again, submit a '
+                                      'new run.']}},
             {'code': 'MRL-STATE-204',
              'title': "This training attempt can't do that right now.",
              'why': "The attempt isn't running on this machine, already exists, or is in a step "
@@ -1674,6 +1919,12 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                     'not match.',
              'what_to_do': {'steps': ['Wait until nothing else is writing to the file.',
                                       'Start the upload again.']}},
+            {'code': 'MRL-STORE-190',
+             'title': 'Some parts of this upload are missing or the wrong size.',
+             'why': 'The app can finish an upload only when every part has arrived at its full '
+                    'size. Details list the parts.',
+             'what_to_do': {'steps': ['Send the parts listed in Details again.',
+                                      'Then finish the upload again.']}},
             {'code': 'MRL-VAL-001',
              'title': 'The app could not read this request.',
              'why': 'The request is not in a format the app understands. Part of it may be '
@@ -1781,6 +2032,14 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                                       'the task needs.',
                                       'If a script started the job, fix the input named in '
                                       'Details.']}},
+            {'code': 'MRL-VAL-160',
+             'title': "This passphrase or recovery key doesn't open your saved setup.",
+             'why': "The saved setup is locked with your sync passphrase. The app can't read it "
+                    'with a different one.',
+             'what_to_do': {'steps': ['Check for typing mistakes and the right letter case.',
+                                      'Use the recovery key you saved when you turned on sync.',
+                                      'Without either one, nobody can open the saved setup. Set up '
+                                      'this computer again by hand.']}},
             {'code': 'MRL-VAL-200',
              'title': "The training attempt has settings the agent can't use.",
              'why': 'A name, path or runtime in the attempt is missing or has the wrong form. '
