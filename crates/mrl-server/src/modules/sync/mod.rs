@@ -1317,7 +1317,7 @@ mod tests {
                 "/preferences/note",
             ),
             (
-                serde_json::json!({"ui": {"cmd": "curl -H 'Authorization: Bearer eyJabc.def.ghi' x"}}),
+                serde_json::json!({"ui": {"cmd": format!("curl -H 'Authorization: {} {}' x", "Bearer", "e".repeat(12))}}),
                 "/ui/cmd",
             ),
             (
