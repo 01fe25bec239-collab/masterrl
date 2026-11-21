@@ -108,33 +108,39 @@ pub async fn audit(
 /// Refuses text PostgreSQL can't store: a NUL character in any string or key of `v`.
 /// The field error points at the first place it is found.
 pub fn no_nul(v: &serde_json::Value) -> Result<(), JobsError> {
-    fn find(v: &serde_json::Value, at: &str) -> Option<String> {
+    fn find(v: &serde_json::Value) -> Option<Vec<String>> {
         match v {
-            serde_json::Value::String(s) if s.contains('\0') => Some(at.to_owned()),
-            serde_json::Value::Array(items) => items
-                .iter()
-                .enumerate()
-                .find_map(|(i, x)| find(x, &format!("{at}/{i}"))),
-            serde_json::Value::Object(map) => map.iter().find_map(|(k, x)| {
-                let here = format!("{at}/{}", k.replace('~', "~0").replace('/', "~1"));
-                if k.contains('\0') {
-                    Some(here)
+            serde_json::Value::String(s) if s.contains('\0') => Some(Vec::new()),
+            serde_json::Value::Array(items) => items.iter().enumerate().find_map(|(i, item)| {
+                let mut path = find(item)?;
+                path.push(i.to_string());
+                Some(path)
+            }),
+            serde_json::Value::Object(map) => map.iter().find_map(|(key, value)| {
+                let mut path = if key.contains('\0') {
+                    Vec::new()
                 } else {
-                    find(x, &here)
-                }
+                    find(value)?
+                };
+                path.push(key.replace('~', "~0").replace('/', "~1"));
+                Some(path)
             }),
             _ => None,
         }
     }
-    match find(v, "") {
+    match find(v) {
         None => Ok(()),
-        Some(path) => Err(ApiError::validation(vec![crate::error::FieldError::new(
-            if path.is_empty() { "/" } else { &path },
-            ErrorCode::FieldValue,
-            "Text can't contain the NUL character (\\u0000).",
-            "Remove the NUL character from this value.",
-        )])
-        .into()),
+        Some(mut path) => {
+            path.reverse();
+            let pointer = format!("/{}", path.join("/"));
+            Err(ApiError::validation(vec![crate::error::FieldError::new(
+                &pointer,
+                ErrorCode::FieldValue,
+                "Text can't contain the NUL character (\\u0000).",
+                "Remove the NUL character from this value.",
+            )])
+            .into())
+        }
     }
 }
 
@@ -200,6 +206,17 @@ mod tests {
         );
         assert_eq!(org_text(Uuid::nil()), None);
         assert_eq!(org_text(org.as_uuid()), Some(org.to_string()));
+    }
+
+    #[test]
+    fn nul_error_points_to_the_escaped_nested_path() {
+        let valid = serde_json::json!({"a/b": [{"~name": "ok"}]});
+        assert!(no_nul(&valid).is_ok());
+        let bad = serde_json::json!({"a/b": [{}, {"~name": "before\0after"}]});
+        let JobsError::Api(err) = no_nul(&bad).unwrap_err() else {
+            panic!("expected a validation error");
+        };
+        assert_eq!(err.errors[0].path, "/a~1b/1/~0name");
     }
 
     #[test]
