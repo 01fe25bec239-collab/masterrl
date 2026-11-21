@@ -82,6 +82,13 @@ fn claim(targets: &Targets, id: Uuid) -> bool {
     true
 }
 
+/// True while a dial to `id` runs.
+fn busy(targets: &Targets, id: Uuid) -> bool {
+    targets
+        .lock()
+        .is_ok_and(|t| t.get(&id).is_some_and(|t| t.busy))
+}
+
 fn done(targets: &Targets, id: Uuid, ok: bool) {
     if let Ok(mut t) = targets.lock() {
         let t = t.entry(id).or_default();
@@ -131,10 +138,10 @@ async fn scan(
             done(&targets, node, ok);
         });
     }
-    let tokens: Vec<(Uuid, serde_json::Value)> = sqlx::query_as(
+    let tokens: Vec<(Uuid, serde_json::Value, Option<Uuid>)> = sqlx::query_as(
         // Unused tokens, and used ones whose machine never connected (it may have lost the
         // answer and waits again with the same key) until the token expires.
-        "SELECT t.id, t.endpoint FROM node_enrollment_tokens t
+        "SELECT t.id, t.endpoint, t.used_by_node_id FROM node_enrollment_tokens t
          LEFT JOIN compute_nodes n ON n.id = t.used_by_node_id
          WHERE t.endpoint IS NOT NULL AND t.expires_at > now()
            AND (t.used_at IS NULL OR (t.used_key_sha256 IS NOT NULL AND n.status = 'ENROLLING' AND n.session_epoch = 0
@@ -143,8 +150,11 @@ async fn scan(
     )
     .fetch_all(gw.db.pool())
     .await?;
-    for (token, endpoint) in tokens {
-        if !claim(targets, token) {
+    for (token, endpoint, node) in tokens {
+        // A machine that got its answer is being dialed as a node right now: dialing it again
+        // to re-deliver the answer would take its connection and fail both. One that lost the
+        // answer fails the node dial at once (no certificate), and the next scan re-delivers.
+        if node.is_some_and(|n| busy(targets, n)) || !claim(targets, token) {
             continue;
         }
         let Ok(endpoint) = serde_json::from_value::<Endpoint>(endpoint) else {

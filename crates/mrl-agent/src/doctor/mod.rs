@@ -394,11 +394,7 @@ fn apple(f: &Facts) -> (Outcome, String, Option<&'static str>) {
         "{} with {} unified memory{}",
         a.chip,
         gib(a.unified_memory_total_bytes),
-        if a.mlx_available {
-            ", MLX available"
-        } else {
-            ""
-        }
+        if a.mlx_available { ", can run MLX" } else { "" }
     );
     if a.unified_memory_total_bytes < 16 * GIB || !a.mlx_available {
         (
@@ -1074,6 +1070,23 @@ mod tests {
     fn outcome(r: &DoctorReport, name: &str) -> (Outcome, Option<&'static str>) {
         let c = r.checks.iter().find(|c| c.check == name).unwrap();
         (c.outcome, c.code)
+    }
+
+    #[test]
+    fn a_mac_that_can_run_mlx_does_not_claim_it_is_installed() {
+        let mut f = facts(0, 0);
+        f.inventory.apple = Some(crate::hw::apple::AppleInfo {
+            chip: "Apple M4 Pro".into(),
+            unified_memory_total_bytes: 24 * GIB,
+            unified_memory_used_bytes: 0,
+            memory_pressure: None,
+            memory_pressure_fraction: None,
+            gpu_cores: Some(20),
+            mlx_available: true,
+        });
+        let (outcome, line, _) = apple(&f);
+        assert_eq!(outcome, Outcome::Ok);
+        assert_eq!(line, "Apple M4 Pro with 24 GiB unified memory, can run MLX");
     }
 
     #[test]
