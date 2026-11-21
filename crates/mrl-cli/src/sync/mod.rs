@@ -5,7 +5,8 @@
 
 use crate::auth::{Client, Credentials};
 use serde_json::{json, Value};
-use std::io::BufRead;
+use std::io::{BufRead, Write};
+use std::path::{Path, PathBuf};
 
 /// `mrl sync`.
 #[derive(Debug, clap::Args)]
@@ -81,7 +82,9 @@ pub fn run(args: &SyncArgs, store: &dyn Credentials) -> Result<(), String> {
             println!("Run `mrl sync push` to save your setup.");
         }
         SyncCommand::Push => {
-            let done = push_once(&|body| client.post("/sync/push", body))?;
+            let done = push_pending(&push_state_dir()?, &client.server, &|body| {
+                client.post("/sync/push", body)
+            })?;
             println!(
                 "Saved copy {} of your setup ({} kept).",
                 done["version"], done["copies"]
@@ -106,15 +109,85 @@ pub fn run(args: &SyncArgs, store: &dyn Credentials) -> Result<(), String> {
     Ok(())
 }
 
-/// One push, retried up to twice when the core or the sync service did not answer. Every try
-/// carries the same `op_id`, so a push the service saved before its reply was lost is not
-/// saved a second time (which would push an older copy out of the 5 kept).
-fn push_once(post: &dyn Fn(&Value) -> Result<Value, String>) -> Result<Value, String> {
-    let body = json!({ "op_id": uuid::Uuid::now_v7().to_string() });
-    let transient = |e: &str| e.contains("MRL-LINK-160") || e.contains("could not reach the core");
+fn push_state_dir() -> Result<PathBuf, String> {
+    let base = if cfg!(windows) {
+        std::env::var_os("LOCALAPPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        std::env::home_dir().map(|home| home.join("Library/Application Support"))
+    } else {
+        std::env::var_os("XDG_STATE_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::home_dir().map(|home| home.join(".local/state")))
+    };
+    base.map(|base| base.join("masterrl"))
+        .ok_or_else(|| "could not locate an app folder for pending setup pushes".to_owned())
+}
+
+fn push_pending(
+    dir: &Path,
+    server: &str,
+    post: &dyn Fn(&Value) -> Result<Value, String>,
+) -> Result<Value, String> {
+    let io = |e| format!("could not save the pending setup push: {e}");
+    std::fs::create_dir_all(dir).map_err(io)?;
+    let lock = std::fs::File::options()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(dir.join("setup-push.lock"))
+        .map_err(io)?;
+    // Two CLI invocations must not overwrite the pending retry ID.
+    lock.lock().map_err(io)?;
+    let path = dir.join("setup-push.json");
+    let temp = dir.join("setup-push.json.tmp");
+    let mut pending: std::collections::BTreeMap<String, String> = match std::fs::read(&path) {
+        Ok(raw) => serde_json::from_slice(&raw)
+            .map_err(|_| "the pending setup push could not be read".to_owned())?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Default::default(),
+        Err(e) => return Err(io(e)),
+    };
+    let save = |values: &std::collections::BTreeMap<String, String>| -> Result<(), String> {
+        let bytes = serde_json::to_vec(values).map_err(|e| e.to_string())?;
+        let mut file = std::fs::File::create(&temp).map_err(io)?;
+        file.write_all(&bytes).map_err(io)?;
+        file.sync_all().map_err(io)?;
+        drop(file);
+        std::fs::rename(&temp, &path).map_err(io)
+    };
+    let id = pending
+        .entry(server.to_owned())
+        .or_insert_with(|| uuid::Uuid::now_v7().to_string())
+        .clone();
+    save(&pending)?;
+    let done = push_once(&id, post)?;
+    pending.remove(server);
+    save(&pending)?;
+    Ok(done)
+}
+
+/// Retry a push with the same operation ID until a well-formed acknowledgement arrives.
+fn push_once(id: &str, post: &dyn Fn(&Value) -> Result<Value, String>) -> Result<Value, String> {
+    let body = json!({ "op_id": id });
+    let transient = |e: &str| {
+        e.contains("MRL-LINK-160")
+            || e.starts_with("could not reach the core")
+            || e.starts_with("could not read the core's reply")
+    };
     let mut tries = 0;
     loop {
-        match post(&body) {
+        let result = post(&body).and_then(|done| {
+            if done["version"].as_i64().is_some_and(|v| v > 0)
+                && done["copies"]
+                    .as_u64()
+                    .is_some_and(|n| (1..=5).contains(&n))
+            {
+                Ok(done)
+            } else {
+                Err("could not read the core's reply to the setup push".to_owned())
+            }
+        });
+        match result {
             Err(e) if transient(&e) && tries < 2 => {
                 tries += 1;
                 std::thread::sleep(std::time::Duration::from_secs(1));
@@ -199,7 +272,7 @@ mod tests {
                 Ok(json!({"version": 6, "copies": 5}))
             }
         };
-        assert_eq!(push_once(&post).unwrap()["version"], 6);
+        assert_eq!(push_once("operation", &post).unwrap()["version"], 6);
         let ids = seen.into_inner();
         assert_eq!(ids.len(), 3);
         assert!(ids.iter().all(|i| i == &ids[0]));
@@ -209,8 +282,30 @@ mod tests {
             calls.set(calls.get() + 1);
             Err("MRL-STATE-160: not set up".to_owned())
         };
-        assert!(push_once(&refuse).is_err());
+        assert!(push_once("operation", &refuse).is_err());
         assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn an_unconfirmed_push_reuses_its_operation_after_reopening_the_journal() {
+        let dir = std::env::temp_dir().join(format!("mrl-push-test-{}", uuid::Uuid::new_v4()));
+        let first_id = std::cell::RefCell::new(None);
+        let first = push_pending(&dir, "http://127.0.0.1:8080", &|body| {
+            first_id.replace(body["op_id"].as_str().map(str::to_owned));
+            Err("the core did not confirm the push".to_owned())
+        });
+        assert!(first.is_err());
+        push_pending(&dir, "http://127.0.0.1:8080", &|body| {
+            assert_eq!(body["op_id"].as_str(), first_id.borrow().as_deref());
+            Ok(json!({"version":1,"copies":1}))
+        })
+        .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("setup-push.json")).unwrap(),
+            "{}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        assert!(push_once("op", &|_| Ok(Value::Null)).is_err());
     }
 
     #[test]

@@ -65,6 +65,7 @@ struct Mock {
     refresh: Mutex<HashMap<String, MockUser>>,
     rows: Mutex<HashMap<String, Value>>,
     versions: Mutex<HashMap<String, i64>>,
+    push_receipts: Mutex<HashMap<(String, String), (i64, String)>>,
     offline: AtomicBool,
     access_ttl: AtomicI64,
     refresh_limited: AtomicU32,
@@ -132,6 +133,7 @@ impl MockSupabase {
             refresh: Mutex::default(),
             rows: Mutex::default(),
             versions: Mutex::default(),
+            push_receipts: Mutex::default(),
             offline: AtomicBool::new(false),
             access_ttl: AtomicI64::new(3600),
             refresh_limited: AtomicU32::new(0),
@@ -484,8 +486,10 @@ async fn push_copy(State(m): State<Arc<Mock>>, h: HeaderMap, Json(body): Json<Va
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if let Some(hit) = saved.iter().find(|c| !op.is_null() && c["op"] == op) {
-        return Json(json!({ "version": hit["version"], "at": hit["at"], "copies": saved.len() }))
+    let mut receipts = lock(&m.push_receipts);
+    let op_key = op.as_str().map(|id| (sub.clone(), id.to_owned()));
+    if let Some((version, at)) = op_key.as_ref().and_then(|id| receipts.get(id)) {
+        return Json(json!({ "version": version, "at": at, "copies": saved.len() }))
             .into_response();
     }
     let mut versions = lock(&m.versions);
@@ -506,6 +510,9 @@ async fn push_copy(State(m): State<Arc<Mock>>, h: HeaderMap, Json(body): Json<Va
     copies.truncate(5);
     let kept = copies.len();
     rows.insert(sub, Value::Array(copies));
+    if let Some(id) = op_key {
+        receipts.insert(id, (version, at.clone()));
+    }
     let lost = m
         .lost_push_replies
         .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))

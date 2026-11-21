@@ -35,7 +35,7 @@ pub enum SupabaseError {
     Offline(String),
     /// Supabase answered no (bad code, revoked refresh token, …). Its free-text reason is
     /// not kept: it can repeat what was sent, so errors and logs show only status and code.
-    #[error("the sign-in service refused the request (HTTP {status} {code})")]
+    #[error("the sign-in service refused the request (HTTP {status})")]
     Refused {
         /// HTTP status.
         status: u16,
@@ -48,7 +48,7 @@ pub enum SupabaseError {
 }
 
 /// UUIDs as text in JSON (this build's `uuid` has no serde support).
-mod uuid_text {
+pub(super) mod uuid_text {
     use serde::Deserialize;
     use uuid::Uuid;
 
@@ -228,15 +228,10 @@ pub async fn send(req: reqwest::RequestBuilder) -> Result<reqwest::Response, Sup
         )));
     }
     let body: Value = res.json().await.unwrap_or(Value::Null);
-    // Machine codes only (like `refresh_token_not_found`); anything else is dropped.
     let code = ["error_code", "error"]
         .iter()
-        .find_map(|k| body.get(*k).and_then(Value::as_str))
-        .filter(|c| {
-            (1..=64).contains(&c.len())
-                && c.bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-        })
+        .filter_map(|k| body.get(*k).and_then(Value::as_str))
+        .find(|code| super::signin::refresh_is_dead(code))
         .unwrap_or_default()
         .to_owned();
     Err(SupabaseError::Refused {

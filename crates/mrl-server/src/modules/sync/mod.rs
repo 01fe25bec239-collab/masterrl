@@ -170,15 +170,18 @@ fn secret_shaped(s: &str) -> bool {
         .any(|w| {
             SECRET_PREFIXES
                 .iter()
-                .any(|p| w.starts_with(p) && w.len() >= p.len() + 12 && !w.ends_with("_ref"))
+                .any(|p| w.starts_with(p) && w.len() >= p.len() + 12)
         });
-    let words: Vec<&str> = lower.split_whitespace().collect();
-    let bearer = words
+    let words: Vec<&str> = lower
+        .split(|c: char| c.is_ascii_whitespace() || matches!(c, ':' | '\'' | '"'))
+        .filter(|w| !w.is_empty())
+        .collect();
+    let authorization = words
         .windows(2)
-        .any(|w| w[0] == "bearer" && w[1].len() >= 8);
+        .any(|w| matches!(w[0], "bearer" | "basic" | "token" | "digest") && w[1].len() >= 8);
     token_word
         || t.contains("-----BEGIN")
-        || bearer
+        || authorization
         || ["bearer ", "basic ", "token ", "digest "]
             .iter()
             .any(|p| lower.starts_with(p))
@@ -462,8 +465,8 @@ fn remote_error(e: SupabaseError) -> Fail {
         .into(),
         // A 5xx may have saved the copy before failing: the client retries with its op_id.
         SupabaseError::Refused { status, .. } if status >= 500 => offline(),
-        SupabaseError::Refused { status, code, .. } => {
-            tracing::warn!(status, code = %code, "the sync service refused a request");
+        SupabaseError::Refused { status, .. } => {
+            tracing::warn!(status, "the sync service refused a request");
             ApiError::new(
                 ErrorCode::Unavailable,
                 format!("The sync service refused the request (HTTP {status})."),
@@ -584,7 +587,11 @@ async fn caller(state: &AppState, shared: &Shared, ctx: &RequestContext) -> Resu
 }
 
 fn sign_in(state: &AppState, shared: &Shared) -> SignIn {
-    SignIn::new(shared.supabase.clone(), state.seams.secrets.clone())
+    SignIn::new(
+        shared.db.clone(),
+        shared.supabase.clone(),
+        state.seams.secrets.clone(),
+    )
 }
 
 /// The stored sign-in, only when it is the caller's own account: the Supabase user linked to
@@ -644,6 +651,10 @@ async fn load_profile(db: &Db, user: UserId) -> Result<SetupProfile, ApiError> {
             .fetch_optional(db.pool())
             .await
             .map_err(|e| db_error(e.into()))?;
+    profile_from_row(raw)
+}
+
+fn profile_from_row(raw: Option<Value>) -> Result<SetupProfile, ApiError> {
     match raw {
         None => Ok(SetupProfile::default()),
         Some(v) => {
@@ -884,30 +895,40 @@ pub async fn settle_key(
     }
 }
 
-/// The active key and its KDF settings. Read again when a setup or restore retired the key
-/// between reading its name and reading the keychain, so a push never sees sync as off
-/// in the middle of a rotation.
-async fn current_key(
+/// Get the key reference, KDF and profile from one database snapshot. If a later
+/// rotation removed that key before we could load it, repeat the whole read.
+async fn current_setup(
     db: &Db,
     secrets: &dyn SecretStore,
     user: UserId,
-) -> Result<Option<([u8; crypto::KEY_LEN], Value)>, ApiError> {
-    for _ in 0..3 {
-        let Some((key_ref, kdf)) = active_key(db, user).await? else {
+) -> Result<Option<([u8; crypto::KEY_LEN], Value, Option<Value>)>, ApiError> {
+    loop {
+        let row: Option<(Option<String>, Value, Option<Value>)> = sqlx::query_as(
+            "SELECT s.key_ref, s.kdf, p.profile FROM sync_state s \
+             LEFT JOIN setup_profiles p ON p.user_id = s.user_id WHERE s.user_id = $1",
+        )
+        .bind(user.as_uuid())
+        .fetch_optional(db.pool())
+        .await
+        .map_err(|e| db_error(e.into()))?;
+        let Some((key_ref, kdf, profile)) = row else {
             return Ok(None);
         };
-        if let Some(k) = secrets
-            .get(&key_ref)
+        let name = key_ref.as_deref().unwrap_or(KEY_SECRET);
+        if let Some(key) = secrets
+            .get(name)
             .await?
             .and_then(|k| crypto::key_from_hex(k.expose()))
         {
-            return Ok(Some((k, kdf)));
+            return Ok(Some((key, kdf, profile)));
         }
-        if active_key(db, user).await?.map(|(r, _)| r).as_deref() == Some(key_ref.as_str()) {
+        if active_key(db, user)
+            .await?
+            .is_some_and(|(active, _)| active == name)
+        {
             return Ok(None);
         }
     }
-    Ok(None)
 }
 
 /// `POST /sync/push` body (optional).
@@ -926,6 +947,7 @@ async fn push(
     State(state): State<AppState>,
     Extension(shared): Extension<Arc<Shared>>,
     ctx: RequestContext,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Json<Pushed>, Fail> {
     let c = caller(&state, &shared, &ctx).await?;
@@ -950,16 +972,29 @@ async fn push(
                 "Make one UUID per push and send it again on retries.",
             )]))
         })?,
-        None => uuid::Uuid::now_v7(),
+        None => headers
+            .get(crate::http::idempotency::IDEMPOTENCY_KEY)
+            .map_or_else(uuid::Uuid::now_v7, |key| {
+                use sha2::{Digest, Sha256};
+                let hash = Sha256::new()
+                    .chain_update(b"mrl-sync-push/v1:")
+                    .chain_update(ctx.principal.id.as_bytes())
+                    .chain_update([0])
+                    .chain_update(key.as_bytes())
+                    .finalize();
+                let mut bytes = [0; 16];
+                bytes.copy_from_slice(&hash[..16]);
+                uuid::Builder::from_custom_bytes(bytes).into_uuid()
+            }),
     };
     let sb = online(&shared)?;
-    let Some((key, kdf)) = current_key(&shared.db, c.secrets.as_ref(), c.user).await? else {
+    let Some((key, kdf, profile)) = current_setup(&shared.db, c.secrets.as_ref(), c.user).await?
+    else {
         return Err(not_set_up());
     };
     let kdf: KdfParams = serde_json::from_value(kdf)
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
-    let profile = load_profile(&shared.db, c.user).await?;
-    check(&profile)?;
+    let profile = profile_from_row(profile)?;
     let access = own_access(&state, &shared, &c).await?;
     let plain = serde_json::to_vec(&profile)
         .map_err(|e| ApiError::new(ErrorCode::Internal, e.to_string()))?;
@@ -972,7 +1007,12 @@ async fn push(
     };
     let pushed = push_copy(sb, &access, &blob, op)
         .await
-        .map_err(remote_error)?;
+        .map_err(|error| match error {
+            SupabaseError::BadAnswer(_) => {
+                remote_error(SupabaseError::Offline("unconfirmed push".into()))
+            }
+            other => remote_error(other),
+        })?;
     let (version, now) = (pushed.version, state.seams.clock.now());
     let event = audit::event(
         now,
@@ -1230,7 +1270,7 @@ async fn status(
             .fetch_optional(shared.db.pool())
             .await
             .map_err(|e| db_error(e.into()))?;
-    let set_up = current_key(&shared.db, c.secrets.as_ref(), c.user)
+    let set_up = current_setup(&shared.db, c.secrets.as_ref(), c.user)
         .await?
         .is_some();
     let si = sign_in(&state, &shared);
@@ -1318,6 +1358,10 @@ mod tests {
             ),
             (
                 serde_json::json!({"ui": {"cmd": format!("curl -H 'Authorization: {} {}' x", "Bearer", "e".repeat(12))}}),
+                "/ui/cmd",
+            ),
+            (
+                serde_json::json!({"ui": {"cmd": format!("example {} {} argument", "Basic", "e".repeat(12))}}),
                 "/ui/cmd",
             ),
             (

@@ -2,6 +2,7 @@
 //! OS keychain. Local work never needs it; it is needed for setup sync and joining a team.
 
 use super::supabase::{Supabase, SupabaseError, SupabaseUser, TokenSet};
+use crate::db::Db;
 use crate::modules::sync::crypto;
 use crate::seams::{SeamError, Secret, SecretStore};
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -15,6 +16,8 @@ use time::OffsetDateTime;
 
 /// `SecretStore` name of the Supabase session (access and refresh token).
 pub const SESSION_SECRET: &str = "auth.supabase_session";
+/// A session waiting for its database transaction to commit.
+pub const PENDING_SECRET: &str = "auth.supabase_pending";
 /// Code: the sign-in has expired and the user must sign in again.
 pub const EXPIRED: &str = "MRL-AUTH-160";
 /// Code: a sign-in did not finish (expired, used twice, or refused).
@@ -44,6 +47,13 @@ struct Stored {
     /// another project (or from before this field) counts as signed out and is never sent.
     #[serde(default)]
     issuer: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Pending {
+    #[serde(with = "super::supabase::uuid_text")]
+    operation: uuid::Uuid,
+    session: Stored,
 }
 
 /// Serializes every read-modify-write of the stored session (refresh, sign-in, sign-out), so
@@ -95,6 +105,9 @@ pub enum SignInError {
     /// Supabase could not be reached.
     #[error("{0}")]
     Offline(String),
+    /// The database could not confirm the sign-in transaction.
+    #[error("the database could not confirm the sign-in; try again")]
+    Reconcile,
     /// The keychain failed.
     #[error("{0}")]
     Store(String),
@@ -111,6 +124,7 @@ pub struct Access {
 
 /// This install's sign-in session, kept in `secrets`.
 pub struct SignIn {
+    db: Db,
     supabase: Option<Supabase>,
     secrets: Option<Arc<dyn SecretStore>>,
 }
@@ -122,8 +136,12 @@ fn store_err(e: SeamError) -> SignInError {
 
 impl SignIn {
     /// The session for this project, kept in `secrets`.
-    pub fn new(supabase: Option<Supabase>, secrets: Option<Arc<dyn SecretStore>>) -> Self {
-        Self { supabase, secrets }
+    pub fn new(db: Db, supabase: Option<Supabase>, secrets: Option<Arc<dyn SecretStore>>) -> Self {
+        Self {
+            db,
+            supabase,
+            secrets,
+        }
     }
 
     fn parts(&self) -> Result<(&Supabase, &dyn SecretStore), SignInError> {
@@ -154,37 +172,51 @@ impl SignIn {
             .map_err(store_err)
     }
 
-    /// Keeps the tokens of a finished sign-in, while `held` covers the whole sign-in.
-    pub async fn keep(&self, held: &SessionHeld, t: &TokenSet) -> Result<(), SignInError> {
-        let _ = held;
-        self.store_tokens(t).await
-    }
-
-    /// The stored session as it is now (raw), to put back if a sign-in does not finish.
-    pub async fn snapshot(&self, held: &SessionHeld) -> Result<Option<Secret>, SignInError> {
-        let _ = held;
-        let (_, store) = self.parts()?;
-        store.get(SESSION_SECRET).await.map_err(store_err)
-    }
-
-    /// Puts a [`SignIn::snapshot`] back (`None`: no session).
-    pub async fn put_back(
+    /// Stages an exchanged session without replacing the current one.
+    pub async fn stage(
         &self,
-        held: &SessionHeld,
-        raw: Option<Secret>,
+        _held: &SessionHeld,
+        operation: uuid::Uuid,
+        t: &TokenSet,
     ) -> Result<(), SignInError> {
-        let _ = held;
         let (_, store) = self.parts()?;
-        match raw {
-            Some(v) => store.set(SESSION_SECRET, v).await,
-            None => store.delete(SESSION_SECRET).await,
-        }
-        .map_err(store_err)
+        let pending = Pending {
+            operation,
+            session: self.stored(t)?,
+        };
+        let raw = serde_json::to_string(&pending).map_err(|e| SignInError::Store(e.to_string()))?;
+        store
+            .set(PENDING_SECRET, Secret::new(raw))
+            .await
+            .map_err(store_err)
     }
 
-    async fn store_tokens(&self, t: &TokenSet) -> Result<(), SignInError> {
+    /// Publishes a pending session if its transaction committed. If publication or its
+    /// acknowledgement is interrupted, the next read repeats the same decision.
+    pub async fn reconcile(&self, _held: &SessionHeld) -> Result<bool, SignInError> {
+        let (_, store) = self.parts()?;
+        let Some(raw) = store.get(PENDING_SECRET).await.map_err(store_err)? else {
+            return Ok(false);
+        };
+        let pending: Pending = serde_json::from_str(raw.expose())
+            .map_err(|_| SignInError::Store("the pending sign-in could not be read".into()))?;
+        let committed: Option<Option<uuid::Uuid>> = sqlx::query_scalar(
+            "SELECT signin_operation FROM users WHERE is_local_owner FOR UPDATE",
+        )
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(|_| SignInError::Reconcile)?;
+        let published = committed.flatten() == Some(pending.operation);
+        if published {
+            self.save(&pending.session).await?;
+        }
+        store.delete(PENDING_SECRET).await.map_err(store_err)?;
+        Ok(published)
+    }
+
+    fn stored(&self, t: &TokenSet) -> Result<Stored, SignInError> {
         let (supabase, _) = self.parts()?;
-        self.save(&Stored {
+        Ok(Stored {
             access_token: t.access_token.clone(),
             refresh_token: t.refresh_token.clone(),
             expires_at: t.expiry(),
@@ -192,7 +224,6 @@ impl SignIn {
             expired: false,
             issuer: supabase.issuer(),
         })
-        .await
     }
 
     /// The state, without going online.
@@ -200,6 +231,12 @@ impl SignIn {
         if self.supabase.is_none() {
             return Ok(SignInState::NotConfigured);
         }
+        self.state_held(&hold_session().await).await
+    }
+
+    /// Reads the current state with the session lock already held.
+    pub async fn state_held(&self, held: &SessionHeld) -> Result<SignInState, SignInError> {
+        self.reconcile(held).await?;
         Ok(match self.load().await? {
             None => SignInState::SignedOut,
             Some(s) if s.expired => SignInState::Expired,
@@ -212,13 +249,16 @@ impl SignIn {
         if self.supabase.is_none() {
             return Ok(None);
         }
+        let held = hold_session().await;
+        self.reconcile(&held).await?;
         Ok(self.load().await?.map(|s| s.user))
     }
 
     /// A live access token, refreshed first when it is about to expire.
     pub async fn access(&self) -> Result<Access, SignInError> {
         let (supabase, _) = self.parts()?;
-        let _held = SESSION_LOCK.lock().await;
+        let held = hold_session().await;
+        self.reconcile(&held).await?;
         let mut s = self.load().await?.ok_or(SignInError::SignedOut)?;
         if s.expired {
             return Err(SignInError::Expired);
@@ -226,8 +266,8 @@ impl SignIn {
         if s.expires_at - REFRESH_MARGIN <= OffsetDateTime::now_utc().unix_timestamp() {
             match supabase.refresh(&s.refresh_token).await {
                 Ok(t) => {
-                    self.store_tokens(&t).await?;
-                    s = self.load().await?.ok_or(SignInError::SignedOut)?;
+                    s = self.stored(&t)?;
+                    self.save(&s).await?;
                 }
                 // Only a definite "this refresh token is dead" ends the session; a rate limit
                 // or another refusal is temporary.
@@ -252,7 +292,8 @@ impl SignIn {
             Err(SignInError::NotConfigured) => return Ok(()),
             Err(e) => return Err(e),
         };
-        let _held = SESSION_LOCK.lock().await;
+        let held = hold_session().await;
+        self.reconcile(&held).await?;
         // Only a session of this project is ended there; another project's is just forgotten.
         if let Some(s) = self.load().await? {
             if let Err(e) = supabase.logout(&s.access_token).await {
@@ -264,7 +305,7 @@ impl SignIn {
 }
 
 /// Supabase's answers that mean the refresh token can never work again.
-fn refresh_is_dead(code: &str) -> bool {
+pub(super) fn refresh_is_dead(code: &str) -> bool {
     matches!(
         code,
         "refresh_token_not_found"

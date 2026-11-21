@@ -127,6 +127,7 @@ impl From<super::signin::SignInError> for Fail {
             E::Offline(d) => {
                 Coded::new(super::supabase::OFFLINE, StatusCode::SERVICE_UNAVAILABLE, d).into()
             }
+            E::Reconcile => ApiError::new(ErrorCode::Unavailable, e.to_string()).into(),
             E::Store(d) => keychain_coded(&d)
                 .unwrap_or_else(|| {
                     Coded::new(
