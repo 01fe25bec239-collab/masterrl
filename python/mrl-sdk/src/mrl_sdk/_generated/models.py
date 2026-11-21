@@ -132,6 +132,36 @@ class CopyInfo(TypedDict):
     """Version."""
 
 
+class CreateEnrollmentToken(TypedDict):
+    """`POST /pools/{pool}/enrollment-tokens`."""
+
+    endpoint: NotRequired[dict[str, Any]]
+
+    labels: NotRequired[dict[str, Any] | None]
+    """Labels the new machine gets."""
+
+    lifecycle: NotRequired[dict[str, Any]]
+
+    ttl_seconds: NotRequired[int | None]
+    """How long the token works, 60 s - 7 days (default 1 hour)."""
+
+
+class CreatePool(TypedDict):
+    """`POST /pools`."""
+
+    attempt_lease_ttl_seconds: NotRequired[int | None]
+    """Attempt lease length, 10-3600 s (default 90)."""
+
+    flags: NotRequired[list[str]]
+    """Flags."""
+
+    name: str
+    """Unique name, 1-100 characters."""
+
+    provider_kind: NotRequired[str | None]
+    """`agent` (default), `kubernetes`, `slurm` or `cloud_vm`."""
+
+
 class CreateToken(TypedDict):
     """Make an access token."""
 
@@ -146,6 +176,10 @@ class CreateToken(TypedDict):
 
     scopes: list[str]
     """`["*"]`, or areas like `["runs:write", "datasets:read"]`."""
+
+
+Endpoint = dict[str, Any]
+"""How the core dials one machine (stored in `compute_nodes.endpoint`)."""
 
 
 class Experiment(TypedDict):
@@ -216,6 +250,49 @@ class FieldError(TypedDict):
 
     path: str
     """JSON Pointer to the field, like `/config/peft/r`."""
+
+
+class GpuView(TypedDict):
+    """A GPU and its latest reading."""
+
+    arch: str
+    """Architecture, like `sm_80`."""
+
+    device_uuid: str
+    """Vendor UUID (stable identity)."""
+
+    health: str
+    """OK, DEGRADED, FAILED or QUARANTINED."""
+
+    id: str
+    """`gpu_…`."""
+
+    index: int
+    """Index on the node."""
+
+    memory_used_bytes: NotRequired[int | None]
+    """Latest memory use."""
+
+    model: str
+    """Model name."""
+
+    observed_at: NotRequired[str | None]
+    """When the reading was taken."""
+
+    temperature_c: NotRequired[int | None]
+    """Latest temperature."""
+
+    thermal_throttling: NotRequired[bool | None]
+    """Latest thermal throttling flag."""
+
+    utilization_percent: NotRequired[int | None]
+    """Latest utilization (TELEMETRY lane)."""
+
+    vendor: str
+    """`nvidia`, `amd`, `apple`, `intel` or `other`."""
+
+    vram_total_bytes: int
+    """Memory."""
 
 
 class Health(TypedDict):
@@ -318,6 +395,10 @@ class JobPatch(TypedDict):
     """New priority, -1000 to 1000. Higher runs first."""
 
 
+Lifecycle = Literal["STATIC", "EPHEMERAL"]
+"""Node lifecycle (Doc 04 PBC-04-5)."""
+
+
 class LoginRequest(TypedDict):
     """Start a sign-in."""
 
@@ -408,6 +489,132 @@ class NewToken(TypedDict):
     """`mrl_pat_…`. Store it now; it is never shown again."""
 
 
+class NodeDetail(TypedDict):
+    """A machine with its GPUs, inventory and latest telemetry."""
+
+    agent_version: NotRequired[str | None]
+    """Agent version."""
+
+    cert_expires_at: NotRequired[str | None]
+    """When the current certificate ends."""
+
+    created_at: str
+    """Enrolled."""
+
+    gpus: list[GpuView]
+    """Its GPUs with their latest readings."""
+
+    hostname: str
+    """Host name the agent reported."""
+
+    id: str
+    """`node_…`."""
+
+    inventory: NotRequired[dict[str, Any] | None]
+    """The last full inventory."""
+
+    labels: dict[str, Any]
+    """Labels from the join token."""
+
+    last_heartbeat_at: NotRequired[str | None]
+    """Last heartbeat."""
+
+    lifecycle: Lifecycle
+    """STATIC or EPHEMERAL."""
+
+    pool_id: str
+    """`pool_…`."""
+
+    protocol_version: NotRequired[str | None]
+    """Gateway protocol version."""
+
+    running_attempts: int
+    """Attempts running at the last heartbeat."""
+
+    session_epoch: int
+    """Bumped on every new CONTROL session."""
+
+    status: str
+    """ENROLLING, ONLINE, DEGRADED, OFFLINE, DRAINING or DECOMMISSIONED."""
+
+    status_reason: NotRequired[str | None]
+    """Why the status last changed."""
+
+    status_version: int
+    """Bumped on every status change."""
+
+    telemetry: NotRequired[dict[str, Any] | None]
+    """Latest node readings (memory, disk, battery)."""
+
+    telemetry_at: NotRequired[str | None]
+    """When those were taken."""
+
+    transport: NotRequired[str | None]
+    """`direct`, `ssh`, `tailscale` or `cloudflare_tunnel`."""
+
+
+class NodeView(TypedDict):
+    """A machine."""
+
+    agent_version: NotRequired[str | None]
+    """Agent version."""
+
+    cert_expires_at: NotRequired[str | None]
+    """When the current certificate ends."""
+
+    created_at: str
+    """Enrolled."""
+
+    hostname: str
+    """Host name the agent reported."""
+
+    id: str
+    """`node_…`."""
+
+    labels: dict[str, Any]
+    """Labels from the join token."""
+
+    last_heartbeat_at: NotRequired[str | None]
+    """Last heartbeat."""
+
+    lifecycle: Lifecycle
+    """STATIC or EPHEMERAL."""
+
+    pool_id: str
+    """`pool_…`."""
+
+    protocol_version: NotRequired[str | None]
+    """Gateway protocol version."""
+
+    running_attempts: int
+    """Attempts running at the last heartbeat."""
+
+    session_epoch: int
+    """Bumped on every new CONTROL session."""
+
+    status: str
+    """ENROLLING, ONLINE, DEGRADED, OFFLINE, DRAINING or DECOMMISSIONED."""
+
+    status_reason: NotRequired[str | None]
+    """Why the status last changed."""
+
+    status_version: int
+    """Bumped on every status change."""
+
+    transport: NotRequired[str | None]
+    """`direct`, `ssh`, `tailscale` or `cloudflare_tunnel`."""
+
+
+class NodeViewPage(TypedDict):
+    """One page of results."""
+
+    items: list[NodeView]
+    """The items on this page."""
+
+    next_cursor: NotRequired[str | None]
+    """Pass as `cursor` for the next page; `null` on the last page."""
+
+
 class Org(TypedDict):
     """An org."""
 
@@ -431,6 +638,38 @@ class OrgPage(TypedDict):
     """One page of results."""
 
     items: list[Org]
+    """The items on this page."""
+
+    next_cursor: NotRequired[str | None]
+    """Pass as `cursor` for the next page; `null` on the last page."""
+
+
+class PoolView(TypedDict):
+    """A pool."""
+
+    attempt_lease_ttl_seconds: int
+    """How long an attempt lease lasts without a renewing heartbeat."""
+
+    created_at: str
+    """Created."""
+
+    flags: list[str]
+    """Flags like `pii_allowed`."""
+
+    id: str
+    """`pool_…`."""
+
+    name: str
+    """Unique name."""
+
+    provider_kind: str
+    """`agent`, `kubernetes`, `slurm` or `cloud_vm`."""
+
+
+class PoolViewPage(TypedDict):
+    """One page of results."""
+
+    items: list[PoolView]
     """The items on this page."""
 
     next_cursor: NotRequired[str | None]
@@ -863,6 +1102,28 @@ class TimelineEntryPage(TypedDict):
     """Pass as `cursor` for the next page; `null` on the last page."""
 
 
+class TokenCreated(TypedDict):
+    """A new join token. The token is shown once."""
+
+    ca_sha256: str
+    """The CA fingerprint the agent pins (also inside the token)."""
+
+    enroll_command: str
+    """What to run on the machine."""
+
+    expires_at: str
+    """When it stops working."""
+
+    id: str
+    """Token row id."""
+
+    lifecycle: Lifecycle
+    """The machine's lifecycle."""
+
+    token: str
+    """`mrlj_<secret>_<CA fingerprint>`; single use."""
+
+
 class TokenInfo(TypedDict):
     """A token as listed (never the token itself)."""
 
@@ -964,15 +1225,20 @@ __all__ = [
     "CallbackRequest",
     "CheckResult",
     "CopyInfo",
+    "CreateEnrollmentToken",
+    "CreatePool",
     "CreateToken",
+    "Endpoint",
     "Experiment",
     "ExperimentPage",
     "ExperimentPatch",
     "FieldError",
+    "GpuView",
     "Health",
     "Job",
     "JobPage",
     "JobPatch",
+    "Lifecycle",
     "LoginRequest",
     "LoginStarted",
     "Machine",
@@ -980,8 +1246,13 @@ __all__ = [
     "NewExperiment",
     "NewItem",
     "NewToken",
+    "NodeDetail",
+    "NodeView",
+    "NodeViewPage",
     "Org",
     "OrgPage",
+    "PoolView",
+    "PoolViewPage",
     "Problem",
     "Project",
     "ProjectPage",
@@ -1007,6 +1278,7 @@ __all__ = [
     "TeamMembership",
     "TimelineEntry",
     "TimelineEntryPage",
+    "TokenCreated",
     "TokenInfo",
     "TokenInfoPage",
     "Transport",

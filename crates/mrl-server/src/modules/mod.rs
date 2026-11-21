@@ -16,6 +16,7 @@ pub mod jobs;
 pub mod runs;
 
 // <mrl:modules P18> P18 `pub mod` lines go right below this line.
+pub mod nodes;
 
 // <mrl:modules P19> P19 `pub mod` lines go right below this line.
 // </mrl:modules>

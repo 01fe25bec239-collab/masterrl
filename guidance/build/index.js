@@ -2889,6 +2889,41 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-LINK-184",
+      "title": "The app and this machine can't reach each other.",
+      "why": "The address may be wrong, the other side may not be running, or a network rule may block it.",
+      "what_to_do": {
+        "steps": [
+          "Read the failing step in Details.",
+          "Check that the agent and the app are both running.",
+          "Run `mrl-agent connection-test` on the machine for a step-by-step check."
+        ]
+      }
+    },
+    {
+      "code": "MRL-LINK-185",
+      "title": "Confirm this machine's key before the first connection.",
+      "why": "This is the first remote sign-in (`ssh`) to this machine. The app checks its key so nobody can pretend to be it.",
+      "what_to_do": {
+        "steps": [
+          "On the machine, run `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub`.",
+          "Confirm in the app only if the fingerprint matches the one in Details."
+        ]
+      }
+    },
+    {
+      "code": "MRL-LINK-186",
+      "title": "This machine's sign-in key changed.",
+      "why": "The key differs from the one you confirmed. Someone may be intercepting the connection, or the machine was reinstalled.",
+      "what_to_do": {
+        "steps": [
+          "Don't connect until you know why the key changed.",
+          "If the machine was reinstalled, remove its old entry from the app's known hosts file named in Details.",
+          "Connect again and confirm the new key."
+        ]
+      }
+    },
+    {
       "code": "MRL-MODEL-001",
       "title": "The app did not load this model's files, to keep your computer safe.",
       "why": "The weights use the pickle format, which can run hidden code. The app allows only safetensors files.",
@@ -3000,6 +3035,85 @@ export const catalog = deepFreeze({
           "Read the command and its message in Details.",
           "Run `mrl-agent service install` again.",
           "If it still fails, start the agent by hand with `mrl-agent run`."
+        ]
+      }
+    },
+    {
+      "code": "MRL-NODE-180",
+      "title": "The join token can't be used.",
+      "why": "Each token adds one machine and works for a short time. This one is unknown, used or expired.",
+      "what_to_do": {
+        "steps": [
+          "In the app, open Machines and create a new join token.",
+          "Run the enroll command again with the new token."
+        ]
+      }
+    },
+    {
+      "code": "MRL-NODE-181",
+      "title": "The app did not accept this machine's certificate.",
+      "why": "The certificate was revoked, has expired, or belongs to another machine. The machine may also have been removed.",
+      "what_to_do": {
+        "steps": [
+          "Read the reason in Details.",
+          "If the machine was removed by mistake, create a new join token and enroll it again.",
+          "Run `mrl-agent enroll --force` with the new token on that machine."
+        ]
+      }
+    },
+    {
+      "code": "MRL-NODE-182",
+      "title": "This machine has not joined the app yet.",
+      "why": "The agent needs its own certificate before it can connect, and it has none yet.",
+      "what_to_do": {
+        "steps": [
+          "In the app, open Machines and create a join token.",
+          "On this machine, run the enroll command the app shows."
+        ]
+      }
+    },
+    {
+      "code": "MRL-NODE-183",
+      "title": "The app's certificate authority can't be used.",
+      "why": "The app keeps a private key to sign machine certificates. It could not read or save that key.",
+      "what_to_do": {
+        "steps": [
+          "Check that the app's data folder is on a disk with free space.",
+          "Make sure your account can write to the folder named in Details.",
+          "Restart the app."
+        ]
+      }
+    },
+    {
+      "code": "MRL-NODE-187",
+      "title": "The app did not send this command to the machine.",
+      "why": "The machine is draining or was removed, or this version can't send that kind of command yet.",
+      "what_to_do": {
+        "steps": [
+          "Check the machine's status in the app.",
+          "Pick another machine, or bring this one back before trying again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-NODE-188",
+      "title": "This machine has too many messages waiting for the app.",
+      "why": "The app has been out of reach for a long time. The agent keeps important messages until the app has them.",
+      "what_to_do": {
+        "steps": [
+          "Reconnect this machine to the app; the waiting messages are sent then.",
+          "To keep more while offline, raise `gateway.spool_max_bytes` in the agent settings."
+        ]
+      }
+    },
+    {
+      "code": "MRL-NODE-189",
+      "title": "The app and the agent don't understand each other.",
+      "why": "They may run versions that don't match, or a message was damaged on the way.",
+      "what_to_do": {
+        "steps": [
+          "Update the agent and the app to the same version.",
+          "Connect again."
         ]
       }
     },

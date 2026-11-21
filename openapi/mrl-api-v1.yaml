@@ -395,6 +395,93 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /api/v1/nodes/{node}:
+    get:
+      tags:
+      - compute
+      operationId: get_node
+      parameters:
+      - name: node
+        in: path
+        description: '`node_…`'
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The machine, its GPUs and latest telemetry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeDetail'
+        '404':
+          description: No such machine.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/nodes/{node}:decommission:
+    post:
+      tags:
+      - compute
+      operationId: decommission
+      parameters:
+      - name: node
+        in: path
+        description: '`node_…`'
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Removed; its certificates are revoked.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeView'
+        '404':
+          description: No such machine.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Drain it first, or wait for its attempts.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/nodes/{node}:drain:
+    post:
+      tags:
+      - compute
+      operationId: drain
+      parameters:
+      - name: node
+        in: path
+        description: '`node_…`'
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The machine takes no new work.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NodeView'
+        '404':
+          description: No such machine.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Not possible in this state.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/orgs:
     get:
       tags:
@@ -515,6 +602,128 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
         '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/pools:
+    get:
+      tags:
+      - compute
+      operationId: list_pools
+      parameters:
+      - name: limit
+        in: query
+        description: Page size, 1–200.
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: From `next_cursor`.
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Pools.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_PoolView'
+    post:
+      tags:
+      - compute
+      operationId: create_pool
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreatePool'
+        required: true
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PoolView'
+        '422':
+          description: A value needs a change.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/pools/{pool}/enrollment-tokens:
+    post:
+      tags:
+      - compute
+      operationId: create_enrollment_token
+      parameters:
+      - name: pool
+        in: path
+        description: '`pool_…`'
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateEnrollmentToken'
+        required: true
+      responses:
+        '201':
+          description: The token (shown once).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenCreated'
+        '404':
+          description: No such pool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: A value needs a change.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/pools/{pool}/nodes:
+    get:
+      tags:
+      - compute
+      operationId: list_nodes
+      parameters:
+      - name: pool
+        in: path
+        description: '`pool_…`'
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–200.
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: From `next_cursor`.
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Machines in the pool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_NodeView'
+        '404':
+          description: No such pool.
           content:
             application/json:
               schema:
@@ -1193,6 +1402,60 @@ components:
           type: integer
           format: int64
           description: Version.
+    CreateEnrollmentToken:
+      type: object
+      description: '`POST /pools/{pool}/enrollment-tokens`.'
+      properties:
+        endpoint:
+          oneOf:
+          - $ref: '#/components/schemas/Endpoint'
+            description: Set when the core should dial the new machine (its agent waits with `enroll --listen`).
+          - type: 'null'
+        labels:
+          type:
+          - object
+          - 'null'
+          description: Labels the new machine gets.
+        lifecycle:
+          oneOf:
+          - $ref: '#/components/schemas/Lifecycle'
+            description: STATIC (default) or EPHEMERAL.
+          - type: 'null'
+        ttl_seconds:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: How long the token works, 60 s – 7 days (default 1 hour).
+          minimum: 0
+      additionalProperties: false
+    CreatePool:
+      type: object
+      description: '`POST /pools`.'
+      required:
+      - name
+      properties:
+        attempt_lease_ttl_seconds:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Attempt lease length, 10–3600 s (default 90).
+          minimum: 0
+        flags:
+          type: array
+          items:
+            type: string
+          description: Flags.
+        name:
+          type: string
+          description: Unique name, 1–100 characters.
+        provider_kind:
+          type:
+          - string
+          - 'null'
+          description: '`agent` (default), `kubernetes`, `slurm` or `cloud_vm`.'
+      additionalProperties: false
     CreateToken:
       type: object
       description: Make an access token.
@@ -1221,6 +1484,86 @@ components:
             type: string
           description: '`["*"]`, or areas like `["runs:write", "datasets:read"]`.'
       additionalProperties: false
+    Endpoint:
+      oneOf:
+      - type: object
+        description: The agent listens on this `host:port` in the local network.
+        required:
+        - address
+        - kind
+        properties:
+          address:
+            type: string
+            description: '`host:port`.'
+          kind:
+            type: string
+            enum:
+            - direct
+      - type: object
+        description: The core opens SSH to `host` and forwards to the agent's loopback port.
+        required:
+        - host
+        - agent_port
+        - kind
+        properties:
+          agent_port:
+            type: integer
+            format: int32
+            description: The agent's `gateway.listen` port on the machine's loopback.
+            minimum: 0
+          host:
+            type: string
+            description: Host name, address or `~/.ssh/config` alias.
+          key_secret:
+            type:
+            - string
+            - 'null'
+            description: |-
+              Secret-store name of an OpenSSH private key (optional; the SSH agent and
+              `~/.ssh` keys are tried too).
+          kind:
+            type: string
+            enum:
+            - ssh
+          port:
+            type:
+            - integer
+            - 'null'
+            format: int32
+            description: 'SSH port (default: from `~/.ssh/config`, else 22).'
+            minimum: 0
+          user:
+            type:
+            - string
+            - 'null'
+            description: 'SSH user (default: from `~/.ssh/config`, else this account''s name).'
+      - type: object
+        description: The agent listens on this Tailscale `address:port` (100.x or MagicDNS name).
+        required:
+        - address
+        - kind
+        properties:
+          address:
+            type: string
+            description: '`host:port`.'
+          kind:
+            type: string
+            enum:
+            - tailscale
+      - type: object
+        description: The agent is exposed by `cloudflared` on this hostname.
+        required:
+        - hostname
+        - kind
+        properties:
+          hostname:
+            type: string
+            description: The tunnel's public hostname.
+          kind:
+            type: string
+            enum:
+            - cloudflare_tunnel
+      description: How the core dials one machine (stored in `compute_nodes.endpoint`).
     Experiment:
       type: object
       description: An experiment, as the API shows it.
@@ -1311,6 +1654,74 @@ components:
         path:
           type: string
           description: JSON Pointer to the field, like `/config/peft/r`.
+    GpuView:
+      type: object
+      description: A GPU and its latest reading.
+      required:
+      - id
+      - vendor
+      - device_uuid
+      - index
+      - model
+      - arch
+      - vram_total_bytes
+      - health
+      properties:
+        arch:
+          type: string
+          description: Architecture, like `sm_80`.
+        device_uuid:
+          type: string
+          description: Vendor UUID (stable identity).
+        health:
+          type: string
+          description: OK, DEGRADED, FAILED or QUARANTINED.
+        id:
+          type: string
+          description: '`gpu_…`.'
+        index:
+          type: integer
+          format: int32
+          description: Index on the node.
+        memory_used_bytes:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Latest memory use.
+        model:
+          type: string
+          description: Model name.
+        observed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When the reading was taken.
+        temperature_c:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Latest temperature.
+        thermal_throttling:
+          type:
+          - boolean
+          - 'null'
+          description: Latest thermal throttling flag.
+        utilization_percent:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Latest utilization (TELEMETRY lane).
+        vendor:
+          type: string
+          description: '`nvidia`, `amd`, `apple`, `intel` or `other`.'
+        vram_total_bytes:
+          type: integer
+          format: int64
+          description: Memory.
     Health:
       type: object
       description: '`/healthz` body.'
@@ -1453,6 +1864,12 @@ components:
           format: int32
           description: New priority, −1000 to 1000. Higher runs first.
       additionalProperties: false
+    Lifecycle:
+      type: string
+      description: Node lifecycle (Doc 04 PBC-04-5).
+      enum:
+      - STATIC
+      - EPHEMERAL
     LoginRequest:
       type: object
       description: Start a sign-in.
@@ -1585,6 +2002,117 @@ components:
         token:
           type: string
           description: '`mrl_pat_…`. Store it now; it is never shown again.'
+    NodeDetail:
+      allOf:
+      - $ref: '#/components/schemas/NodeView'
+        description: The machine.
+      - type: object
+        required:
+        - gpus
+        properties:
+          gpus:
+            type: array
+            items:
+              $ref: '#/components/schemas/GpuView'
+            description: Its GPUs with their latest readings.
+          inventory:
+            type:
+            - object
+            - 'null'
+            description: The last full inventory.
+          telemetry:
+            type:
+            - object
+            - 'null'
+            description: Latest node readings (memory, disk, battery).
+          telemetry_at:
+            type:
+            - string
+            - 'null'
+            format: date-time
+            description: When those were taken.
+      description: A machine with its GPUs, inventory and latest telemetry.
+    NodeView:
+      type: object
+      description: A machine.
+      required:
+      - id
+      - pool_id
+      - hostname
+      - lifecycle
+      - status
+      - status_version
+      - session_epoch
+      - labels
+      - running_attempts
+      - created_at
+      properties:
+        agent_version:
+          type:
+          - string
+          - 'null'
+          description: Agent version.
+        cert_expires_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When the current certificate ends.
+        created_at:
+          type: string
+          format: date-time
+          description: Enrolled.
+        hostname:
+          type: string
+          description: Host name the agent reported.
+        id:
+          type: string
+          description: '`node_…`.'
+        labels:
+          type: object
+          description: Labels from the join token.
+        last_heartbeat_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Last heartbeat.
+        lifecycle:
+          $ref: '#/components/schemas/Lifecycle'
+          description: STATIC or EPHEMERAL.
+        pool_id:
+          type: string
+          description: '`pool_…`.'
+        protocol_version:
+          type:
+          - string
+          - 'null'
+          description: Gateway protocol version.
+        running_attempts:
+          type: integer
+          format: int32
+          description: Attempts running at the last heartbeat.
+        session_epoch:
+          type: integer
+          format: int64
+          description: Bumped on every new CONTROL session.
+        status:
+          type: string
+          description: ENROLLING, ONLINE, DEGRADED, OFFLINE, DRAINING or DECOMMISSIONED.
+        status_reason:
+          type:
+          - string
+          - 'null'
+          description: Why the status last changed.
+        status_version:
+          type: integer
+          format: int64
+          description: Bumped on every status change.
+        transport:
+          type:
+          - string
+          - 'null'
+          description: '`direct`, `ssh`, `tailscale` or `cloudflare_tunnel`.'
     Org:
       type: object
       description: An org.
@@ -1939,6 +2467,101 @@ components:
           - string
           - 'null'
           description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_NodeView:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: A machine.
+            required:
+            - id
+            - pool_id
+            - hostname
+            - lifecycle
+            - status
+            - status_version
+            - session_epoch
+            - labels
+            - running_attempts
+            - created_at
+            properties:
+              agent_version:
+                type:
+                - string
+                - 'null'
+                description: Agent version.
+              cert_expires_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+                description: When the current certificate ends.
+              created_at:
+                type: string
+                format: date-time
+                description: Enrolled.
+              hostname:
+                type: string
+                description: Host name the agent reported.
+              id:
+                type: string
+                description: '`node_…`.'
+              labels:
+                type: object
+                description: Labels from the join token.
+              last_heartbeat_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+                description: Last heartbeat.
+              lifecycle:
+                $ref: '#/components/schemas/Lifecycle'
+                description: STATIC or EPHEMERAL.
+              pool_id:
+                type: string
+                description: '`pool_…`.'
+              protocol_version:
+                type:
+                - string
+                - 'null'
+                description: Gateway protocol version.
+              running_attempts:
+                type: integer
+                format: int32
+                description: Attempts running at the last heartbeat.
+              session_epoch:
+                type: integer
+                format: int64
+                description: Bumped on every new CONTROL session.
+              status:
+                type: string
+                description: ENROLLING, ONLINE, DEGRADED, OFFLINE, DRAINING or DECOMMISSIONED.
+              status_reason:
+                type:
+                - string
+                - 'null'
+                description: Why the status last changed.
+              status_version:
+                type: integer
+                format: int64
+                description: Bumped on every status change.
+              transport:
+                type:
+                - string
+                - 'null'
+                description: '`direct`, `ssh`, `tailscale` or `cloudflare_tunnel`.'
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
     Page_Org:
       type: object
       description: One page of results.
@@ -1973,6 +2596,54 @@ components:
               slug:
                 type: string
                 description: Slug, unique on this core.
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_PoolView:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: A pool.
+            required:
+            - id
+            - name
+            - provider_kind
+            - attempt_lease_ttl_seconds
+            - flags
+            - created_at
+            properties:
+              attempt_lease_ttl_seconds:
+                type: integer
+                format: int32
+                description: How long an attempt lease lasts without a renewing heartbeat.
+                minimum: 0
+              created_at:
+                type: string
+                format: date-time
+                description: Created.
+              flags:
+                type: array
+                items:
+                  type: string
+                description: Flags like `pii_allowed`.
+              id:
+                type: string
+                description: '`pool_…`.'
+              name:
+                type: string
+                description: Unique name.
+              provider_kind:
+                type: string
+                description: '`agent`, `kubernetes`, `slurm` or `cloud_vm`.'
           description: The items on this page.
         next_cursor:
           type:
@@ -2260,6 +2931,40 @@ components:
           - string
           - 'null'
           description: Pass as `cursor` for the next page; `null` on the last page.
+    PoolView:
+      type: object
+      description: A pool.
+      required:
+      - id
+      - name
+      - provider_kind
+      - attempt_lease_ttl_seconds
+      - flags
+      - created_at
+      properties:
+        attempt_lease_ttl_seconds:
+          type: integer
+          format: int32
+          description: How long an attempt lease lasts without a renewing heartbeat.
+          minimum: 0
+        created_at:
+          type: string
+          format: date-time
+          description: Created.
+        flags:
+          type: array
+          items:
+            type: string
+          description: Flags like `pii_allowed`.
+        id:
+          type: string
+          description: '`pool_…`.'
+        name:
+          type: string
+          description: Unique name.
+        provider_kind:
+          type: string
+          description: '`agent`, `kubernetes`, `slurm` or `cloud_vm`.'
     Problem:
       type: object
       description: RFC 9457 problem document.
@@ -2843,6 +3548,36 @@ components:
         type:
           type: string
           description: Event type, like `job.queued`.
+    TokenCreated:
+      type: object
+      description: A new join token. The token is shown once.
+      required:
+      - id
+      - token
+      - expires_at
+      - ca_sha256
+      - lifecycle
+      - enroll_command
+      properties:
+        ca_sha256:
+          type: string
+          description: The CA fingerprint the agent pins (also inside the token).
+        enroll_command:
+          type: string
+          description: What to run on the machine.
+        expires_at:
+          type: string
+          format: date-time
+          description: When it stops working.
+        id:
+          type: string
+          description: Token row id.
+        lifecycle:
+          $ref: '#/components/schemas/Lifecycle'
+          description: The machine's lifecycle.
+        token:
+          type: string
+          description: '`mrlj_<secret>_<CA fingerprint>`; single use.'
     TokenInfo:
       type: object
       description: A token as listed (never the token itself).
@@ -2970,3 +3705,5 @@ tags:
   description: Experiments, runs, config snapshots and timelines.
 - name: jobs
   description: 'Jobs: state, cancel and priority.'
+- name: compute
+  description: Pools, machines and their GPUs.

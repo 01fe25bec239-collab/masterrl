@@ -72,6 +72,20 @@ def py_type(schema: dict[str, Any], names: set[str]) -> str:
     return f"{text} | None" if nullable else text
 
 
+def flattened(s: dict[str, Any], schemas: dict[str, Any]) -> dict[str, Any]:
+    """`s` with every `allOf` part (a `$ref` or an inline object) merged into one object."""
+    if "allOf" not in s:
+        return s
+    props: dict[str, Any] = dict(s.get("properties", {}))
+    required: list[str] = list(s.get("required", []))
+    for part in s["allOf"]:
+        ref = part.get("$ref", "")
+        piece = flattened(schemas[ref.rsplit("/", 1)[-1]], schemas) if ref else part
+        props.update(piece.get("properties", {}))
+        required += [r for r in piece.get("required", []) if r not in required]
+    return {**s, "properties": props, "required": required}
+
+
 def models(spec: dict[str, Any]) -> str:
     """Source of `models.py`."""
     schemas: dict[str, Any] = spec["components"]["schemas"]
@@ -85,17 +99,22 @@ def models(spec: dict[str, Any]) -> str:
     ]
     exported: list[str] = []
     for name in sorted(schemas, key=class_name):
-        s = schemas[name]
+        s = flattened(schemas[name], schemas)
         exported.append(class_name(name))
         if "enum" in s:
             lines += ["", f"{name} = {py_type(s, names)}", *doc(s.get("description"), "")]
+            continue
+        if "oneOf" in s or "anyOf" in s:
+            # A choice of shapes: no single TypedDict describes it.
+            lines += ["", f"{class_name(name)} = dict[str, Any]", *doc(s.get("description"), "")]
             continue
         lines += ["", "", f"class {class_name(name)}(TypedDict):"]
         lines += doc(s.get("description"), "    ")
         props: dict[str, Any] = s.get("properties", {})
         required = set(s.get("required", []))
         if not props:
-            lines.append("    pass")
+            if not lines[-1].endswith('"""'):
+                lines.append("    pass")
             continue
         if lines[-1].endswith('"""'):
             lines.append("")

@@ -47,6 +47,24 @@ impl Task {
     }
 }
 
+/// Mutual TLS for the shared gRPC listener, for a module that must see client certificates
+/// (the agent gateway). With it the listener speaks TLS in solo mode too.
+pub struct GrpcTls {
+    /// Checks client certificates; it may allow connections without one. Handlers see the
+    /// accepted chain as `ConnectInfo<crate::http::tls::TlsPeer>`.
+    pub client_verifier: Arc<dyn tokio_rustls::rustls::server::danger::ClientCertVerifier>,
+    /// Served to clients that ask (SNI) for one of `server_names`, and to every client when
+    /// `[server.tls]` is not set.
+    pub certified_key: Arc<tokio_rustls::rustls::sign::CertifiedKey>,
+    /// Names `certified_key` is for, like `core.masterrl.internal`.
+    pub server_names: Vec<String>,
+    /// gRPC services (`package.Service`) that authenticate their callers themselves (client
+    /// certificates, join tokens). In solo mode only these skip the launch-secret check.
+    pub open_services: Vec<&'static str>,
+    /// Told the listener's bound address once it is bound.
+    pub on_listen: Box<dyn FnOnce(std::net::SocketAddr) + Send>,
+}
+
 /// One feature area of the server. Every method has an empty default.
 ///
 /// Register a module by adding one line inside `// <mrl:register>` in `registry.rs`,
@@ -93,6 +111,12 @@ pub trait ServerModule: Send + Sync {
     /// gRPC services. Adding any makes the server bind the gRPC listener.
     fn grpc_services(&self, routes: &mut tonic::service::RoutesBuilder) {
         let _ = routes;
+    }
+
+    /// Mutual TLS for the gRPC listener (asked after the startup steps ran; the first module
+    /// that returns one sets it).
+    fn grpc_tls(&self) -> Option<GrpcTls> {
+        None
     }
 
     /// Steps run in order before listeners open, like database migrations.
