@@ -21,6 +21,10 @@ pub fn consumers(db: &Db) -> Vec<Arc<dyn EventConsumer>> {
         // <mrl:consumers P18> P18 consumers go right below this line.
 
         // <mrl:consumers P19> P19 consumers go right below this line.
+        // <mrl:consumers P21> P21 consumers go right below this line.
+        // <mrl:consumers P22> P22 consumers go right below this line.
+        // <mrl:consumers P23> P23 consumers go right below this line.
+        // <mrl:consumers P24> P24 consumers go right below this line.
         // </mrl:consumers>
     ]
 }
@@ -55,6 +59,10 @@ pub fn modules(db: &Db, config: &crate::Config) -> Vec<Box<dyn ServerModule>> {
             db.clone(),
             config,
         )),
+        // <mrl:register P21> P21 modules go right below this line.
+        // <mrl:register P22> P22 modules go right below this line.
+        // <mrl:register P23> P23 modules go right below this line.
+        // <mrl:register P24> P24 modules go right below this line.
         // </mrl:register>
     ]
 }

@@ -69,6 +69,10 @@ hyper-util = { version = "=0.1.21", features = ["tokio"] }
 mrl-storage = { path = "../mrl-storage" }
 tempfile = "=3.27.0"
 url = "=2.5.8"
+# <mrl:deps P21> P21 dependencies go right below this line.
+# <mrl:deps P22> P22 dependencies go right below this line.
+# <mrl:deps P23> P23 dependencies go right below this line.
+# <mrl:deps P24> P24 dependencies go right below this line.
 
 [dev-dependencies]
 mrl-domain = { path = "../mrl-domain" }

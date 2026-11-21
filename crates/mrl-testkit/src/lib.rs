@@ -25,6 +25,10 @@ pub mod supabase;
 mod p19_artifacts;
 
 // <mrl:testkit P20> P20 `pub mod` lines go right below this line.
+// <mrl:testkit P21> P21 `pub mod` lines go right below this line.
+// <mrl:testkit P22> P22 `pub mod` lines go right below this line.
+// <mrl:testkit P23> P23 `pub mod` lines go right below this line.
+// <mrl:testkit P24> P24 `pub mod` lines go right below this line.
 
 /// The version of this crate, taken from its `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
