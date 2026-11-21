@@ -1999,7 +1999,8 @@ impl Runner {
     async fn finish_with(&mut self, decision: ExitDecision) -> ExitDecision {
         // Uploads still running get to finish (not after a self-fence), so their commands get
         // their real result; every command still without one is then answered as failed.
-        let until = Instant::now() + UPLOAD_DRAIN;
+        let drain_limit = Instant::now() + UPLOAD_DRAIN;
+        let until = drain_limit.min(self.lease.unwrap_or(drain_limit));
         while !(self.in_flight.is_empty() && self.adhoc.is_empty()) && !self.self_fenced {
             for (_, done) in std::mem::take(&mut self.unsaved) {
                 self.on_upload(done).await;

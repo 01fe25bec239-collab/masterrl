@@ -1967,6 +1967,44 @@ mod runner_tests {
         assert_eq!(got.lock().unwrap().len(), 1);
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upload_drain_stops_at_the_lease_after_worker_exit() {
+        let (base, got) = slow_sink(Duration::from_secs(6)).await;
+        let path = "w.bin";
+        let mut fx =
+            RunnerFixture::readopt(spec("att_drainlease", serde_json::json!({})), |_| {}).await;
+        std::fs::write(fx.staging().join(path), b"weights").unwrap();
+        fx.control
+            .send(Control::Lease {
+                heartbeat_seq: 1,
+                heartbeat_sent: std::time::Instant::now(),
+                duration_s: 3,
+                kill_budget_s: 0,
+            })
+            .await
+            .unwrap();
+        fx.control
+            .send(Control::Upload {
+                command_id: "up-drain".into(),
+                checkpoint_id: String::new(),
+                targets: vec![target(&base, path, &sha_hex(b"weights"), 7)],
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !fx.saved().adhoc_uploads.contains_key("up-drain") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        fx.end_workers();
+        let result = done(&mut fx).await;
+        assert_eq!(result.command_id, "up-drain");
+        assert!(result.failure.is_some());
+        assert!(got.lock().unwrap().is_empty());
+    }
+
     /// Two commands for one checkpoint before the worker asks to commit: the first is answered
     /// as replaced, the second owns the upload and gets its result.
     #[tokio::test(flavor = "multi_thread")]

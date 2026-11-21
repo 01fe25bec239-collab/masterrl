@@ -401,8 +401,8 @@ impl Envs {
             plan.check_build_backends(&copy, &uv_version)
                 .map_err(install_err)?;
             let snap_project = copy.project.clone();
-            if dir.join("pyvenv.cfg").is_file() {
-                // An interrupted sync can leave package metadata without entrypoints.
+            {
+                // An interrupted sync can leave a directory without Python or entrypoints.
                 // Keep uv's artifact cache, but rebuild the unpublished virtualenv.
                 if std::fs::read_dir(dir.join(PINS)).is_ok_and(|mut pins| pins.next().is_some()) {
                     return Err(install_err(
