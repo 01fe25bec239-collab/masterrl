@@ -8,23 +8,23 @@
 //! exponential backoff 1 s → 60 s with full jitter. Leader-elected, so one replica dials.
 
 use super::session;
-use super::{PeerInfo, KEEPALIVE, MAX_MESSAGE_BYTES};
+use super::{KEEPALIVE, MAX_MESSAGE_BYTES, PeerInfo};
 use crate::db::LeaderElection;
 use crate::modules::nodes::ca::node_name;
 use crate::modules::nodes::{Gateway, NodesError};
 use crate::transports::{BoxIo, Endpoint};
 use hyper_util::rt::TokioIo;
 use mrl_proto::agent::v1::agent_endpoint_service_client::AgentEndpointServiceClient;
-use mrl_proto::agent::v1::{core_message, CoreHello, CoreMessage, Lane};
+use mrl_proto::agent::v1::{CoreHello, CoreMessage, Lane, core_message};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::TlsConnector;
-use tokio_stream::wrappers::ReceiverStream;
+use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_stream::StreamExt;
+use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -137,7 +137,9 @@ async fn scan(
         "SELECT t.id, t.endpoint FROM node_enrollment_tokens t
          LEFT JOIN compute_nodes n ON n.id = t.used_by_node_id
          WHERE t.endpoint IS NOT NULL AND t.expires_at > now()
-           AND (t.used_at IS NULL OR n.status = 'ENROLLING')",
+           AND (t.used_at IS NULL OR (t.used_key_sha256 IS NOT NULL AND n.status = 'ENROLLING' AND n.session_epoch = 0
+                  AND EXISTS (SELECT 1 FROM node_certificates c WHERE c.node_id = n.id AND c.revoked_at IS NULL AND c.not_after > now())
+                  AND NOT EXISTS (SELECT 1 FROM node_certificates c WHERE c.node_id = n.id AND c.revoked_at IS NOT NULL)))",
     )
     .fetch_all(gw.db.pool())
     .await?;
@@ -268,7 +270,13 @@ async fn dial_node(
     endpoint: &Endpoint,
     lead: &CancellationToken,
 ) -> Result<(), NodesError> {
-    let io = open(gw, endpoint).await?;
+    let io = bounded(
+        "opening the transport",
+        Duration::from_secs(30),
+        lead,
+        open(gw, endpoint),
+    )
+    .await?;
     let pki = gw.pki()?;
     let name =
         ServerName::try_from(node_name(node)).map_err(|e| NodesError::Protocol(e.to_string()))?;
@@ -339,7 +347,13 @@ async fn dial_enroll(
     endpoint: &Endpoint,
     lead: &CancellationToken,
 ) -> Result<(), NodesError> {
-    let io = open(gw, endpoint).await?;
+    let io = bounded(
+        "opening the transport",
+        Duration::from_secs(30),
+        lead,
+        open(gw, endpoint),
+    )
+    .await?;
     let pki = gw.pki()?;
     let name = ServerName::try_from("enroll.masterrl.internal")
         .map_err(|e| NodesError::Protocol(e.to_string()))?;

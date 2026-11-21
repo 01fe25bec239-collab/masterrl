@@ -15,7 +15,7 @@
 //! and METRICS/LOGS are acked and discarded (counter). TELEMETRY always updates
 //! `node_telemetry_latest` here, and also reaches a sink that takes it.
 
-use mrl_proto::agent::v1::{agent_message::Body, AgentMessage};
+use mrl_proto::agent::v1::{AgentMessage, agent_message::Body};
 use mrl_proto::worker::v1::worker_message::Body as WorkerBody;
 use prometheus::{IntCounterVec, Opts};
 use std::sync::{Arc, OnceLock, RwLock};
@@ -106,7 +106,9 @@ pub trait LaneSink: Send + Sync {
     fn name(&self) -> &'static str;
     /// The lanes this sink takes (the first registered sink for a lane wins).
     fn lanes(&self) -> &'static [LaneKind];
-    /// Handles one item. Must be idempotent per `(node_id, stream, seq)`.
+    /// Handles one item. Must be idempotent per `(node_id, stream, seq)`. Lossy delivery
+    /// holds the node session fence. Keep lossy callbacks short and finish their writes before
+    /// returning. A lossy callback cannot change session ownership for its own node.
     async fn deliver(&self, item: LaneItem) -> Result<(), SinkError>;
 }
 
@@ -232,6 +234,45 @@ pub(crate) struct Owner {
     pub epoch: i64,
 }
 
+impl Owner {
+    /// A lossy item is delivered under the session fence. Use a dedicated connection so
+    /// sinks can acquire a pooled connection, even when the pool has only one.
+    pub async fn deliver(
+        &self,
+        session: &tokio_util::sync::CancellationToken,
+        sink: &dyn LaneSink,
+        item: LaneItem,
+    ) {
+        use sqlx::Connection;
+        let delivery = async {
+            let mut conn = self.db.dedicated().await?;
+            let mut tx = conn.begin().await.map_err(crate::db::DbError::from)?;
+            super::store::lock_lane_epoch(&mut tx, self.node, true).await?;
+            if !super::store::holds_lane(&mut tx, self.node, self.epoch).await? {
+                session.cancel();
+                return Ok(());
+            }
+            if !session.is_cancelled() {
+                if let Err(e) = sink.deliver(item).await {
+                    tracing::warn!(error = %e, "lossy lane sink failed");
+                }
+            }
+            Ok::<_, super::NodesError>(())
+        };
+        tokio::select! {
+            biased;
+            () = session.cancelled() => {}
+            result = tokio::time::timeout(std::time::Duration::from_secs(5), delivery) => {
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => tracing::debug!(error = %e, "lossy lane fence unavailable"),
+                    Err(_) => tracing::debug!("lossy lane delivery timed out"),
+                }
+            }
+        }
+    }
+}
+
 /// A bounded METRICS or LOGS queue for one stream, drained into the sink by its own task.
 ///
 /// - METRICS, when full: every other queued item is dropped (oldest first), so the series stays
@@ -288,7 +329,7 @@ impl LossyLane {
     /// With `owner`, each item is delivered only while that session is still the node's in the
     /// database (a takeover on another replica stops delivery before this stream hears of it).
     // ponytail: items still queued when their session ends are dropped (lossy lanes, D-04-05);
-    // one epoch read per item, batch it if lane rates get high.
+    // shortcut: one fenced connection per item, batch delivery when lane rates require it.
     pub fn start(
         router: &LaneRouter,
         lane: LaneKind,
@@ -317,17 +358,8 @@ impl LossyLane {
                     match next {
                         Some(item) => {
                             if let Some(o) = &owner {
-                                match super::store::is_current(&o.db, o.node, o.epoch).await {
-                                    Ok(true) => {}
-                                    Ok(false) => {
-                                        session.cancel();
-                                        return;
-                                    }
-                                    // Can't tell: fail closed, this item is dropped.
-                                    Err(_) => continue,
-                                }
-                            }
-                            if let Err(e) = sink.deliver(item).await {
+                                o.deliver(&session, sink.as_ref(), item).await;
+                            } else if let Err(e) = sink.deliver(item).await {
                                 tracing::warn!(lane = lane.as_str(), error = %e, "lane sink failed; item dropped");
                             }
                         }
