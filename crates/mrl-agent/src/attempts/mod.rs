@@ -145,6 +145,33 @@ pub(crate) async fn send_event(
     Some(saved)
 }
 
+/// What runs once the gateway saved an event the manager posted (see [`post`]).
+type OnSaved = Box<dyn FnOnce() + Send>;
+
+/// How the manager (not a runner) hands an event to the gateway: from a background task, so
+/// the caller never waits for room in the channel. The gateway may start draining only after
+/// [`Attempts::readopt`] or [`Attempts::handle`] returned, while re-adopted runners already
+/// fill the channel. `on_saved` runs once the gateway saved the event (never if it was
+/// dropped unsaved). Events are delivered in the order of `events`, and their `on_saved`
+/// calls run one after another in that order (they may rewrite the same record).
+fn post(tx: &AttemptEventSender, events: Vec<(AttemptEvent, Option<OnSaved>)>) {
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let mut receipts = Vec::with_capacity(events.len());
+        for (event, on_saved) in events {
+            let Some(receipt) = send_event(&tx, event).await else {
+                break;
+            };
+            receipts.push((receipt, on_saved));
+        }
+        for (receipt, on_saved) in receipts {
+            if let (Ok(()), Some(f)) = (receipt.await, on_saved) {
+                f();
+            }
+        }
+    });
+}
+
 /// Marks every event saved as it arrives, for local tools and tests that keep no journal
 /// (`attempt run`, `attempt stop-all`). The gateway must not use it.
 pub fn auto_saved(mut rx: AttemptEvents) -> tokio::task::JoinHandle<()> {
@@ -291,11 +318,6 @@ impl Attempts {
             }
         }
         let secrets = self.secrets_for(&spec)?;
-        // Every check passed: from now on this job's older epochs are refused.
-        lock(&self.epochs)
-            .entry(spec.attempt.job_id.clone())
-            .and_modify(|e| *e = (*e).max(spec.attempt.fencing_epoch))
-            .or_insert(spec.attempt.fencing_epoch);
         let rec_lease_s = spec.lease_s;
         let rec = AttemptRecord {
             socket: runner::socket_path(self.shared.ctx.state.root(), &id),
@@ -322,9 +344,12 @@ impl Attempts {
             uploads: BTreeMap::new(),
             results: BTreeMap::new(),
             adhoc_uploads: BTreeMap::new(),
+            hw_events: Vec::new(),
         };
         record::private_dir(&job_dir).map_err(|e| crate::AgentError::state(&job_dir, e))?;
         rec.save(&job_dir)?;
+        // Accepted (its record is saved): from now on this job's older epochs are refused.
+        self.note_epoch(&rec);
         // Used: the staged inputs are in the spec, the credentials in `secrets`.
         lock(&self.pending).remove(&id);
         let _ = std::fs::remove_file(self.pending_path(&id));
@@ -514,13 +539,26 @@ impl Attempts {
         .await
     }
 
-    /// Passes GPU events (from the telemetry reader) to the attempts using those GPUs.
+    /// Passes GPU events (from the telemetry reader) to the attempts using those GPUs. They
+    /// are exit evidence, so none is dropped: a runner whose control queue is full gets them
+    /// once it has room (called outside a tokio runtime, only if it has room now).
     pub fn hw_events(&self, events: &[HwEvent]) {
         if events.is_empty() {
             return;
         }
+        let rt = tokio::runtime::Handle::try_current().ok();
         for l in lock(&self.live).values() {
-            let _ = l.control.try_send(Control::Hw(events.to_vec()));
+            let (control, events) = (l.control.clone(), events.to_vec());
+            match &rt {
+                Some(rt) => {
+                    rt.spawn(async move {
+                        let _ = control.send(Control::Hw(events)).await;
+                    });
+                }
+                None => {
+                    let _ = control.try_send(Control::Hw(events));
+                }
+            }
         }
     }
 
@@ -581,7 +619,7 @@ impl Attempts {
                 if !rec.results.is_empty() || !rec.adhoc_uploads.is_empty() {
                     if let Ok(_claim) = self.claim(&id) {
                         if let Ok(Some(mut fresh)) = AttemptRecord::load(&dir) {
-                            self.replay_results(&dir, &mut fresh).await;
+                            self.replay_results(&dir, &mut fresh);
                         }
                     }
                 }
@@ -599,7 +637,7 @@ impl Attempts {
             rec = fresh;
             if let Some(d) = rec.exit.clone() {
                 out.push(status_of(&rec, Some(&d)));
-                self.replay_results(&dir, &mut rec).await;
+                self.replay_results(&dir, &mut rec);
                 drop(claim);
                 continue;
             }
@@ -657,7 +695,10 @@ impl Attempts {
                 drop(claim);
                 st
             };
-            let _ = send_event(&self.shared.events, AttemptEvent::Status(status.clone())).await;
+            post(
+                &self.shared.events,
+                vec![(AttemptEvent::Status(status.clone()), None)],
+            );
             out.push(status);
         }
         out
@@ -689,11 +730,12 @@ impl Attempts {
             .exit_report
             .as_deref()
             .and_then(|b| <ExitReport as prost::Message>::decode(b).ok());
-        let d = if report.is_some() || oom_killed {
+        let d = if report.is_some() || oom_killed || !rec.hw_events.is_empty() {
             exit::decide(&exit::ExitEvidence {
                 report,
                 exit_code,
                 oom_killed,
+                hw_events: rec.hw_events.clone(),
                 readopted: true,
                 cancel_requested: rec.cancel_requested,
                 final_committed: rec.final_committed(),
@@ -727,13 +769,13 @@ impl Attempts {
         let _ = rec.save(dir);
         let _ = crate::janitor::release(&self.shared.ctx, &self.shared.envs, rec, &HashSet::new())
             .await;
-        self.replay_results(dir, rec).await;
+        self.replay_results(dir, rec);
         status_of(rec, Some(&d))
     }
 
     /// Sends the upload results an ended attempt saved but never got out (its agent stopped
     /// in between), then forgets them.
-    async fn replay_results(&self, dir: &std::path::Path, rec: &mut AttemptRecord) {
+    fn replay_results(&self, dir: &std::path::Path, rec: &mut AttemptRecord) {
         // Uploads still saved as running when it ended can't be resumed any more: they fail.
         for (command_id, _) in std::mem::take(&mut rec.adhoc_uploads) {
             rec.results.insert(
@@ -742,25 +784,26 @@ impl Attempts {
             );
         }
         let _ = rec.save(dir);
-        // Handed over without waiting (the gateway may drain events only after `readopt`
-        // returns); each is removed from the record once the gateway saved it.
-        for (command_id, failure) in rec.results.clone() {
-            let r = runner::upload_result(command_id.clone(), failure);
-            let Some(receipt) = send_event(&self.shared.events, AttemptEvent::CommandDone(r)).await
-            else {
-                break;
-            };
-            let dir = dir.to_path_buf();
-            tokio::spawn(async move {
-                if receipt.await.is_ok() {
+        // Handed over without waiting (see `post`); each is removed from the record once the
+        // gateway saved it.
+        let events = rec
+            .results
+            .clone()
+            .into_iter()
+            .map(|(command_id, failure)| {
+                let r = runner::upload_result(command_id.clone(), failure);
+                let dir = dir.to_path_buf();
+                let forget: OnSaved = Box::new(move || {
                     if let Ok(Some(mut saved)) = AttemptRecord::load(&dir) {
                         if saved.results.remove(&command_id).is_some() {
                             let _ = saved.save(&dir);
                         }
                     }
-                }
-            });
-        }
+                });
+                (AttemptEvent::CommandDone(r), Some(forget))
+            })
+            .collect();
+        post(&self.shared.events, events);
     }
 
     /// Handles an attempt command. `None` for commands this runtime does not own (deployments).
@@ -909,7 +952,10 @@ impl Attempts {
                     &facts.inventory,
                     self.shared.ctx.state.root(),
                 );
-                let _ = send_event(&self.shared.events, AttemptEvent::Probe(result)).await;
+                post(
+                    &self.shared.events,
+                    vec![(AttemptEvent::Probe(result), None)],
+                );
                 Ok(())
             }
             Kind::LaunchDeployment(_) | Kind::StopDeployment(_) => return None,

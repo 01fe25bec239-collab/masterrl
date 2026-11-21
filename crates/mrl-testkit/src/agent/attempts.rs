@@ -377,6 +377,7 @@ impl RunnerFixture {
             uploads: Default::default(),
             results: Default::default(),
             adhoc_uploads: Default::default(),
+            hw_events: Vec::new(),
         };
         edit(&mut record);
         let job = agent.ctx.state.job_dir(&id);
@@ -1685,13 +1686,17 @@ mod runner_tests {
         let next =
             mrl_agent::attempts::Attempts::new(Arc::clone(&fx.agent.ctx), etx, None).unwrap();
         next.readopt().await;
-        let mut got = None;
-        while let Ok(e) = erx.try_recv() {
-            if let AttemptEvent::CommandDone(r) = e.saved() {
-                got = Some(r);
+        // Handed over in the background (readopt never waits for the gateway).
+        let got = tokio::time::timeout(RECV_TIMEOUT, async {
+            while let Some(e) = erx.recv().await {
+                if let AttemptEvent::CommandDone(r) = e.saved() {
+                    return Some(r);
+                }
             }
-        }
-        assert_eq!(got.unwrap().command_id, "up-10");
+            None
+        })
+        .await;
+        assert_eq!(got.unwrap().unwrap().command_id, "up-10");
         // Removed from the record once the gateway saved it (just now).
         for _ in 0..40 {
             if fx.saved().results.is_empty() {

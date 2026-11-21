@@ -680,6 +680,7 @@ async fn orphaned_job(
         uploads: Default::default(),
         results: Default::default(),
         adhoc_uploads: Default::default(),
+        hw_events: Vec::new(),
     };
     (rec, orphan)
 }
@@ -1012,6 +1013,7 @@ fn old_record(
         uploads: Default::default(),
         results: Default::default(),
         adhoc_uploads: Default::default(),
+        hw_events: Vec::new(),
     }
 }
 

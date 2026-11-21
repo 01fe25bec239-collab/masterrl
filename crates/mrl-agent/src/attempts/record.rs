@@ -79,6 +79,10 @@ pub struct AttemptRecord {
     /// a restarted agent sends them again (or fails them once the attempt has ended).
     #[serde(default)]
     pub adhoc_uploads: BTreeMap<String, Vec<UploadTarget>>,
+    /// GPU events (XID, out of memory, device lost) on this attempt's GPUs: exit evidence,
+    /// saved so a re-adopted attempt (or one that ended while no agent ran) still has it.
+    #[serde(default)]
+    pub hw_events: Vec<crate::hw::HwEvent>,
 }
 
 /// The tickets for one checkpoint.

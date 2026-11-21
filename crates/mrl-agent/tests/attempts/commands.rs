@@ -7,7 +7,7 @@ use mrl_agent::config::{AgentConfig, CacheConfig, SandboxChoice, SandboxConfig};
 use mrl_agent::AgentContext;
 use mrl_proto::agent::v1::command::Kind;
 use mrl_proto::agent::v1::{Cleanup, Command};
-use mrl_proto::common::v1::AttemptRef;
+use mrl_proto::common::v1::{AttemptRef, FailureClass};
 
 #[tokio::test]
 async fn cleanup_refuses_an_attempt_id_that_leaves_the_state_folder() {
@@ -877,6 +877,7 @@ async fn windows_reports_a_surviving_worker_lost() {
         uploads: Default::default(),
         results: Default::default(),
         adhoc_uploads: Default::default(),
+        hw_events: Vec::new(),
     };
     let job = ctx.state.job_dir("att_win");
     std::fs::create_dir_all(&job).unwrap();
@@ -1246,4 +1247,207 @@ async fn staging_survives_concurrent_eviction() {
     }
     stop.store(true, std::sync::atomic::Ordering::Relaxed);
     evictor.join().unwrap();
+}
+
+fn config(dir: &std::path::Path) -> AgentConfig {
+    AgentConfig {
+        state_dir: dir.join("state"),
+        cache: CacheConfig {
+            max_bytes: Some(1 << 20),
+            min_free_bytes: 0,
+        },
+        sandbox: SandboxConfig {
+            backend: SandboxChoice::None,
+            bwrap_path: None,
+        },
+        ..AgentConfig::default()
+    }
+}
+
+/// Launches a spec that fails right after staging and returns its saved record.
+async fn ended(
+    attempts: &Arc<Attempts>,
+    ctx: &AgentContext,
+    dir: &std::path::Path,
+    id: &str,
+) -> mrl_agent::attempts::record::AttemptRecord {
+    attempts
+        .launch(bad_lock_spec(dir, id, "job_m", 1, serde_json::json!({})))
+        .unwrap();
+    tokio::time::timeout(WAIT, attempts.wait(id))
+        .await
+        .unwrap()
+        .unwrap();
+    mrl_agent::attempts::record::AttemptRecord::load(&ctx.state.job_dir(id))
+        .unwrap()
+        .unwrap()
+}
+
+/// The manager's own events (re-adoption statuses, saved upload results, probe results)
+/// never wait for the gateway: it may start draining only after `readopt` and `handle`
+/// returned. Once it drains, every saved result still arrives and is then forgotten.
+#[tokio::test(flavor = "multi_thread")]
+async fn manager_events_never_wait_for_the_gateway() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, first, _rx) = manager(dir.path());
+    // Ended with two results never sent.
+    let mut done = ended(&first, &ctx, dir.path(), "att_m1").await;
+    done.results.insert("c1".into(), None);
+    done.results.insert("c2".into(), Some("failed".into()));
+    done.save(&ctx.state.job_dir("att_m1")).unwrap();
+    // Never ended, its workers gone: closed as lost on re-adoption, with one result.
+    let mut lost = ended(&first, &ctx, dir.path(), "att_m2").await;
+    lost.exit = None;
+    lost.workers.clear();
+    lost.results.insert("c3".into(), None);
+    lost.save(&ctx.state.job_dir("att_m2")).unwrap();
+
+    // Room for one event, and nobody reads yet.
+    let (tx, rx) = mrl_agent::attempts::attempt_events(1);
+    let second = Attempts::new(Arc::clone(&ctx), tx, None).unwrap();
+    let statuses = tokio::time::timeout(WAIT, second.readopt())
+        .await
+        .expect("readopt returns with the channel full");
+    assert_eq!(statuses.len(), 2);
+    let probe = Command {
+        command_id: "p".into(),
+        kind: Some(Kind::Probe(mrl_proto::agent::v1::Probe {
+            request_id: "r".into(),
+            ..Default::default()
+        })),
+    };
+    let r = tokio::time::timeout(WAIT, second.handle(&probe))
+        .await
+        .expect("a probe returns with the channel full")
+        .unwrap();
+    assert!(r.accepted);
+
+    // The gateway starts draining: the results get out and are forgotten.
+    let _rx = mrl_agent::attempts::auto_saved(rx);
+    let load = |id: &str| {
+        mrl_agent::attempts::record::AttemptRecord::load(&ctx.state.job_dir(id))
+            .unwrap()
+            .unwrap()
+    };
+    for _ in 0..100 {
+        if load("att_m1").results.is_empty() && load("att_m2").results.is_empty() {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    panic!("saved results were not delivered");
+}
+
+/// A launch whose record can't be saved is not accepted, so it raises no epoch: an older
+/// epoch of the same job still launches.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_launch_that_was_not_saved_raises_no_epoch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, attempts, _rx) = manager(dir.path());
+    let jobs = ctx.state.root().join("jobs");
+    std::fs::create_dir_all(&jobs).unwrap();
+    // The job folder can't be created: its name is a link to nowhere.
+    std::os::unix::fs::symlink(dir.path().join("nowhere").join("x"), jobs.join("att_n1")).unwrap();
+    let newer = bad_lock_spec(dir.path(), "att_n1", "job_n", 5, serde_json::json!({}));
+    assert!(attempts.launch(newer).is_err());
+    let older = bad_lock_spec(dir.path(), "att_n2", "job_n", 3, serde_json::json!({}));
+    attempts
+        .launch(older)
+        .expect("epoch 5 was never accepted, so epoch 3 still launches");
+}
+
+/// GPU events are exit evidence: none is dropped while the runner is busy (its control
+/// queue full), and every one is saved in the record.
+#[tokio::test(flavor = "multi_thread")]
+async fn gpu_events_are_never_dropped() {
+    use mrl_agent::hw::fake::{FakeHw, Fault};
+    let dir = tempfile::tempdir().unwrap();
+    let hw = Arc::new(FakeHw::with_gpus(1, "Fake A100", 80 << 30));
+    let backends: Vec<Arc<dyn mrl_agent::hw::HwBackend>> = vec![Arc::clone(&hw) as _];
+    let ctx = Arc::new(AgentContext::with_hw(config(dir.path()), backends).unwrap());
+    let (tx, rx) = mrl_agent::attempts::attempt_events(1);
+    let attempts = Attempts::new(Arc::clone(&ctx), tx, None).unwrap();
+    let url = stuck_link().await;
+    // The first attempt's status fills the channel; nobody reads it yet.
+    attempts
+        .launch(bad_lock_spec(
+            dir.path(),
+            "att_g1",
+            "job_g",
+            1,
+            slow_input(&url),
+        ))
+        .unwrap();
+    for _ in 0..100 {
+        if rx.len() == 1 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(rx.len(), 1);
+    // The second one waits to publish its first status, so it reads no command.
+    let mut s = bad_lock_spec(dir.path(), "att_g2", "job_g", 1, slow_input(&url));
+    s.roles[0].gpus = vec![0];
+    attempts.launch(s).unwrap();
+    hw.inject(Fault::Oom { index: 0 });
+    let events: Vec<_> = ctx.hw.iter().flat_map(|b| b.drain_events()).collect();
+    assert_eq!(events.len(), 1);
+    let uuid = events[0].uuid.clone();
+    // 40 different events (more than the runner's control queue holds), plus repeats of
+    // each, which are kept once.
+    for code in 1000..1040 {
+        let e = mrl_agent::hw::HwEvent::now(&uuid, mrl_agent::hw::HwEventKind::Xid { code });
+        attempts.hw_events(&[e.clone(), e]);
+    }
+    let _rx = mrl_agent::attempts::auto_saved(rx);
+    let job = ctx.state.job_dir("att_g2");
+    let mut saved = 0;
+    for _ in 0..100 {
+        saved = mrl_agent::attempts::record::AttemptRecord::load(&job)
+            .unwrap()
+            .unwrap()
+            .hw_events
+            .len();
+        if saved == 40 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        saved, 40,
+        "every GPU event reached the attempt and was saved"
+    );
+    for id in ["att_g1", "att_g2"] {
+        assert!(
+            attempts
+                .handle(&cancel_cmd("job_g", id))
+                .await
+                .unwrap()
+                .accepted
+        );
+    }
+}
+
+/// An attempt that ended while no agent ran it keeps its saved GPU evidence: a GPU OOM seen
+/// before the restart decides the outcome, not "worker lost".
+#[tokio::test(flavor = "multi_thread")]
+async fn saved_gpu_evidence_decides_an_attempt_that_ended_unseen() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, first, _rx) = manager(dir.path());
+    let mut rec = ended(&first, &ctx, dir.path(), "att_o1").await;
+    rec.exit = None;
+    rec.workers.clear();
+    rec.hw_events = vec![mrl_agent::hw::HwEvent::now(
+        "GPU-0",
+        mrl_agent::hw::HwEventKind::OutOfMemory,
+    )];
+    rec.save(&ctx.state.job_dir("att_o1")).unwrap();
+    let (tx, rx) = mrl_agent::attempts::attempt_events(16);
+    let _rx = mrl_agent::attempts::auto_saved(rx);
+    let restarted = Attempts::new(Arc::clone(&ctx), tx, None).unwrap();
+    let statuses = restarted.readopt().await;
+    let f = statuses[0].failure.as_ref().unwrap();
+    assert_eq!(f.class, FailureClass::Oom as i32, "{f:?}");
+    assert_eq!(f.sub_code, "OOM_GPU");
 }

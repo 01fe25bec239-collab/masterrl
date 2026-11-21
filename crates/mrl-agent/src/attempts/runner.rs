@@ -232,7 +232,6 @@ pub struct Runner {
     report: Option<ExitReport>,
     primary_exit: Option<WorkerExit>,
     secondary_oom: bool,
-    hw_events: Vec<HwEvent>,
     env_mismatch: Option<String>,
     protocol_error: Option<String>,
     stalled: bool,
@@ -361,7 +360,6 @@ impl Runner {
             report: None,
             primary_exit: None,
             secondary_oom: false,
-            hw_events: Vec::new(),
             env_mismatch: None,
             protocol_error: None,
             stalled: false,
@@ -541,6 +539,22 @@ impl Runner {
         self.save();
     }
 
+    /// Keeps a GPU event as exit evidence (saved with the record) when it is on one of this
+    /// attempt's GPUs and new: one per GPU and kind, so a repeating event can't grow the
+    /// record. True when kept.
+    fn keep_hw(&mut self, e: HwEvent) -> bool {
+        let new = self.gpu_uuids.contains(&e.uuid)
+            && !self
+                .rec
+                .hw_events
+                .iter()
+                .any(|h| h.uuid == e.uuid && h.kind == e.kind);
+        if new {
+            self.rec.hw_events.push(e);
+        }
+        new
+    }
+
     fn lookup_gpus(&self) -> HashSet<String> {
         let wanted: HashSet<u32> = self
             .rec
@@ -658,7 +672,9 @@ impl Runner {
                         self.accept_plan(checkpoint_id, command_id, targets).await;
                     }
                     Some(Control::Hw(events)) => {
-                        self.hw_events.extend(events.into_iter().filter(|e| self.gpu_uuids.contains(&e.uuid)));
+                        for e in events {
+                            self.keep_hw(e);
+                        }
                     }
                     Some(Control::Acked { .. }) => {}
                 }
@@ -1870,14 +1886,9 @@ impl Runner {
                 }
             }
             Control::Hw(events) => {
-                let mine: Vec<HwEvent> = events
-                    .into_iter()
-                    .filter(|e| self.gpu_uuids.contains(&e.uuid))
-                    .collect();
-                for e in mine {
+                for e in events {
                     let fatal = matches!(e.kind, HwEventKind::DeviceLost);
-                    self.hw_events.push(e);
-                    if fatal {
+                    if self.keep_hw(e) && fatal {
                         self.stop_all().await;
                     }
                 }
@@ -1917,7 +1928,7 @@ impl Runner {
             exit_code: p.as_ref().and_then(|p| p.code),
             signal: p.as_ref().and_then(|p| p.signal),
             oom_killed: self.secondary_oom || p.as_ref().is_some_and(|p| p.oom),
-            hw_events: self.hw_events.clone(),
+            hw_events: self.rec.hw_events.clone(),
             self_fenced: self.self_fenced,
             stalled: self.stalled,
             env_mismatch: self.env_mismatch.clone(),
