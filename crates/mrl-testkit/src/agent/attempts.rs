@@ -2475,6 +2475,151 @@ mod session_wiring {
         daemon.stop().await;
     }
 
+    /// Wave 4 exit check, Linux with a systemd user session: the real `mrl-agent` installed as
+    /// the user service (`KillMode=process`) is restarted with `systemctl --user restart`; the
+    /// worker keeps running, the new agent re-adopts it and lists it RUNNING in its first
+    /// ReconcileReport, and the core's cancel still ends it. Run with
+    /// `MRL_TEST_SYSTEMD=1 MRL_AGENT_BIN=<path to mrl-agent>`.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL, uv, systemd --user and MRL_TEST_SYSTEMD=1"]
+    async fn a_systemd_restart_keeps_and_readopts_the_attempt() {
+        let (Ok(_), Ok(bin)) = (
+            std::env::var("MRL_TEST_SYSTEMD"),
+            std::env::var("MRL_AGENT_BIN"),
+        ) else {
+            eprintln!("SKIPPED: set MRL_TEST_SYSTEMD=1 and MRL_AGENT_BIN");
+            return;
+        };
+        if !uv_ready("a_systemd_restart_keeps_and_readopts_the_attempt") {
+            return;
+        }
+        let sh = |args: &[&str]| {
+            let out = std::process::Command::new(args[0])
+                .args(&args[1..])
+                .output()
+                .unwrap();
+            assert!(
+                out.status.success(),
+                "{args:?}: {}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        let s = setup(|_| {}).await;
+        let rt = fake_runtime(&s.agent.ctx);
+        let settings = s.agent.ctx.state.root().with_file_name("agent.toml");
+        std::fs::write(&settings, toml::to_string(&s.agent.ctx.config).unwrap()).unwrap();
+        let config = settings.to_str().unwrap();
+        sh(&[&bin, "--config", config, "service", "install"]);
+        // Removed again even when an assert fails, so a failed run leaves no service behind.
+        struct Installed(String, String);
+        impl Drop for Installed {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new(&self.0)
+                    .args(["--config", &self.1, "service", "uninstall"])
+                    .status();
+            }
+        }
+        let _installed = Installed(bin.clone(), config.to_owned());
+        let unit = sh(&["systemctl", "--user", "cat", "mrl-agent.service"]);
+        assert!(unit.contains("KillMode=process"), "{unit}");
+
+        let attempt = AttemptId::new();
+        let id = attempt.to_string();
+        let l = s
+            .sender
+            .send(
+                s.node,
+                launch(attempt, &rt, json!({"steps": 900, "step_seconds": 0.2})),
+            )
+            .await
+            .unwrap();
+        wait_state(&s.gw, l.id, "COMPLETED").await;
+        s.control.until_phase(&id, AttemptPhase::Running).await;
+        let job = s.agent.ctx.state.job_dir(&id);
+        let worker = || {
+            mrl_agent::attempts::record::AttemptRecord::load(&job)
+                .unwrap()
+                .unwrap()
+                .workers
+                .iter()
+                .find(|w| w.primary)
+                .map(|w| w.identity.clone())
+                .unwrap()
+        };
+        let before_worker = worker();
+        let agent_pid = sh(&[
+            "systemctl",
+            "--user",
+            "show",
+            "-p",
+            "MainPID",
+            "--value",
+            "mrl-agent.service",
+        ]);
+        let before = s.control.all().last().map_or(0, |(seq, _)| *seq);
+
+        sh(&["systemctl", "--user", "restart", "mrl-agent.service"]);
+        let agent_pid_after = sh(&[
+            "systemctl",
+            "--user",
+            "show",
+            "-p",
+            "MainPID",
+            "--value",
+            "mrl-agent.service",
+        ]);
+        assert_ne!(
+            agent_pid.trim(),
+            agent_pid_after.trim(),
+            "the agent itself restarted"
+        );
+        s.control
+            .until("a reconcile report after the restart", |all| {
+                all.iter()
+                    .any(|(seq, b)| *seq > before && matches!(b, Msg::Reconcile(_)))
+            })
+            .await;
+        let first = s
+            .control
+            .all()
+            .into_iter()
+            .find_map(|(seq, b)| match b {
+                Msg::Reconcile(r) if seq > before => Some(r),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            first
+                .attempts
+                .iter()
+                .any(|st| st.attempt.as_ref().is_some_and(|a| a.attempt_id == id)
+                    && st.phase == AttemptPhase::Running as i32),
+            "{first:?}"
+        );
+        assert_eq!(
+            worker(),
+            before_worker,
+            "the same worker process kept running"
+        );
+        eprintln!(
+            "agent pid {} -> {}; worker {before_worker:?} kept",
+            agent_pid.trim(),
+            agent_pid_after.trim()
+        );
+
+        let c = s.sender.send(s.node, cancel(attempt)).await.unwrap();
+        wait_state(&s.gw, c.id, "COMPLETED").await;
+        s.control.until_phase(&id, AttemptPhase::Exited).await;
+        let ended = s.control.statuses(&id).last().unwrap().1.clone();
+        assert_eq!(
+            ended.exit_kind,
+            mrl_proto::worker::v1::ExitKind::Cancelled as i32,
+            "{ended:?}"
+        );
+    }
+
     /// Every lease grant renews the attempt's lease, counted from the heartbeat it answers.
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs PostgreSQL and uv (just test-integration)"]

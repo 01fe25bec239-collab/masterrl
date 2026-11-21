@@ -50,6 +50,7 @@ object_store = { workspace = true, features = ["aws"] }
 
 # <mrl:deps P20> P20 dependencies go right below this line.
 tokio-stream = { version = "=0.1.19", features = ["net"] }
+toml = "=1.2.0"
 # <mrl:deps P21> P21 dependencies go right below this line.
 # <mrl:deps P22> P22 dependencies go right below this line.
 # <mrl:deps P23> P23 dependencies go right below this line.

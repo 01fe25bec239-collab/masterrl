@@ -1,10 +1,12 @@
 //! cgroup v2 job cgroups (Linux).
 //!
 //! The agent needs a cgroup it may write: the systemd user unit sets `Delegate=yes`, so the
-//! service's own cgroup works (and is used only when the agent runs in `mrl-agent.service`). Because cgroup v2 forbids processes in a cgroup that hands out
-//! controllers, the agent first moves itself into a `agent` leaf, then enables `cpu`, `memory`
-//! and `pids` for its children and puts each job in `job-<name>`. A configured
-//! `exec.cgroup_root` must already be empty of processes.
+//! service's own cgroup works (and is used only when the agent runs in `mrl-agent.service`).
+//! Because cgroup v2 forbids processes in a cgroup that hands out controllers, the agent runs
+//! in an `agent` leaf (systemd starts it there with `DelegateSubgroup=agent`; otherwise it
+//! moves itself), then enables `cpu`, `memory` and `pids` for the service cgroup's children
+//! and puts each job in `job-<name>`. A configured `exec.cgroup_root` must already be empty
+//! of processes.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -35,6 +37,20 @@ fn own_cgroup() -> Option<PathBuf> {
     Some(Path::new(MOUNT).join(rel.trim().trim_start_matches('/')))
 }
 
+/// The service cgroup jobs go under: the parent when systemd started the agent in its
+/// `agent` leaf (`DelegateSubgroup=agent`), else the agent's own cgroup.
+fn job_root(own: PathBuf) -> PathBuf {
+    let in_leaf = own.file_name().is_some_and(|n| n == "agent")
+        && own
+            .parent()
+            .and_then(Path::file_name)
+            .is_some_and(|n| n == crate::service::SYSTEMD_UNIT);
+    match own.parent() {
+        Some(unit) if in_leaf => unit.to_path_buf(),
+        _ => own,
+    }
+}
+
 impl Cgroups {
     /// Sets up the job root. `Err` explains, in plain words, why limits are unavailable.
     pub(crate) fn open(configured: Option<&Path>) -> Result<Self, String> {
@@ -56,7 +72,7 @@ impl Cgroups {
                         crate::service::SYSTEMD_UNIT
                     ));
                 }
-                (own, true)
+                (job_root(own), true)
             }
         };
         let has_procs = read(&root.join("cgroup.procs"))
@@ -223,5 +239,20 @@ impl JobCgroup {
             std::thread::sleep(Duration::from_millis(10));
         }
         let _ = std::fs::remove_dir(&self.path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jobs_go_next_to_the_agent_leaf_systemd_started() {
+        let unit = Path::new("/sys/fs/cgroup/user.slice/app.slice/mrl-agent.service");
+        assert_eq!(job_root(unit.join("agent")), unit);
+        // Not in the unit's leaf: its own cgroup.
+        assert_eq!(job_root(unit.to_path_buf()), unit);
+        let other = Path::new("/sys/fs/cgroup/user.slice/other.service/agent");
+        assert_eq!(job_root(other.to_path_buf()), other);
     }
 }

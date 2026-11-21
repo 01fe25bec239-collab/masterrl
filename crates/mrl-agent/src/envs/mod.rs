@@ -1102,17 +1102,41 @@ fn python_home(env_dir: &Path) -> Option<PathBuf> {
     (!home.starts_with(env_dir)).then_some(home)
 }
 
-/// Finds `name` on `PATH`.
+/// Finds `name` on `PATH`, then in the usual per-user install folders (`~/.local/bin`,
+/// `~/.cargo/bin`) and Homebrew's, which a background service's PATH lacks.
 pub fn which(name: &str) -> Option<PathBuf> {
-    let path = std::env::var_os("PATH")?;
-    std::env::split_paths(&path).find_map(|d| {
-        let names: &[String] = if cfg!(windows) {
-            &[format!("{name}.exe"), name.to_owned()]
-        } else {
-            &[name.to_owned()]
-        };
-        names.iter().map(|n| d.join(n)).find(|p| p.is_file())
-    })
+    let home = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from);
+    which_in(name, std::env::var_os("PATH"), home)
+}
+
+/// [`which`] over an explicit `PATH` and home folder. After `PATH` come the usual per-user
+/// install folders (uv's installer puts uv in `~/.local/bin`) and Homebrew's: a background
+/// service (systemd user unit, launchd agent) starts with a PATH that has none of them.
+fn which_in(
+    name: &str,
+    path: Option<std::ffi::OsString>,
+    home: Option<PathBuf>,
+) -> Option<PathBuf> {
+    let mut dirs: Vec<PathBuf> = path
+        .map(|p| std::env::split_paths(&p).collect())
+        .unwrap_or_default();
+    if let Some(home) = home {
+        dirs.push(home.join(".local").join("bin"));
+        dirs.push(home.join(".cargo").join("bin"));
+    }
+    if cfg!(unix) {
+        dirs.push(PathBuf::from("/opt/homebrew/bin"));
+        dirs.push(PathBuf::from("/usr/local/bin"));
+    }
+    let names: Vec<String> = if cfg!(windows) {
+        vec![format!("{name}.exe"), name.to_owned()]
+    } else {
+        vec![name.to_owned()]
+    };
+    dirs.iter()
+        .find_map(|d| names.iter().map(|n| d.join(n)).find(|p| p.is_file()))
 }
 
 /// Free bytes on the disk that holds `path`.
@@ -1124,6 +1148,30 @@ pub fn disk_free(path: &Path) -> Option<u64> {
 mod tests {
     use super::*;
     use crate::state::cache::CacheBudget;
+
+    #[test]
+    fn a_program_off_path_is_found_in_the_users_install_folder() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join(".local").join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let exe = if cfg!(windows) {
+            "uv-test.exe"
+        } else {
+            "uv-test"
+        };
+        std::fs::write(bin.join(exe), b"").unwrap();
+        // A service's PATH: system folders only.
+        let path = Some(std::ffi::OsString::from(if cfg!(windows) {
+            "C:\\Windows\\System32"
+        } else {
+            "/usr/bin:/bin"
+        }));
+        assert_eq!(
+            which_in("uv-test", path.clone(), Some(home.path().to_path_buf())),
+            Some(bin.join(exe))
+        );
+        assert_eq!(which_in("uv-test", path, None), None);
+    }
 
     fn envs(dir: &Path) -> Envs {
         let cache = NodeCache::open(
