@@ -1,7 +1,7 @@
 //! `/jobs` endpoints: list, read, cancel and change priority.
 
 use super::error::JobsError;
-use super::model::{Job, JobRow};
+use super::model::{Job, JobRow, JOB_KINDS};
 use super::scope::{self, resource};
 use super::transitions::{job_cols, JobTransitions};
 use crate::app::AppState;
@@ -68,6 +68,17 @@ pub async fn list(
             )
         })?;
     }
+    if let Some(k) = f.kind.as_deref().filter(|k| !JOB_KINDS.contains(k)) {
+        return Err(ApiError::new(
+            ErrorCode::Filter,
+            format!(
+                "kind `{}` is not a job kind; use one of {}.",
+                k.escape_debug(),
+                JOB_KINDS.join(", ")
+            ),
+        )
+        .into());
+    }
     let project = f
         .project
         .as_deref()
@@ -84,12 +95,18 @@ pub async fn list(
     // solo owner (one person, every local org); otherwise the caller's org. The authorizer
     // still decides row by row.
     let org = match project {
+        // Authorize the project first, like every project route: hidden, foreign and
+        // missing answer the same 404.
         Some(p) => {
-            // Authorize the project first: hidden and missing answer the same 404.
-            let org = projects.org_for(&ctx, p).await?;
-            let res = resource("project", Some(p.to_string()), org, p.as_uuid());
-            scope::authorize(&state, &ctx, "runs.read", &res).await?;
-            Some(org)
+            let prj = p.to_string();
+            let scoped = crate::modules::runs::experiments::project_scope(
+                &state,
+                &ctx,
+                &projects,
+                &prj,
+                "runs.read",
+            );
+            Some(scoped.await?.0)
         }
         // A caller bound to an org scans it; one with no org (the solo owner, or a token
         // the solo owner made without a project) scans every org.

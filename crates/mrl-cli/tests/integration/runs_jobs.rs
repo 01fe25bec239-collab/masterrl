@@ -1821,6 +1821,72 @@ async fn legacy_rows_move_keeping_experiments_lineage_and_events() {
     }
 }
 
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn legacy_runs_move_when_the_org_already_used_their_submit_key() {
+    use mrl_server::seams::{Principal, PrincipalKind};
+    let db = TestDb::new().await;
+    let org = OrgId::new();
+    let [p, q] = [(); 2].map(|_| ProjectId::new());
+    let solo = vec![TestUser {
+        token: "solo".into(),
+        principal: Principal {
+            id: "usr_local".into(),
+            kind: PrincipalKind::LocalOwner,
+            org: None,
+        },
+        role: Role::Owner,
+    }];
+    async fn submit(srv: &TestServer, prj: ProjectId, body: Value) -> Value {
+        let path = format!("/api/v1/projects/{prj}/runs");
+        let res = call(
+            srv,
+            Method::POST,
+            &path,
+            "solo",
+            Some("nightly"),
+            Some(&body),
+        )
+        .await;
+        assert_eq!(res.status, 201, "{path}: {}", res.text());
+        res.json()
+    }
+    // Before the directory: key `nightly` in P, under the nil org.
+    let old = runs_server_with(
+        db.db(),
+        accepting_chains(),
+        &solo,
+        vec![],
+        &Harness::default(),
+    )
+    .await;
+    let local = submit(&old, p, submission("local")).await;
+    old.shutdown().await.unwrap();
+    // The directory knows only Q: P stays, and `nightly` is used again in the org.
+    let harness = Harness::default();
+    *harness.rules.lock().unwrap() = AuthRules::with_projects(&[(q, org)]);
+    let srv = runs_server_with(db.db(), accepting_chains(), &solo, vec![], &harness).await;
+    let body = submission("org");
+    let theirs = submit(&srv, q, body.clone()).await;
+    srv.shutdown().await.unwrap();
+    // Now P is known too: its run moves although the org already has that key.
+    *harness.rules.lock().unwrap() = AuthRules::with_projects(&[(p, org), (q, org)]);
+    let srv = runs_server_with(db.db(), accepting_chains(), &solo, vec![], &harness).await;
+    let left: i64 = sqlx::query_scalar("SELECT count(*) FROM runs WHERE org_id = $1")
+        .bind(uuid::Uuid::nil())
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(left, 0, "the run in P stayed under the nil org");
+    let path = format!("/api/v1/runs/{}", local["id"].as_str().unwrap());
+    let res = call(&srv, Method::GET, &path, "solo", None, None).await;
+    assert_eq!(res.status, 200, "{}", res.text());
+    // The key still means the org's run.
+    let again = submit(&srv, q, body).await;
+    assert_eq!(again["id"], theirs["id"]);
+    srv.shutdown().await.unwrap();
+}
+
 /// A job of a new run in `e`, moved to ALLOCATING.
 async fn allocating(e: &Env, key: &str) -> JobRow {
     let run = e.submit("res", key, &submission(key)).await.json();
@@ -2165,6 +2231,24 @@ async fn nul_characters_are_field_errors() {
         "{}",
         res.text()
     );
+    // Query-string filters are checked before they reach the database.
+    let runs = format!("/api/v1/projects/{}/runs", e.project);
+    for q in [
+        "/api/v1/jobs?kind=%00",
+        "/api/v1/jobs?kind=bogus",
+        "/api/v1/jobs?state=%00",
+        "/api/v1/jobs?project=%00",
+        &format!("{runs}?state=%00"),
+        &format!("{runs}?experiment=%00"),
+    ] {
+        let res = call(&e.srv, Method::GET, q, "res", None, None).await;
+        assert_eq!(
+            (res.status, res.json()["code"].clone()),
+            (400, json!("MRL-VAL-006")),
+            "{q}: {}",
+            res.text()
+        );
+    }
     let runs: i64 = sqlx::query_scalar("SELECT count(*) FROM runs")
         .fetch_one(e.db.pool())
         .await

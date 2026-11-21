@@ -8,7 +8,8 @@
 //! [`RehomeLocalRows`] runs at startup: rows stored under the nil org (by a solo build
 //! without a directory) move to their project's org once a directory can say which.
 //! Projects linked by a parent run move together in one transaction; a local experiment
-//! whose name the org already uses gets a fixed new name, keeping its id and metadata.
+//! whose name the org already uses gets a fixed new name, keeping its id and metadata, and
+//! a local run whose submit key its creator already used in the org gets a fixed new key.
 
 use super::error::JobsError;
 use super::scope;
@@ -94,6 +95,13 @@ impl RehomeLocalRows {
               WHERE dup.org_id = $3 AND dup.project_id = ANY($2) AND keep.org_id = $1 \
                 AND keep.project_id = dup.project_id AND keep.name = dup.name",
             "UPDATE experiments SET org_id = $1 WHERE org_id = $3 AND project_id = ANY($2)",
+            // Likewise a local run whose submit key its creator already used in the org gets
+            // the same `(local …)` suffix on its key; the plain key keeps meaning the org's run.
+            "UPDATE runs dup \
+                SET submit_key = dup.submit_key || ' (local ' || right(replace(dup.id::text, '-', ''), 8) || ')' \
+               FROM runs keep \
+              WHERE dup.org_id = $3 AND dup.project_id = ANY($2) AND keep.org_id = $1 \
+                AND keep.created_by = dup.created_by AND keep.submit_key = dup.submit_key",
             "UPDATE runs SET org_id = $1 WHERE org_id = $3 AND project_id = ANY($2)",
             "UPDATE run_configs SET org_id = $1 WHERE org_id = $3 \
                AND run_id IN (SELECT id FROM runs WHERE project_id = ANY($2))",

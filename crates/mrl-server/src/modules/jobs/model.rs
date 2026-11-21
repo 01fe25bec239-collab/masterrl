@@ -7,6 +7,20 @@ use serde::Serialize;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+/// Every job kind (the `jobs.kind` check in migration 17004).
+pub const JOB_KINDS: [&str; 10] = [
+    "TRAIN",
+    "EVAL",
+    "DATA_PREP",
+    "IMPORT",
+    "REWARD_PREVIEW",
+    "MERGE_ADAPTER",
+    "CONVERT",
+    "QUANTIZE",
+    "EXPORT",
+    "GENERATE",
+];
+
 /// One `jobs` row.
 #[derive(Debug, Clone, PartialEq, sqlx::FromRow)]
 pub struct JobRow {

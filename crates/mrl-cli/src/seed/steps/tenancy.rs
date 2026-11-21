@@ -72,6 +72,17 @@ fn line(kind: &str, slug: &str, id: &str, created: bool) -> String {
     format!("{verb} {kind} `{slug}` ({id})")
 }
 
+/// `/{parent}/{id}/{child}`, with the id (read from a server reply) percent-encoded. An
+/// empty, `.` or `..` id is refused: it would not stay one path segment.
+fn under(parent: &str, id: &str, child: &str) -> Result<String, String> {
+    if matches!(id, "" | "." | "..") {
+        return Err(format!(
+            "The server gave `{id}` as an id in {parent}, which can't be used in a request."
+        ));
+    }
+    Ok(format!("/{parent}/{}/{child}", crate::commands::encode(id)))
+}
+
 fn need(v: &Option<String>, what: &str) -> Result<String, String> {
     v.clone()
         .ok_or_else(|| format!("the {what} step did not run first"))
@@ -119,7 +130,7 @@ impl SeedStep for Workspace {
     }
     fn run(&self, api: &Api, state: &mut SeedState) -> Result<String, String> {
         let org = need(&state.org, "org")?;
-        let (id, created) = ensure(api, &format!("/orgs/{org}/workspaces"), WORKSPACE)?;
+        let (id, created) = ensure(api, &under("orgs", &org, "workspaces")?, WORKSPACE)?;
         state.workspace = Some(id.clone());
         Ok(line("workspace", WORKSPACE, &id, created))
     }
@@ -134,7 +145,7 @@ impl SeedStep for Project {
     }
     fn run(&self, api: &Api, state: &mut SeedState) -> Result<String, String> {
         let ws = need(&state.workspace, "workspace")?;
-        let (id, created) = ensure(api, &format!("/workspaces/{ws}/projects"), PROJECT)?;
+        let (id, created) = ensure(api, &under("workspaces", &ws, "projects")?, PROJECT)?;
         state.project = Some(id.clone());
         Ok(line("project", PROJECT, &id, created))
     }
@@ -143,6 +154,21 @@ impl SeedStep for Project {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ids_from_replies_stay_one_path_segment() {
+        assert_eq!(
+            under("orgs", "org_1", "workspaces").unwrap(),
+            "/orgs/org_1/workspaces"
+        );
+        assert_eq!(
+            under("workspaces", "../auth/x?y", "projects").unwrap(),
+            "/workspaces/..%2Fauth%2Fx%3Fy/projects"
+        );
+        for dots in ["", ".", ".."] {
+            assert!(under("orgs", dots, "workspaces").is_err(), "{dots:?}");
+        }
+    }
 
     #[test]
     fn find_matches_by_slug() {
