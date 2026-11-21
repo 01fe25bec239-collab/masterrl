@@ -438,7 +438,11 @@ fn route_of(gw: &Gateway, node: Uuid, msg: &AgentMessage) -> Route {
     if own(&msg.body) {
         return Route::None;
     }
-    if gw.lanes.sink_for(LaneKind::Control).is_some() {
+    if gw
+        .lanes
+        .control_sink(crate::modules::nodes::lanes::control_kind(msg))
+        .is_some()
+    {
         return Route::Inbox;
     }
     tracing::warn!(node = %NodeId::from_uuid(node), body = body_name(msg), "no sink for this CONTROL message; journaled to node_events");
