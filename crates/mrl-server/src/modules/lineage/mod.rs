@@ -381,7 +381,10 @@ async fn walk(
     );
     let mut order = vec![root];
     let mut edges = Vec::new();
+    // Edges in the answer (each once), and edges walked per direction: an edge the upward
+    // walk used can still carry the downward one.
     let mut seen_edges = HashSet::new();
+    let mut walked: HashSet<((NodeRef, Relation, NodeRef), bool)> = HashSet::new();
     // Nodes to expand next, going up and going down; each at most once per direction. A
     // node keeps the direction it was reached in, so `both` is the two walks together.
     let mut ups: Vec<NodeRef> = if up { vec![root] } else { Vec::new() };
@@ -438,10 +441,9 @@ async fn walk(
                 NodeRef::new(&r.from_kind, r.from_id),
                 NodeRef::new(&r.to_kind, r.to_id),
             );
-            if !seen_edges.insert((from, relation, to)) {
-                continue;
-            }
-            if edges.len() >= MAX_EDGES {
+            let edge = (from, relation, to);
+            let fresh = !seen_edges.contains(&edge);
+            if fresh && edges.len() >= MAX_EDGES {
                 truncated = true;
                 break;
             }
@@ -452,11 +454,14 @@ async fn walk(
             };
             // Which end is new, and which way it continues.
             let mut reached = Vec::new();
-            if ups.contains(&lower) {
+            if ups.contains(&lower) && walked.insert((edge, true)) {
                 reached.push((upper, true));
             }
-            if downs.contains(&upper) {
+            if downs.contains(&upper) && walked.insert((edge, false)) {
                 reached.push((lower, false));
+            }
+            if reached.is_empty() {
+                continue;
             }
             for (n, going_up) in reached {
                 let visible = match shown.get(&n) {
@@ -497,12 +502,14 @@ async fn walk(
                     }
                 }
             }
-            let id_of = |n: &NodeRef| shown.get(n).map(|x| x.id.clone()).unwrap_or_default();
-            edges.push(Edge {
-                from: id_of(&from),
-                relation,
-                to: id_of(&to),
-            });
+            if seen_edges.insert(edge) {
+                let id_of = |n: &NodeRef| shown.get(n).map(|x| x.id.clone()).unwrap_or_default();
+                edges.push(Edge {
+                    from: id_of(&from),
+                    relation,
+                    to: id_of(&to),
+                });
+            }
         }
         ups = next_up;
         downs = next_down;

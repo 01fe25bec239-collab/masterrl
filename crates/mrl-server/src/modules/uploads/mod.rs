@@ -10,7 +10,10 @@
 //! 4. `POST /uploads/{up}:complete` joins the parts, checks the sha256 of the whole file and
 //!    stores it as the blob `orgs/{org}/blobs/sha256/…` (once per content). `:abort` cancels.
 //!
-//! Parts are objects under `orgs/{org}/uploads/{id}/parts/`. The cleanup job expires open
+//! Every part write (signed in or through a ticket) must have the part's exact length and
+//! lands only while the upload is OPEN and before its deadline: a write that races a
+//! completion, abort or expiry is deleted again and refused. Part tickets never outlive the
+//! upload. Parts are objects under `orgs/{org}/uploads/{id}/parts/`. The cleanup job expires open
 //! uploads after 24 hours and deletes anything under `uploads/` older than that which no
 //! open upload owns, plus scratch folders a killed process left behind.
 
@@ -18,8 +21,8 @@ use crate::app::AppState;
 use crate::error::{ApiError, ErrorCode, FieldError};
 use crate::http::BODY_LIMIT;
 use crate::modules::artifacts::{
-    codes, destination, field, not_found, org_of, owned, scratch, split_action, ArtifactStore,
-    Error, UploadBlob,
+    codes, destination, field, is_idempotency_conflict, not_found, org_of, owned, scratch,
+    split_action, ArtifactStore, Created, Error, Idempotency, UploadBlob,
 };
 use crate::seams::{Decision, RequestContext};
 use axum::body::Bytes;
@@ -49,7 +52,7 @@ pub const MAX_PARTS: u64 = 10_000;
 const MAX_PRESIGN: usize = 1000;
 
 /// `POST /uploads` body.
-#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NewUpload {
     /// File name, shown to people (1–255 characters, no `/` or `\`).
@@ -282,6 +285,100 @@ async fn received(store: &Store, row: &Row) -> Result<BTreeMap<u64, u64>, Error>
         .collect())
 }
 
+/// Deletes a closed upload's parts. The upload's new state is already committed, so a
+/// failure is only logged: the cleanup job deletes leftover parts after 24 hours.
+async fn tidy(store: &Store, upload_key: &str) {
+    if let Err(e) = delete_parts(store, upload_key).await {
+        tracing::warn!(
+            code = e.code(),
+            upload = upload_key,
+            "could not delete the parts of a closed upload; the cleanup job will"
+        );
+    }
+}
+
+/// True while upload `id` takes changes: OPEN and before its deadline (database time, the
+/// same check completion and abort make).
+async fn still_open(store: &ArtifactStore, id: Uuid) -> Result<bool, Error> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM uploads WHERE id = $1 AND state = 'OPEN' AND expires_at > now())",
+    )
+    .bind(id)
+    .fetch_one(store.db().pool())
+    .await?)
+}
+
+/// After a part was written: if the upload closed meanwhile (completed, aborted, expired),
+/// the part is deleted again and the write refused, so nothing lands in a closed upload.
+async fn fence(store: &ArtifactStore, st: &Store, row: &Row, key: &str) -> Result<(), Error> {
+    if still_open(store, row.id).await? {
+        return Ok(());
+    }
+    if let Err(e) = st.delete(key).await {
+        tracing::warn!(
+            code = e.code(),
+            "could not delete a late part; the cleanup job will"
+        );
+    }
+    Err(closed(row))
+}
+
+/// A ticket PUT to an upload part (`uploads/{up}/parts/{n}`): the length it must have.
+pub(crate) struct PartTarget {
+    row: Row,
+    key: String,
+    /// Exact bytes the part needs.
+    pub(crate) len: u64,
+}
+
+/// When `key` is a part of an upload of `org`: that part, which must still be open.
+pub(crate) async fn part_target(
+    store: &ArtifactStore,
+    st: &Store,
+    key: &str,
+) -> Result<Option<PartTarget>, Error> {
+    let Some(rest) = key.strip_prefix(st.keys().prefix()) else {
+        return Ok(None);
+    };
+    let segs: Vec<&str> = rest.split('/').collect();
+    let (up, n) = match segs.as_slice() {
+        ["uploads", up, "parts", n] if up.parse::<UploadId>().is_ok() => (*up, *n),
+        _ => return Ok(None),
+    };
+    let row = load(store, st.keys().org_id(), up).await?;
+    let Some(n) = n.parse::<u64>().ok().filter(|n| *n < row.part_count()) else {
+        return Err(field("/n", "This upload has no part with this number."));
+    };
+    if !row.is_open() {
+        return Err(closed(&row));
+    }
+    Ok(Some(PartTarget {
+        len: row.part_len(n),
+        key: key.to_owned(),
+        row,
+    }))
+}
+
+impl PartTarget {
+    /// The part's bytes must be exactly [`PartTarget::len`].
+    pub(crate) fn check_len(&self, got: u64) -> Result<(), Error> {
+        if got == self.len {
+            Ok(())
+        } else {
+            Err(Error::coded(
+                codes::PARTS_INCOMPLETE,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("This part has {got} bytes; it must have {}.", self.len),
+            ))
+        }
+    }
+
+    /// After the write: refused (and the part deleted) if the upload closed meanwhile.
+    pub(crate) async fn fence(&self, store: &ArtifactStore, st: &Store) -> Result<(), Error> {
+        fence(store, st, &self.row, &self.key).await
+    }
+}
+
 async fn delete_parts(store: &Store, upload_key: &str) -> Result<(), Error> {
     for o in store.list(&store.keys().upload_parts(upload_key)?).await? {
         store.delete(&o.key).await?;
@@ -352,6 +449,7 @@ pub(crate) async fn create(
     State(s): State<AppState>,
     Extension(store): Extension<Arc<ArtifactStore>>,
     ctx: RequestContext,
+    headers: HeaderMap,
     Json(new): Json<NewUpload>,
 ) -> Result<(StatusCode, Json<Upload>), Error> {
     let org = org_of(&ctx)?;
@@ -362,10 +460,29 @@ pub(crate) async fn create(
     )
     .await?;
     let part_size = check_new(&new)?;
+    // A retry with the same Idempotency-Key (authorized afresh above) gets the same upload.
+    let idem = Idempotency::of(&headers, &new);
+    let earlier = || async {
+        match &idem {
+            Some(i) => match i
+                .earlier(store.db(), Created::Upload, &org, &ctx.principal.id)
+                .await?
+            {
+                Some(id) => Ok(Some(
+                    load(&store, &org, &UploadId::from_uuid(id).to_string()).await?,
+                )),
+                None => Ok(None),
+            },
+            None => Ok::<_, Error>(None),
+        }
+    };
+    if let Some(row) = earlier().await? {
+        return Ok((StatusCode::CREATED, Json(row.into_upload(Vec::new()))));
+    }
     let id = s.seams.ids.new_uuid();
-    let row: Row = sqlx::query_as(concat!(
-        "INSERT INTO uploads (id, org_id, project_id, created_by, filename, size, sha256, part_size, state, expires_at)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'OPEN', now() + interval '24 hours')
+    let row: Result<Row, sqlx::Error> = sqlx::query_as(concat!(
+        "INSERT INTO uploads (id, org_id, project_id, created_by, filename, size, sha256, part_size, state, expires_at, idempotency_key, request_sha256)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'OPEN', now() + interval '24 hours', $9, $10)
          RETURNING ",
         columns!()
     ))
@@ -377,8 +494,16 @@ pub(crate) async fn create(
     .bind(i64::try_from(new.size).unwrap_or(i64::MAX))
     .bind(&new.sha256)
     .bind(i64::try_from(part_size).unwrap_or(i64::MAX))
+    .bind(idem.as_ref().map(|i| &i.key))
+    .bind(idem.as_ref().map(|i| &i.request_sha256))
     .fetch_one(store.db().pool())
-    .await?;
+    .await;
+    let row = match row {
+        Err(e) if is_idempotency_conflict(&e) => {
+            earlier().await?.ok_or_else(|| not_found("upload"))?
+        }
+        other => other?,
+    };
     Ok((StatusCode::CREATED, Json(row.into_upload(Vec::new()))))
 }
 
@@ -452,7 +577,9 @@ pub(crate) async fn put_part(
         }
     }
     let st = store.org_store(&org).await?;
-    st.put(&part_key(&st, &row, n)?, body).await?;
+    let key = part_key(&st, &row, n)?;
+    st.put(&key, body).await?;
+    fence(store.as_ref(), &st, &row, &key).await?;
     Ok(Json(
         serde_json::json!({ "part": n, "size": want, "sha256": sha }),
     ))
@@ -532,8 +659,22 @@ async fn presign_upload(
             ));
         }
         let key = part_key(&st, &row, n)?;
+        // A part ticket never outlives the upload.
+        let left = std::time::Duration::try_from(row.expires_at - OffsetDateTime::now_utc())
+            .unwrap_or_default()
+            .min(crate::modules::artifacts::TICKET_TTL);
+        if left < std::time::Duration::from_secs(1) {
+            return Err(closed(&row));
+        }
         let ticket = store
-            .ticket(&s.seams, ctx, &key, TicketMethod::Put, row.part_len(n))
+            .ticket_for(
+                &s.seams,
+                ctx,
+                &key,
+                TicketMethod::Put,
+                row.part_len(n),
+                left,
+            )
             .await?;
         out.push(PartTicket { part: n, ticket });
     }
@@ -553,7 +694,8 @@ async fn abort_upload(
     let org = &org_of(ctx)?;
     let row = load_visible(s, store, ctx, org, up).await?;
     let done = sqlx::query(
-        "UPDATE uploads SET state = 'ABORTED', finished_at = now() WHERE id = $1 AND state = 'OPEN'",
+        "UPDATE uploads SET state = 'ABORTED', finished_at = now()
+         WHERE id = $1 AND state = 'OPEN' AND expires_at > now()",
     )
     .bind(row.id)
     .execute(store.db().pool())
@@ -562,7 +704,7 @@ async fn abort_upload(
     if done == 0 {
         return Err(closed(&row));
     }
-    delete_parts(&store.org_store(org).await?, &row.key()).await?;
+    tidy(&store.org_store(org).await?, &row.key()).await;
     let row = load(store, org, &row.key()).await?;
     Ok(row.into_upload(Vec::new()))
 }
@@ -605,11 +747,14 @@ async fn complete_upload(
         ));
     }
     let dir = store.scratch_dir()?;
-    let blob = join_and_store(&st, &row, &dir.path().join("file")).await?;
+    let file = dir.path().join("file");
+    let sha = join(&st, &row, &file).await?;
+    let blob = st.keys().blob(&sha)?;
+    store.put_blob(&st, &file, &blob, row.size(), &sha).await?;
     scratch::close(dir)?;
     let done = sqlx::query(
         "UPDATE uploads SET state = 'COMPLETED', blob_key = $2, finished_at = now()
-         WHERE id = $1 AND state = 'OPEN'",
+         WHERE id = $1 AND state = 'OPEN' AND expires_at > now()",
     )
     .bind(row.id)
     .bind(&blob)
@@ -619,11 +764,13 @@ async fn complete_upload(
     if done == 0 {
         return Err(closed(&row));
     }
-    delete_parts(&st, &row.key()).await?;
+    tidy(&st, &row.key()).await;
     Ok(load(store, org, &row.key()).await?.into_upload(Vec::new()))
 }
 
-async fn join_and_store(st: &Store, row: &Row, tmp: &std::path::Path) -> Result<String, Error> {
+/// Joins the parts into `tmp`, checking each part's length as read, the total and the
+/// sha256; returns the sha256.
+async fn join(st: &Store, row: &Row, tmp: &std::path::Path) -> Result<String, Error> {
     let io = |e: std::io::Error| {
         Error::from(StorageError::Io {
             path: tmp.to_owned(),
@@ -669,34 +816,25 @@ async fn join_and_store(st: &Store, row: &Row, tmp: &std::path::Path) -> Result<
         }
         .into());
     }
-    let blob = st.keys().blob(&actual)?;
-    store_blob(st, tmp, &blob, row.size(), &actual).await?;
-    Ok(blob)
+    Ok(actual)
 }
 
-/// Stores the checked local file `tmp` (`size` bytes hashing to `sha256`) at `blob`, its
-/// content address. An object already there is reused only when its bytes hash to
-/// `sha256`; one that is missing, another size or corrupted is rewritten from `tmp`.
-pub(crate) async fn store_blob(
+/// True when `blob` holds `size` bytes hashing to `sha256`.
+pub(crate) async fn blob_intact(
     st: &Store,
-    tmp: &std::path::Path,
     blob: &str,
     size: u64,
     sha256: &str,
-) -> Result<(), Error> {
-    let intact = match st.head(blob).await {
+) -> Result<bool, Error> {
+    match st.head(blob).await {
         Ok(info) if info.size == size => match st.sha256(blob).await {
-            Ok(have) => have == sha256,
-            Err(StorageError::NotFound { .. }) => false,
-            Err(e) => return Err(e.into()),
+            Ok(have) => Ok(have == sha256),
+            Err(StorageError::NotFound { .. }) => Ok(false),
+            Err(e) => Err(e.into()),
         },
-        Ok(_) | Err(StorageError::NotFound { .. }) => false,
-        Err(e) => return Err(e.into()),
-    };
-    if !intact {
-        store_file(st, tmp, blob, size).await?;
+        Ok(_) | Err(StorageError::NotFound { .. }) => Ok(false),
+        Err(e) => Err(e.into()),
     }
-    Ok(())
 }
 
 /// Stores the local file `tmp` of `size` bytes at `key`: one put up to 16 MiB, else a
@@ -730,33 +868,49 @@ pub struct Swept {
     pub objects: u64,
     /// Artifacts left PENDING for 24 hours, now FAILED.
     pub stale_artifacts: u64,
+    /// Blobs whose commit never happened, deleted.
+    pub blobs: u64,
     /// Scratch folders older than 24 hours (left by a killed process), deleted.
     pub scratch: u64,
 }
 
-/// One cleanup pass: expires open uploads after 24 hours, deletes objects under each org's
-/// `uploads/` older than 24 hours that no open upload owns, and fails artifacts left
-/// PENDING for 24 hours, and deletes scratch folders older than 24 hours.
+/// One cleanup pass at the current time; see [`sweep_at`].
 pub async fn sweep(store: &ArtifactStore) -> Result<Swept, Error> {
+    sweep_at(store, OffsetDateTime::now_utc()).await
+}
+
+/// One cleanup pass as if it were `now` (tests move it forward): expires open uploads past
+/// their deadline; fails artifacts left PENDING for 24 hours; deletes objects under the
+/// `uploads/` area of every org P19 knows (uploads, artifacts, write intents) that are older
+/// than 24 hours and no open upload owns, which covers multipart staging too; deletes blobs
+/// whose write intent is older than 24 hours when nothing references them (a commit that
+/// never happened); and deletes scratch folders older than 24 hours. Native S3 multipart
+/// sessions are not visible here (P08 / bucket lifecycle).
+pub async fn sweep_at(store: &ArtifactStore, now: OffsetDateTime) -> Result<Swept, Error> {
     let pool = store.db().pool();
+    let cutoff = now - time::Duration::hours(24);
     let expired = sqlx::query(
         "UPDATE uploads SET state = 'EXPIRED', finished_at = now()
-         WHERE state = 'OPEN' AND expires_at < now()",
+         WHERE state = 'OPEN' AND expires_at < $1",
     )
+    .bind(now)
     .execute(pool)
     .await?
     .rows_affected();
     let stale_artifacts = sqlx::query(
-        "UPDATE artifacts SET state = 'FAILED'
-         WHERE state = 'PENDING' AND created_at < now() - interval '24 hours'",
+        "UPDATE artifacts SET state = 'FAILED' WHERE state = 'PENDING' AND created_at < $1",
     )
+    .bind(cutoff)
     .execute(pool)
     .await?
     .rows_affected();
-    // ponytail: one listing per org that ever uploaded; page through orgs when there are many.
-    let orgs: Vec<String> = sqlx::query_scalar("SELECT DISTINCT org_id FROM uploads")
-        .fetch_all(pool)
-        .await?;
+    // ponytail: one listing per known org; page through orgs when there are many.
+    let orgs: Vec<String> = sqlx::query_scalar(
+        "SELECT org_id FROM uploads UNION SELECT org_id FROM artifacts
+         UNION SELECT org_id FROM storage_intents",
+    )
+    .fetch_all(pool)
+    .await?;
     let open: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM uploads WHERE state = 'OPEN'")
         .fetch_all(pool)
         .await?;
@@ -765,7 +919,6 @@ pub async fn sweep(store: &ArtifactStore) -> Result<Swept, Error> {
         .map(|id| UploadId::from_uuid(id).to_string())
         .collect();
     let backend = store.backend().await?;
-    let cutoff = OffsetDateTime::now_utc() - time::Duration::hours(24);
     let mut objects = 0;
     for org in orgs {
         let st = backend.org(&org)?;
@@ -778,14 +931,50 @@ pub async fn sweep(store: &ArtifactStore) -> Result<Swept, Error> {
             }
         }
     }
+    // Blobs written for a commit that never happened. Still referenced (a finished upload,
+    // an artifact not FAILED) or written again since: kept.
+    let intents: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT DISTINCT org_id, key, sha256 FROM storage_intents
+         WHERE sha256 IS NOT NULL AND created_at < $1",
+    )
+    .bind(cutoff)
+    .fetch_all(pool)
+    .await?;
+    let mut blobs = 0;
+    for (org, key, sha) in intents {
+        let used: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM uploads WHERE org_id = $1 AND blob_key = $2 AND state = 'COMPLETED')
+                 OR EXISTS (SELECT 1 FROM artifacts a, jsonb_array_elements(a.manifest -> 'files') f
+                            WHERE a.org_id = $1 AND a.state <> 'FAILED' AND f ->> 'sha256' = $3)
+                 OR EXISTS (SELECT 1 FROM storage_intents
+                            WHERE org_id = $1 AND key = $2 AND created_at >= $4)",
+        )
+        .bind(&org)
+        .bind(&key)
+        .bind(&sha)
+        .bind(cutoff)
+        .fetch_one(pool)
+        .await?;
+        if !used {
+            backend.org(&org)?.delete(&key).await?;
+            blobs += 1;
+        }
+    }
+    // Kept a second day so the org stays visible until its staging is old enough to go.
+    sqlx::query("DELETE FROM storage_intents WHERE created_at < $1")
+        .bind(cutoff - time::Duration::hours(24))
+        .execute(pool)
+        .await?;
     let root = store.scratch_root().to_owned();
-    let scratch = tokio::task::spawn_blocking(move || scratch::sweep(&root))
+    let scratch_cutoff = std::time::SystemTime::from(now) - scratch::MAX_AGE;
+    let scratch = tokio::task::spawn_blocking(move || scratch::sweep(&root, scratch_cutoff))
         .await
         .unwrap_or(0);
     Ok(Swept {
         expired,
         objects,
         stale_artifacts,
+        blobs,
         scratch,
     })
 }
@@ -830,7 +1019,7 @@ mod tests {
         st.put(&super::part_key(&st, &row, 0).unwrap(), short.into())
             .await
             .unwrap();
-        let err = super::join_and_store(&st, &row, &dir.path().join("file"))
+        let err = super::join(&st, &row, &dir.path().join("file"))
             .await
             .unwrap_err();
         assert_eq!(err.code(), super::codes::PARTS_INCOMPLETE);

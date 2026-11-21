@@ -172,13 +172,26 @@ impl ServerModule for ArtifactsModule {
     }
 }
 
-/// `[object_store]` as a storage backend. Errors are kept for the first use.
+/// `[object_store]` as a storage backend, reading the region from `AWS_REGION` or
+/// `AWS_DEFAULT_REGION` (default `us-east-1`). Errors are kept for the first use.
 fn backend_config(config: &Config) -> Result<BackendConfig, String> {
+    backend_config_with(config, &|k| std::env::var(k).ok())
+}
+
+/// [`backend_config`] with the environment given.
+fn backend_config_with(
+    config: &Config,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<BackendConfig, String> {
     let os = &config.object_store;
     match os.url.as_deref() {
-        Some(url) if url.starts_with("file://") => Ok(BackendConfig::Local {
-            root: url.trim_start_matches("file://").into(),
-        }),
+        // A file URL as a native path: `file:///C:/mrl` is `C:\mrl` on Windows, and
+        // escapes like `%20` are decoded.
+        Some(url) if url.starts_with("file://") => url::Url::parse(url)
+            .ok()
+            .and_then(|u| u.to_file_path().ok())
+            .map(|root| BackendConfig::Local { root })
+            .ok_or_else(|| format!("object_store.url {url:?} is not a local file path")),
         Some(url) => {
             // Config validation refuses a path after the bucket: objects live under `orgs/`
             // at the bucket root.
@@ -186,7 +199,10 @@ fn backend_config(config: &Config) -> Result<BackendConfig, String> {
             let bucket = rest.split('/').next().unwrap_or(rest);
             Ok(BackendConfig::S3(S3Config {
                 bucket: bucket.to_owned(),
-                region: "us-east-1".to_owned(),
+                region: env("AWS_REGION")
+                    .or_else(|| env("AWS_DEFAULT_REGION"))
+                    .filter(|r| !r.is_empty())
+                    .unwrap_or_else(|| "us-east-1".to_owned()),
                 endpoint: os.endpoint.clone(),
                 access_key_id: None,
                 secret_access_key: None,
@@ -317,8 +333,9 @@ impl ArtifactStore {
         Ok(self.backend().await?.org(org)?)
     }
 
-    /// A transfer ticket for `key` in the caller's org. GET tickets (downloads) are audited.
-    /// PUT tickets never point into the reserved `blobs/` area, however it is spelled.
+    /// A transfer ticket for `key` in the caller's org, valid for [`TICKET_TTL`]. GET
+    /// tickets (downloads) are audited. PUT tickets never point into the reserved `blobs/`
+    /// area, however it is spelled.
     pub async fn ticket(
         &self,
         seams: &Seams,
@@ -327,14 +344,26 @@ impl ArtifactStore {
         method: TicketMethod,
         max_size: u64,
     ) -> Result<TransferTicket, Error> {
+        self.ticket_for(seams, ctx, key, method, max_size, TICKET_TTL)
+            .await
+    }
+
+    /// [`ArtifactStore::ticket`] valid for `ttl` (at most 15 minutes).
+    pub async fn ticket_for(
+        &self,
+        seams: &Seams,
+        ctx: &RequestContext,
+        key: &str,
+        method: TicketMethod,
+        max_size: u64,
+        ttl: Duration,
+    ) -> Result<TransferTicket, Error> {
         let org = org_of(ctx)?;
         let store = self.signing(seams.secrets.as_ref()).await?.0.org(&org)?;
         if method == TicketMethod::Put && is_immutable(&store, key) {
             return Err(immutable());
         }
-        let ticket = store
-            .transfer_ticket(key, method, max_size, TICKET_TTL)
-            .await?;
+        let ticket = store.transfer_ticket(key, method, max_size, ttl).await?;
         if method == TicketMethod::Get {
             seams
                 .audit
@@ -368,6 +397,7 @@ impl ArtifactStore {
         seams: &Seams,
         ctx: &RequestContext,
         new: NewArtifact,
+        idem: Option<&Idempotency>,
     ) -> Result<Artifact, Error> {
         let org = org_of(ctx)?;
         let dest = destination("artifact", &org, new.project_id.clone());
@@ -398,9 +428,13 @@ impl ArtifactStore {
         let (prefix, sources) = self
             .sources(seams, ctx, &org, &store, id, &new, &manifest)
             .await?;
+        // A retry of an earlier registration (checked afresh above) answers with its row.
+        if let Some(a) = self.earlier(idem, &org, &ctx.principal.id).await? {
+            return Ok(a);
+        }
         let inserted = sqlx::query(
-            "INSERT INTO artifacts (id, org_id, project_id, name, kind, prefix, manifest, size_bytes, state, created_by)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'PENDING', $9)",
+            "INSERT INTO artifacts (id, org_id, project_id, name, kind, prefix, manifest, size_bytes, state, created_by, idempotency_key, request_sha256)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'PENDING', $9, $10, $11)",
         )
         .bind(id)
         .bind(&org)
@@ -411,9 +445,17 @@ impl ArtifactStore {
         .bind(&new.manifest)
         .bind(size)
         .bind(&ctx.principal.id)
+        .bind(idem.map(|i| &i.key))
+        .bind(idem.map(|i| &i.request_sha256))
         .execute(self.db.pool())
         .await;
         match inserted {
+            Err(e) if is_idempotency_conflict(&e) => {
+                return self
+                    .earlier(idem, &org, &ctx.principal.id)
+                    .await?
+                    .ok_or_else(|| not_found("artifact"))
+            }
             Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
                 return Err(Error::coded(
                     codes::NAME_TAKEN,
@@ -439,6 +481,61 @@ impl ArtifactStore {
         self.get(&org, id)
             .await?
             .ok_or_else(|| not_found("artifact"))
+    }
+
+    /// Stores the checked local file `tmp` (`size` bytes hashing to `sha256`) at `blob`, its
+    /// content address. An object already there is reused only when its bytes hash to
+    /// `sha256`; one that is missing, another size or corrupted is rewritten from `tmp`.
+    /// Before writing, an intent is recorded, so a blob whose referencing commit never
+    /// happens (the server stopped) is deleted by the cleanup job.
+    pub(crate) async fn put_blob(
+        &self,
+        st: &Store,
+        tmp: &std::path::Path,
+        blob: &str,
+        size: u64,
+        sha256: &str,
+    ) -> Result<(), Error> {
+        if crate::modules::uploads::blob_intact(st, blob, size, sha256).await? {
+            return Ok(());
+        }
+        self.intend(st.keys().org_id(), blob, Some(sha256)).await?;
+        crate::modules::uploads::store_file(st, tmp, blob, size).await
+    }
+
+    /// Records that P19 is about to write `key` of `org` (a blob when `sha256` is given).
+    pub(crate) async fn intend(
+        &self,
+        org: &str,
+        key: &str,
+        sha256: Option<&str>,
+    ) -> Result<(), Error> {
+        sqlx::query(
+            "INSERT INTO storage_intents (id, org_id, key, sha256) VALUES ($1, $2, $3, $4)",
+        )
+        .bind(Uuid::now_v7())
+        .bind(org)
+        .bind(key)
+        .bind(sha256)
+        .execute(self.db.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// The artifact an earlier try with this Idempotency-Key made, if any.
+    async fn earlier(
+        &self,
+        idem: Option<&Idempotency>,
+        org: &str,
+        by: &str,
+    ) -> Result<Option<Artifact>, Error> {
+        let Some(i) = idem else {
+            return Ok(None);
+        };
+        match i.earlier(&self.db, Created::Artifact, org, by).await? {
+            Some(id) => self.get(org, id).await,
+            None => Ok(None),
+        }
     }
 
     /// Where each manifest file comes from, checked before anything is reserved, and the
@@ -585,7 +682,8 @@ impl ArtifactStore {
             Err(e) => return Err(e.into()),
         }
         let blob = store.keys().blob(&f.sha256)?;
-        crate::modules::uploads::store_blob(store, &local, &blob, f.size, &f.sha256).await?;
+        self.put_blob(store, &local, &blob, f.size, &f.sha256)
+            .await?;
         scratch::close(dir)?;
         Ok(None)
     }
@@ -601,7 +699,7 @@ impl ArtifactStore {
                 let (org, links) = (org.clone(), links.clone());
                 Box::pin(async move {
                     let n = sqlx::query(
-                        "UPDATE artifacts SET state = 'COMMITTED', committed_at = now()
+                        "UPDATE artifacts SET state = 'COMMITTED', committed_at = now(), files_checked = true
                          WHERE id = $1 AND state = 'PENDING'",
                     )
                     .bind(id)
@@ -667,7 +765,7 @@ impl ArtifactStore {
     /// The artifact `id` in `org`, in any state.
     pub async fn get(&self, org: &str, id: Uuid) -> Result<Option<Artifact>, Error> {
         let row: Option<ArtifactRow> = sqlx::query_as(
-            "SELECT id, project_id, name, kind, prefix, manifest, size_bytes, state, created_by, created_at, committed_at
+            "SELECT id, project_id, name, kind, prefix, manifest, size_bytes, state, created_by, created_at, committed_at, files_checked
              FROM artifacts WHERE org_id = $1 AND id = $2",
         )
         .bind(org)
@@ -745,15 +843,6 @@ enum Source {
     Upload(String, UploadBlob),
 }
 
-/// True when `blob` exists with `size` bytes.
-async fn blob_stored(store: &Store, blob: &str, size: u64) -> Result<bool, Error> {
-    match store.head(blob).await {
-        Ok(info) => Ok(info.size == size),
-        Err(StorageError::NotFound { .. }) => Ok(false),
-        Err(e) => Err(e.into()),
-    }
-}
-
 fn mismatch(problems: &[String]) -> Error {
     let shown: Vec<&str> = problems.iter().take(20).map(String::as_str).collect();
     Error::coded(
@@ -765,6 +854,89 @@ fn mismatch(problems: &[String]) -> Error {
             shown.join("; ")
         ),
     )
+}
+
+/// A caller's `Idempotency-Key` (already checked by the middleware) with the hash of its
+/// request. P19 answers are never replayed by the middleware, so each creation endpoint
+/// finds the row an earlier try with this key made, after a fresh authorization check.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Idempotency {
+    /// The key.
+    pub key: String,
+    /// sha256 of the parsed request, re-serialized.
+    pub request_sha256: String,
+}
+
+/// Tables whose creations are deduped by [`Idempotency`].
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Created {
+    Upload,
+    Artifact,
+    Secret,
+}
+
+impl Idempotency {
+    /// From the request headers and the parsed body; `None` without the header.
+    pub fn of(headers: &axum::http::HeaderMap, body: &impl Serialize) -> Option<Self> {
+        let key = headers
+            .get(crate::http::idempotency::IDEMPOTENCY_KEY)?
+            .to_str()
+            .ok()?
+            .to_owned();
+        let bytes = serde_json::to_vec(body).ok()?;
+        Some(Self {
+            key,
+            request_sha256: mrl_storage::sha256_hex(&bytes),
+        })
+    }
+
+    /// The id of the row `created_by` already made in `org` with this key (artifacts: not
+    /// FAILED). The same key with another request is 422 MRL-IDEM-002.
+    pub(crate) async fn earlier(
+        &self,
+        db: &Db,
+        table: Created,
+        org: &str,
+        created_by: &str,
+    ) -> Result<Option<Uuid>, Error> {
+        let sql = match table {
+            Created::Upload => {
+                "SELECT id, request_sha256 FROM uploads
+                 WHERE org_id = $1 AND created_by = $2 AND idempotency_key = $3"
+            }
+            Created::Artifact => {
+                "SELECT id, request_sha256 FROM artifacts
+                 WHERE org_id = $1 AND created_by = $2 AND idempotency_key = $3 AND state <> 'FAILED'"
+            }
+            Created::Secret => {
+                "SELECT id, request_sha256 FROM secrets_metadata
+                 WHERE org_id = $1 AND created_by = $2 AND idempotency_key = $3"
+            }
+        };
+        let found: Option<(Uuid, Option<String>)> = sqlx::query_as(sql)
+            .bind(org)
+            .bind(created_by)
+            .bind(&self.key)
+            .fetch_optional(db.pool())
+            .await?;
+        match found {
+            Some((_, sha)) if sha.as_deref() != Some(self.request_sha256.as_str()) => {
+                Err(ApiError::new(
+                    ErrorCode::IdempotencyMismatch,
+                    "This key was already used with a different request body.",
+                )
+                .into())
+            }
+            other => Ok(other.map(|(id, _)| id)),
+        }
+    }
+}
+
+/// True for a unique violation of a `*_idempotency` index: a concurrent try with the same
+/// key won.
+pub(crate) fn is_idempotency_conflict(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(d) if d.code().as_deref() == Some("23505")
+        && d.constraint().is_some_and(|c| c.ends_with("_idempotency")))
 }
 
 /// A new item of `kind` about to be created in `org` and `project`: creation is
@@ -985,7 +1157,7 @@ fn kind_str(m: &ArtifactManifest) -> String {
 
 /// A lineage link given when registering: this artifact `relation` `to`, or `from` `relation`
 /// this artifact. Exactly one of `from` and `to` is set.
-#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NewLink {
     /// How the two are related.
@@ -1022,7 +1194,7 @@ impl NewLink {
 }
 
 /// `POST /artifacts` body.
-#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NewArtifact {
     /// Unique name in the org (or project).
@@ -1061,6 +1233,7 @@ struct ArtifactRow {
     created_by: String,
     created_at: OffsetDateTime,
     committed_at: Option<OffsetDateTime>,
+    files_checked: bool,
 }
 
 /// A registered artifact.
@@ -1096,6 +1269,8 @@ pub struct Artifact {
     pub committed_at: Option<OffsetDateTime>,
     #[serde(skip)]
     uuid: Uuid,
+    #[serde(skip)]
+    files_checked: bool,
 }
 
 impl Artifact {
@@ -1120,6 +1295,7 @@ impl From<ArtifactRow> for Artifact {
             created_by: r.created_by,
             created_at: r.created_at,
             committed_at: r.committed_at,
+            files_checked: r.files_checked,
         }
     }
 }
@@ -1157,6 +1333,7 @@ async fn register(
     State(s): State<AppState>,
     Extension(store): Extension<Arc<ArtifactStore>>,
     ctx: RequestContext,
+    headers: axum::http::HeaderMap,
     Json(body): Json<NewArtifact>,
 ) -> Result<(StatusCode, Json<Artifact>), Error> {
     if body.prefix.is_some() {
@@ -1167,7 +1344,16 @@ async fn register(
     }
     Ok((
         StatusCode::CREATED,
-        Json(store.register(&s.seams, &ctx, body).await?),
+        Json(
+            store
+                .register(
+                    &s.seams,
+                    &ctx,
+                    body.clone(),
+                    Idempotency::of(&headers, &body).as_ref(),
+                )
+                .await?,
+        ),
     ))
 }
 
@@ -1224,7 +1410,7 @@ async fn list(
     let mut items = Vec::with_capacity(want);
     'scan: loop {
         let rows: Vec<ArtifactRow> = sqlx::query_as(
-            "SELECT id, project_id, name, kind, prefix, manifest, size_bytes, state, created_by, created_at, committed_at
+            "SELECT id, project_id, name, kind, prefix, manifest, size_bytes, state, created_by, created_at, committed_at, files_checked
              FROM artifacts
              WHERE org_id = $1 AND state = 'COMMITTED' AND ($2::text IS NULL OR kind = $2)
                AND ($3::uuid IS NULL OR id > $3)
@@ -1293,10 +1479,13 @@ async fn action(
         .find(|f| f.path == body.path)
         .ok_or_else(|| field("/path", "This artifact has no file at this path."))?;
     // Committed files are read from their checked copies, never from the source prefix.
-    // Artifacts registered before copies existed get theirs now, from the prefix, checked.
+    // Artifacts committed before copies existed (`files_checked` false) have the copy
+    // checked now: reused only when it hashes right, else made again from the prefix.
     let st = store.org_store(&org).await?;
     let key = st.keys().blob(&file.sha256)?;
-    if !blob_stored(&st, &key, file.size).await? {
+    if !found.files_checked
+        && !crate::modules::uploads::blob_intact(&st, &key, file.size, &file.sha256).await?
+    {
         let src = st.keys().join(&found.prefix, &file.path)?;
         if let Some(problem) = store.snapshot_file(&st, &src, file).await? {
             return Err(mismatch(&[problem]));
@@ -1334,6 +1523,62 @@ mod tests {
             .as_bytes(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn storage_settings_follow_the_platform_and_region() {
+        use super::{backend_config_with, BackendConfig};
+        let config = |url: &str| {
+            let mut c = crate::config::Config::default();
+            c.object_store.url = Some(url.to_owned());
+            c
+        };
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| {
+                pairs
+                    .iter()
+                    .find(|(n, _)| *n == k)
+                    .map(|(_, v)| (*v).to_owned())
+            }
+        };
+        let s3 = |pairs| match backend_config_with(&config("s3://b"), &env(pairs)) {
+            Ok(BackendConfig::S3(c)) => c,
+            other => panic!("unexpected: {:?}", other.err()),
+        };
+        assert_eq!(s3(&[]).region, "us-east-1");
+        assert_eq!(
+            s3(&[("AWS_DEFAULT_REGION", "eu-west-1")]).region,
+            "eu-west-1"
+        );
+        assert_eq!(
+            s3(&[
+                ("AWS_REGION", "ap-south-1"),
+                ("AWS_DEFAULT_REGION", "eu-west-1")
+            ])
+            .region,
+            "ap-south-1"
+        );
+        assert_eq!(s3(&[]).bucket, "b");
+        let local = |url| match backend_config_with(&config(url), &env(&[])) {
+            Ok(BackendConfig::Local { root }) => root,
+            other => panic!("unexpected: {:?}", other.err()),
+        };
+        #[cfg(windows)]
+        assert_eq!(
+            local("file:///C:/mrl/objects"),
+            std::path::PathBuf::from(r"C:\mrl\objects")
+        );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                local("file:///var/mrl"),
+                std::path::PathBuf::from("/var/mrl")
+            );
+            assert_eq!(
+                local("file:///var/my%20data"),
+                std::path::PathBuf::from("/var/my data")
+            );
+        }
     }
 
     #[test]

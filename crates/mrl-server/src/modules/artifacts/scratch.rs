@@ -47,15 +47,13 @@ pub fn close(dir: TempDir) -> Result<(), Error> {
     dir.close().map_err(|e| io(&path, e))
 }
 
-/// Deletes scratch folders under `root` older than [`MAX_AGE`]; returns how many. Entries
-/// that are not folders with [`PREFIX`] are left alone.
-pub fn sweep(root: &Path) -> u64 {
+/// Deletes scratch folders under `root` last changed before `cutoff` (the cleanup job
+/// passes now minus [`MAX_AGE`]); returns how many. Entries that are not folders with
+/// [`PREFIX`] are left alone.
+pub fn sweep(root: &Path, cutoff: SystemTime) -> u64 {
     let Ok(entries) = std::fs::read_dir(root) else {
         return 0;
     };
-    let cutoff = SystemTime::now()
-        .checked_sub(MAX_AGE)
-        .unwrap_or(SystemTime::UNIX_EPOCH);
     let mut removed = 0;
     for entry in entries.flatten() {
         let ours = entry.file_name().to_string_lossy().starts_with(PREFIX);
@@ -96,7 +94,11 @@ mod tests {
         }
         let kept = root.path().join("other");
         std::fs::create_dir(&kept).unwrap();
-        assert_eq!(sweep(root.path()), 0, "fresh folders stay");
+        assert_eq!(
+            sweep(root.path(), SystemTime::now() - MAX_AGE),
+            0,
+            "fresh folders stay"
+        );
         // Ageing a folder needs opening it as a file, which only Unix allows.
         #[cfg(unix)]
         {
@@ -104,7 +106,11 @@ mod tests {
             for p in [d.path(), kept.as_path()] {
                 std::fs::File::open(p).unwrap().set_modified(old).unwrap();
             }
-            assert_eq!(sweep(root.path()), 1, "only our old folder goes");
+            assert_eq!(
+                sweep(root.path(), SystemTime::now() - MAX_AGE),
+                1,
+                "only our old folder goes"
+            );
             assert!(!d.path().exists() && kept.exists());
         }
         let d2 = dir(root.path()).unwrap();

@@ -153,7 +153,8 @@ impl IntoResponse for Error {
     }
 }
 
-/// Layer: renders [`Error::Coded`] responses as problem documents.
+/// Layer on every P19 route: renders [`Error::Coded`] responses as problem documents and
+/// marks every response not replayable.
 pub async fn render(req: Request, next: Next) -> Response {
     let trace_id = req
         .extensions()
@@ -164,7 +165,12 @@ pub async fn render(req: Request, next: Next) -> Response {
         || crate::http::shown_path(req.uri().path()).to_owned(),
         |u| crate::http::shown_path(u.path()).to_owned(),
     );
-    let res = next.run(req).await;
+    let mut res = next.run(req).await;
+    // P19 answers are never replayed by the generic Idempotency-Key middleware: tickets go
+    // stale and every answer depends on current permissions. Creation endpoints dedupe
+    // retries themselves (see `crate::modules::artifacts::Idempotency`).
+    res.extensions_mut()
+        .insert(crate::http::idempotency::NotReplayable);
     let Some(p) = res.extensions().get::<Arc<Pending>>().cloned() else {
         return res;
     };

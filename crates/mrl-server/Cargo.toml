@@ -53,6 +53,7 @@ utoipa = { workspace = true, features = ["yaml"] }
 mrl-domain = { path = "../mrl-domain" }
 mrl-storage = { path = "../mrl-storage" }
 tempfile = "=3.27.0"
+url = "=2.5.8"
 
 [dev-dependencies]
 mrl-domain = { path = "../mrl-domain" }

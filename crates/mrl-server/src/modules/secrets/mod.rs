@@ -26,7 +26,8 @@ use crate::config::Mode;
 use crate::db::{Db, Tx};
 use crate::error::{ApiError, ErrorCode, FieldError};
 use crate::modules::artifacts::{
-    check_name, codes, destination, field, not_found, org_of, owned, resource, ArtifactStore, Error,
+    allow, check_name, codes, destination, field, is_idempotency_conflict, not_found, org_of,
+    owned, resource, ArtifactStore, Created, Error, Idempotency,
 };
 use crate::seams::{
     AuditEvent, AuditOutcome, Decision, RequestContext, Resource, Secret, SecretStore,
@@ -53,7 +54,7 @@ pub(crate) const READ: &str = "tenancy.read";
 const MANAGE: &str = "secrets.manage";
 
 /// `POST /secrets` body.
-#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct NewSecret {
     /// Unique name in the org (or project).
@@ -213,6 +214,7 @@ impl SecretResolver {
         id: Uuid,
     ) -> Result<(), Error> {
         let row = self.row_any(org, id).await?;
+        let _lock = SecretLock::take(&self.db, id).await?;
         sqlx::query("UPDATE secrets_metadata SET deleting = true WHERE org_id = $1 AND id = $2")
             .bind(org)
             .bind(id)
@@ -241,8 +243,11 @@ impl SecretResolver {
     /// transaction where the run's owner checked that `run` is a real run of `org` and that
     /// the caller may attach secrets to it. The secret must allow the `run` use and not be
     /// being deleted (its row is locked until `tx` ends, so a delete waits).
+    #[allow(clippy::too_many_arguments)]
     pub async fn grant(
         &self,
+        seams: &crate::seams::Seams,
+        ctx: &RequestContext,
         tx: &mut Tx,
         org: &str,
         secret: SecretId,
@@ -262,6 +267,9 @@ impl SecretResolver {
         .fetch_optional(&mut **tx)
         .await?
         .ok_or_else(|| not_found("secret"))?;
+        // The caller must be able to manage this very secret (with its project), not only
+        // the run.
+        allow(seams, ctx, MANAGE, &row.resource(org)).await?;
         if row.deleting {
             return Err(deleting(&row));
         }
@@ -371,6 +379,24 @@ async fn value(
         .ok_or_else(empty)
 }
 
+/// A PostgreSQL session lock on one secret, held on a connection of its own. Rotation and
+/// deletion take it, so they never interleave, even across server replicas. The connection
+/// is closed instead of reused when this drops, which releases the lock however the
+/// request ends (finished, failed or cancelled).
+struct SecretLock(#[allow(dead_code)] sqlx::pool::PoolConnection<sqlx::Postgres>);
+
+impl SecretLock {
+    async fn take(db: &Db, id: Uuid) -> Result<Self, Error> {
+        let mut conn = db.pool().acquire().await?;
+        conn.close_on_drop();
+        sqlx::query("SELECT pg_advisory_lock(hashtextextended($1, 0))")
+            .bind(format!("mrl.secret:{id}"))
+            .execute(&mut *conn)
+            .await?;
+        Ok(Self(conn))
+    }
+}
+
 fn deleting(row: &Row) -> Error {
     Error::coded(
         codes::SECRET_DELETING,
@@ -406,12 +432,37 @@ fn parse_id(s: &str) -> Result<Uuid, Error> {
         .map_err(|_| not_found("secret"))
 }
 
+/// Records `action` on `target`. Every mutation audits before it changes anything, so an
+/// audit that fails leaves nothing changed (503, safe to retry); a mutation that then
+/// fails records a second, `Failed` event (best effort).
 async fn audit(
     s: &AppState,
     ctx: &RequestContext,
     org: &str,
     action: &str,
     target: String,
+) -> Result<(), Error> {
+    record(s, ctx, org, action, target, AuditOutcome::Success).await
+}
+
+/// Best effort: notes that `action` failed after it was audited.
+async fn audit_failed(s: &AppState, ctx: &RequestContext, org: &str, action: &str, target: String) {
+    if let Err(e) = record(s, ctx, org, action, target, AuditOutcome::Failed).await {
+        tracing::warn!(
+            code = e.code(),
+            action,
+            "could not record a failed secret change"
+        );
+    }
+}
+
+async fn record(
+    s: &AppState,
+    ctx: &RequestContext,
+    org: &str,
+    action: &str,
+    target: String,
+    outcome: AuditOutcome,
 ) -> Result<(), Error> {
     s.seams
         .audit
@@ -422,7 +473,7 @@ async fn audit(
             project: ctx.project.clone(),
             action: action.to_owned(),
             target,
-            outcome: AuditOutcome::Success,
+            outcome,
             trace_id: ctx.trace_id.clone(),
         })
         .await?;
@@ -493,6 +544,7 @@ pub(crate) async fn create(
     State(s): State<AppState>,
     Extension(store): Extension<Arc<ArtifactStore>>,
     ctx: RequestContext,
+    headers: axum::http::HeaderMap,
     Json(new): Json<NewSecret>,
 ) -> Result<(StatusCode, Json<SecretMeta>), Error> {
     let org = org_of(&ctx)?;
@@ -506,6 +558,24 @@ pub(crate) async fn create(
     if new.env_var.is_some() && s.config.server.mode != Mode::Solo {
         return Err(env_refused());
     }
+    // A retry with the same Idempotency-Key (authorized afresh above) gets the same secret.
+    let idem = Idempotency::of(&headers, &new);
+    let resolver = SecretResolver::new(store.db().clone(), s.config.server.mode);
+    let earlier = || async {
+        match &idem {
+            Some(i) => match i
+                .earlier(store.db(), Created::Secret, &org, &ctx.principal.id)
+                .await?
+            {
+                Some(id) => Ok(Some(resolver.row_any(&org, id).await?)),
+                None => Ok(None),
+            },
+            None => Ok::<_, Error>(None),
+        }
+    };
+    if let Some(row) = earlier().await? {
+        return Ok((StatusCode::CREATED, Json(row.into())));
+    }
     let id = s.seams.ids.new_uuid();
     let (backend, reference) = match &new.env_var {
         Some(v) => ("env", v.clone()),
@@ -514,9 +584,11 @@ pub(crate) async fn create(
             format!("mrl.secret.{org}.{}", SecretId::from_uuid(id)),
         ),
     };
+    let target = SecretId::from_uuid(id).to_string();
+    audit(&s, &ctx, &org, "secrets.create", target.clone()).await?;
     let row: Result<Row, sqlx::Error> = sqlx::query_as(concat!(
-        "INSERT INTO secrets_metadata (id, org_id, project_id, name, backend, ref, kind, allowed_uses, created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) RETURNING ",
+        "INSERT INTO secrets_metadata (id, org_id, project_id, name, backend, ref, kind, allowed_uses, created_by, idempotency_key, request_sha256)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11) RETURNING ",
         columns!()
     ))
     .bind(id)
@@ -528,26 +600,28 @@ pub(crate) async fn create(
     .bind(&new.kind)
     .bind(&uses)
     .bind(&ctx.principal.id)
+    .bind(idem.as_ref().map(|i| &i.key))
+    .bind(idem.as_ref().map(|i| &i.request_sha256))
     .fetch_one(store.db().pool())
     .await;
     let row = match row {
-        Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
-            return Err(Error::coded(
-                codes::NAME_TAKEN,
-                StatusCode::CONFLICT,
-                format!("A secret named {:?} already exists here.", new.name),
-            ))
+        Ok(row) => row,
+        Err(e) => {
+            audit_failed(&s, &ctx, &org, "secrets.create", target).await;
+            if is_idempotency_conflict(&e) {
+                earlier().await?.ok_or_else(|| not_found("secret"))?
+            } else if matches!(&e, sqlx::Error::Database(d) if d.code().as_deref() == Some("23505"))
+            {
+                return Err(Error::coded(
+                    codes::NAME_TAKEN,
+                    StatusCode::CONFLICT,
+                    format!("A secret named {:?} already exists here.", new.name),
+                ));
+            } else {
+                return Err(e.into());
+            }
         }
-        other => other?,
     };
-    audit(
-        &s,
-        &ctx,
-        &org,
-        "secrets.create",
-        SecretId::from_uuid(id).to_string(),
-    )
-    .await?;
     Ok((StatusCode::CREATED, Json(row.into())))
 }
 
@@ -648,26 +722,30 @@ pub(crate) async fn set_value(
         ));
     }
     let secrets = store_of(s.seams.secrets.as_ref())?;
-    // The row stays locked while the value is written: a delete waits for it, and a
-    // rotation that starts after a delete began is refused.
-    let mut tx = store.db().pool().begin().await?;
-    let locked: Option<bool> =
-        sqlx::query_scalar("SELECT deleting FROM secrets_metadata WHERE id = $1 FOR UPDATE")
+    // Held until the end: a delete waits for this rotation, and one that already began
+    // makes it refuse.
+    let _lock = SecretLock::take(store.db(), id).await?;
+    let state: Option<bool> =
+        sqlx::query_scalar("SELECT deleting FROM secrets_metadata WHERE id = $1")
             .bind(id)
-            .fetch_optional(&mut *tx)
+            .fetch_optional(store.db().pool())
             .await?;
-    match locked {
+    match state {
         None => return Err(not_found("secret")),
         Some(true) => return Err(deleting(&row)),
         Some(false) => {}
     }
-    secrets.set(&row.reference, Secret::new(value)).await?;
+    audit(&s, &ctx, &org, "secrets.set_value", sec.clone()).await?;
+    // The time is saved before the value: a stop after the write still shows the rotation
+    // (a failed write only makes the time early, never late).
     sqlx::query("UPDATE secrets_metadata SET rotated_at = now() WHERE id = $1")
         .bind(id)
-        .execute(&mut *tx)
+        .execute(store.db().pool())
         .await?;
-    tx.commit().await?;
-    audit(&s, &ctx, &org, "secrets.set_value", sec).await?;
+    if let Err(e) = secrets.set(&row.reference, Secret::new(value)).await {
+        audit_failed(&s, &ctx, &org, "secrets.set_value", sec).await;
+        return Err(e.into());
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -686,10 +764,14 @@ pub(crate) async fn delete(
         .row_any(&org, id)
         .await?;
     s.authorize(&ctx, MANAGE, &row.resource(&org)).await?;
-    SecretResolver::new(store.db().clone(), s.config.server.mode)
+    audit(&s, &ctx, &org, "secrets.delete", sec.clone()).await?;
+    if let Err(e) = SecretResolver::new(store.db().clone(), s.config.server.mode)
         .delete(s.seams.secrets.as_ref(), &org, id)
-        .await?;
-    audit(&s, &ctx, &org, "secrets.delete", sec).await?;
+        .await
+    {
+        audit_failed(&s, &ctx, &org, "secrets.delete", sec).await;
+        return Err(e);
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

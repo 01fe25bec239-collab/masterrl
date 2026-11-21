@@ -6,7 +6,8 @@
 //!   `x-mrl-content-sha256`, checked against that hash; then it is stored at the ticket's key
 //!   (one put up to 16 MiB, multipart above). Tickets never allow writing under `blobs/`.
 //! - GET: the object must fit the ticket's size limit. `Range: bytes=N-` and `bytes=N-M`
-//!   resume a download (206); the body streams in 8 MiB pieces.
+//!   resume a download (206); the body streams in 8 MiB pieces, all from the version the
+//!   response started with (a replaced object cuts the response short).
 //!
 //! The path carries the ticket, so spans, logs and problem `instance`s show
 //! `/api/v1/transfer/{ticket}` instead (`crate::http::shown_path`). In solo mode the
@@ -57,20 +58,39 @@ pub(super) async fn upload(
     if let Some(n) = declared {
         claims.check_size(n).map_err(|e| too_large(e.to_string()))?;
     }
+    // A part of an upload: it must be open, and the part exactly its length.
+    let part = crate::modules::uploads::part_target(&store, &st, &claims.key).await?;
+    if let (Some(p), Some(n)) = (&part, declared) {
+        p.check_len(n)?;
+    }
     // Streamed into a private folder while counting and hashing, so the ticket's size limit
     // holds even without a content-length and nothing large sits in memory. The folder (with
     // the multipart ledger) goes when this returns or the request is cancelled.
     let dir = store.scratch_dir()?;
-    let (size, sha) = receive(&st, &claims, &headers, body, &dir.path().join("body")).await?;
+    let (size, sha) = receive(
+        &store,
+        &st,
+        &claims,
+        part.as_ref(),
+        &headers,
+        body,
+        &dir.path().join("body"),
+    )
+    .await?;
     super::scratch::close(dir)?;
+    if let Some(p) = &part {
+        p.fence(&store, &st).await?;
+    }
     Ok(Json(
         serde_json::json!({ "key": claims.key, "size": size, "sha256": sha }),
     ))
 }
 
 async fn receive(
+    store: &ArtifactStore,
     st: &mrl_storage::Store,
     claims: &mrl_storage::TicketClaims,
+    part: Option<&crate::modules::uploads::PartTarget>,
     headers: &HeaderMap,
     body: Body,
     tmp: &std::path::Path,
@@ -115,6 +135,14 @@ async fn receive(
             .into());
         }
     }
+    if let Some(p) = part {
+        p.check_len(size)?;
+    }
+    // Large bodies go up in parts (staged under `uploads/` on some backends): the intent
+    // lets the cleanup job find this org's leftovers if the server stops halfway.
+    if size > mrl_storage::TransferOptions::default().part_size {
+        store.intend(st.keys().org_id(), &claims.key, None).await?;
+    }
     crate::modules::uploads::store_file(st, tmp, &claims.key, size).await?;
     Ok((size, sha))
 }
@@ -153,14 +181,27 @@ pub(super) async fn download(
         }
     };
     let key = claims.key.clone();
+    // One version for the whole response: after each piece is read the object must still
+    // be the one the response started with (same ETag, size and time); otherwise the stream
+    // fails, which cuts the response short instead of mixing two versions.
+    let version = (info.etag.clone(), info.size, info.last_modified);
     let stream = futures_util::stream::try_unfold(start, move |at| {
-        let (org, key) = (org.clone(), key.clone());
+        let (org, key, version) = (org.clone(), key.clone(), version.clone());
         async move {
             if at >= end {
                 return Ok::<_, StorageError>(None);
             }
             let next = (at + CHUNK).min(end);
-            Ok(Some((org.get_range(&key, at..next).await?, next)))
+            let piece = org.get_range(&key, at..next).await?;
+            let now = org.head(&key).await?;
+            if (now.etag.clone(), now.size, now.last_modified) != version {
+                return Err(StorageError::ChecksumMismatch {
+                    key: key.clone(),
+                    expected: format!("version {:?}", version.0),
+                    actual: format!("version {:?}", now.etag),
+                });
+            }
+            Ok(Some((piece, next)))
         }
     });
     let mut res = Response::new(Body::from_stream(stream));
