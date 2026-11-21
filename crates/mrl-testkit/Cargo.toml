@@ -45,11 +45,8 @@ prost = { workspace = true }
 prost-types = "=0.14.6"
 
 # <mrl:deps P19> P19 dependencies go right below this line.
-mrl-domain = { path = "../mrl-domain" }
 mrl-storage = { path = "../mrl-storage" }
 object_store = { workspace = true, features = ["aws"] }
-tracing = { workspace = true }
-tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 # <mrl:deps P20> P20 dependencies go right below this line.
 

@@ -482,7 +482,7 @@ fn sha256_hex_ok(s: &str) -> Option<&str> {
 }
 
 /// Opens an upload.
-#[utoipa::path(post, path = "/uploads", tag = "uploads", request_body = NewUpload,
+#[utoipa::path(post, path = "/uploads", tag = "uploads", operation_id = "create_upload", request_body = NewUpload,
     responses((status = 201, body = Upload), (status = 422, body = crate::error::Problem)))]
 pub(crate) async fn create(
     State(s): State<AppState>,
@@ -548,7 +548,7 @@ pub(crate) async fn create(
 }
 
 /// Reads an upload and the parts that arrived.
-#[utoipa::path(get, path = "/uploads/{up}", tag = "uploads",
+#[utoipa::path(get, path = "/uploads/{up}", tag = "uploads", operation_id = "get_upload",
     params(("up" = String, Path, description = "`up_…`")),
     responses((status = 200, body = Upload), (status = 404, body = crate::error::Problem)))]
 pub(crate) async fn get(

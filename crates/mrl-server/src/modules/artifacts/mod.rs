@@ -353,19 +353,25 @@ impl ArtifactStore {
             .transfer_ticket(key, method, max_size, TICKET_TTL)
             .await?;
         if method == TicketMethod::Get {
+            // A successful action is recorded inside a transaction (the audit sink's rule).
+            let mut tx = self.db().begin().await?;
             seams
                 .audit
-                .record(AuditEvent {
-                    at: seams.clock.now(),
-                    actor: ctx.principal.id.clone(),
-                    org: Some(org),
-                    project: ctx.project.clone(),
-                    action: "transfer.ticket_issued".to_owned(),
-                    target: key.to_owned(),
-                    outcome: AuditOutcome::Success,
-                    trace_id: ctx.trace_id.clone(),
-                })
+                .record_in(
+                    &mut tx,
+                    AuditEvent {
+                        at: seams.clock.now(),
+                        actor: ctx.principal.id.clone(),
+                        org: Some(org),
+                        project: ctx.project.clone(),
+                        action: "transfer.ticket_issued".to_owned(),
+                        target: key.to_owned(),
+                        outcome: AuditOutcome::Success,
+                        trace_id: ctx.trace_id.clone(),
+                    },
+                )
                 .await?;
+            tx.commit().await?;
         }
         Ok(ticket)
     }
@@ -1495,7 +1501,7 @@ async fn get_one(
 }
 
 /// Lists committed artifacts, newest last.
-#[utoipa::path(get, path = "/artifacts", tag = "artifacts", params(ListQuery),
+#[utoipa::path(get, path = "/artifacts", tag = "artifacts", operation_id = "list_artifacts", params(ListQuery),
     responses((status = 200, body = Object, description = "`{items: [Artifact], next_cursor}`")))]
 async fn list(
     State(s): State<AppState>,

@@ -459,7 +459,9 @@ fn parse_id(s: &str) -> Result<Uuid, Error> {
 }
 
 /// The attempt event is required before mutation. Its action names the attempt, so a
-/// process stop at this point cannot leave a false record of a completed change.
+/// process stop at this point cannot leave a false record of a completed change. The event
+/// and the outcome row commit together (`record_in`: the audit sink stores successful
+/// changes only inside the transaction that makes them).
 async fn audit_attempt(
     db: &Db,
     s: &AppState,
@@ -468,15 +470,18 @@ async fn audit_attempt(
     action: &str,
     target: &str,
 ) -> Result<Uuid, Error> {
-    record(
-        s,
-        ctx,
-        org,
-        &format!("{action}.attempt"),
-        target.to_owned(),
-        AuditOutcome::Success,
-    )
-    .await?;
+    let mut tx = db.begin().await?;
+    let event = AuditEvent {
+        at: s.seams.clock.now(),
+        actor: ctx.principal.id.clone(),
+        org: Some(org.to_owned()),
+        project: ctx.project.clone(),
+        action: format!("{action}.attempt"),
+        target: target.to_owned(),
+        outcome: AuditOutcome::Success,
+        trace_id: ctx.trace_id.clone(),
+    };
+    s.seams.audit.record_in(&mut tx, event).await?;
     let id = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO secret_mutation_audit (id, org_id, actor, project_id, action, target, trace_id)
@@ -489,8 +494,9 @@ async fn audit_attempt(
     .bind(action)
     .bind(target)
     .bind(&ctx.trace_id)
-    .execute(db.pool())
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(id)
 }
 
@@ -524,27 +530,38 @@ struct AuditRow {
     outcome: String,
 }
 
-/// Forward the durable outcome to the configured sink.
+/// Forward the durable outcome to the configured sink, in one transaction with it.
 async fn audit_outcome(db: &Db, s: &AppState, id: Uuid, failed: bool) {
-    let persisted: Result<Option<AuditRow>, Error> = async {
-        let mut conn = db.pool().acquire().await?;
+    let forwarded: Result<bool, Error> = async {
+        let mut tx = db.begin().await?;
         if failed {
-            finish_audit(&mut conn, Some(id), "failed").await?;
+            finish_audit(&mut tx, Some(id), "failed").await?;
         }
-        Ok(sqlx::query_as(
+        let row: Option<AuditRow> = sqlx::query_as(
             "SELECT finished_at, org_id, actor, project_id, action, target, trace_id, outcome
              FROM secret_mutation_audit WHERE id = $1 AND outcome IS NOT NULL",
         )
         .bind(id)
-        .fetch_optional(&mut *conn)
-        .await?)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            return Ok(false);
+        };
+        s.seams.audit.record_in(&mut tx, outcome_event(row)).await?;
+        tx.commit().await?;
+        Ok(true)
     }
     .await;
-    let Ok(Some(row)) = persisted else {
-        tracing::warn!(audit_id = %id, "could not read the secret change outcome");
-        return;
-    };
-    let event = AuditEvent {
+    match forwarded {
+        Ok(true) => {}
+        Ok(false) => tracing::warn!(audit_id = %id, "could not read the secret change outcome"),
+        Err(_) => tracing::warn!(audit_id = %id, "could not forward the secret change outcome"),
+    }
+}
+
+/// The audit event for a finished secret change.
+fn outcome_event(row: AuditRow) -> AuditEvent {
+    AuditEvent {
         at: row.finished_at,
         org: Some(row.org_id),
         actor: row.actor,
@@ -557,34 +574,7 @@ async fn audit_outcome(db: &Db, s: &AppState, id: Uuid, failed: bool) {
         } else {
             AuditOutcome::Failed
         },
-    };
-    if s.seams.audit.record(event).await.is_err() {
-        tracing::warn!(audit_id = %id, "could not forward the secret change outcome");
     }
-}
-
-async fn record(
-    s: &AppState,
-    ctx: &RequestContext,
-    org: &str,
-    action: &str,
-    target: String,
-    outcome: AuditOutcome,
-) -> Result<(), Error> {
-    s.seams
-        .audit
-        .record(AuditEvent {
-            at: s.seams.clock.now(),
-            actor: ctx.principal.id.clone(),
-            org: Some(org.to_owned()),
-            project: ctx.project.clone(),
-            action: action.to_owned(),
-            target,
-            outcome,
-            trace_id: ctx.trace_id.clone(),
-        })
-        .await?;
-    Ok(())
 }
 
 fn check_new(new: &NewSecret) -> Result<Vec<String>, Error> {
@@ -645,7 +635,7 @@ fn check_new(new: &NewSecret) -> Result<Vec<String>, Error> {
 }
 
 /// Creates a secret reference (no value).
-#[utoipa::path(post, path = "/secrets", tag = "secrets", request_body = NewSecret,
+#[utoipa::path(post, path = "/secrets", tag = "secrets", operation_id = "create_secret", request_body = NewSecret,
     responses((status = 201, body = SecretMeta), (status = 409, body = crate::error::Problem)))]
 pub(crate) async fn create(
     State(s): State<AppState>,
@@ -747,7 +737,7 @@ pub(crate) async fn create(
 }
 
 /// Lists secret references.
-#[utoipa::path(get, path = "/secrets", tag = "secrets",
+#[utoipa::path(get, path = "/secrets", tag = "secrets", operation_id = "list_secrets",
     responses((status = 200, body = Object, description = "`{items: [SecretMeta]}`")))]
 pub(crate) async fn list(
     State(s): State<AppState>,
@@ -782,7 +772,7 @@ pub(crate) async fn list(
 }
 
 /// Reads one secret reference.
-#[utoipa::path(get, path = "/secrets/{sec}", tag = "secrets", params(("sec" = String, Path, description = "`sec_…`")),
+#[utoipa::path(get, path = "/secrets/{sec}", tag = "secrets", operation_id = "get_secret", params(("sec" = String, Path, description = "`sec_…`")),
     responses((status = 200, body = SecretMeta), (status = 404, body = crate::error::Problem)))]
 pub(crate) async fn get(
     State(s): State<AppState>,
