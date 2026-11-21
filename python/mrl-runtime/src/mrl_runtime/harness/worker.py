@@ -192,6 +192,7 @@ class Harness:
         self._pause_request = ""
         self._smoke_stop = False
         self._checkpoint_requests: list[str] = []
+        self._seen_checkpoint_requests: set[str] = set()
         self._acknowledged: list[str] = []
         self._hard_deadline: float | None = None
         self._lease_deadline: float | None = None
@@ -574,11 +575,11 @@ class Harness:
                 if not primary:
                     self._harness_line("[warning] a non-primary role yielded a checkpoint; ignored")
                     return
+                requests, self._checkpoint_requests = self._checkpoint_requests, []
                 staged = await self.provider.stage(event, {**self._metrics, **event.metrics})
                 self.provider.submit(staged)
                 self._final_staged = self._final_staged or event.is_final
-                self._acknowledged.extend(self._checkpoint_requests)
-                self._checkpoint_requests.clear()
+                self._acknowledged.extend(requests)
             case Log():
                 self._harness_line(f"[{event.level}] {event.message}")
             case EngineWarning():
@@ -726,6 +727,9 @@ class Harness:
                 "[warning] this engine cannot save a checkpoint on demand; request ignored"
             )
             return
+        if req.request_id in self._seen_checkpoint_requests:
+            return
+        self._seen_checkpoint_requests.add(req.request_id)
         self._checkpoint_requests.append(req.request_id)
         self.engine.checkpoint(self._ctx)
 

@@ -343,48 +343,32 @@ impl Envs {
         };
         // One space decision for everything written next (the lock, when the cache lacks it,
         // and the install), before any of it is written.
-        let lock_cached = self.cache.get(lock_sha256)?.is_some();
+        let lock_cached = self.cache.get_pinned(lock_sha256, holder)?.is_some();
         if install.is_some() || !lock_cached {
             let incoming = if lock_cached { 0 } else { lock.len() as u64 }
                 + install.as_ref().map_or(0, |(_, plan)| plan.install_bytes);
             self.make_room(dir, incoming)?;
         }
-        // The verified lock is kept in the node cache, pinned while the attempt runs. Filled
-        // again if another reservation evicts it before the pin (see files::PIN_TRIES).
-        let mut tries = 0;
-        let mut cached = lock_cached;
-        loop {
-            if !cached {
-                // A file of its own per insert: two packages of one lock install under different
-                // environment locks and may both fill the cache at once.
-                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let tmp = self
-                    .cache
-                    .incoming_dir()
-                    .join(format!("{lock_sha256}.{}-{n}.lock", std::process::id()));
-                let inserted = async {
-                    tokio::fs::write(&tmp, &lock)
-                        .await
-                        .map_err(|e| AgentError::state(&tmp, e))?;
-                    self.cache.insert_file(&tmp, lock_sha256).await
-                }
-                .await;
-                if inserted.is_err() {
-                    let _ = std::fs::remove_file(&tmp);
-                }
-                inserted?;
+        if !lock_cached {
+            // A file of its own per insert: two packages of one lock install under different
+            // environment locks and may both fill the cache at once.
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let tmp = self
+                .cache
+                .incoming_dir()
+                .join(format!("{lock_sha256}.{}-{n}.lock", std::process::id()));
+            let inserted = async {
+                tokio::fs::write(&tmp, &lock)
+                    .await
+                    .map_err(|e| AgentError::state(&tmp, e))?;
+                self.cache.insert_pinned(&tmp, lock_sha256, holder).await
             }
-            match self.cache.pin(lock_sha256, holder) {
-                Ok(()) => break,
-                Err(AgentError::UnknownName { .. })
-                    if tries < crate::attempts::files::PIN_TRIES =>
-                {
-                    tries += 1;
-                    cached = false;
-                }
-                Err(e) => return Err(e.into()),
+            .await;
+            if inserted.is_err() {
+                let _ = std::fs::remove_file(&tmp);
             }
+            inserted?;
         }
 
         if let Some((uv, plan)) = install {
@@ -393,7 +377,9 @@ impl Envs {
             // one left by a dead agent is reclaimed by `Envs::open`.
             // Named after the environment folder (runtime and package), so two packages of
             // one lock installing at once never share a copy.
-            let snap = ScopedDir(self.snapshot_dir(dir));
+            static COPY_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let seq = COPY_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let snap = ScopedDir(self.snapshot_dir(&dir.with_extension(format!("copy-{seq}"))));
             let dirs: Vec<PathBuf> = plan.local.iter().map(|p| p.dir.clone()).collect();
             // Off the async runtime, and stopped if the install is cancelled (the lease ran
             // out): a large project never holds the attempt past its deadline.
@@ -405,8 +391,8 @@ impl Envs {
                 self.root.clone(),
                 stop.flag(),
             );
-            let copy = tokio::task::spawn_blocking(move || {
-                snapshot_project(&p, &dirs, &l, &snap_dir, &root, &flag)
+            let (snap, copy) = tokio::task::spawn_blocking(move || {
+                snapshot_project(&p, &dirs, &l, &snap_dir, &root, &flag).map(|copy| (snap, copy))
             })
             .await
             .map_err(|e| install_err(format!("the project copy stopped ({e})")))?
@@ -415,6 +401,23 @@ impl Envs {
             plan.check_build_backends(&copy, &uv_version)
                 .map_err(install_err)?;
             let snap_project = copy.project.clone();
+            if dir.join("pyvenv.cfg").is_file() {
+                // An interrupted sync can leave package metadata without entrypoints.
+                // Keep uv's artifact cache, but rebuild the unpublished virtualenv.
+                if std::fs::read_dir(dir.join(PINS)).is_ok_and(|mut pins| pins.next().is_some()) {
+                    return Err(install_err(
+                        "the incomplete environment is still pinned".into(),
+                    ));
+                }
+                let incomplete =
+                    ScopedDir(self.snapshot_dir(&dir.with_extension(format!("incomplete-{seq}"))));
+                std::fs::rename(dir, &incomplete.0).map_err(|e| AgentError::state(dir, e))?;
+                tokio::task::spawn_blocking(move || drop(incomplete))
+                    .await
+                    .map_err(|e| {
+                        install_err(format!("could not clear the interrupted install ({e})"))
+                    })?;
+            }
             let mut cmd = tokio::process::Command::new(uv);
             cmd.args(["sync", "--frozen", "--no-dev", "--no-editable", "--project"])
                 .arg(&snap_project)
@@ -899,7 +902,25 @@ fn copy_tree(
             }
             copy_tree(&src, &to.join(&name), exclude, stop)?;
         } else if t.is_file() {
-            std::fs::copy(&src, to.join(&name))?;
+            use std::io::{Read, Write};
+            let dest = to.join(&name);
+            let mut input = std::fs::File::open(&src)?;
+            let mut output = std::fs::File::create(&dest)?;
+            let mut buf = vec![0; 1 << 20];
+            loop {
+                if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "the install was cancelled",
+                    ));
+                }
+                let n = input.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                output.write_all(&buf[..n])?;
+            }
+            std::fs::set_permissions(dest, input.metadata()?.permissions())?;
         }
     }
     Ok(())

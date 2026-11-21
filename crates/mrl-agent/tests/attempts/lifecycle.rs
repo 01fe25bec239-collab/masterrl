@@ -525,6 +525,32 @@ async fn environment_cache_miss_then_hit() {
     let (attempts, _) = manager(&ctx);
     let s = spec("att_env", serde_json::json!({}), serde_json::json!({}));
     let rt = &s.runtimes[0];
+    // Interrupt a real locked install once uv starts reporting progress, then retry it.
+    let installing = Arc::new(tokio::sync::Notify::new());
+    {
+        let notice = Arc::clone(&installing);
+        let progress = move |p: mrl_agent::envs::EnvProgress| {
+            if p.stage == "installing" {
+                notice.notify_one();
+            }
+        };
+        let first_try = attempts
+            .envs()
+            .materialize(rt, "att_interrupted", &progress);
+        tokio::pin!(first_try);
+        tokio::time::timeout(WAIT, async {
+            tokio::select! {
+                biased;
+                () = installing.notified() => {}
+                result = &mut first_try => panic!("install ended before interruption: {result:?}"),
+            }
+        })
+        .await
+        .unwrap();
+    }
+    assert!(attempts.envs().installed().is_empty());
+    attempts.envs().unpin_all("att_interrupted").unwrap();
+
     let lines = Arc::new(Mutex::new(Vec::new()));
     let l = Arc::clone(&lines);
     let progress = move |p: mrl_agent::envs::EnvProgress| l.lock().unwrap().push(p.stage);
@@ -1317,11 +1343,10 @@ async fn stop_all_ends_workers_the_service_left_running() {
     assert!(rec.exit.is_some(), "its outcome is recorded");
 }
 
-/// The agent died after starting the primary of a two-worker attempt but before the second:
-/// the restart can't complete the barrier, so it stops the primary, reports the attempt lost
-/// and fails the upload command that was still waiting.
+/// A secondary dies before preparing while the agent is down. Re-adoption must close
+/// the barrier, stop the primary, and answer outstanding upload commands.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_half_started_attempt_is_closed_on_restart() {
+async fn a_dead_secondary_prevents_re_adoption() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = ctx(dir.path(), None);
     let mut primary = std::process::Command::new("sleep")
@@ -1333,6 +1358,14 @@ async fn a_half_started_attempt_is_closed_on_restart() {
     rec.spec.roles[0].count = 2;
     rec.spec.barrier = true;
     rec.workers[0].role_id = "trainer.0".into();
+    let mut secondary = rec.workers[0].clone();
+    secondary.role_id = "trainer.1".into();
+    secondary.primary = false;
+    secondary.identity = ProcIdentity::Pid {
+        pid: u32::MAX - 7,
+        start_time: 1,
+    };
+    rec.workers.push(secondary);
     rec.phase = AttemptPhase::Preparing as i32;
     rec.socket = mrl_agent::attempts::runner::socket_path(ctx.state.root(), "att_half");
     rec.uploads.insert(
@@ -1358,7 +1391,7 @@ async fn a_half_started_attempt_is_closed_on_restart() {
         .unwrap();
     let f = st.failure.as_ref().unwrap();
     assert_eq!(f.sub_code, "WORKER_LOST");
-    assert!(f.message.contains("starting the training workers"), "{f:?}");
+    assert!(f.message.contains("did not survive the restart"), "{f:?}");
     assert!(attempts.running().is_empty(), "not re-adopted");
     seen.until("the waiting command's result", |evs| {
         evs.iter().any(|e| {
@@ -1393,6 +1426,9 @@ async fn the_sweep_retires_old_attempts_on_its_own() {
         rec.exit = Some(mrl_agent::attempts::exit::decide(&Default::default()));
         let job = ctx.state.job_dir(id);
         std::fs::create_dir_all(job.join("work")).unwrap();
+        if id == "att_unsent" {
+            rec.results.insert("up-1".into(), None);
+        }
         rec.save(&job).unwrap();
         let file = job.join(mrl_agent::attempts::record::RECORD_FILE);
         std::fs::File::options()
@@ -1404,22 +1440,30 @@ async fn the_sweep_retires_old_attempts_on_its_own() {
         job
     };
     let (recent, ancient) = (ended("att_4d", 4), ended("att_15d", 15));
+    let unsent = ended("att_unsent", 15);
     let envs = mrl_agent::envs::Envs::open(ctx.state.root(), Arc::clone(&ctx.cache)).unwrap();
     let report = mrl_agent::janitor::sweep(&ctx, &envs, &Default::default())
         .await
         .unwrap();
-    assert_eq!(report.purged, ["att_4d"]);
+    assert_eq!(report.purged.len(), 2);
+    assert!(report.purged.iter().any(|s| s == "att_unsent"));
+    assert!(AttemptRecord::load(&unsent)
+        .unwrap()
+        .unwrap()
+        .results
+        .contains_key("up-1"));
     assert_eq!(report.retired, ["att_15d"]);
     assert!(!recent.join("work").exists() && recent.join("attempt.json").exists());
     assert!(!ancient.exists());
     let (attempts, _seen) = manager(&ctx);
-    let ids: Vec<String> = attempts
+    let mut ids: Vec<String> = attempts
         .readopt()
         .await
         .into_iter()
         .filter_map(|s| s.attempt.map(|a| a.attempt_id))
         .collect();
-    assert_eq!(ids, ["att_4d"], "only the attempt still kept is reported");
+    ids.sort();
+    assert_eq!(ids, ["att_4d", "att_unsent"]);
 }
 
 /// The lease runs out while the event reader is stuck: the launch ends fenced and no worker

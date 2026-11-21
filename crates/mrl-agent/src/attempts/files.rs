@@ -47,35 +47,23 @@ pub async fn stage_inputs(
             Arc::clone(fills.entry(input.sha256.clone()).or_default())
         };
         let _filling = fill.lock().await;
-        let mut tries = 0;
-        let object = loop {
-            let object = match ctx.cache.get(&input.sha256)? {
-                Some(p) => p,
-                None => {
-                    ctx.cache.reserve(input.size)?;
-                    // Named by hash, so an interrupted download resumes from `<tmp>.part`.
-                    let tmp = ctx
-                        .cache
-                        .incoming_dir()
-                        .join(format!("{}.in", input.sha256));
-                    if let Some(ticket) = input.ticket() {
-                        ctx.transfer
-                            .download(&ticket, &tmp, Some(&input.sha256))
-                            .await?;
-                    } else if let Some(file) = &input.file {
-                        copy_stoppable(file, &tmp, false).await?;
-                    }
-                    ctx.cache.insert_file(&tmp, &input.sha256).await?
+        let object = match ctx.cache.get_pinned(&input.sha256, holder)? {
+            Some(p) => p,
+            None => {
+                ctx.cache.reserve(input.size)?;
+                // Named by hash, so an interrupted download resumes from `<tmp>.part`.
+                let tmp = ctx
+                    .cache
+                    .incoming_dir()
+                    .join(format!("{}.in", input.sha256));
+                if let Some(ticket) = input.ticket() {
+                    ctx.transfer
+                        .download(&ticket, &tmp, Some(&input.sha256))
+                        .await?;
+                } else if let Some(file) = &input.file {
+                    copy_stoppable(file, &tmp, false).await?;
                 }
-            };
-            // ponytail: the node cache has no "get and pin" in one step, so another
-            // reservation can evict the entry in between; it is then filled again. Ceiling:
-            // PIN_TRIES rounds under constant eviction. A pinning lookup on NodeCache
-            // (state/cache.rs) would remove the gap.
-            match ctx.cache.pin(&input.sha256, holder) {
-                Ok(()) => break object,
-                Err(AgentError::UnknownName { .. }) if tries < PIN_TRIES => tries += 1,
-                Err(e) => return Err(e.into()),
+                ctx.cache.insert_pinned(&tmp, &input.sha256, holder).await?
             }
         };
         drop(_filling);
@@ -105,9 +93,6 @@ pub async fn stage_inputs(
     }
     Ok(staged)
 }
-
-/// How often a fill is repeated when its entry was evicted before it could be pinned.
-pub(crate) const PIN_TRIES: u32 = 5;
 
 /// Cache fills in progress, by sha256.
 static FILLS: std::sync::LazyLock<
@@ -141,46 +126,45 @@ impl Drop for StopOnDrop {
 /// Copies `from` to `to` off the async runtime, 1 MiB at a time, stopping (and removing the
 /// partial copy) as soon as the calling task is cancelled. `create_new`: fail if `to` exists.
 async fn copy_stoppable(from: &Path, to: &Path, create_new: bool) -> Result<(), AttemptError> {
-    use std::io::{Read, Write};
-    let stop = StopOnDrop::new();
-    let flag = stop.flag();
-    let (src, dst) = (from.to_path_buf(), to.to_path_buf());
-    let copied = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        let mut input = std::fs::File::open(&src)?;
-        let mut output = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .create_new(create_new)
-            .truncate(true)
-            .open(&dst)?;
-        let mut buf = vec![0u8; 1 << 20];
-        let result = loop {
-            if flag.load(std::sync::atomic::Ordering::Relaxed) {
-                break Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "the attempt stopped during the copy",
-                ));
-            }
-            match input.read(&mut buf) {
-                Ok(0) => break output.sync_all(),
-                Ok(n) => {
-                    if let Err(e) = output.write_all(&buf[..n]) {
-                        break Err(e);
-                    }
-                }
-                Err(e) => break Err(e),
-            }
-        };
-        if result.is_err() {
-            drop(output);
-            let _ = std::fs::remove_file(&dst);
+    let input = tokio::fs::File::open(from)
+        .await
+        .map_err(|e| AgentError::state(from, e))?;
+    let output = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .create_new(create_new)
+        .truncate(true)
+        .open(to)
+        .map_err(|e| AgentError::state(to, e))?;
+    let cleanup = RemoveFile(to.to_path_buf());
+    let mut output = tokio::fs::File::from_std(output);
+    let mut input = tokio::io::BufReader::with_capacity(1 << 20, input);
+    let copied = tokio::io::copy_buf(&mut input, &mut output).await;
+    let result = match copied {
+        Ok(_) => output.sync_all().await,
+        Err(e) => Err(e),
+    };
+    drop(output);
+    if result.is_ok() {
+        cleanup.keep();
+    }
+    result.map_err(|e| AgentError::state(to, e).into())
+}
+
+struct RemoveFile(PathBuf);
+
+impl RemoveFile {
+    fn keep(mut self) {
+        self.0.clear();
+    }
+}
+
+impl Drop for RemoveFile {
+    fn drop(&mut self) {
+        if !self.0.as_os_str().is_empty() {
+            let _ = std::fs::remove_file(&self.0);
         }
-        result
-    })
-    .await
-    .map_err(|e| AgentError::state(to, std::io::Error::other(e.to_string())))?;
-    drop(stop);
-    copied.map_err(|e| AgentError::state(to, e).into())
+    }
 }
 
 /// Unix: a hard link to the (read-only) cache object, for container workers only. False when
@@ -325,45 +309,36 @@ pub async fn snapshot(
         std::process::id(),
         SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    let (staging_c, snap_c) = (staging.to_path_buf(), snap.clone());
-    let copied = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-        let src = open_beneath(&staging_c, &rel_path)?;
+    let result = async {
+        use tokio::io::AsyncReadExt;
+        let src = open_beneath(staging, &rel_path)?;
         let meta = src.metadata()?;
-        if !meta.is_file() {
-            return Err(std::io::Error::other("not a regular file"));
+        if !meta.is_file() || meta.len() != size {
+            return Err(std::io::Error::other(
+                "not a regular file of the authorized size",
+            ));
         }
-        if meta.len() != size {
-            return Err(std::io::Error::other(format!(
-                "it holds {} bytes, not the {size} authorized",
-                meta.len()
-            )));
-        }
-        let mut dst = std::fs::OpenOptions::new()
+        // Create synchronously so cancellation cannot orphan a file before its guard exists.
+        let dst = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&snap_c)?;
-        // At most one byte past the authorized size: a file still growing is caught by the
-        // size check below without filling the disk.
-        std::io::copy(
-            &mut std::io::Read::take(src, size.saturating_add(1)),
-            &mut dst,
-        )?;
-        dst.sync_all()
-    })
-    .await;
-    let fail = |why: String| {
-        let _ = std::fs::remove_file(&snap);
-        Err(why)
-    };
-    match copied {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return fail(format!("{rel} can't be read safely ({e})")),
-        Err(e) => return fail(format!("{rel} can't be read ({e})")),
+            .open(&snap)?;
+        let cleanup = RemoveFile(snap.clone());
+        let mut dst = tokio::fs::File::from_std(dst);
+        let src = tokio::io::BufReader::with_capacity(1 << 20, tokio::fs::File::from_std(src));
+        tokio::io::copy_buf(&mut src.take(size.saturating_add(1)), &mut dst).await?;
+        dst.sync_all().await?;
+        Ok::<_, std::io::Error>(cleanup)
     }
+    .await
+    .map_err(|e| format!("{rel} can't be read safely ({e})"))?;
     match mrl_storage::sha256_file(&snap).await {
-        Ok((n, actual)) if n == size && actual == sha256 => Ok(snap),
-        Ok(_) => fail(format!("{rel} does not match what the worker reported")),
-        Err(e) => fail(format!("{rel} can't be read ({e})")),
+        Ok((n, actual)) if n == size && actual == sha256 => {
+            result.keep();
+            Ok(snap)
+        }
+        Ok(_) => Err(format!("{rel} does not match what the worker reported")),
+        Err(e) => Err(format!("{rel} can't be read ({e})")),
     }
 }
 
@@ -385,9 +360,8 @@ pub async fn send(
                 actual,
             })
         })?;
-    let sent = deliver(ctx, &src, rel, sha256, dest).await;
-    let _ = std::fs::remove_file(&src);
-    sent
+    let src = RemoveFile(src);
+    deliver(ctx, &src.0, rel, sha256, dest).await
 }
 
 async fn deliver(
@@ -406,18 +380,22 @@ async fn deliver(
             if let Some(p) = to.parent() {
                 std::fs::create_dir_all(p).map_err(|e| AgentError::state(p, e))?;
             }
-            tokio::fs::copy(src, &to)
-                .await
-                .map_err(|e| AgentError::state(&to, e))?;
-            let (_, copied) = mrl_storage::sha256_file(&to).await?;
-            if copied != sha256 {
+            let file_name = src.file_name().unwrap_or_default().to_string_lossy();
+            let temp = to.with_file_name(format!(".mrl-upload-{file_name}"));
+            copy_stoppable(src, &temp, true).await?;
+            let temp = RemoveFile(temp);
+            let (_, actual) = mrl_storage::sha256_file(&temp.0).await?;
+            if actual != sha256 {
                 return Err(StorageError::ChecksumMismatch {
-                    key: to.display().to_string(),
+                    key: rel.to_owned(),
                     expected: sha256.to_owned(),
-                    actual: copied,
+                    actual,
                 }
                 .into());
             }
+            tokio::fs::rename(&temp.0, &to)
+                .await
+                .map_err(|e| AgentError::state(&to, e))?;
         }
     }
     Ok(())

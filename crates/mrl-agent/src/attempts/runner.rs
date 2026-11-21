@@ -177,7 +177,7 @@ async fn prepare(
 }
 
 enum StopMsg {
-    Stop(Duration),
+    Stop(Instant),
     Kill,
     Detach,
 }
@@ -451,10 +451,6 @@ impl Runner {
             .exit_report
             .as_deref()
             .and_then(|b| ExitReport::decode(b).ok());
-        // Uploads accepted before the restart start again (a PUT can be repeated).
-        for (command_id, targets) in self.rec.adhoc_uploads.clone() {
-            self.start_adhoc(command_id, targets);
-        }
         // The saved deadline, never a fresh one: an expired lease fences at once.
         if let Some(at) = self.rec.lease_deadline_unix_ms {
             self.arm_lease(at);
@@ -462,6 +458,10 @@ impl Runner {
         // A cancel or pause deadline set before the restart still holds.
         if let Some(at) = self.rec.stop_deadline_unix_ms {
             self.stop_at = Some(instant_at(at));
+        }
+        // Uploads accepted before the restart start again (a PUT can be repeated).
+        for (command_id, targets) in self.rec.adhoc_uploads.clone() {
+            self.start_adhoc(command_id, targets);
         }
         self.main_loop(control).await
     }
@@ -520,7 +520,7 @@ impl Runner {
         duration_s: u32,
         kill_budget_s: u32,
     ) -> bool {
-        if heartbeat_seq <= self.rec.lease_heartbeat_seq {
+        if self.self_fenced || heartbeat_seq <= self.rec.lease_heartbeat_seq {
             return false;
         }
         let ago = std::time::Instant::now().saturating_duration_since(heartbeat_sent);
@@ -657,16 +657,20 @@ impl Runner {
                     Some(Control::Pause { request_id, deadline_s, reason }) => {
                         // Sent to the workers when they connect (they pause at once); its
                         // deadline holds from now, as after the launch.
-                        self.remember(&AgentBody::Pause(PauseRequest { request_id, deadline_s, reason }));
+                        if self.remember(&AgentBody::Pause(PauseRequest { request_id, deadline_s, reason })).is_err() {
+                            ack_with(ack, false);
+                            continue;
+                        }
                         self.pause_requested = true;
                         self.set_stop_deadline(Duration::from_secs(deadline_s.into()) + DEADLINE_MARGIN);
                     }
                     Some(Control::Checkpoint { request_id, deadline_s, reason }) => {
-                        self.remember(&AgentBody::CheckpointRequest(CheckpointRequest {
-                            request_id,
-                            deadline_s,
-                            reason,
-                        }));
+                        if self.remember(&AgentBody::CheckpointRequest(CheckpointRequest {
+                            request_id, deadline_s, reason,
+                        })).is_err() {
+                            ack_with(ack, false);
+                            continue;
+                        }
                     }
                     Some(Control::Upload { command_id, checkpoint_id, targets }) => {
                         self.accept_plan(checkpoint_id, command_id, targets).await;
@@ -926,6 +930,7 @@ impl Runner {
                 biased;
                 () = tokio::time::sleep_until(lease_at), if self.lease.is_some() && !self.self_fenced => {
                     self.self_fenced = true;
+                    self.abort_transfers().await;
                     self.stop_all().await;
                 }
                 () = tokio::time::sleep_until(stop_at), if self.stop_at.is_some() => {
@@ -946,10 +951,11 @@ impl Runner {
                     }
                     Some(c) => {
                         let (c, ack) = split_ack(Some(c));
-                        if let Some(c) = c {
-                            self.on_control(c).await;
-                        }
-                        let saved = self.save();
+                        let handled = match c {
+                            Some(c) => self.on_control(c).await,
+                            None => true,
+                        };
+                        let saved = handled && self.save();
                         ack_with(ack, saved);
                     }
                     // The manager is gone without a detach: stop the attempt.
@@ -984,7 +990,7 @@ impl Runner {
             grace = grace.min(Duration::from_millis(left));
         }
         for w in self.workers.values() {
-            let _ = w.stop.send(StopMsg::Stop(grace)).await;
+            let _ = w.stop.send(StopMsg::Stop(Instant::now() + grace)).await;
         }
         self.set_phase(AttemptPhase::Stopping).await;
     }
@@ -1219,11 +1225,8 @@ impl Runner {
             }
             ProcIdentity::Container { id: None, .. } => {
                 let identity = w.identity.clone();
-                let bound = tokio::task::spawn_blocking(move || identity.verified(&token))
-                    .await
-                    .ok()
-                    .flatten();
-                if let Some(bound) = bound {
+                let bound = identity.verified(&token).await;
+                if let Ok(Some(bound)) = bound {
                     if let Some(w) = self.rec.workers.iter_mut().find(|w| w.role_id == role_id) {
                         w.identity = bound;
                     }
@@ -1291,18 +1294,27 @@ impl Runner {
     }
 
     /// Keeps a control request so a reconnecting worker gets it again.
-    /// A request with a request id already kept is kept once.
-    fn remember(&mut self, body: &AgentBody) {
+    /// Returns whether the request was saved and is new to this worker session.
+    fn remember(&mut self, body: &AgentBody) -> Result<bool, ()> {
         let id = request_id(body);
-        if id.is_some() && self.kept_requests().any(|b| request_id(&b) == id) {
-            return;
+        if id.is_some()
+            && self.kept_requests().any(|b| {
+                std::mem::discriminant(&b) == std::mem::discriminant(body) && request_id(&b) == id
+            })
+        {
+            return Ok(false);
         }
         let msg = mrl_proto::worker::v1::AgentMessage {
             ack_seq: 0,
             body: Some(body.clone()),
         };
         self.rec.requests.push(msg.encode_to_vec());
-        self.save();
+        if self.save() {
+            Ok(true)
+        } else {
+            self.rec.requests.pop();
+            Err(())
+        }
     }
 
     /// The control requests kept for reconnecting workers.
@@ -1426,13 +1438,6 @@ impl Runner {
                 self.rec
                     .checkpoints
                     .insert(s.checkpoint_id.clone(), ck.clone());
-                // Saved in the same write as the checkpoint.
-                self.rec.requests.retain(|raw| {
-                    !mrl_proto::worker::v1::AgentMessage::decode(raw.as_slice())
-                        .ok()
-                        .and_then(|m| m.body)
-                        .is_some_and(|b| matches!(b, AgentBody::CheckpointRequest(_)))
-                });
                 if !self.save() {
                     return false;
                 }
@@ -1471,6 +1476,15 @@ impl Runner {
             Some(WorkerBody::Exit(r)) if primary => {
                 // Saved before the ack, so an agent restart still knows how the worker ended.
                 self.rec.exit_report = Some(r.encode_to_vec());
+                self.rec.requests.retain(|raw| {
+                    !mrl_proto::worker::v1::AgentMessage::decode(raw.as_slice())
+                        .ok()
+                        .and_then(|m| m.body)
+                        .is_some_and(|body| {
+                            matches!(body, AgentBody::CheckpointRequest(req)
+                            if r.acknowledged_requests.contains(&req.request_id))
+                        })
+                });
                 self.report = Some(r.clone());
                 self.save()
             }
@@ -1481,6 +1495,9 @@ impl Runner {
     /// Starts uploading a checkpoint once the worker asked to commit it and every file has an
     /// authorized target whose size and sha256 match what the worker staged.
     async fn try_commit(&mut self, id: &str) {
+        if self.self_fenced || self.lease_over() {
+            return;
+        }
         let Some(ck) = self.rec.checkpoints.get(id).cloned() else {
             return;
         };
@@ -1625,6 +1642,9 @@ impl Runner {
 
     /// Starts sending files outside a checkpoint for `command_id` (in the background).
     fn start_adhoc(&mut self, command_id: String, targets: Vec<UploadTarget>) {
+        if self.self_fenced || self.lease_over() {
+            return;
+        }
         let ctx = Arc::clone(&self.sh.ctx);
         let staging = self.staging();
         let tx = self.uploads_tx.clone();
@@ -1727,7 +1747,7 @@ impl Runner {
         }
     }
 
-    async fn on_control(&mut self, c: Control) {
+    async fn on_control(&mut self, c: Control) -> bool {
         match c {
             Control::Start(reply) => {
                 let all_prepared = self.rec.prepared.len() == self.rec.spec.workers().len();
@@ -1742,13 +1762,20 @@ impl Runner {
                         .filter(|r| !self.rec.started.contains(r))
                         .cloned()
                         .collect();
-                    for role in waiting {
-                        self.rec.started.push(role.clone());
-                        self.save();
-                        self.send(&role, AgentBody::Start(Start {})).await;
+                    let old_len = self.rec.started.len();
+                    self.rec.started.extend(waiting.iter().cloned());
+                    self.rec.phase = AttemptPhase::Running as i32;
+                    if self.save() {
+                        for role in waiting {
+                            self.send(&role, AgentBody::Start(Start {})).await;
+                        }
+                        self.status(None).await;
+                        Ok(())
+                    } else {
+                        self.rec.started.truncate(old_len);
+                        self.rec.phase = AttemptPhase::Prepared as i32;
+                        Err(AttemptError::state(self.id(), "could not save the start"))
                     }
-                    self.set_phase(AttemptPhase::Running).await;
-                    Ok(())
                 } else {
                     Err(AttemptError::state(
                         self.id(),
@@ -1768,7 +1795,9 @@ impl Runner {
                     grace_s,
                     reason,
                 });
-                self.remember(&body);
+                if self.remember(&body).is_err() {
+                    return false;
+                }
                 // Armed on receipt: the grace period runs from now, however long the workers
                 // take to accept the request.
                 self.set_stop_deadline(Duration::from_secs(grace_s.into()) + DEADLINE_MARGIN);
@@ -1785,7 +1814,9 @@ impl Runner {
                     deadline_s,
                     reason,
                 });
-                self.remember(&body);
+                if self.remember(&body).is_err() {
+                    return false;
+                }
                 // Armed on receipt, before the (bounded) send.
                 self.set_stop_deadline(Duration::from_secs(deadline_s.into()) + DEADLINE_MARGIN);
                 if let Some(role) = self.primary_role() {
@@ -1802,9 +1833,14 @@ impl Runner {
                     deadline_s,
                     reason,
                 });
-                self.remember(&body);
-                if let Some(role) = self.primary_role() {
-                    self.send(&role, body).await;
+                match self.remember(&body) {
+                    Ok(true) => {
+                        if let Some(role) = self.primary_role() {
+                            self.send(&role, body).await;
+                        }
+                    }
+                    Ok(false) => {}
+                    Err(()) => return false,
                 }
             }
             Control::Upload {
@@ -1812,9 +1848,14 @@ impl Runner {
                 checkpoint_id,
                 targets,
             } => {
+                if self.self_fenced || self.lease_over() {
+                    self.command_done(command_id, Some("the attempt's lease expired".into()))
+                        .await;
+                    return true;
+                }
                 if checkpoint_id.is_empty() {
                     if self.adhoc.contains_key(&command_id) {
-                        return; // a replay of a running upload: answered when it ends
+                        return true; // a replay of a running upload: answered when it ends
                     }
                     // Saved before it starts, so a restarted agent knows about it.
                     self.rec
@@ -1839,7 +1880,7 @@ impl Runner {
                             );
                             self.command_done(command_id, Some(why)).await;
                         }
-                        return;
+                        return true;
                     }
                     let state = self
                         .rec
@@ -1902,6 +1943,7 @@ impl Runner {
                 let _ = saved.send(false);
             }
         }
+        true
     }
 
     /// True when the attempt is over (every worker ended).
@@ -1911,7 +1953,7 @@ impl Runner {
                 // The primary decides the attempt; the others are stopped now.
                 let grace = Duration::from_secs(self.sh.ctx.config.exec.kill_grace_secs);
                 for other in self.workers.values() {
-                    let _ = other.stop.send(StopMsg::Stop(grace)).await;
+                    let _ = other.stop.send(StopMsg::Stop(Instant::now() + grace)).await;
                 }
                 self.primary_exit = Some(exit);
             } else {
@@ -1942,6 +1984,18 @@ impl Runner {
         self.finish_with(decide(&ev)).await
     }
 
+    async fn abort_transfers(&mut self) {
+        for task in self.ck_tasks.values().chain(self.adhoc.values()) {
+            task.abort();
+        }
+        for (_, task) in self.ck_tasks.drain() {
+            let _ = task.await;
+        }
+        for (_, task) in self.adhoc.drain() {
+            let _ = task.await;
+        }
+    }
+
     async fn finish_with(&mut self, decision: ExitDecision) -> ExitDecision {
         // Uploads still running get to finish (not after a self-fence), so their commands get
         // their real result; every command still without one is then answered as failed.
@@ -1960,14 +2014,7 @@ impl Runner {
         }
         // Transfers still running are stopped and joined before anything is reported or
         // cleaned up: no PUT outlives the attempt.
-        for (_, t) in self.ck_tasks.drain() {
-            t.abort();
-            let _ = t.await;
-        }
-        for t in self.adhoc.values_mut() {
-            t.abort();
-            let _ = t.await;
-        }
+        self.abort_transfers().await;
         // Results that made it before the stop keep their real outcome (and an unsaved one
         // gets one more save).
         while let Ok(u) = self.uploads_rx.try_recv() {
@@ -1990,8 +2037,7 @@ impl Runner {
         }
         // Uploads of other files still running are stopped, so no transfer outlives the
         // attempt, and their commands fail.
-        for (command_id, _) in std::mem::take(&mut self.adhoc) {
-            self.rec.adhoc_uploads.remove(&command_id);
+        for (command_id, _) in std::mem::take(&mut self.rec.adhoc_uploads) {
             let why = "the attempt ended before the upload finished".to_owned();
             self.command_done(command_id, Some(why)).await;
         }
@@ -2144,20 +2190,19 @@ pub fn docker_run_args<'a>(
 
 /// Container exit code and OOM flag (`docker inspect`).
 pub(crate) async fn container_exit(name: &str) -> (Option<i32>, bool) {
-    let Some(docker) = crate::envs::which("docker") else {
-        return (None, false);
-    };
-    let out = tokio::process::Command::new(docker)
-        .args([
+    use super::record::{docker_output, DOCKER_TIMEOUT};
+    let Some(out) = docker_output(
+        &[
+            "container",
             "inspect",
             "--format",
             "{{.State.ExitCode}} {{.State.OOMKilled}}",
             name,
-        ])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .await;
-    let Ok(out) = out else {
+        ],
+        DOCKER_TIMEOUT,
+    )
+    .await
+    .filter(|out| out.status.success()) else {
         return (None, false);
     };
     let text = String::from_utf8_lossy(&out.stdout);
@@ -2166,15 +2211,16 @@ pub(crate) async fn container_exit(name: &str) -> (Option<i32>, bool) {
     (code, parts.next() == Some("true"))
 }
 
-async fn docker(args: &[&str]) {
-    if let Some(d) = crate::envs::which("docker") {
-        let _ = tokio::process::Command::new(d)
-            .args(args)
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .await;
+async fn docker_stop(id: &str, grace: Duration) {
+    use super::record::{docker_output, DOCKER_TIMEOUT};
+    if !grace.is_zero()
+        && docker_output(&["stop", "-t", &grace.as_secs().to_string(), id], grace)
+            .await
+            .is_some_and(|out| out.status.success())
+    {
+        return;
     }
+    let _ = docker_output(&["kill", id], DOCKER_TIMEOUT).await;
 }
 
 /// Watches a worker the agent started.
@@ -2196,7 +2242,7 @@ fn spawn_exec(
             let pending = container.clone().filter(|_| id.is_none());
             async move {
                 let (name, token) = pending?;
-                tokio::task::spawn_blocking(move || super::record::owned_container(&name, &token))
+                super::record::owned_container(&name, &token)
                     .await
                     .ok()
                     .flatten()
@@ -2212,21 +2258,21 @@ fn spawn_exec(
                     }
                 }
                 msg = rx.recv() => match msg {
-                    Some(StopMsg::Stop(grace)) => {
+                    Some(StopMsg::Stop(until)) => {
                         if let Some(found) = resolve(&mut id).await {
                             id = Some(found);
                         }
                         if let Some(c) = &id {
-                            docker(&["stop", "-t", &grace.as_secs().to_string(), c]).await;
+                            docker_stop(c, until.saturating_duration_since(Instant::now())).await;
                         }
-                        break exec.stop(grace).await;
+                        break exec.stop(until.saturating_duration_since(Instant::now())).await;
                     }
                     Some(StopMsg::Kill) => {
                         if let Some(found) = resolve(&mut id).await {
                             id = Some(found);
                         }
                         if let Some(c) = &id {
-                            docker(&["kill", c]).await;
+                            docker_stop(c, Duration::ZERO).await;
                         }
                         let _ = exec.kill().await;
                     }
@@ -2299,16 +2345,7 @@ pub fn signal_identity(identity: &ProcIdentity, force: bool) {
                     .status();
             }
         }
-        ProcIdentity::Container { name, id } => {
-            let name = id.clone().unwrap_or_else(|| name.clone());
-            let _ = std::process::Command::new(
-                crate::envs::which("docker").unwrap_or_else(|| "docker".into()),
-            )
-            .args([if force { "kill" } else { "stop" }, &name])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status();
-        }
+        ProcIdentity::Container { .. } => {}
     }
 }
 
@@ -2320,35 +2357,36 @@ fn spawn_watch(
 ) -> mpsc::Sender<StopMsg> {
     let (tx, mut rx) = mpsc::channel(4);
     tokio::spawn(async move {
-        let alive = |id: &ProcIdentity| {
-            let id = id.clone();
-            async move {
-                tokio::task::spawn_blocking(move || id.alive())
-                    .await
-                    .unwrap_or(false)
-            }
-        };
         loop {
             tokio::select! {
                 () = tokio::time::sleep(Duration::from_millis(500)) => {
-                    if !alive(&identity).await {
+                    if !super::record::running(&identity).await {
                         break;
                     }
                 }
                 msg = rx.recv() => match msg {
-                    Some(StopMsg::Stop(grace)) => {
+                    Some(StopMsg::Stop(until)) => {
+                        if let ProcIdentity::Container { id: Some(id), .. } = &identity {
+                            docker_stop(id, until.saturating_duration_since(Instant::now())).await;
+                            break;
+                        }
                         signal_identity(&identity, false);
-                        let until = Instant::now() + grace;
-                        while Instant::now() < until && alive(&identity).await {
+                        while Instant::now() < until && super::record::running(&identity).await {
                             tokio::time::sleep(Duration::from_millis(200)).await;
                         }
                         // Escalate only if the original process is still there.
-                        if alive(&identity).await {
+                        if super::record::running(&identity).await {
                             signal_identity(&identity, true);
                         }
                         break;
                     }
-                    Some(StopMsg::Kill) => signal_identity(&identity, true),
+                    Some(StopMsg::Kill) => {
+                        if let ProcIdentity::Container { id: Some(id), .. } = &identity {
+                            docker_stop(id, Duration::ZERO).await;
+                        } else {
+                            signal_identity(&identity, true);
+                        }
+                    },
                     Some(StopMsg::Detach) | None => return,
                 },
             }
@@ -2441,7 +2479,7 @@ mod tests {
                     Some((name, token)),
                     etx,
                 );
-                stop.send(StopMsg::Stop(Duration::from_secs(1)))
+                stop.send(StopMsg::Stop(Instant::now() + Duration::from_secs(1)))
                     .await
                     .unwrap();
                 erx.recv().await.unwrap()

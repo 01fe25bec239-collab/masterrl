@@ -87,7 +87,10 @@ def test_pause_checkpoints_then_exits_paused(tmp_path: Path) -> None:
 def test_on_demand_checkpoint_keeps_training(tmp_path: Path) -> None:
     async def ask(agent: FakeAgent, _: object) -> None:
         await agent.wait_for(lambda m: m.HasField("progress") and m.progress.step >= 2)
-        await agent.send(pb.AgentMessage(checkpoint_request=pb.CheckpointRequest(request_id="c1")))
+        request = pb.AgentMessage(checkpoint_request=pb.CheckpointRequest(request_id="c1"))
+        await agent.send(request)
+        await agent.wait_for(lambda m: m.HasField("checkpoint_staged"))
+        await agent.send(request)
 
     r = _run(tmp_path, {"steps": 30, "checkpoint_every": 0, "step_seconds": 0.01}, control=ask)
     report = r.exit_report

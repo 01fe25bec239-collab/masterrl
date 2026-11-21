@@ -281,6 +281,15 @@ impl NodeCache {
 
     /// The entry's path if it is cached; marks it as just used.
     pub fn get(&self, sha256: &str) -> Result<Option<PathBuf>> {
+        self.lookup(sha256, None)
+    }
+
+    /// Looks up an entry and pins it before eviction can observe it.
+    pub fn get_pinned(&self, sha256: &str, holder: &str) -> Result<Option<PathBuf>> {
+        self.lookup(sha256, Some(holder))
+    }
+
+    fn lookup(&self, sha256: &str, holder: Option<&str>) -> Result<Option<PathBuf>> {
         check_sha(sha256)?;
         let mut index = self.lock();
         index.clock += 1;
@@ -289,6 +298,7 @@ impl NodeCache {
             return Ok(None);
         };
         entry.last_used = clock;
+        entry.pins.extend(holder.map(str::to_owned));
         self.save(&index)?;
         Ok(Some(self.object_path(sha256)))
     }
@@ -337,6 +347,15 @@ impl NodeCache {
     /// matches. Evicts first if needed. If the entry already exists, `src` is removed.
     /// Returns the entry's path.
     pub async fn insert_file(&self, src: &Path, sha256: &str) -> Result<PathBuf> {
+        self.insert(src, sha256, None).await
+    }
+
+    /// Verifies, inserts and pins a file before releasing the cache lock.
+    pub async fn insert_pinned(&self, src: &Path, sha256: &str, holder: &str) -> Result<PathBuf> {
+        self.insert(src, sha256, Some(holder)).await
+    }
+
+    async fn insert(&self, src: &Path, sha256: &str, holder: Option<&str>) -> Result<PathBuf> {
         check_sha(sha256)?;
         let (size, actual) = mrl_storage::sha256_file(src).await?;
         if actual != sha256 {
@@ -353,6 +372,7 @@ impl NodeCache {
         let clock = index.clock;
         if let Some(entry) = index.entries.get_mut(sha256) {
             entry.last_used = clock;
+            entry.pins.extend(holder.map(str::to_owned));
             self.save(&index)?;
             std::fs::remove_file(src).map_err(|e| AgentError::state(src, e))?;
             return Ok(dest);
@@ -373,7 +393,7 @@ impl NodeCache {
             Entry {
                 size,
                 last_used: clock,
-                pins: BTreeSet::new(),
+                pins: holder.map(str::to_owned).into_iter().collect(),
             },
         );
         self.save(&index)?;

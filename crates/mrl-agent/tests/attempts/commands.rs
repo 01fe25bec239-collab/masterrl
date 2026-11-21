@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use mrl_agent::attempts::Attempts;
+use mrl_agent::attempts::{AttemptEvent, Attempts};
 use mrl_agent::config::{AgentConfig, CacheConfig, SandboxChoice, SandboxConfig};
 use mrl_agent::AgentContext;
 use mrl_proto::agent::v1::command::Kind;
@@ -1099,7 +1099,7 @@ async fn signed_links_never_reach_error_text() {
         max_size: 7,
         expires_at: time::OffsetDateTime::now_utc() + time::Duration::minutes(10),
         // Port 9: nothing listens, so the request fails with a connection error.
-        url: "http://127.0.0.1:9/obj/SENTINEL_PATH?X-Sig=SENTINEL_SIG".into(),
+        url: "http://127.0.0.1:9/obj/,;SENTINEL_PATH?X-Sig=SENTINEL_SIG".into(),
         presigned: true,
         headers: Default::default(),
     };
@@ -1160,6 +1160,22 @@ async fn staged_inputs_survive_a_restart() {
     };
     assert!(first.handle(&stage).await.unwrap().accepted);
     assert!(first.handle(&stage).await.unwrap().accepted, "a retry");
+    let creds = Command {
+        command_id: "credentials".into(),
+        kind: Some(Kind::UpdateCredentials(
+            mrl_proto::agent::v1::UpdateCredentials {
+                attempt: attempt_ref("job_p", "att_p"),
+                credentials: vec![mrl_proto::agent::v1::Credential {
+                    name: "hf_hub".into(),
+                    value: b"credential-sentinel".to_vec(),
+                    ..Default::default()
+                }],
+            },
+        )),
+    };
+    assert!(first.handle(&creds).await.unwrap().accepted);
+    let pending = std::fs::read(ctx.state.root().join("pending/att_p.stage")).unwrap();
+    assert!(!String::from_utf8_lossy(&pending).contains("credential-sentinel"));
     drop(first);
     let (tx, _rx2) = mrl_agent::attempts::attempt_events(16);
     let _rx2 = mrl_agent::attempts::auto_saved(_rx2);
@@ -1186,6 +1202,14 @@ async fn staged_inputs_survive_a_restart() {
             ..Default::default()
         })),
     };
+    let refused = second.handle(&launch).await.unwrap();
+    assert!(!refused.accepted);
+    assert!(refused
+        .failure
+        .unwrap()
+        .message
+        .contains("credentials again"));
+    assert!(second.handle(&creds).await.unwrap().accepted);
     assert!(second.handle(&launch).await.unwrap().accepted);
     let rec = mrl_agent::attempts::record::AttemptRecord::load(&ctx.state.job_dir("att_p"))
         .unwrap()
@@ -1443,11 +1467,59 @@ async fn saved_gpu_evidence_decides_an_attempt_that_ended_unseen() {
         mrl_agent::hw::HwEventKind::OutOfMemory,
     )];
     rec.save(&ctx.state.job_dir("att_o1")).unwrap();
+    let advisory = ctx.state.job_dir("att_o2");
+    std::fs::create_dir_all(&advisory).unwrap();
+    rec.spec.attempt.attempt_id = "att_o2".into();
+    rec.hw_events[0].kind = mrl_agent::hw::HwEventKind::Xid { code: 13 };
+    rec.save(&advisory).unwrap();
     let (tx, rx) = mrl_agent::attempts::attempt_events(16);
     let _rx = mrl_agent::attempts::auto_saved(rx);
     let restarted = Attempts::new(Arc::clone(&ctx), tx, None).unwrap();
     let statuses = restarted.readopt().await;
-    let f = statuses[0].failure.as_ref().unwrap();
-    assert_eq!(f.class, FailureClass::Oom as i32, "{f:?}");
-    assert_eq!(f.sub_code, "OOM_GPU");
+    let failure = |id: &str| {
+        statuses
+            .iter()
+            .find(|s| s.attempt.as_ref().is_some_and(|r| r.attempt_id == id))
+            .unwrap()
+            .failure
+            .as_ref()
+            .unwrap()
+    };
+    assert_eq!(failure("att_o1").sub_code, "OOM_GPU");
+    assert_eq!(failure("att_o2").class, FailureClass::NodeLost as i32);
+    assert_eq!(failure("att_o2").sub_code, "WORKER_LOST");
+}
+
+#[tokio::test]
+async fn an_accepted_probe_survives_restart_before_receipt() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, first, _rx) = manager(dir.path());
+    let command = Command {
+        command_id: "probe-1".into(),
+        kind: Some(Kind::Probe(mrl_proto::agent::v1::Probe {
+            request_id: "probe-request".into(),
+            ..Default::default()
+        })),
+    };
+    assert!(first.handle(&command).await.unwrap().accepted);
+    drop(first);
+    let (tx, mut rx) = mrl_agent::attempts::attempt_events(1);
+    let next = Attempts::new(Arc::clone(&ctx), tx, None).unwrap();
+    next.readopt().await;
+    let envelope = tokio::time::timeout(WAIT, rx.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    let AttemptEvent::Probe(result) = envelope.saved() else {
+        panic!("expected a saved probe");
+    };
+    assert_eq!(result.request_id, "probe-request");
+    let probe_dir = ctx.state.root().join("probes");
+    tokio::time::timeout(WAIT, async {
+        while std::fs::read_dir(&probe_dir).unwrap().next().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
 }

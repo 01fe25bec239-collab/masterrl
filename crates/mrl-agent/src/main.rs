@@ -94,6 +94,8 @@ enum Command {
 enum ServiceAction {
     /// Start the agent with the computer (user-level, no admin rights).
     Install,
+    /// Stop the agent and end active attempts.
+    Stop,
     /// Stop the agent and remove the service.
     Uninstall,
     /// Show whether the service is installed and running.
@@ -224,6 +226,10 @@ async fn dispatch(config: Option<PathBuf>, command: Command) -> Result<ExitCode,
                         eprintln!("{NAME}: note: {w}");
                     }
                     println!("Installed the {manager:?} service; it starts with your computer.");
+                }
+                ServiceAction::Stop => {
+                    service::apply(&service::stop_plan(manager, &target))?;
+                    println!("Stopped the {manager:?} service and ended active attempts.");
                 }
                 ServiceAction::Uninstall => {
                     for w in service::apply(&service::uninstall_plan(manager, &target))? {

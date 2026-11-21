@@ -332,7 +332,7 @@ pub fn install_plan(manager: Manager, t: &Target) -> Result<Plan> {
 
 /// Once the service has stopped: ends the attempts still running (the service manager leaves
 /// workers alone so a restart can re-adopt them).
-fn stop_attempts(t: &Target) -> Action {
+fn stop_attempts(t: &Target, required: bool) -> Action {
     run(
         &[
             &t.exe.display().to_string(),
@@ -341,8 +341,28 @@ fn stop_attempts(t: &Target) -> Action {
             "attempt",
             "stop-all",
         ],
-        false,
+        required,
     )
+}
+
+/// Stops the installed service and terminates the attempts it left running.
+pub fn stop_plan(manager: Manager, t: &Target) -> Plan {
+    let stop = match manager {
+        Manager::SystemdUser => run(&["systemctl", "--user", "stop", SYSTEMD_UNIT], true),
+        Manager::Launchd => run(
+            &[
+                "launchctl",
+                "bootout",
+                &format!("gui/{}/{LAUNCHD_LABEL}", t.uid),
+            ],
+            true,
+        ),
+        Manager::WslTask => run(&["schtasks.exe", "/End", "/TN", TASK_NAME], true),
+    };
+    Plan {
+        manager,
+        actions: vec![stop, stop_attempts(t, true)],
+    }
 }
 
 /// What `uninstall` does with `manager`.
@@ -353,7 +373,7 @@ pub fn uninstall_plan(manager: Manager, t: &Target) -> Plan {
                 &["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT],
                 false,
             ),
-            stop_attempts(t),
+            stop_attempts(t, false),
             Action::Remove {
                 path: t.systemd_unit_path(),
             },
@@ -368,7 +388,7 @@ pub fn uninstall_plan(manager: Manager, t: &Target) -> Plan {
                 ],
                 false,
             ),
-            stop_attempts(t),
+            stop_attempts(t, false),
             Action::Remove {
                 path: t.plist_path(),
             },
@@ -511,6 +531,20 @@ mod tests {
             uid: 501,
             distro: Some("Ubuntu".into()),
             log_dir: "/home/me/state/logs".into(),
+        }
+    }
+
+    #[test]
+    fn service_stop_ends_attempts_after_stopping_the_daemon() {
+        let t = target();
+        for manager in [Manager::SystemdUser, Manager::Launchd, Manager::WslTask] {
+            let plan = stop_plan(manager, &t);
+            assert_eq!(plan.actions.len(), 2);
+            assert!(matches!(
+                &plan.actions[0],
+                Action::Run { required: true, .. }
+            ));
+            assert_eq!(plan.actions[1], stop_attempts(&t, true));
         }
     }
 

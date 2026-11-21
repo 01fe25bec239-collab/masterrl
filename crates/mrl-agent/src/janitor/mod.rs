@@ -67,42 +67,32 @@ pub async fn release(
         // A container is touched only when it carries this launch's token, and then by its
         // id: an old record never stops or removes a newer launch's container that reused the
         // name.
-        let identity = if matches!(w.identity, ProcIdentity::Container { .. }) {
-            let (i, t) = (w.identity.clone(), token.clone());
-            match tokio::task::spawn_blocking(move || i.verified(&t))
-                .await
-                .ok()
-                .flatten()
-            {
-                Some(v) => v,
-                None => {
-                    report.errors.push(format!(
-                        "container for {} is not this launch's; left alone",
-                        w.role_id
-                    ));
-                    continue;
+        match &w.identity {
+            ProcIdentity::Container { .. } => match w.identity.verified(&token).await {
+                Ok(Some(ProcIdentity::Container { id: Some(id), .. })) => {
+                    use crate::attempts::record::{docker_output, DOCKER_TIMEOUT};
+                    if docker_output(&["rm", "-f", &id], DOCKER_TIMEOUT)
+                        .await
+                        .is_some_and(|out| out.status.success())
+                    {
+                        report.killed += 1;
+                    } else {
+                        report
+                            .errors
+                            .push(format!("could not remove the container for {}", w.role_id));
+                    }
                 }
+                Err(()) => report.errors.push(format!(
+                    "could not verify ownership of the container for {}",
+                    w.role_id
+                )),
+                _ => {}
+            },
+            ProcIdentity::Pid { .. } if w.identity.alive() => {
+                signal_identity(&w.identity, true);
+                report.killed += 1;
             }
-        } else {
-            w.identity.clone()
-        };
-        let probe = identity.clone();
-        let alive = tokio::task::spawn_blocking(move || probe.alive())
-            .await
-            .unwrap_or(false);
-        if alive {
-            signal_identity(&identity, true);
-            report.killed += 1;
-        }
-        if let ProcIdentity::Container { id: Some(id), .. } = &identity {
-            if let Some(docker) = crate::envs::which("docker") {
-                let _ = tokio::process::Command::new(docker)
-                    .args(["rm", "-f", id])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .await;
-            }
+            _ => {}
         }
     }
     for cg in rec.workers.iter().filter_map(|w| w.cgroup.as_deref()) {
@@ -116,9 +106,11 @@ pub async fn release(
     }
     let job_dir = ctx.state.job_dir(&id);
     report.killed += kill_leftovers(&job_dir, &token);
-    match envs.unpin_all(&id) {
-        Ok(n) => report.unpinned = n,
-        Err(e) => report.errors.push(e.explain()),
+    if report.errors.is_empty() {
+        match envs.unpin_all(&id) {
+            Ok(n) => report.unpinned = n,
+            Err(e) => report.errors.push(e.explain()),
+        }
     }
     report.gpu_warnings = gpu_residue(ctx, gpu_uuids).await;
     report
@@ -376,7 +368,12 @@ pub async fn sweep(ctx: &AgentContext, envs: &Envs, live: &HashSet<String>) -> R
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.elapsed().ok());
-        if age.is_some_and(|a| a > KEEP_RECORDS) {
+        if r.errors.is_empty()
+            && rec.results.is_empty()
+            && rec.adhoc_uploads.is_empty()
+            && rec.uploads.values().all(|plan| plan.answered)
+            && age.is_some_and(|a| a > KEEP_RECORDS)
+        {
             // Retired: the scratch, the record, the logs and its lock all go.
             purge(ctx.state.root(), &dir)?;
             make_writable(&dir);

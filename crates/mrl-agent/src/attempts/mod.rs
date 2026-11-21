@@ -207,6 +207,14 @@ struct Pending {
     attempt: Option<AttemptRef>,
     items: Vec<StageItem>,
     creds: BTreeMap<String, Secret>,
+    required_creds: std::collections::BTreeSet<String>,
+}
+
+// Keep metadata and staged inputs in one atomic write while keeping secret values in memory.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedPending {
+    staged: Vec<u8>,
+    required_creds: std::collections::BTreeSet<String>,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -238,16 +246,27 @@ impl Attempts {
         // Inputs staged before a restart, for launches still to come.
         if let Ok(rd) = std::fs::read_dir(me.shared.ctx.state.root().join("pending")) {
             for f in rd.flatten() {
-                let staged = std::fs::read(f.path()).ok().and_then(|b| {
-                    <mrl_proto::agent::v1::StageArtifacts as prost::Message>::decode(b.as_slice())
-                        .ok()
+                if f.path().extension().and_then(|ext| ext.to_str()) != Some("stage") {
+                    continue;
+                }
+                use prost::Message;
+                let bytes =
+                    std::fs::read(f.path()).map_err(|e| crate::AgentError::state(f.path(), e))?;
+                let saved = serde_json::from_slice::<SavedPending>(&bytes).unwrap_or_else(|_| {
+                    SavedPending {
+                        staged: bytes,
+                        required_creds: Default::default(),
+                    }
                 });
-                if let Some(a) = staged.and_then(|s| Some((s.attempt?, s.items))) {
+                let staged = mrl_proto::agent::v1::StageArtifacts::decode(saved.staged.as_slice())
+                    .map_err(|_| AttemptError::state("", "could not read saved staging data"))?;
+                if let Some(attempt) = staged.attempt {
                     lock(&me.pending).insert(
-                        a.0.attempt_id.clone(),
+                        attempt.attempt_id.clone(),
                         Pending {
-                            attempt: Some(a.0),
-                            items: a.1,
+                            attempt: Some(attempt),
+                            items: staged.items,
+                            required_creds: saved.required_creds,
                             creds: BTreeMap::new(),
                         },
                     );
@@ -417,6 +436,17 @@ impl Attempts {
     /// for this attempt with `UpdateCredentials` (as `MRL_CREDENTIAL_<NAME>`).
     pub fn secrets_for(&self, spec: &AttemptSpec) -> Result<Vec<(String, Secret)>, AttemptError> {
         let pending = lock(&self.pending);
+        if let Some(p) = pending.get(&spec.attempt.attempt_id) {
+            if p.required_creds
+                .iter()
+                .any(|name| !p.creds.contains_key(name))
+            {
+                return Err(AttemptError::state(
+                    &spec.attempt.attempt_id,
+                    "send the attempt credentials again before launch",
+                ));
+            }
+        }
         let given = pending.get(&spec.attempt.attempt_id).map(|p| &p.creds);
         let granted: Vec<String> = spec.secrets.iter().map(|g| g.name.clone()).collect();
         let sent = given
@@ -589,7 +619,54 @@ impl Attempts {
     /// others lost, and reports attempts that ended earlier with their saved outcome. Returns
     /// the status of each (for the reconcile report).
     pub async fn readopt(self: &Arc<Self>) -> Vec<AttemptStatus> {
-        self.readopt_where(|_| true).await
+        let statuses = self.readopt_where(|_| true).await;
+        if let Ok(entries) = std::fs::read_dir(self.probe_dir()) {
+            for entry in entries
+                .flatten()
+                .filter(|e| e.path().extension().is_some_and(|ext| ext == "probe"))
+            {
+                use prost::Message;
+                if let Ok(bytes) = std::fs::read(entry.path()) {
+                    if let Ok(probe) = mrl_proto::agent::v1::ProbeResult::decode(bytes.as_slice()) {
+                        self.post_probe(entry.path(), probe);
+                    }
+                }
+            }
+        }
+        statuses
+    }
+
+    fn probe_dir(&self) -> std::path::PathBuf {
+        self.shared.ctx.state.root().join("probes")
+    }
+
+    fn post_probe(&self, path: std::path::PathBuf, probe: mrl_proto::agent::v1::ProbeResult) {
+        post(
+            &self.shared.events,
+            vec![(
+                AttemptEvent::Probe(probe),
+                Some(Box::new(move || {
+                    let _ = std::fs::remove_file(path);
+                })),
+            )],
+        );
+    }
+
+    fn save_probe(
+        &self,
+        command_id: &str,
+        probe: mrl_proto::agent::v1::ProbeResult,
+    ) -> Result<(), AttemptError> {
+        let dir = self.probe_dir();
+        let path = dir.join(format!(
+            "{}.probe",
+            mrl_storage::sha256_hex(command_id.as_bytes())
+        ));
+        record::private_dir(&dir)
+            .and_then(|()| record::write_private(&path, &prost::Message::encode_to_vec(&probe)))
+            .map_err(|e| crate::AgentError::state(&path, e))?;
+        self.post_probe(path, probe);
+        Ok(())
     }
 
     /// [`Self::readopt`] for the attempts whose id `wanted` accepts (a local `attempt run`
@@ -616,7 +693,10 @@ impl Attempts {
                 // Ended before the restart: reported again, in case its status never got out.
                 out.push(status_of(&rec, Some(&d)));
                 // Only once nobody else holds it (its runner may still be finishing).
-                if !rec.results.is_empty() || !rec.adhoc_uploads.is_empty() {
+                if !rec.results.is_empty()
+                    || !rec.adhoc_uploads.is_empty()
+                    || rec.uploads.values().any(|plan| !plan.answered)
+                {
                     if let Ok(_claim) = self.claim(&id) {
                         if let Ok(Some(mut fresh)) = AttemptRecord::load(&dir) {
                             self.replay_results(&dir, &mut fresh);
@@ -641,51 +721,43 @@ impl Attempts {
                 drop(claim);
                 continue;
             }
-            // A container is adopted only when it carries this launch's token, and from then on
-            // by its id; one that is gone or took over the name is dropped from the record, so
-            // nothing here ever stops it.
+            // Keep identities that could not be verified so the janitor can retry cleanup.
             let token = runner::attempt_token(&rec.nonce);
-            let mut checked = Vec::with_capacity(rec.workers.len());
-            for mut w in std::mem::take(&mut rec.workers) {
-                if matches!(w.identity, record::ProcIdentity::Container { .. }) {
-                    let (i, t) = (w.identity.clone(), token.clone());
-                    match tokio::task::spawn_blocking(move || i.verified(&t))
-                        .await
-                        .ok()
-                        .flatten()
-                    {
-                        Some(v) => w.identity = v,
-                        None => continue,
+            let mut alive = HashSet::new();
+            let mut unknown = false;
+            for worker in &mut rec.workers {
+                match worker.identity.verified(&token).await {
+                    Ok(Some(identity)) => {
+                        if record::running(&identity).await {
+                            alive.insert(worker.role_id.clone());
+                        }
+                        worker.identity = identity;
                     }
+                    Ok(None) => {}
+                    Err(()) => unknown = true,
                 }
-                checked.push(w);
             }
-            rec.workers = checked;
             let _ = rec.save(&dir);
             let primary_alive = rec
                 .workers
                 .iter()
-                .find(|w| w.primary)
-                .is_some_and(|w| w.identity.alive());
-            // Every worker the launch expanded must have been started (and recorded): an
-            // agent that died halfway through starting them leaves an attempt that can never
-            // get past its barrier, so it is stopped and reported lost.
+                .any(|w| w.primary && alive.contains(&w.role_id));
             let complete = rec
                 .spec
                 .workers()
                 .iter()
-                .all(|(id, _, _)| rec.workers.iter().any(|w| &w.role_id == id));
-            // Windows: the worker server is TCP on a port picked at start, which a restarted
-            // agent can't get back, so a surviving worker could never reconnect. It is stopped
-            // (by the recovery below) and reported lost instead of re-adopted.
+                .all(|(id, _, _)| alive.contains(id));
+            // A restarted Windows agent cannot take back the same localhost endpoint.
             let readoptable = primary_alive && complete && cfg!(unix);
             let status = if readoptable {
                 let runner = Runner::new(Arc::clone(&self.shared), rec.clone(), Vec::new());
                 self.spawn(&rec, true, runner, claim);
                 status_of(&rec, None)
             } else {
-                let why = if !complete && primary_alive {
-                    "The agent stopped while it was starting the training workers, so the attempt can't continue; its workers were stopped."
+                let why = if unknown {
+                    "The agent could not verify the container after restart. Cleanup will check it again."
+                } else if !complete && primary_alive {
+                    "Some training workers did not survive the restart, so the attempt cannot continue."
                 } else if primary_alive {
                     "The agent restarted; on Windows it can't reconnect to a running training worker, so it stopped it."
                 } else {
@@ -716,13 +788,18 @@ impl Attempts {
         lost_why: &str,
     ) -> AttemptStatus {
         let (mut exit_code, mut oom_killed) = (None, false);
+        let token = runner::attempt_token(&rec.nonce);
         for w in &rec.workers {
-            if let record::ProcIdentity::Container { id: Some(cid), .. } = &w.identity {
-                let (code, oom) = runner::container_exit(cid).await;
-                if w.primary {
-                    exit_code = code;
+            if matches!(w.identity, record::ProcIdentity::Container { .. }) {
+                if let Ok(Some(record::ProcIdentity::Container { id: Some(cid), .. })) =
+                    w.identity.verified(&token).await
+                {
+                    let (code, oom) = runner::container_exit(&cid).await;
+                    if w.primary {
+                        exit_code = code;
+                    }
+                    oom_killed |= oom;
                 }
-                oom_killed |= oom;
             }
             oom_killed |= w.cgroup.as_deref().is_some_and(cgroup_oom_killed);
         }
@@ -730,18 +807,19 @@ impl Attempts {
             .exit_report
             .as_deref()
             .and_then(|b| <ExitReport as prost::Message>::decode(b).ok());
-        let d = if report.is_some() || oom_killed || !rec.hw_events.is_empty() {
-            exit::decide(&exit::ExitEvidence {
-                report,
-                exit_code,
-                oom_killed,
-                hw_events: rec.hw_events.clone(),
-                readopted: true,
-                cancel_requested: rec.cancel_requested,
-                final_committed: rec.final_committed(),
-                needs_final_checkpoint: rec.needs_final_checkpoint(),
-                ..exit::ExitEvidence::default()
-            })
+        let evidence = exit::ExitEvidence {
+            report,
+            exit_code,
+            oom_killed,
+            hw_events: rec.hw_events.clone(),
+            readopted: true,
+            cancel_requested: rec.cancel_requested,
+            final_committed: rec.final_committed(),
+            needs_final_checkpoint: rec.needs_final_checkpoint(),
+            ..exit::ExitEvidence::default()
+        };
+        let d = if evidence.report.is_some() || exit::evidence_failure(&evidence).is_some() {
+            exit::decide(&evidence)
         } else {
             ExitDecision {
                 phase: AttemptPhase::Exited as i32,
@@ -757,13 +835,6 @@ impl Attempts {
                 }),
             }
         };
-        for plan in rec.uploads.values_mut().filter(|p| !p.answered) {
-            plan.answered = true;
-            rec.results.insert(
-                plan.command_id.clone(),
-                Some("the attempt ended before its checkpoint was uploaded".into()),
-            );
-        }
         rec.phase = d.phase;
         rec.exit = Some(d.clone());
         let _ = rec.save(dir);
@@ -781,6 +852,13 @@ impl Attempts {
             rec.results.insert(
                 command_id,
                 Some("the agent stopped during the upload".into()),
+            );
+        }
+        for plan in rec.uploads.values_mut().filter(|p| !p.answered) {
+            plan.answered = true;
+            rec.results.insert(
+                plan.command_id.clone(),
+                Some("the attempt ended before its checkpoint was uploaded".into()),
             );
         }
         let _ = rec.save(dir);
@@ -938,6 +1016,7 @@ impl Attempts {
                         let v = String::from_utf8(c.value.clone()).map_err(|_| {
                             AttemptError::Spec(format!("credential {} is not text", c.name))
                         })?;
+                        p.required_creds.insert(c.name.clone());
                         p.creds.insert(c.name.clone(), Secret::new(v));
                     }
                     Ok(())
@@ -952,11 +1031,7 @@ impl Attempts {
                     &facts.inventory,
                     self.shared.ctx.state.root(),
                 );
-                post(
-                    &self.shared.events,
-                    vec![(AttemptEvent::Probe(result), None)],
-                );
-                Ok(())
+                self.save_probe(&cmd.command_id, result)
             }
             Kind::LaunchDeployment(_) | Kind::StopDeployment(_) => return None,
         };
@@ -1143,13 +1218,18 @@ impl Attempts {
         // Staged inputs are saved before the command is accepted, so a restarted agent still
         // has them for the launch. Credentials are never written down: after a restart the
         // core sends them again.
-        let saved = mrl_proto::agent::v1::StageArtifacts {
+        let staged = mrl_proto::agent::v1::StageArtifacts {
             attempt: next.attempt.clone(),
             items: next.items.clone(),
         };
+        let saved = serde_json::to_vec(&SavedPending {
+            staged: prost::Message::encode_to_vec(&staged),
+            required_creds: next.required_creds.clone(),
+        })
+        .map_err(|_| AttemptError::state(id, "could not encode the staged inputs"))?;
         let path = self.pending_path(id);
         record::private_dir(path.parent().unwrap_or(&path))
-            .and_then(|()| record::write_private(&path, &prost::Message::encode_to_vec(&saved)))
+            .and_then(|()| record::write_private(&path, &saved))
             .map_err(|e| crate::AgentError::state(&path, e))?;
         pending.insert(id.to_owned(), next);
         Ok(())
