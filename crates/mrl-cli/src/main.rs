@@ -16,6 +16,8 @@ const GIT_SHA: &str = git_version::git_version!(
 );
 
 // <mrl:cli-mods P16> P16 `mod` lines go right below this line.
+mod auth;
+mod sync;
 
 // <mrl:cli-mods P17> P17 `mod` lines go right below this line.
 mod api;
@@ -39,7 +41,12 @@ enum Command {
     /// Show the version and git commit.
     Version,
     // <mrl:cli-commands P16> P16 subcommands go right below this line.
-
+    /// Sign in to your MasterRL account in the browser and save an access token.
+    Login(crate::auth::LoginArgs),
+    /// Sign out on this computer and forget the access token.
+    Logout(crate::auth::LogoutArgs),
+    /// Sync your setup through your account, end-to-end encrypted.
+    Sync(crate::sync::SyncArgs),
     // <mrl:cli-commands P17> P17 subcommands go right below this line.
     /// Settings: server address, access token, default project.
     #[command(subcommand)]
@@ -88,6 +95,11 @@ fn main() -> ExitCode {
 fn run(command: Command) -> Result<(), String> {
     match command {
         // <mrl:cli-dispatch P16> P16 match arms go right below this line.
+        Command::Login(a) => {
+            crate::auth::login(&a, &crate::auth::Keyring, &crate::auth::open_browser)
+        }
+        Command::Logout(a) => crate::auth::logout(&a, &crate::auth::Keyring),
+        Command::Sync(a) => crate::sync::run(&a, &crate::auth::Keyring),
 
         // <mrl:cli-dispatch P17> P17 match arms go right below this line.
         Command::Config(c) => commands::config(c),

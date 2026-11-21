@@ -517,7 +517,37 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         "This dataset file has a column type the app doesn't read.",
     ),
     // <mrl:errors P16> rows for P16 go right below this line.
-
+    (code(Auth, 160), "Your sign-in has expired."),
+    (code(Auth, 161), "The sign-in did not finish."),
+    (code(Auth, 162), "Sign-in isn't set up in this app."),
+    (
+        code(Auth, 163),
+        "This app is signed in to a different account.",
+    ),
+    (
+        code(Link, 160),
+        "The app could not reach the sign-in service.",
+    ),
+    (
+        code(Val, 160),
+        "This passphrase or recovery key doesn't open your saved setup.",
+    ),
+    (
+        code(ErrorFamily::State, 160),
+        "Setup sync isn't turned on yet.",
+    ),
+    (
+        code(ErrorFamily::State, 161),
+        "Setup sync runs on your own computer.",
+    ),
+    (code(Res, 160), "There is no saved setup to restore."),
+    (code(Env, 160), "This computer has no keychain service."),
+    (
+        code(Env, 161),
+        "The app could not use this computer's keychain.",
+    ),
+    (code(Env, 162), "The keychain request was cancelled."),
+    (code(Conflict, 160), "This short name is already used here."),
     // <mrl:errors P17> rows for P17 go right below this line.
     (
         code(ErrorFamily::State, 170),
