@@ -549,7 +549,27 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
     (code(Env, 162), "The keychain request was cancelled."),
     (code(Conflict, 160), "This short name is already used here."),
     // <mrl:errors P17> rows for P17 go right below this line.
-
+    (
+        code(ErrorFamily::State, 170),
+        "This job can't take that step right now.",
+    ),
+    (
+        code(Conflict, 170),
+        "The job changed while the app was updating it.",
+    ),
+    (
+        code(Conflict, 171),
+        "An experiment with this name already exists in this project.",
+    ),
+    (code(Idem, 170), "Submitting a run needs a request key."),
+    (
+        code(Auth, 170),
+        "The `mrl` command has no access token yet.",
+    ),
+    (
+        code(Env, 170),
+        "The `mrl` command could not reach the server.",
+    ),
     // <mrl:errors P18> rows for P18 go right below this line.
 
     // <mrl:errors P19> rows for P19 go right below this line.

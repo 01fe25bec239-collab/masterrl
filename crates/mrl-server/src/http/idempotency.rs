@@ -23,6 +23,10 @@ pub const REPLAYED: HeaderName = HeaderName::from_static("idempotent-replayed");
 const MAX_STORED_BODY: usize = 8 * 1024 * 1024;
 const KEPT_HEADERS: [HeaderName; 3] = [header::CONTENT_TYPE, header::LOCATION, header::ETAG];
 
+/// Paths whose handlers check and replay their own durable submission records.
+#[derive(Clone)]
+pub(super) struct HandlerOwned(pub std::sync::Arc<std::collections::HashSet<&'static str>>);
+
 /// The middleware. Runs after authentication (keys are scoped per principal).
 pub async fn middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
     if req.method() != Method::POST {
@@ -41,6 +45,18 @@ pub async fn middleware(State(state): State<AppState>, req: Request, next: Next)
             .into_response()
         }
     };
+    if let (Some(owned), Some(path)) = (
+        req.extensions().get::<HandlerOwned>(),
+        req.extensions().get::<axum::extract::MatchedPath>(),
+    ) {
+        let path = path.as_str();
+        if owned
+            .0
+            .contains(path.strip_prefix(super::API_PREFIX).unwrap_or(path))
+        {
+            return next.run(req).await;
+        }
+    }
     let scope = match req.extensions().get::<RequestContext>() {
         Some(ctx) => ctx.principal.id.clone(),
         None => return ApiError::new(ErrorCode::Unauthenticated, "Sign in first.").into_response(),

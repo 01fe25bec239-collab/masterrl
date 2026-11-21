@@ -7,7 +7,7 @@ use crate::pg::TestDb;
 use crate::seams::InMemorySecretStore;
 use crate::server::TestResponse;
 use axum::http::Method;
-use mrl_domain::ids::{OrgId, ProjectId, UserId, WorkspaceId};
+use mrl_domain::ids::{DatasetVersionId, ModelVersionId, OrgId, ProjectId, UserId, WorkspaceId};
 use mrl_domain::rbac::{allowed, Action, Role};
 use mrl_server::config::Mode;
 use mrl_server::modules::auth::supabase::{JwtVerifier, Supabase};
@@ -497,6 +497,66 @@ async fn every_route_answers_by_role_in_team_mode() {
             w = ws.as_uuid()
         ))
         .await;
+    // Runs and jobs (P17): one project, and one run (with its job and default experiment)
+    // made by another person, so every role below acts on someone else's work.
+    let prj = ProjectId::new();
+    core.db
+        .seed(&format!(
+            "INSERT INTO projects (id, org_id, workspace_id, slug, name)
+             VALUES ('{p}', '{o}', '{w}', 'rbac', 'RBAC');",
+            p = prj.as_uuid(),
+            o = org.as_uuid(),
+            w = ws.as_uuid()
+        ))
+        .await;
+    let submission = json!({
+        "name": "rbac",
+        "algorithm_id": "sft",
+        "base_model_version_id": ModelVersionId::new().to_string(),
+        "dataset_version_ids": [DatasetVersionId::new().to_string()],
+        "config": {"epochs": 1},
+    });
+    let seeder = MockUser::new("seed@example.com", "Seed");
+    let seed_jwt = sb.access_token(&seeder, 600);
+    let me = core
+        .call(
+            Method::GET,
+            "/api/v1/auth/me",
+            &Auth::Bearer(seed_jwt.clone()),
+            None,
+        )
+        .await;
+    assert_eq!(me.status, 200, "{}", me.text());
+    let seed_user: uuid::Uuid =
+        sqlx::query_scalar("SELECT id FROM users WHERE supabase_user_id = $1")
+            .bind(seeder.id)
+            .fetch_one(core.db.pool())
+            .await
+            .unwrap();
+    let mut tx = core.db.db().begin().await.unwrap();
+    tenancy::bind_role(
+        &mut tx,
+        org,
+        UserId::from_uuid(seed_user),
+        Role::Owner,
+        Scope::Org,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let seeded = core
+        .call_with(
+            Method::POST,
+            &format!("/api/v1/projects/{prj}/runs"),
+            &Auth::Bearer(seed_jwt),
+            Some(submission.clone()),
+            &[("idempotency-key", "rbac-seed")],
+        )
+        .await;
+    assert_eq!(seeded.status, 201, "{}", seeded.text());
+    let seeded = seeded.json();
+    let field = |k: &str| seeded[k].as_str().unwrap().to_owned();
+    let (run, job, exp) = (field("id"), field("job_id"), field("experiment_id"));
     let mut routes: Vec<(Method, String, Action, Option<Value>)> = base
         .iter()
         .map(|(m, p, a, b)| (m.clone(), (*p).to_owned(), *a, b.clone()))
@@ -540,7 +600,67 @@ async fn every_route_answers_by_role_in_team_mode() {
             Some(json!({"slug": "taken", "name": "Taken"})),
         ),
     ]);
+    // Runs and jobs (P17). Cancels and priority changes on another person's work need
+    // runs.cancel_any; the job list is filtered by project so it authorizes (unfiltered,
+    // it only hides rows).
+    let get = |p: String| (Method::GET, p, Action::RunsRead, None);
+    routes.extend([
+        get(format!("/api/v1/projects/{prj}/experiments")),
+        (
+            Method::POST,
+            format!("/api/v1/projects/{prj}/experiments"),
+            Action::RunsSubmit,
+            Some(json!({"name": "rbac-experiment"})),
+        ),
+        get(format!("/api/v1/experiments/{exp}")),
+        (
+            Method::PATCH,
+            format!("/api/v1/experiments/{exp}"),
+            Action::RunsSubmit,
+            Some(json!({"description": "checked by every role"})),
+        ),
+        get(format!("/api/v1/projects/{prj}/runs")),
+        (
+            Method::POST,
+            format!("/api/v1/projects/{prj}/runs"),
+            Action::RunsSubmit,
+            Some(submission),
+        ),
+        get(format!("/api/v1/runs/{run}")),
+        get(format!("/api/v1/runs/{run}/config")),
+        get(format!("/api/v1/runs/{run}/attempts")),
+        get(format!("/api/v1/runs/{run}/timeline")),
+        (
+            Method::POST,
+            format!("/api/v1/runs/{run}:cancel"),
+            Action::RunsCancelAny,
+            None,
+        ),
+        get(format!("/api/v1/jobs?project={prj}")),
+        get(format!("/api/v1/jobs/{job}")),
+        (
+            Method::PATCH,
+            format!("/api/v1/jobs/{job}"),
+            Action::RunsCancelAny,
+            Some(json!({"priority": 1})),
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/jobs/{job}:cancel"),
+            Action::RunsCancelAny,
+            None,
+        ),
+    ]);
+    // A run submission needs an Idempotency-Key (keys are per person).
+    let key_for = |method: &Method, path: &str| -> &'static [(&'static str, &'static str)] {
+        if *method == Method::POST && path.ends_with("/runs") {
+            &[("idempotency-key", "rbac")]
+        } else {
+            &[]
+        }
+    };
     let matches = |pattern: &str, path: &str| {
+        let path = path.split('?').next().unwrap_or(path);
         let (a, b): (Vec<&str>, Vec<&str>) =
             (pattern.split('/').collect(), path.split('/').collect());
         a.len() == b.len() && a.iter().zip(&b).all(|(x, y)| x.starts_with('{') || x == y)
@@ -562,7 +682,8 @@ async fn every_route_answers_by_role_in_team_mode() {
         }
     }
     // What an allowed call answers. Sync is personal, so a team core refuses it (409
-    // MRL-STATE-161); taken slugs are 409; the token id below does not exist (404).
+    // MRL-STATE-161); taken slugs and experiment names are 409; the token id below does not
+    // exist (404).
     let expected = |method: &Method, path: &str| -> &'static [u16] {
         match (method.as_str(), path) {
             (_, p) if p.starts_with("/api/v1/sync/") => &[409],
@@ -571,6 +692,12 @@ async fn every_route_answers_by_role_in_team_mode() {
             ("DELETE", p) if p.starts_with("/api/v1/auth/tokens/") => &[404],
             ("POST", p) if p.ends_with("/workspaces") => &[409],
             ("POST", p) if p.ends_with("/projects") => &[201, 409],
+            ("POST", p) if p.ends_with("/experiments") => &[201, 409],
+            ("PATCH", p) if p.contains("/experiments/") => &[200],
+            ("POST", p) if p.ends_with("/runs") => &[201],
+            // The run is REJECTED (no engine yet), so its job can't change any more.
+            ("POST", p) if p.ends_with(":cancel") => &[409],
+            ("PATCH", p) if p.contains("/jobs/") => &[409],
             ("GET", _) => &[200],
             _ => &[],
         }
@@ -604,12 +731,14 @@ async fn every_route_answers_by_role_in_team_mode() {
             if *method == Method::POST && path == "/api/v1/auth/logout" {
                 continue; // checked last: it would end nothing here, but keep the table honest
             }
+            let key = key_for(method, path);
             let r = core
-                .call(
+                .call_with(
                     method.clone(),
                     path,
                     &Auth::Bearer(jwt.clone()),
                     body.clone(),
+                    key,
                 )
                 .await;
             let refused = r.status == 403 && r.json()["code"] == "MRL-PERM-001";
@@ -672,11 +801,12 @@ async fn every_route_answers_by_role_in_team_mode() {
             continue;
         }
         let r = core
-            .call(
+            .call_with(
                 method.clone(),
                 path,
                 &Auth::Bearer(narrow.clone()),
                 body.clone(),
+                key_for(method, path),
             )
             .await;
         if path.starts_with("/api/v1/sync/") {

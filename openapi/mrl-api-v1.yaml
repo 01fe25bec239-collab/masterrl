@@ -211,6 +211,190 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /api/v1/experiments/{exp}:
+    get:
+      tags:
+      - runs
+      summary: '`GET /experiments/{exp}`'
+      operationId: get_experiment
+      parameters:
+      - name: exp
+        in: path
+        description: Experiment id, `exp_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The experiment; `ETag` is its version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Experiment'
+        '404':
+          description: No such experiment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    patch:
+      tags:
+      - runs
+      summary: '`PATCH /experiments/{exp}`. `If-Match` is optional.'
+      operationId: update_experiment
+      parameters:
+      - name: exp
+        in: path
+        description: Experiment id, `exp_…`.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExperimentPatch'
+        required: true
+      responses:
+        '200':
+          description: The changed experiment.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Experiment'
+        '412':
+          description: '`If-Match` is stale.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/jobs:
+    get:
+      tags:
+      - jobs
+      summary: '`GET /jobs`'
+      operationId: list_jobs
+      parameters:
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      - name: state
+        in: query
+        description: Only jobs in this state, like `QUEUED`.
+        required: false
+        schema:
+          type: string
+      - name: kind
+        in: query
+        description: Only jobs of this kind, like `TRAIN`.
+        required: false
+        schema:
+          type: string
+      - name: project
+        in: query
+        description: Only jobs in this project (`prj_…`).
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: A page of jobs, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_Job'
+  /api/v1/jobs/{job}:
+    get:
+      tags:
+      - jobs
+      summary: '`GET /jobs/{job}`'
+      operationId: get_job
+      parameters:
+      - name: job
+        in: path
+        description: Job id, `job_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The job; `ETag` is its version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '404':
+          description: No such job.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    patch:
+      tags:
+      - jobs
+      summary: '`PATCH /jobs/{job}`: change priority (maintainers). `If-Match` is optional.'
+      operationId: update_job
+      parameters:
+      - name: job
+        in: path
+        description: Job id, `job_…`.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/JobPatch'
+        required: true
+      responses:
+        '200':
+          description: The changed job.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '412':
+          description: '`If-Match` is stale.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/jobs/{job}:cancel:
+    post:
+      tags:
+      - jobs
+      summary: '`POST /jobs/{job}:cancel` (axum sees `/jobs/{job}` with the action in the segment).'
+      operationId: cancel_job
+      parameters:
+      - name: job
+        in: path
+        description: Job id, `job_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The job, now CANCELLING or CANCELLED.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Job'
+        '409':
+          description: The job already finished.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/orgs:
     get:
       tags:
@@ -331,6 +515,295 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
         '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/projects/{prj}/experiments:
+    get:
+      tags:
+      - runs
+      summary: '`GET /projects/{prj}/experiments`'
+      operationId: list_experiments
+      parameters:
+      - name: prj
+        in: path
+        description: Project id, `prj_…`.
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: A page of experiments, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_Experiment'
+    post:
+      tags:
+      - runs
+      summary: '`POST /projects/{prj}/experiments`'
+      operationId: create_experiment
+      parameters:
+      - name: prj
+        in: path
+        description: Project id, `prj_…`.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NewExperiment'
+        required: true
+      responses:
+        '201':
+          description: Created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Experiment'
+        '409':
+          description: The name is taken.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/projects/{prj}/runs:
+    get:
+      tags:
+      - runs
+      summary: '`GET /projects/{prj}/runs`'
+      operationId: list_runs
+      parameters:
+      - name: prj
+        in: path
+        description: Project id, `prj_…`.
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      - name: experiment
+        in: query
+        description: Only runs in this experiment (`exp_…`).
+        required: false
+        schema:
+          type: string
+      - name: state
+        in: query
+        description: Only runs whose job is in this state, like `REJECTED`.
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: A page of runs, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_Run'
+    post:
+      tags:
+      - runs
+      summary: '`POST /projects/{prj}/runs`. Needs `Idempotency-Key`.'
+      description: |-
+        Creates the run, its config snapshot and its job, then validates: the answer is the
+        run in QUEUED, or in REJECTED with every problem and a hint in `state_reason`.
+      operationId: submit_run
+      parameters:
+      - name: prj
+        in: path
+        description: Project id, `prj_…`.
+        required: true
+        schema:
+          type: string
+      - name: Idempotency-Key
+        in: header
+        description: A new random value per run; a retry with the same key returns the same run.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RunSubmission'
+        required: true
+      responses:
+        '201':
+          description: The run, QUEUED or REJECTED.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+        '400':
+          description: No `Idempotency-Key` (MRL-IDEM-170) or an unreadable body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Fields need a change, or the key was used for another run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/runs/{run}:
+    get:
+      tags:
+      - runs
+      summary: '`GET /runs/{run}`'
+      operationId: get_run
+      parameters:
+      - name: run
+        in: path
+        description: Run id, `run_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+        '404':
+          description: No such run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/runs/{run}/attempts:
+    get:
+      tags:
+      - runs
+      summary: '`GET /runs/{run}/attempts`'
+      operationId: list_run_attempts
+      parameters:
+      - name: run
+        in: path
+        description: Run id, `run_…`.
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The run's attempts, oldest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_Attempt'
+  /api/v1/runs/{run}/config:
+    get:
+      tags:
+      - runs
+      summary: '`GET /runs/{run}/config`'
+      operationId: get_run_config
+      parameters:
+      - name: run
+        in: path
+        description: Run id, `run_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The immutable config snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunConfig'
+  /api/v1/runs/{run}/timeline:
+    get:
+      tags:
+      - runs
+      summary: '`GET /runs/{run}/timeline`: the outbox events of the run''s job and attempts, in order.'
+      operationId: get_run_timeline
+      parameters:
+      - name: run
+        in: path
+        description: Run id, `run_…`.
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: State changes, oldest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_TimelineEntry'
+  /api/v1/runs/{run}:cancel:
+    post:
+      tags:
+      - runs
+      summary: '`POST /runs/{run}:cancel` (axum sees `/runs/{run}` with the action in the segment).'
+      operationId: cancel_run
+      parameters:
+      - name: run
+        in: path
+        description: Run id, `run_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The run, now CANCELLING or CANCELLED.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Run'
+        '409':
+          description: The run already finished (MRL-STATE-170).
           content:
             application/json:
               schema:
@@ -563,6 +1036,61 @@ paths:
                 $ref: '#/components/schemas/Readiness'
 components:
   schemas:
+    Attempt:
+      type: object
+      description: One attempt at running a job.
+      required:
+      - id
+      - job_id
+      - attempt_no
+      - epoch
+      - state
+      - created_at
+      properties:
+        attempt_no:
+          type: integer
+          format: int32
+          description: 1, 2, 3, … per job.
+        created_at:
+          type: string
+          format: date-time
+          description: Created.
+        ended_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When it ended.
+        epoch:
+          type: integer
+          format: int64
+          description: The job's epoch when this attempt was created.
+        failure_class:
+          type:
+          - string
+          - 'null'
+          description: Failure class of an error exit.
+        id:
+          type: string
+          description: '`att_…`.'
+        job_id:
+          type: string
+          description: '`job_…`.'
+        last_step:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Last training step reported.
+        started_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When it started running.
+        state:
+          type: string
+          description: '`PENDING`, `LAUNCHING`, `RUNNING`, `EXITED_OK`, `EXITED_ERROR`, `LOST`, `KILLED`.'
     AuditRecord:
       type: object
       description: One audit record.
@@ -693,6 +1221,75 @@ components:
             type: string
           description: '`["*"]`, or areas like `["runs:write", "datasets:read"]`.'
       additionalProperties: false
+    Experiment:
+      type: object
+      description: An experiment, as the API shows it.
+      required:
+      - id
+      - project_id
+      - name
+      - tags
+      - version
+      - created_by
+      - created_at
+      - updated_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+          description: Created.
+        created_by:
+          type: string
+          description: Creator's principal id.
+        description:
+          type:
+          - string
+          - 'null'
+          description: Free text.
+        id:
+          type: string
+          description: '`exp_…`.'
+        name:
+          type: string
+          description: Unique in the project.
+        project_id:
+          type: string
+          description: '`prj_…`.'
+        tags:
+          type: array
+          items:
+            type: string
+          description: Labels.
+        updated_at:
+          type: string
+          format: date-time
+          description: Last changed.
+        version:
+          type: integer
+          format: int64
+          description: Bumped by every change; also the `ETag`.
+    ExperimentPatch:
+      type: object
+      description: '`PATCH /experiments/{exp}` body; absent fields stay as they are.'
+      properties:
+        description:
+          type:
+          - string
+          - 'null'
+          description: New description.
+        name:
+          type:
+          - string
+          - 'null'
+          description: New name.
+        tags:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+          description: New labels (replace the old ones).
+      additionalProperties: false
     FieldError:
       type: object
       description: One field problem inside a 422 response.
@@ -723,6 +1320,139 @@ components:
         status:
           type: string
           description: '`ok`.'
+    Job:
+      type: object
+      description: A job, as the API shows it.
+      required:
+      - id
+      - project_id
+      - kind
+      - state
+      - state_version
+      - epoch
+      - priority
+      - resource_request
+      - retry_policy
+      - retries_used
+      - created_by
+      - created_at
+      - updated_at
+      - version
+      properties:
+        created_at:
+          type: string
+          format: date-time
+          description: Created.
+        created_by:
+          type: string
+          description: Principal id of the submitter.
+        current_attempt_id:
+          type:
+          - string
+          - 'null'
+          description: '`att_…`, the latest attempt.'
+        epoch:
+          type: integer
+          format: int64
+          description: Fencing epoch.
+        failure_class:
+          type:
+          - string
+          - 'null'
+          description: Failure class of the last failure, like `OOM/OOM_GPU`.
+        finished_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When it reached a final state.
+        id:
+          type: string
+          description: '`job_…`.'
+        kind:
+          type: string
+          description: '`TRAIN`, `EVAL`, `DATA_PREP`, ….'
+        max_runtime_seconds:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Longest allowed run time.
+        next_eligible_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Earliest retry time while in RETRY_WAIT.
+        pool_id:
+          type:
+          - string
+          - 'null'
+          description: '`pool_…`, once placed.'
+        priority:
+          type: integer
+          format: int32
+          description: Higher runs first.
+        project_id:
+          type: string
+          description: '`prj_…`.'
+        queued_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Last time it entered QUEUED.
+        resource_request:
+          type: object
+          description: What the job asks the scheduler for.
+        retries_used:
+          type: object
+          description: Retries used per failure class.
+        retry_policy:
+          type: object
+          description: 'Retry rules: `{auto_tune, budgets}`.'
+        run_id:
+          type:
+          - string
+          - 'null'
+          description: '`run_…`, for TRAIN and EVAL jobs.'
+        started_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: First time it entered RUNNING.
+        state:
+          type: string
+          description: '`CREATED`, `QUEUED`, `RUNNING`, `REJECTED`, ….'
+        state_reason:
+          type:
+          - object
+          - 'null'
+          description: 'Why the job is in this state: `{code, message, problems?}`.'
+        state_version:
+          type: integer
+          format: int64
+          description: Bumped by every state change.
+        updated_at:
+          type: string
+          format: date-time
+          description: Last changed.
+        version:
+          type: integer
+          format: int64
+          description: Bumped by every change; also the `ETag`.
+    JobPatch:
+      type: object
+      description: '`PATCH /jobs/{job}` body.'
+      required:
+      - priority
+      properties:
+        priority:
+          type: integer
+          format: int32
+          description: New priority, −1000 to 1000. Higher runs first.
+      additionalProperties: false
     LoginRequest:
       type: object
       description: Start a sign-in.
@@ -797,6 +1527,26 @@ components:
           - $ref: '#/components/schemas/UserInfo'
             description: The person (absent for an unknown principal).
           - type: 'null'
+    NewExperiment:
+      type: object
+      description: '`POST /projects/{prj}/experiments` body.'
+      required:
+      - name
+      properties:
+        description:
+          type:
+          - string
+          - 'null'
+          description: Free text.
+        name:
+          type: string
+          description: 1–200 characters, unique in the project.
+        tags:
+          type: array
+          items:
+            type: string
+          description: Up to 50 labels.
+      additionalProperties: false
     NewItem:
       type: object
       description: A new org, workspace or project.
@@ -861,6 +1611,75 @@ components:
         slug:
           type: string
           description: Slug, unique on this core.
+    Page_Attempt:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: One attempt at running a job.
+            required:
+            - id
+            - job_id
+            - attempt_no
+            - epoch
+            - state
+            - created_at
+            properties:
+              attempt_no:
+                type: integer
+                format: int32
+                description: 1, 2, 3, … per job.
+              created_at:
+                type: string
+                format: date-time
+                description: Created.
+              ended_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+                description: When it ended.
+              epoch:
+                type: integer
+                format: int64
+                description: The job's epoch when this attempt was created.
+              failure_class:
+                type:
+                - string
+                - 'null'
+                description: Failure class of an error exit.
+              id:
+                type: string
+                description: '`att_…`.'
+              job_id:
+                type: string
+                description: '`job_…`.'
+              last_step:
+                type:
+                - integer
+                - 'null'
+                format: int64
+                description: Last training step reported.
+              started_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+                description: When it started running.
+              state:
+                type: string
+                description: '`PENDING`, `LAUNCHING`, `RUNNING`, `EXITED_OK`, `EXITED_ERROR`, `LOST`, `KILLED`.'
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
     Page_AuditRecord:
       type: object
       description: One page of results.
@@ -917,6 +1736,203 @@ components:
               trace_id:
                 type: string
                 description: Trace id.
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_Experiment:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: An experiment, as the API shows it.
+            required:
+            - id
+            - project_id
+            - name
+            - tags
+            - version
+            - created_by
+            - created_at
+            - updated_at
+            properties:
+              created_at:
+                type: string
+                format: date-time
+                description: Created.
+              created_by:
+                type: string
+                description: Creator's principal id.
+              description:
+                type:
+                - string
+                - 'null'
+                description: Free text.
+              id:
+                type: string
+                description: '`exp_…`.'
+              name:
+                type: string
+                description: Unique in the project.
+              project_id:
+                type: string
+                description: '`prj_…`.'
+              tags:
+                type: array
+                items:
+                  type: string
+                description: Labels.
+              updated_at:
+                type: string
+                format: date-time
+                description: Last changed.
+              version:
+                type: integer
+                format: int64
+                description: Bumped by every change; also the `ETag`.
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_Job:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: A job, as the API shows it.
+            required:
+            - id
+            - project_id
+            - kind
+            - state
+            - state_version
+            - epoch
+            - priority
+            - resource_request
+            - retry_policy
+            - retries_used
+            - created_by
+            - created_at
+            - updated_at
+            - version
+            properties:
+              created_at:
+                type: string
+                format: date-time
+                description: Created.
+              created_by:
+                type: string
+                description: Principal id of the submitter.
+              current_attempt_id:
+                type:
+                - string
+                - 'null'
+                description: '`att_…`, the latest attempt.'
+              epoch:
+                type: integer
+                format: int64
+                description: Fencing epoch.
+              failure_class:
+                type:
+                - string
+                - 'null'
+                description: Failure class of the last failure, like `OOM/OOM_GPU`.
+              finished_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+                description: When it reached a final state.
+              id:
+                type: string
+                description: '`job_…`.'
+              kind:
+                type: string
+                description: '`TRAIN`, `EVAL`, `DATA_PREP`, ….'
+              max_runtime_seconds:
+                type:
+                - integer
+                - 'null'
+                format: int64
+                description: Longest allowed run time.
+              next_eligible_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+                description: Earliest retry time while in RETRY_WAIT.
+              pool_id:
+                type:
+                - string
+                - 'null'
+                description: '`pool_…`, once placed.'
+              priority:
+                type: integer
+                format: int32
+                description: Higher runs first.
+              project_id:
+                type: string
+                description: '`prj_…`.'
+              queued_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+                description: Last time it entered QUEUED.
+              resource_request:
+                type: object
+                description: What the job asks the scheduler for.
+              retries_used:
+                type: object
+                description: Retries used per failure class.
+              retry_policy:
+                type: object
+                description: 'Retry rules: `{auto_tune, budgets}`.'
+              run_id:
+                type:
+                - string
+                - 'null'
+                description: '`run_…`, for TRAIN and EVAL jobs.'
+              started_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+                description: First time it entered RUNNING.
+              state:
+                type: string
+                description: '`CREATED`, `QUEUED`, `RUNNING`, `REJECTED`, ….'
+              state_reason:
+                type:
+                - object
+                - 'null'
+                description: 'Why the job is in this state: `{code, message, problems?}`.'
+              state_version:
+                type: integer
+                format: int64
+                description: Bumped by every state change.
+              updated_at:
+                type: string
+                format: date-time
+                description: Last changed.
+              version:
+                type: integer
+                format: int64
+                description: Bumped by every change; also the `ETag`.
           description: The items on this page.
         next_cursor:
           type:
@@ -1001,6 +2017,155 @@ components:
               workspace_id:
                 type: string
                 description: '`ws_…`.'
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_Run:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: A run, as the API shows it. `state` mirrors its job.
+            required:
+            - id
+            - project_id
+            - experiment_id
+            - job_id
+            - name
+            - kind
+            - algorithm_id
+            - base_model_version_id
+            - state
+            - created_by
+            - created_at
+            properties:
+              algorithm_id:
+                type: string
+                description: The method, like `sft`.
+              base_model_version_id:
+                type: string
+                description: '`mv_…`.'
+              created_at:
+                type: string
+                format: date-time
+                description: Created.
+              created_by:
+                type: string
+                description: Submitter's principal id.
+              engine_version_id:
+                type:
+                - string
+                - 'null'
+                description: The engine version picked by validation, once engines are registered.
+              experiment_id:
+                type: string
+                description: '`exp_…`.'
+              failure_class:
+                type:
+                - string
+                - 'null'
+                description: Failure class of the last failure.
+              final_checkpoint_id:
+                type:
+                - string
+                - 'null'
+                description: Final checkpoint, `ckpt_…`.
+              id:
+                type: string
+                description: '`run_…`.'
+              job_id:
+                type: string
+                description: The run's job, `job_…`.
+              kind:
+                type: string
+                description: '`TRAIN` or `EVAL`.'
+              latest_committed_checkpoint_id:
+                type:
+                - string
+                - 'null'
+                description: Latest committed checkpoint, `ckpt_…`.
+              name:
+                type: string
+                description: Name.
+              parent_checkpoint_id:
+                type:
+                - string
+                - 'null'
+                description: '`ckpt_…` this run starts from.'
+              parent_run_id:
+                type:
+                - string
+                - 'null'
+                description: '`run_…` this run branches from.'
+              project_id:
+                type: string
+                description: '`prj_…`.'
+              reward_version_id:
+                type:
+                - string
+                - 'null'
+                description: '`rwdv_…`.'
+              state:
+                type: string
+                description: 'The job''s state: `QUEUED`, `RUNNING`, `REJECTED`, ….'
+              state_reason:
+                type:
+                - object
+                - 'null'
+                description: 'Why: `{code, message, problems?}`; for REJECTED, every problem with a hint.'
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_TimelineEntry:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: 'One timeline entry: an outbox event of the run''s job or one of its attempts.'
+            required:
+            - type
+            - aggregate_kind
+            - aggregate_id
+            - aggregate_seq
+            - payload
+            - at
+            properties:
+              aggregate_id:
+                type: string
+                description: '`job_…` or `att_…`.'
+              aggregate_kind:
+                type: string
+                description: '`job` or `attempt`.'
+              aggregate_seq:
+                type: integer
+                format: int64
+                description: The aggregate's version after the change.
+              at:
+                type: string
+                format: date-time
+                description: When it happened.
+              payload:
+                type: object
+                description: The event body (`from`, `to`, `reason`, …).
+              type:
+                type: string
+                description: Event type, like `job.queued`.
           description: The items on this page.
         next_cursor:
           type:
@@ -1211,6 +2376,28 @@ components:
         status:
           type: string
           description: '`ready`, `not_ready` or `draining`.'
+    Rejection:
+      type: object
+      description: 'Why a job could not be queued, or a step failed: one problem.'
+      required:
+      - code
+      - message
+      - hint
+      properties:
+        code:
+          type: string
+          description: Error code, like `MRL-CAP-001`.
+        hint:
+          type: string
+          description: What to do, from the guidance catalog.
+        message:
+          type: string
+          description: What is wrong, in plain words.
+        path:
+          type:
+          - string
+          - 'null'
+          description: JSON Pointer into the submission, like `/algorithm_id`.
     RestoreRequest:
       type: object
       description: Restore a saved setup. Give the passphrase or the recovery key.
@@ -1271,6 +2458,217 @@ components:
         scope_kind:
           type: string
           description: '`org`, `workspace` or `project`.'
+    Run:
+      type: object
+      description: A run, as the API shows it. `state` mirrors its job.
+      required:
+      - id
+      - project_id
+      - experiment_id
+      - job_id
+      - name
+      - kind
+      - algorithm_id
+      - base_model_version_id
+      - state
+      - created_by
+      - created_at
+      properties:
+        algorithm_id:
+          type: string
+          description: The method, like `sft`.
+        base_model_version_id:
+          type: string
+          description: '`mv_…`.'
+        created_at:
+          type: string
+          format: date-time
+          description: Created.
+        created_by:
+          type: string
+          description: Submitter's principal id.
+        engine_version_id:
+          type:
+          - string
+          - 'null'
+          description: The engine version picked by validation, once engines are registered.
+        experiment_id:
+          type: string
+          description: '`exp_…`.'
+        failure_class:
+          type:
+          - string
+          - 'null'
+          description: Failure class of the last failure.
+        final_checkpoint_id:
+          type:
+          - string
+          - 'null'
+          description: Final checkpoint, `ckpt_…`.
+        id:
+          type: string
+          description: '`run_…`.'
+        job_id:
+          type: string
+          description: The run's job, `job_…`.
+        kind:
+          type: string
+          description: '`TRAIN` or `EVAL`.'
+        latest_committed_checkpoint_id:
+          type:
+          - string
+          - 'null'
+          description: Latest committed checkpoint, `ckpt_…`.
+        name:
+          type: string
+          description: Name.
+        parent_checkpoint_id:
+          type:
+          - string
+          - 'null'
+          description: '`ckpt_…` this run starts from.'
+        parent_run_id:
+          type:
+          - string
+          - 'null'
+          description: '`run_…` this run branches from.'
+        project_id:
+          type: string
+          description: '`prj_…`.'
+        reward_version_id:
+          type:
+          - string
+          - 'null'
+          description: '`rwdv_…`.'
+        state:
+          type: string
+          description: 'The job''s state: `QUEUED`, `RUNNING`, `REJECTED`, ….'
+        state_reason:
+          type:
+          - object
+          - 'null'
+          description: 'Why: `{code, message, problems?}`; for REJECTED, every problem with a hint.'
+    RunConfig:
+      type: object
+      description: The immutable config snapshot of a run.
+      required:
+      - run_id
+      - submitted
+      - resolved
+      - resolved_sha256
+      - dataset_version_ids
+      - seeds
+      - created_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+          description: Created.
+        dataset_version_ids:
+          type: array
+          items:
+            type: string
+          description: Dataset versions, `dsv_…`.
+        resolved:
+          type: object
+          description: 'The config after every resolver: what the engine receives.'
+        resolved_sha256:
+          type: string
+          description: Hex SHA-256 of `resolved` (compact JSON, sorted keys).
+        run_id:
+          type: string
+          description: '`run_…`.'
+        runtime_ref:
+          type:
+          - string
+          - 'null'
+          description: Image digest or lock hash, once pinned.
+        seeds:
+          type: object
+          description: Random seeds.
+        submitted:
+          type: object
+          description: What was submitted (the whole request body).
+    RunKind:
+      type: string
+      description: Run kinds (other job kinds have no run).
+      enum:
+      - TRAIN
+      - EVAL
+    RunSubmission:
+      type: object
+      description: '`POST /projects/{prj}/runs` body.'
+      required:
+      - name
+      - algorithm_id
+      - base_model_version_id
+      properties:
+        algorithm_id:
+          type: string
+          description: The method, like `sft`, `dpo` or `grpo`.
+        base_model_version_id:
+          type: string
+          description: The model version to start from, `mv_…`.
+        config:
+          type: object
+          description: The method's settings (a JSON object).
+        dataset_version_ids:
+          type: array
+          items:
+            type: string
+          description: Dataset versions, `dsv_…`.
+        experiment_id:
+          type:
+          - string
+          - 'null'
+          description: '`exp_…`; without it the run joins the project''s `default` experiment.'
+        kind:
+          $ref: '#/components/schemas/RunKind'
+          description: '`TRAIN` (default) or `EVAL`.'
+        max_runtime_seconds:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Longest allowed run time in seconds.
+        name:
+          type: string
+          description: 1–200 characters.
+        parent_checkpoint_id:
+          type:
+          - string
+          - 'null'
+          description: The checkpoint this one starts from, `ckpt_…`.
+        parent_run_id:
+          type:
+          - string
+          - 'null'
+          description: The run this one branches from, `run_…`.
+        priority:
+          type: integer
+          format: int32
+          description: Higher runs first, −1000 to 1000 (default 0).
+        resources:
+          type:
+          - object
+          - 'null'
+          description: What the job asks the scheduler for; default one trainer with one GPU.
+        retry:
+          type:
+          - object
+          - 'null'
+          description: 'Retry rules: `{auto_tune, budgets: {CLASS: n}}`.'
+        reward_version_id:
+          type:
+          - string
+          - 'null'
+          description: The reward version, `rwdv_…`.
+        seeds:
+          type:
+          - object
+          - 'null'
+          description: 'Random seeds; the server picks `{"global": n}` when absent.'
+      additionalProperties: false
     SessionStarted:
       type: object
       description: A renderer session started; the cookie is in `Set-Cookie`.
@@ -1414,6 +2812,37 @@ components:
           - 'null'
           description: The person's role there.
       additionalProperties: false
+    TimelineEntry:
+      type: object
+      description: 'One timeline entry: an outbox event of the run''s job or one of its attempts.'
+      required:
+      - type
+      - aggregate_kind
+      - aggregate_id
+      - aggregate_seq
+      - payload
+      - at
+      properties:
+        aggregate_id:
+          type: string
+          description: '`job_…` or `att_…`.'
+        aggregate_kind:
+          type: string
+          description: '`job` or `attempt`.'
+        aggregate_seq:
+          type: integer
+          format: int64
+          description: The aggregate's version after the change.
+        at:
+          type: string
+          format: date-time
+          description: When it happened.
+        payload:
+          type: object
+          description: The event body (`from`, `to`, `reason`, …).
+        type:
+          type: string
+          description: Event type, like `job.queued`.
     TokenInfo:
       type: object
       description: A token as listed (never the token itself).
@@ -1537,3 +2966,7 @@ tags:
   description: Sign-in, access tokens and sessions.
 - name: sync
   description: Encrypted setup sync.
+- name: runs
+  description: Experiments, runs, config snapshots and timelines.
+- name: jobs
+  description: 'Jobs: state, cancel and priority.'

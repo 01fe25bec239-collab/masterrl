@@ -20,6 +20,10 @@ mod auth;
 mod sync;
 
 // <mrl:cli-mods P17> P17 `mod` lines go right below this line.
+mod api;
+mod commands;
+mod config_file;
+mod seed;
 
 /// The MasterRL command-line client.
 #[derive(Debug, Parser)]
@@ -44,6 +48,24 @@ enum Command {
     /// Sync your setup through your account, end-to-end encrypted.
     Sync(crate::sync::SyncArgs),
     // <mrl:cli-commands P17> P17 subcommands go right below this line.
+    /// Settings: server address, access token, default project.
+    #[command(subcommand)]
+    Config(commands::ConfigCommand),
+    /// Projects.
+    #[command(subcommand)]
+    Projects(commands::ProjectsCommand),
+    /// Experiments (groups of runs).
+    #[command(subcommand)]
+    Experiments(commands::ExperimentsCommand),
+    /// Training and evaluation runs.
+    #[command(subcommand)]
+    Runs(commands::RunsCommand),
+    /// Jobs (the scheduled work behind runs).
+    #[command(subcommand)]
+    Jobs(commands::JobsCommand),
+    /// Developer tools.
+    #[command(subcommand)]
+    Dev(commands::DevCommand),
 }
 
 fn version_line() -> String {
@@ -80,6 +102,12 @@ fn run(command: Command) -> Result<(), String> {
         Command::Sync(a) => crate::sync::run(&a, &crate::auth::Keyring),
 
         // <mrl:cli-dispatch P17> P17 match arms go right below this line.
+        Command::Config(c) => commands::config(c),
+        Command::Projects(c) => commands::projects(c),
+        Command::Experiments(c) => commands::experiments(c),
+        Command::Runs(c) => commands::runs(c),
+        Command::Jobs(c) => commands::jobs(c),
+        Command::Dev(c) => commands::dev(c),
         Command::Version => {
             println!("{}", version_line());
             Ok(())
