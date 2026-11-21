@@ -626,6 +626,34 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         "This server has no place to keep secret values.",
     ),
     // <mrl:errors P20> rows for P20 go right below this line.
+    (
+        code(Val, 200),
+        "The training attempt has settings the agent can't use.",
+    ),
+    (
+        code(Env, 201),
+        "The training environment's lock file doesn't match its fingerprint.",
+    ),
+    (
+        code(Env, 202),
+        "The training environment could not be installed.",
+    ),
+    (
+        code(ErrorFamily::Node, 203),
+        "The agent could not open the connection to the training worker.",
+    ),
+    (
+        code(ErrorFamily::State, 204),
+        "This training attempt can't do that right now.",
+    ),
+    (
+        code(Val, 205),
+        "A file path in the training attempt points outside its folder.",
+    ),
+    (
+        code(ErrorFamily::Node, 206),
+        "This machine is not taking new training runs right now.",
+    ),
 ];
 
 /// Every code with its title: the registry plus every capability rejection.

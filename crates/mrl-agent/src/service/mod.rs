@@ -192,8 +192,9 @@ pub fn systemd_unit(t: &Target) -> String {
          RestartSec=5\n\
          # Lets the agent create job cgroups under its own (cgroup v2).\n\
          Delegate=yes\n\
-         # Stop the agent first, then anything left in its cgroup.\n\
-         KillMode=mixed\n\
+         # Stop only the agent: running workers outlive a restart and the next agent\n\
+         # re-adopts them (`service uninstall` stops them itself).\n\
+         KillMode=process\n\
          TimeoutStopSec=30\n\
          \n\
          [Install]\n\
@@ -329,6 +330,41 @@ pub fn install_plan(manager: Manager, t: &Target) -> Result<Plan> {
     Ok(Plan { manager, actions })
 }
 
+/// Once the service has stopped: ends the attempts still running (the service manager leaves
+/// workers alone so a restart can re-adopt them).
+fn stop_attempts(t: &Target, required: bool) -> Action {
+    run(
+        &[
+            &t.exe.display().to_string(),
+            "--config",
+            &t.config.display().to_string(),
+            "attempt",
+            "stop-all",
+        ],
+        required,
+    )
+}
+
+/// Stops the installed service and terminates the attempts it left running.
+pub fn stop_plan(manager: Manager, t: &Target) -> Plan {
+    let stop = match manager {
+        Manager::SystemdUser => run(&["systemctl", "--user", "stop", SYSTEMD_UNIT], true),
+        Manager::Launchd => run(
+            &[
+                "launchctl",
+                "bootout",
+                &format!("gui/{}/{LAUNCHD_LABEL}", t.uid),
+            ],
+            true,
+        ),
+        Manager::WslTask => run(&["schtasks.exe", "/End", "/TN", TASK_NAME], true),
+    };
+    Plan {
+        manager,
+        actions: vec![stop, stop_attempts(t, true)],
+    }
+}
+
 /// What `uninstall` does with `manager`.
 pub fn uninstall_plan(manager: Manager, t: &Target) -> Plan {
     let actions = match manager {
@@ -337,6 +373,7 @@ pub fn uninstall_plan(manager: Manager, t: &Target) -> Plan {
                 &["systemctl", "--user", "disable", "--now", SYSTEMD_UNIT],
                 false,
             ),
+            stop_attempts(t, false),
             Action::Remove {
                 path: t.systemd_unit_path(),
             },
@@ -351,6 +388,7 @@ pub fn uninstall_plan(manager: Manager, t: &Target) -> Plan {
                 ],
                 false,
             ),
+            stop_attempts(t, false),
             Action::Remove {
                 path: t.plist_path(),
             },
@@ -497,6 +535,20 @@ mod tests {
     }
 
     #[test]
+    fn service_stop_ends_attempts_after_stopping_the_daemon() {
+        let t = target();
+        for manager in [Manager::SystemdUser, Manager::Launchd, Manager::WslTask] {
+            let plan = stop_plan(manager, &t);
+            assert_eq!(plan.actions.len(), 2);
+            assert!(matches!(
+                &plan.actions[0],
+                Action::Run { required: true, .. }
+            ));
+            assert_eq!(plan.actions[1], stop_attempts(&t, true));
+        }
+    }
+
+    #[test]
     fn systemd_plan_writes_a_delegating_unit() {
         let plan = install_plan(Manager::SystemdUser, &target()).unwrap();
         let Action::Write { path, content } = &plan.actions[0] else {
@@ -507,6 +559,8 @@ mod tests {
             "ExecStart=\"/home/me/bin/mrl-agent\" \"run\" \"--config\" \"/home/me/.config/masterrl/my agent.toml\""
         ));
         assert!(content.contains("Delegate=yes") && content.contains("WantedBy=default.target"));
+        // Only the agent is stopped: workers outlive a restart and get re-adopted.
+        assert!(content.contains("KillMode=process") && !content.contains("KillMode=mixed"));
         assert_eq!(
             plan.actions[2],
             run(
@@ -524,7 +578,21 @@ mod tests {
         assert_eq!(systemd_quote("50%\"x"), "\"50%%\\\"x\"");
 
         let un = uninstall_plan(Manager::SystemdUser, &target());
-        assert!(matches!(un.actions[1], Action::Remove { .. }));
+        // Stop the service, then end the attempts it left running, then remove it.
+        assert_eq!(
+            un.actions[1],
+            run(
+                &[
+                    "/home/me/bin/mrl-agent",
+                    "--config",
+                    "/home/me/.config/masterrl/my agent.toml",
+                    "attempt",
+                    "stop-all"
+                ],
+                false
+            )
+        );
+        assert!(matches!(un.actions[2], Action::Remove { .. }));
     }
 
     #[test]

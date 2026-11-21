@@ -49,6 +49,7 @@ mrl-storage = { path = "../mrl-storage" }
 object_store = { workspace = true, features = ["aws"] }
 
 # <mrl:deps P20> P20 dependencies go right below this line.
+tokio-stream = { version = "=0.1.19", features = ["net"] }
 
 [dev-dependencies]
 rcgen = { workspace = true }

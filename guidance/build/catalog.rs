@@ -2657,6 +2657,28 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-ENV-201")),
+            ("title", Value::Str("The training environment's lock file doesn't match its fingerprint.")),
+            ("why", Value::Str("The file that lists the exact package versions changed after the engine was installed. The agent won't install a changed list.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Install the engine again from the app, so its files match."),
+                    Value::Str("If you changed the lock file on purpose, register it as a new engine version."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-ENV-202")),
+            ("title", Value::Str("The training environment could not be installed.")),
+            ("why", Value::Str("Installing the engine's packages or pulling its container image failed. The network may be down, or the disk may be full.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check that this machine is online and has free disk space."),
+                    Value::Str("Read the last installer lines in Details, then start the run again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-IDEM-001")),
             ("title", Value::Str("This request is already running.")),
             ("why", Value::Str("A request with the same request key started earlier and has not finished.")),
@@ -3210,6 +3232,27 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-NODE-203")),
+            ("title", Value::Str("The agent could not open the connection to the training worker.")),
+            ("why", Value::Str("The agent talks to the training worker through a local socket file. It could not create that file.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Make sure your account can write to the agent's state folder."),
+                    Value::Str("Free up disk space, then start the run again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-NODE-206")),
+            ("title", Value::Str("This machine is not taking new training runs right now.")),
+            ("why", Value::Str("Someone asked the machine to finish its current work and take nothing new, for example before an update.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Wait until the machine is back in service, or pick another machine."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-PERM-001")),
             ("title", Value::Str("Your role doesn't allow this action.")),
             ("why", Value::Str("Each project role can do a set list of things. This action needs a different role.")),
@@ -3457,6 +3500,17 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Refresh to see the job's current state."),
                     Value::Str("A finished job never changes again. To try again, submit a new run."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STATE-204")),
+            ("title", Value::Str("This training attempt can't do that right now.")),
+            ("why", Value::Str("The attempt isn't running on this machine, already exists, or is in a step that doesn't allow the action. Details says which.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Wait for the attempt's current step to finish, then try again."),
+                    Value::Str("If the run moved to another machine, act on it there."),
                 ])),
             ])),
         ]),
@@ -3814,6 +3868,28 @@ pub static CATALOG: Value = Value::Map(&[
                     Value::Str("Check for typing mistakes and the right letter case."),
                     Value::Str("Use the recovery key you saved when you turned on sync."),
                     Value::Str("Without either one, nobody can open the saved setup. Set up this computer again by hand."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-200")),
+            ("title", Value::Str("The training attempt has settings the agent can't use.")),
+            ("why", Value::Str("A name, path or runtime in the attempt is missing or has the wrong form. Details names the setting.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Start the run again from the app, so it sends complete settings."),
+                    Value::Str("If you wrote the attempt file yourself, fix the setting named in Details."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-205")),
+            ("title", Value::Str("A file path in the training attempt points outside its folder.")),
+            ("why", Value::Str("Every input and output must stay inside the attempt's own folder. A path with `..` or a full path breaks that rule.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Use a path inside the attempt folder, like `data/train.jsonl`."),
+                    Value::Str("If the app sent the path, report it as a problem with the app."),
                 ])),
             ])),
         ]),

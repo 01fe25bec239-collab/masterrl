@@ -100,12 +100,21 @@ enum Command {
     /// Check, step by step, that this machine can reach the app.
     ConnectionTest,
     // <mrl:cli-commands P20> P20 subcommands go right below this line.
+    /// Check this machine: what it can train, and what to install to unlock more.
+    Doctor(mrl_agent::doctor::DoctorArgs),
+    /// Debug: run one training attempt here without a server.
+    Attempt {
+        #[command(subcommand)]
+        action: mrl_agent::attempts::local::AttemptCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum ServiceAction {
     /// Start the agent with the computer (user-level, no admin rights).
     Install,
+    /// Stop the agent and end active attempts.
+    Stop,
     /// Stop the agent and remove the service.
     Uninstall,
     /// Show whether the service is installed and running.
@@ -173,6 +182,9 @@ async fn dispatch(config: Option<PathBuf>, command: Command) -> Result<ExitCode,
         }
         Command::Run => {
             let (cfg, _) = AgentConfig::load(config.as_deref())?;
+            // One agent per state folder, claimed before the cache opens or the PID file is
+            // written, and held until the agent stops.
+            let _writer = mrl_agent::envs::lock_state(&cfg.state_dir)?;
             let ctx = Arc::new(AgentContext::from_config(cfg)?);
             let shutdown = CancellationToken::new();
             let stop = shutdown.clone();
@@ -290,6 +302,10 @@ async fn dispatch(config: Option<PathBuf>, command: Command) -> Result<ExitCode,
         }
 
         // <mrl:cli-dispatch P20> P20 match arms go right below this line.
+        Command::Doctor(args) => Ok(mrl_agent::doctor::cli(config.as_deref(), args).await),
+        Command::Attempt { action } => {
+            Ok(mrl_agent::attempts::local::cli(config.as_deref(), action).await)
+        }
         Command::Service { action } => {
             let (cfg, file) = AgentConfig::load(config.as_deref())?;
             let state = mrl_agent::state::StateDir::open(&cfg.state_dir)?;
@@ -303,6 +319,10 @@ async fn dispatch(config: Option<PathBuf>, command: Command) -> Result<ExitCode,
                         eprintln!("{NAME}: note: {w}");
                     }
                     println!("Installed the {manager:?} service; it starts with your computer.");
+                }
+                ServiceAction::Stop => {
+                    service::apply(&service::stop_plan(manager, &target))?;
+                    println!("Stopped the {manager:?} service and ended active attempts.");
                 }
                 ServiceAction::Uninstall => {
                     for w in service::apply(&service::uninstall_plan(manager, &target))? {
