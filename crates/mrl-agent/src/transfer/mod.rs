@@ -215,7 +215,7 @@ impl TransferClient {
         }
         let resp = match req.send().await {
             Ok(r) => r,
-            Err(e) => return Ok(Step::Retry(e.to_string())),
+            Err(e) => return Ok(Step::Retry(e.without_url().to_string())),
         };
         let status = resp.status().as_u16();
         match status {
@@ -276,7 +276,7 @@ impl TransferClient {
                 Ok(c) => c,
                 Err(e) => {
                     file.flush().await.map_err(io)?;
-                    return Ok(Step::Retry(e.to_string()));
+                    return Ok(Step::Retry(e.without_url().to_string()));
                 }
             };
             total += chunk.len() as u64;
@@ -362,7 +362,7 @@ impl TransferClient {
             .await;
         let resp = match resp {
             Ok(r) => r,
-            Err(e) => return Ok(Step::Retry(e.to_string())),
+            Err(e) => return Ok(Step::Retry(e.without_url().to_string())),
         };
         match resp.status().as_u16() {
             200..=299 => Ok(Step::Done),

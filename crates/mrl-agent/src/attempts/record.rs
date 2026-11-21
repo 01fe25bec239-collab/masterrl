@@ -198,47 +198,87 @@ impl ProcIdentity {
         }
     }
 
-    /// The same identity, checked to belong to the launch with `token`: a container must carry
-    /// `MRL_ATTEMPT_TOKEN=<token>`, and comes back bound to its id. `None` for a container that
-    /// is gone or belongs to another launch. Process identities are already tied to their start
-    /// time and come back unchanged.
-    pub fn verified(&self, token: &str) -> Option<Self> {
+    /// Confirms that a saved container belongs to this launch. A missing or foreign
+    /// container is absent. An unavailable daemon is an error so cleanup can retry later.
+    pub(crate) async fn verified(&self, token: &str) -> Result<Option<Self>, ()> {
         match self {
-            Self::Pid { .. } => Some(self.clone()),
+            Self::Pid { .. } => Ok(Some(self.clone())),
             Self::Container { name, id } => {
-                let found = owned_container(id.as_deref().unwrap_or(name), token)?;
-                // A bound id never changes; a different one is someone else's container.
-                id.as_ref()
-                    .is_none_or(|i| *i == found)
-                    .then(|| Self::Container {
+                Ok(owned_container(id.as_deref().unwrap_or(name), token)
+                    .await?
+                    .filter(|found| id.as_ref().is_none_or(|saved| saved == found))
+                    .map(|found| Self::Container {
                         name: name.clone(),
                         id: Some(found),
-                    })
+                    }))
             }
         }
     }
 }
 
-/// The id of container `reference` (a name or id) when its environment carries
-/// `MRL_ATTEMPT_TOKEN=<token>`; `None` when it is gone or belongs to another launch.
-pub fn owned_container(reference: &str, token: &str) -> Option<String> {
+/// The inspected container ID, validated against the launch token.
+pub(crate) async fn owned_container(reference: &str, token: &str) -> Result<Option<String>, ()> {
     let mark = format!("{}={token}", super::runner::TOKEN_ENV);
-    let docker = crate::envs::which("docker")?;
-    let out = std::process::Command::new(docker)
-        .args([
+    let out = docker_output(
+        &[
+            "container",
             "inspect",
             "--format",
             "{{.Id}}{{range .Config.Env}}{{println}}{{.}}{{end}}",
             reference,
-        ])
-        .stderr(std::process::Stdio::null())
-        .output()
-        .ok()
-        .filter(|o| o.status.success())?;
+        ],
+        DOCKER_TIMEOUT,
+    )
+    .await
+    .ok_or(())?;
+    if !out.status.success() {
+        let err = String::from_utf8_lossy(&out.stderr);
+        return if err.contains("No such container") || err.contains("No such object") {
+            Ok(None)
+        } else {
+            Err(())
+        };
+    }
     let text = String::from_utf8_lossy(&out.stdout);
     let mut lines = text.lines();
-    let id = lines.next()?.trim().to_owned();
-    (!id.is_empty() && lines.any(|l| l == mark)).then_some(id)
+    let id = lines.next().ok_or(())?.trim().to_owned();
+    Ok((!id.is_empty() && lines.any(|l| l == mark)).then_some(id))
+}
+
+/// Bound Docker inspection and force-kill calls even when the daemon is unavailable.
+pub(crate) const DOCKER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+pub(crate) async fn docker_output(
+    args: &[&str],
+    timeout: std::time::Duration,
+) -> Option<std::process::Output> {
+    let docker = crate::envs::which("docker")?;
+    let run = tokio::process::Command::new(docker)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    tokio::time::timeout(timeout, run).await.ok()?.ok()
+}
+
+pub(crate) async fn running(identity: &ProcIdentity) -> bool {
+    match identity {
+        ProcIdentity::Pid { .. } => identity.alive(),
+        ProcIdentity::Container { name, id } => docker_output(
+            &[
+                "container",
+                "inspect",
+                "--format",
+                "{{.State.Running}}",
+                id.as_deref().unwrap_or(name),
+            ],
+            DOCKER_TIMEOUT,
+        )
+        .await
+        .is_some_and(|out| {
+            out.status.success() && String::from_utf8_lossy(&out.stdout).trim() == "true"
+        }),
+    }
 }
 
 /// Start time of `pid` (seconds since the epoch), if the process exists and is not a zombie.

@@ -185,7 +185,7 @@ fn abnormal_status(ev: &ExitEvidence) -> bool {
 }
 
 /// Out-of-band evidence, strongest first.
-fn evidence_failure(ev: &ExitEvidence) -> Option<Failure> {
+pub(super) fn evidence_failure(ev: &ExitEvidence) -> Option<Failure> {
     if ev.self_fenced {
         return Some(agent_failure(
             FailureClass::NodeLost,

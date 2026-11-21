@@ -1526,8 +1526,7 @@ mod runner_tests {
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, b"weights").unwrap();
         // Every save fails: a folder sits where the record goes.
-        let job = fx.staging().parent().unwrap().to_path_buf();
-        let record = job.join("attempt.json");
+        let record = fx.staging().parent().unwrap().join("attempt.json");
         std::fs::remove_file(&record).unwrap();
         std::fs::create_dir_all(record.join("blocker")).unwrap();
         let (mut w, _) = fx.worker("trainer").await;
@@ -1542,7 +1541,6 @@ mod runner_tests {
         // Saving works again (the ticket has expired): the kept result is saved and only then
         // acknowledged, with no second upload.
         std::fs::remove_dir_all(&record).unwrap();
-        fx.record.save(&job).unwrap();
         let acks = read_until(&mut w, |b| matches!(b, AgentBody::CheckpointCommitAck(_)))
             .await
             .unwrap();
@@ -1765,66 +1763,98 @@ mod runner_tests {
         );
     }
 
-    /// A checkpoint request is kept once per request id, and a staged checkpoint retires it:
-    /// a reconnecting worker is not asked to checkpoint again.
+    /// A duplicate control request has no new effect, and staging cannot acknowledge
+    /// a request that arrived while another checkpoint was being written.
     #[tokio::test(flavor = "multi_thread")]
-    async fn fulfilled_checkpoint_requests_are_not_sent_again() {
+    async fn only_acknowledged_checkpoint_requests_are_retired() {
         let fx = RunnerFixture::readopt(spec("att_cq", serde_json::json!({})), |_| {}).await;
         let (mut w, _) = fx.worker("trainer").await;
-        for _ in 0..2 {
+        for id in ["req-1", "req-1", "req-2"] {
             fx.control
                 .send(Control::Checkpoint {
-                    request_id: "req-1".into(),
+                    request_id: id.into(),
                     deadline_s: 60,
                     reason: "test".into(),
                 })
                 .await
                 .unwrap();
         }
-        read_until(&mut w, |b| matches!(b, AgentBody::CheckpointRequest(_)))
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        assert_eq!(fx.saved().requests.len(), 1, "kept once");
+        let delivered = read_until(&mut w, |b| {
+            matches!(b,
+            AgentBody::CheckpointRequest(r) if r.request_id == "req-2")
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            delivered
+                .iter()
+                .filter(|m| matches!(m, AgentBody::CheckpointRequest(_)))
+                .count(),
+            2
+        );
         let manifest = sha_hex(b"manifest");
-        w.send(Body::CheckpointStaged(
-            mrl_proto::worker::v1::CheckpointStaged {
-                checkpoint_id: "ckpt_q".into(),
-                step: 3,
-                manifest_sha256: manifest.clone(),
-                files: vec![mrl_proto::worker::v1::FileEntry {
-                    path: "checkpoints/ckpt_q/checkpoint-manifest.json".into(),
-                    size: 8,
-                    sha256: manifest,
-                    role: "manifest".into(),
-                }],
-                ..Default::default()
-            },
-        ))
-        .await;
-        read_until(&mut w, |b| matches!(b, AgentBody::UploadGrant(_)))
-            .await
-            .unwrap();
-        assert!(fx.saved().requests.is_empty(), "retired by the checkpoint");
+        let seq = w
+            .send(Body::CheckpointStaged(
+                mrl_proto::worker::v1::CheckpointStaged {
+                    checkpoint_id: "ckpt_q".into(),
+                    step: 3,
+                    manifest_sha256: manifest.clone(),
+                    files: vec![mrl_proto::worker::v1::FileEntry {
+                        path: "checkpoints/ckpt_q/checkpoint-manifest.json".into(),
+                        size: 8,
+                        sha256: manifest,
+                        role: "manifest".into(),
+                    }],
+                    ..Default::default()
+                },
+            ))
+            .await;
+        w.wait_ack(seq).await.unwrap();
+        assert_eq!(fx.saved().requests.len(), 2);
         drop(w);
         let (mut again, _) = fx.worker("trainer").await;
-        // Everything the agent sends on the reconnect (Prepare and whatever is pending).
-        let mut seen = Vec::new();
-        while let Ok(Ok(Some(m))) =
-            tokio::time::timeout(Duration::from_millis(700), again.recv()).await
-        {
-            seen.extend(m.body);
-        }
-        assert!(
-            seen.iter().any(|b| matches!(b, AgentBody::Prepare(_))),
-            "{seen:?}"
-        );
-        assert!(
-            !seen
-                .iter()
-                .any(|b| matches!(b, AgentBody::CheckpointRequest(_))),
-            "{seen:?}"
-        );
+        read_until(&mut again, |b| {
+            matches!(b, AgentBody::CheckpointRequest(r)
+            if r.request_id == "req-2")
+        })
+        .await
+        .unwrap();
+        let seq = again
+            .send(Body::Exit(mrl_proto::worker::v1::ExitReport {
+                kind: ExitKind::Completed as i32,
+                acknowledged_requests: vec!["req-1".into()],
+                ..Default::default()
+            }))
+            .await;
+        again.wait_ack(seq).await.unwrap();
+        assert_eq!(fx.saved().requests.len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_expired_attempt_does_not_restart_saved_uploads() {
+        let (base, got) = sink().await;
+        let path = "w.bin";
+        let mut fx =
+            RunnerFixture::readopt(spec("att_expired_upload", serde_json::json!({})), |r| {
+                r.lease_deadline_unix_ms = Some(now_ms() - 1_000);
+                r.lease_hard_deadline_unix_ms = r.lease_deadline_unix_ms;
+                r.adhoc_uploads.insert(
+                    "up-expired".into(),
+                    vec![target(&base, path, &sha_hex(b"weights"), 7)],
+                );
+            })
+            .await;
+        std::fs::write(fx.staging().join(path), b"weights").unwrap();
+        let result = done(&mut fx).await;
+        assert_eq!(result.command_id, "up-expired");
+        assert!(result.failure.is_some());
+        assert!(got.lock().unwrap().is_empty());
+        let exit = tokio::time::timeout(Duration::from_secs(10), &mut fx.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(exit.phase, AttemptPhase::SelfFenced as i32);
     }
 
     /// The agent stopped right after saving a committed upload (outcome and result in one
@@ -1933,6 +1963,44 @@ mod runner_tests {
         }
         assert_eq!(more, 0, "one result only");
         assert_eq!(got.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn upload_drain_stops_at_the_lease_after_worker_exit() {
+        let (base, got) = slow_sink(Duration::from_secs(6)).await;
+        let path = "w.bin";
+        let mut fx =
+            RunnerFixture::readopt(spec("att_drainlease", serde_json::json!({})), |_| {}).await;
+        std::fs::write(fx.staging().join(path), b"weights").unwrap();
+        fx.control
+            .send(Control::Lease {
+                heartbeat_seq: 1,
+                heartbeat_sent: std::time::Instant::now(),
+                duration_s: 3,
+                kill_budget_s: 0,
+            })
+            .await
+            .unwrap();
+        fx.control
+            .send(Control::Upload {
+                command_id: "up-drain".into(),
+                checkpoint_id: String::new(),
+                targets: vec![target(&base, path, &sha_hex(b"weights"), 7)],
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !fx.saved().adhoc_uploads.contains_key("up-drain") {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        fx.end_workers();
+        let result = done(&mut fx).await;
+        assert_eq!(result.command_id, "up-drain");
+        assert!(result.failure.is_some());
+        assert!(got.lock().unwrap().is_empty());
     }
 
     /// Two commands for one checkpoint before the worker asks to commit: the first is answered

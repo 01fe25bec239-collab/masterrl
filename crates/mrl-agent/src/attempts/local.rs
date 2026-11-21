@@ -203,10 +203,18 @@ async fn stop_all(config: Option<&Path>) -> Result<ExitCode, AttemptError> {
     let (cfg, _) = AgentConfig::load(config)?;
     let _writer = crate::envs::lock_state(&cfg.state_dir)?;
     let ctx = Arc::new(AgentContext::from_config(cfg)?);
-    let (tx, rx) = super::attempt_events(256);
-    // Nobody to tell: events are dropped as they come.
-    let drain = super::auto_saved(rx);
-    let attempts = Attempts::new(ctx, tx, None)?;
+    let (tx, mut rx) = super::attempt_events(256);
+    let drain = tokio::spawn(async move {
+        while let Some(envelope) = rx.recv().await {
+            if !matches!(
+                envelope.event(),
+                AttemptEvent::CommandDone(_) | AttemptEvent::Probe(_)
+            ) {
+                envelope.saved();
+            }
+        }
+    });
+    let attempts = Attempts::new(Arc::clone(&ctx), tx, None)?;
     attempts.readopt().await;
     let running = attempts.running();
     for a in &running {
@@ -217,7 +225,7 @@ async fn stop_all(config: Option<&Path>) -> Result<ExitCode, AttemptError> {
                     attempt: Some(a.clone()),
                     request_id: "stop-all".into(),
                     grace_s: STOP_ALL_GRACE_S,
-                    reason: "the agent service was removed".into(),
+                    reason: "the agent service was stopped".into(),
                 },
             )),
         };
@@ -225,6 +233,27 @@ async fn stop_all(config: Option<&Path>) -> Result<ExitCode, AttemptError> {
     }
     for a in &running {
         attempts.wait(&a.attempt_id).await;
+    }
+    // Retry cleanup of terminal records too, including containers the daemon previously
+    // could not inspect. The service stop must report an incomplete cleanup.
+    let jobs = ctx.state.root().join("jobs");
+    let dirs = std::fs::read_dir(&jobs).map_err(|e| crate::AgentError::state(&jobs, e))?;
+    let mut errors = Vec::new();
+    for entry in dirs {
+        let dir = entry
+            .map_err(|e| crate::AgentError::state(&jobs, e))?
+            .path();
+        if let Some(record) = AttemptRecord::load(&dir)? {
+            let report =
+                crate::janitor::release(&ctx, attempts.envs(), &record, &Default::default()).await;
+            errors.extend(report.errors);
+        }
+    }
+    if !errors.is_empty() {
+        return Err(AttemptError::state(
+            "",
+            format!("could not finish stopping attempts ({})", errors.join(", ")),
+        ));
     }
     eprintln!("mrl-agent: stopped {} running attempt(s)", running.len());
     drop(attempts);
