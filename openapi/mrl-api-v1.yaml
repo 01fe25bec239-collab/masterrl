@@ -7,6 +7,528 @@ info:
     identifier: Apache-2.0
   version: 0.1.0
 paths:
+  /api/v1/audit:
+    get:
+      tags:
+      - audit
+      operationId: list
+      parameters:
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      - name: action
+        in: query
+        description: Only this action, like `auth.session`.
+        required: false
+        schema:
+          type: string
+      - name: actor
+        in: query
+        description: Only this actor, like `usr_…`.
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_AuditRecord'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/auth/callback:
+    post:
+      tags:
+      - auth
+      operationId: callback
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CallbackRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SignedIn'
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/auth/login:
+    post:
+      tags:
+      - auth
+      operationId: login
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginStarted'
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/auth/logout:
+    post:
+      tags:
+      - auth
+      operationId: logout
+      responses:
+        '204':
+          description: Signed out.
+  /api/v1/auth/me:
+    get:
+      tags:
+      - auth
+      operationId: me
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Me'
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/auth/session:
+    post:
+      tags:
+      - auth
+      operationId: start_session
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SessionStarted'
+    delete:
+      tags:
+      - auth
+      operationId: end_session
+      responses:
+        '204':
+          description: Session ended.
+  /api/v1/auth/tokens:
+    get:
+      tags:
+      - auth
+      operationId: list_tokens
+      parameters:
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Your live tokens, newest first, in cursor pages.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_TokenInfo'
+    post:
+      tags:
+      - auth
+      operationId: create_token
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateToken'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NewToken'
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/auth/tokens/{id}:
+    delete:
+      tags:
+      - auth
+      operationId: revoke_token
+      parameters:
+      - name: id
+        in: path
+        description: '`tok_…`'
+        required: true
+        schema:
+          type: string
+      responses:
+        '204':
+          description: Revoked.
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/orgs:
+    get:
+      tags:
+      - tenancy
+      operationId: list_orgs
+      parameters:
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Orgs you hold a role in.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_Org'
+    post:
+      tags:
+      - tenancy
+      operationId: create_org
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NewItem'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Org'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/orgs/{org}/workspaces:
+    get:
+      tags:
+      - tenancy
+      operationId: list_workspaces
+      parameters:
+      - name: org
+        in: path
+        description: '`org_…`'
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_Workspace'
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    post:
+      tags:
+      - tenancy
+      operationId: create_workspace
+      parameters:
+      - name: org
+        in: path
+        description: '`org_…`'
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NewItem'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Workspace'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/sync/profile:
+    get:
+      tags:
+      - sync
+      operationId: get_profile
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SetupProfile'
+    put:
+      tags:
+      - sync
+      operationId: put_profile
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetupProfile'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SetupProfile'
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/sync/push:
+    post:
+      tags:
+      - sync
+      operationId: push
+      requestBody:
+        description: 'Optional: `{"op_id": "<uuid>"}`, the same on retries.'
+        content:
+          application/json:
+            schema:
+              oneOf:
+              - $ref: '#/components/schemas/PushRequest'
+              - type: 'null'
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Pushed'
+        '401':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '503':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/sync/restore:
+    post:
+      tags:
+      - sync
+      operationId: restore
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RestoreRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Restored'
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/sync/setup:
+    post:
+      tags:
+      - sync
+      operationId: setup
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SetupRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SetupDone'
+        '422':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/sync/status:
+    get:
+      tags:
+      - sync
+      operationId: status
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SyncStatus'
+  /api/v1/workspaces/{ws}/projects:
+    get:
+      tags:
+      - tenancy
+      operationId: list_projects
+      parameters:
+      - name: ws
+        in: path
+        description: '`ws_…`'
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_Project'
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    post:
+      tags:
+      - tenancy
+      operationId: create_project
+      parameters:
+      - name: ws
+        in: path
+        description: '`ws_…`'
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NewItem'
+        required: true
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Project'
+        '403':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /healthz:
     get:
       tags:
@@ -41,6 +563,76 @@ paths:
                 $ref: '#/components/schemas/Readiness'
 components:
   schemas:
+    AuditRecord:
+      type: object
+      description: One audit record.
+      required:
+      - id
+      - at
+      - actor
+      - action
+      - target
+      - outcome
+      - details
+      - trace_id
+      properties:
+        action:
+          type: string
+          description: What, like `auth.manage_tokens`.
+        actor:
+          type: string
+          description: Who.
+        at:
+          type: string
+          format: date-time
+          description: When.
+        details:
+          type: object
+          description: Extra facts (never secret values).
+        id:
+          type: string
+          description: Record id.
+        org:
+          type:
+          - string
+          - 'null'
+          description: Org.
+        outcome:
+          type: string
+          description: '`success`, `denied` or `failed`.'
+        project:
+          type:
+          - string
+          - 'null'
+          description: Project.
+        target:
+          type: string
+          description: On what.
+        trace_id:
+          type: string
+          description: Trace id.
+    CallbackRequest:
+      type: object
+      description: Finish a sign-in with the code from the callback.
+      required:
+      - flow_id
+      - code
+      properties:
+        code:
+          type: string
+          description: '`code` from the callback query.'
+        flow_id:
+          type: string
+          description: '`flow` from the callback query.'
+        issue_token:
+          type: boolean
+          description: Also make an access token (for the CLI).
+        token_name:
+          type:
+          - string
+          - 'null'
+          description: Name for that token.
+      additionalProperties: false
     CheckResult:
       type: object
       description: One readiness check result.
@@ -59,6 +651,48 @@ components:
         status:
           type: string
           description: '`ready` or `not_ready`.'
+    CopyInfo:
+      type: object
+      description: A saved copy (metadata only).
+      required:
+      - version
+      - at
+      properties:
+        at:
+          type: string
+          description: When it was pushed.
+        version:
+          type: integer
+          format: int64
+          description: Version.
+    CreateToken:
+      type: object
+      description: Make an access token.
+      required:
+      - name
+      - scopes
+      properties:
+        days:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Lifetime, 1–365 days (default from `auth.token_days`).
+          minimum: 0
+        name:
+          type: string
+          description: A name you recognize, 1–100 characters.
+        project_id:
+          type:
+          - string
+          - 'null'
+          description: Limit the token to one project (`prj_…`).
+        scopes:
+          type: array
+          items:
+            type: string
+          description: '`["*"]`, or areas like `["runs:write", "datasets:read"]`.'
+      additionalProperties: false
     FieldError:
       type: object
       description: One field problem inside a 422 response.
@@ -89,6 +723,378 @@ components:
         status:
           type: string
           description: '`ok`.'
+    LoginRequest:
+      type: object
+      description: Start a sign-in.
+      required:
+      - provider
+      - redirect_uri
+      properties:
+        provider:
+          type: string
+          description: '`google` or `github`.'
+        redirect_uri:
+          type: string
+          description: '`masterrl://auth/callback`, or a loopback address like `http://127.0.0.1:53111/callback`.'
+      additionalProperties: false
+    LoginStarted:
+      type: object
+      description: Open `authorize_url` in the system browser.
+      required:
+      - authorize_url
+      - flow_id
+      properties:
+        authorize_url:
+          type: string
+          description: The address to open.
+        flow_id:
+          type: string
+          description: Pass back with the code; also in the callback query as `flow`.
+    Machine:
+      type: object
+      description: One connected machine.
+      required:
+      - name
+      - address
+      - transport
+      properties:
+        address:
+          type: string
+          description: Host name or address.
+        name:
+          type: string
+          description: Name shown in the app.
+        transport:
+          $ref: '#/components/schemas/Transport'
+          description: How to reach it.
+      additionalProperties: false
+    Me:
+      type: object
+      description: The caller.
+      required:
+      - principal_kind
+      - sign_in
+      - roles
+      properties:
+        principal_kind:
+          type: string
+          description: '`local_owner`, `user` or `service`.'
+        roles:
+          type: array
+          items:
+            $ref: '#/components/schemas/RoleInfo'
+          description: Roles.
+        sign_in:
+          $ref: '#/components/schemas/SignInState'
+          description: This install's Supabase sign-in (solo mode).
+        token_id:
+          type:
+          - string
+          - 'null'
+          description: '`tok_…` when the caller uses an access token.'
+        user:
+          oneOf:
+          - $ref: '#/components/schemas/UserInfo'
+            description: The person (absent for an unknown principal).
+          - type: 'null'
+    NewItem:
+      type: object
+      description: A new org, workspace or project.
+      required:
+      - slug
+      - name
+      properties:
+        name:
+          type: string
+          description: Display name, 1–100 characters.
+        slug:
+          type: string
+          description: 'Short name used in addresses: 1–63 lower-case letters, digits and `-`, starting with a letter or digit.'
+      additionalProperties: false
+    NewToken:
+      type: object
+      description: A token, shown once.
+      required:
+      - id
+      - token
+      - scopes
+      - expires_at
+      properties:
+        expires_at:
+          type: string
+          format: date-time
+          description: Expiry.
+        id:
+          type: string
+          description: '`tok_…`.'
+        scopes:
+          type: array
+          items:
+            type: string
+          description: Scopes.
+        token:
+          type: string
+          description: '`mrl_pat_…`. Store it now; it is never shown again.'
+    Org:
+      type: object
+      description: An org.
+      required:
+      - id
+      - slug
+      - name
+      - kind
+      - created_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+          description: Created.
+        id:
+          type: string
+          description: '`org_…`.'
+        kind:
+          type: string
+          description: '`personal` or `team`.'
+        name:
+          type: string
+          description: Name.
+        slug:
+          type: string
+          description: Slug, unique on this core.
+    Page_AuditRecord:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: One audit record.
+            required:
+            - id
+            - at
+            - actor
+            - action
+            - target
+            - outcome
+            - details
+            - trace_id
+            properties:
+              action:
+                type: string
+                description: What, like `auth.manage_tokens`.
+              actor:
+                type: string
+                description: Who.
+              at:
+                type: string
+                format: date-time
+                description: When.
+              details:
+                type: object
+                description: Extra facts (never secret values).
+              id:
+                type: string
+                description: Record id.
+              org:
+                type:
+                - string
+                - 'null'
+                description: Org.
+              outcome:
+                type: string
+                description: '`success`, `denied` or `failed`.'
+              project:
+                type:
+                - string
+                - 'null'
+                description: Project.
+              target:
+                type: string
+                description: On what.
+              trace_id:
+                type: string
+                description: Trace id.
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_Org:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: An org.
+            required:
+            - id
+            - slug
+            - name
+            - kind
+            - created_at
+            properties:
+              created_at:
+                type: string
+                format: date-time
+                description: Created.
+              id:
+                type: string
+                description: '`org_…`.'
+              kind:
+                type: string
+                description: '`personal` or `team`.'
+              name:
+                type: string
+                description: Name.
+              slug:
+                type: string
+                description: Slug, unique on this core.
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_Project:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: A project.
+            required:
+            - id
+            - org_id
+            - workspace_id
+            - slug
+            - name
+            - created_at
+            properties:
+              created_at:
+                type: string
+                format: date-time
+                description: Created.
+              id:
+                type: string
+                description: '`prj_…`.'
+              name:
+                type: string
+                description: Name.
+              org_id:
+                type: string
+                description: '`org_…`.'
+              slug:
+                type: string
+                description: Slug, unique in the workspace.
+              workspace_id:
+                type: string
+                description: '`ws_…`.'
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_TokenInfo:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: A token as listed (never the token itself).
+            required:
+            - id
+            - name
+            - prefix
+            - scopes
+            - expires_at
+            properties:
+              expires_at:
+                type: string
+                format: date-time
+                description: Expiry.
+              id:
+                type: string
+                description: '`tok_…`.'
+              last_used_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+                description: Last use (to the minute).
+              name:
+                type: string
+                description: Name.
+              prefix:
+                type: string
+                description: First characters, like `mrl_pat_AbCd`.
+              scopes:
+                type: array
+                items:
+                  type: string
+                description: Scopes.
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_Workspace:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: A workspace.
+            required:
+            - id
+            - org_id
+            - slug
+            - name
+            - created_at
+            properties:
+              created_at:
+                type: string
+                format: date-time
+                description: Created.
+              id:
+                type: string
+                description: '`ws_…`.'
+              name:
+                type: string
+                description: Name.
+              org_id:
+                type: string
+                description: '`org_…`.'
+              slug:
+                type: string
+                description: Slug, unique in the org.
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
     Problem:
       type: object
       description: RFC 9457 problem document.
@@ -129,6 +1135,67 @@ components:
         type:
           type: string
           description: '`https://docs.masterrl.dev/errors/<code>`.'
+    Project:
+      type: object
+      description: A project.
+      required:
+      - id
+      - org_id
+      - workspace_id
+      - slug
+      - name
+      - created_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+          description: Created.
+        id:
+          type: string
+          description: '`prj_…`.'
+        name:
+          type: string
+          description: Name.
+        org_id:
+          type: string
+          description: '`org_…`.'
+        slug:
+          type: string
+          description: Slug, unique in the workspace.
+        workspace_id:
+          type: string
+          description: '`ws_…`.'
+    PushRequest:
+      type: object
+      description: '`POST /sync/push` body (optional).'
+      properties:
+        op_id:
+          type:
+          - string
+          - 'null'
+          description: |-
+            A UUID the client keeps for one push and sends again on every retry. The saved
+            history gains one copy per operation, however often it is retried.
+      additionalProperties: false
+    Pushed:
+      type: object
+      description: A copy was saved.
+      required:
+      - version
+      - at
+      - copies
+      properties:
+        at:
+          type: string
+          description: When.
+        copies:
+          type: integer
+          description: Copies kept now (at most 5).
+          minimum: 0
+        version:
+          type: integer
+          format: int64
+          description: Its version.
     Readiness:
       type: object
       description: '`/readyz` body.'
@@ -144,6 +1211,329 @@ components:
         status:
           type: string
           description: '`ready`, `not_ready` or `draining`.'
+    RestoreRequest:
+      type: object
+      description: Restore a saved setup. Give the passphrase or the recovery key.
+      properties:
+        passphrase:
+          type:
+          - string
+          - 'null'
+          description: The sync passphrase.
+        recovery_key:
+          type:
+          - string
+          - 'null'
+          description: The recovery key shown at setup.
+        version:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: An older copy; the newest when absent.
+      additionalProperties: false
+    Restored:
+      type: object
+      description: The setup was restored on this install.
+      required:
+      - version
+      - at
+      - profile
+      properties:
+        at:
+          type: string
+          description: When it was pushed.
+        profile:
+          $ref: '#/components/schemas/SetupProfile'
+          description: The setup now on this install.
+        version:
+          type: integer
+          format: int64
+          description: The copy used.
+    RoleInfo:
+      type: object
+      description: One role a person holds.
+      required:
+      - org
+      - role
+      - scope_kind
+      - scope_id
+      properties:
+        org:
+          type: string
+          description: '`org_…`.'
+        role:
+          type: string
+          description: Role name.
+        scope_id:
+          type: string
+          description: The scope's id.
+        scope_kind:
+          type: string
+          description: '`org`, `workspace` or `project`.'
+    SessionStarted:
+      type: object
+      description: A renderer session started; the cookie is in `Set-Cookie`.
+      required:
+      - csrf_token
+      - expires_at
+      properties:
+        csrf_token:
+          type: string
+          description: Send as `x-csrf-token` on requests from another origin.
+        expires_at:
+          type: string
+          format: date-time
+          description: When the session ends at the latest.
+    SetupDone:
+      type: object
+      description: Setup sync is on.
+      required:
+      - recovery_key
+      properties:
+        recovery_key:
+          type: string
+          description: Shown once. It opens your saved setup if you forget the passphrase.
+    SetupProfile:
+      type: object
+      description: '`setup-profile/v1`.'
+      required:
+      - schema
+      properties:
+        machines:
+          type: array
+          items:
+            $ref: '#/components/schemas/Machine'
+          description: Connected machines.
+        preferences:
+          type: object
+          description: App preferences.
+        schema:
+          type: string
+          description: Always `setup-profile/v1`.
+        team_memberships:
+          type: array
+          items:
+            $ref: '#/components/schemas/TeamMembership'
+          description: Teams.
+        ui:
+          type: object
+          description: UI settings.
+      additionalProperties: false
+    SetupRequest:
+      type: object
+      description: Turn on setup sync.
+      required:
+      - passphrase
+      properties:
+        passphrase:
+          type: string
+          description: At least 12 characters. A forgotten passphrase (and recovery key) means the setup cannot be restored.
+      additionalProperties: false
+    SignInState:
+      type: string
+      description: Where this install's sign-in stands.
+      enum:
+      - not_configured
+      - signed_out
+      - active
+      - expired
+    SignedIn:
+      type: object
+      description: The sign-in finished.
+      required:
+      - user
+      properties:
+        token:
+          oneOf:
+          - $ref: '#/components/schemas/NewToken'
+            description: The new token, when asked for.
+          - type: 'null'
+        user:
+          $ref: '#/components/schemas/UserInfo'
+          description: Who signed in.
+    SyncStatus:
+      type: object
+      description: Where setup sync stands.
+      required:
+      - set_up
+      - sign_in
+      properties:
+        copies:
+          type:
+          - array
+          - 'null'
+          items:
+            $ref: '#/components/schemas/CopyInfo'
+          description: Saved copies, newest first (when signed in and online).
+        copies_unavailable:
+          type:
+          - string
+          - 'null'
+          description: Why `copies` is missing.
+        last_push_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Last push.
+        last_pushed_version:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Version of the last push.
+        last_restore_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Last restore.
+        set_up:
+          type: boolean
+          description: A sync passphrase is set on this install.
+        sign_in:
+          $ref: '#/components/schemas/SignInState'
+          description: This install's sign-in.
+    TeamMembership:
+      type: object
+      description: A team this person belongs to.
+      required:
+      - name
+      - address
+      properties:
+        address:
+          type: string
+          description: Address of the team core.
+        name:
+          type: string
+          description: Team name.
+        role:
+          type:
+          - string
+          - 'null'
+          description: The person's role there.
+      additionalProperties: false
+    TokenInfo:
+      type: object
+      description: A token as listed (never the token itself).
+      required:
+      - id
+      - name
+      - prefix
+      - scopes
+      - expires_at
+      properties:
+        expires_at:
+          type: string
+          format: date-time
+          description: Expiry.
+        id:
+          type: string
+          description: '`tok_…`.'
+        last_used_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Last use (to the minute).
+        name:
+          type: string
+          description: Name.
+        prefix:
+          type: string
+          description: First characters, like `mrl_pat_AbCd`.
+        scopes:
+          type: array
+          items:
+            type: string
+          description: Scopes.
+    Transport:
+      type: object
+      description: |-
+        How the app reaches a machine. Only these typed settings: keys and passwords stay in the
+        keychain, named by `key_ref`; free-form options are refused (unknown fields).
+      required:
+      - kind
+      properties:
+        key_ref:
+          type:
+          - string
+          - 'null'
+          description: Name of the keychain secret that holds the key (never the key itself).
+        kind:
+          type: string
+          description: '`lan`, `ssh`, `tailscale` or `cloudflare_tunnel`.'
+        port:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Port, when not the default.
+          minimum: 0
+        user:
+          type:
+          - string
+          - 'null'
+          description: Login name (SSH).
+      additionalProperties: false
+    UserInfo:
+      type: object
+      description: A person.
+      required:
+      - id
+      - display_name
+      properties:
+        avatar_url:
+          type:
+          - string
+          - 'null'
+          description: Avatar.
+        display_name:
+          type: string
+          description: Name.
+        email:
+          type:
+          - string
+          - 'null'
+          description: Email.
+        id:
+          type: string
+          description: '`usr_…`.'
+    Workspace:
+      type: object
+      description: A workspace.
+      required:
+      - id
+      - org_id
+      - slug
+      - name
+      - created_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+          description: Created.
+        id:
+          type: string
+          description: '`ws_…`.'
+        name:
+          type: string
+          description: Name.
+        org_id:
+          type: string
+          description: '`org_…`.'
+        slug:
+          type: string
+          description: Slug, unique in the org.
 tags:
 - name: health
   description: Liveness and readiness.
+- name: tenancy
+  description: Orgs, workspaces and projects.
+- name: audit
+  description: The audit log.
+- name: auth
+  description: Sign-in, access tokens and sessions.
+- name: sync
+  description: Encrypted setup sync.
