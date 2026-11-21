@@ -132,8 +132,12 @@ async fn scan(
         });
     }
     let tokens: Vec<(Uuid, serde_json::Value)> = sqlx::query_as(
-        "SELECT id, endpoint FROM node_enrollment_tokens
-         WHERE endpoint IS NOT NULL AND used_at IS NULL AND expires_at > now()",
+        // Unused tokens, and used ones whose machine never connected (it may have lost the
+        // answer and waits again with the same key) until the token expires.
+        "SELECT t.id, t.endpoint FROM node_enrollment_tokens t
+         LEFT JOIN compute_nodes n ON n.id = t.used_by_node_id
+         WHERE t.endpoint IS NOT NULL AND t.expires_at > now()
+           AND (t.used_at IS NULL OR n.status = 'ENROLLING')",
     )
     .fetch_all(gw.db.pool())
     .await?;
@@ -209,9 +213,16 @@ async fn lane(
         .await
         .map_err(|_| NodesError::Protocol("stream closed".into()))?;
     let outbound = ReceiverStream::new(rx).map_while(Result::ok);
-    let inbound = client
-        .session(outbound)
-        .await
+    let opened = tokio::select! {
+        () = stop.cancelled() => return Err(NodesError::Protocol("stopped".into())),
+        r = tokio::time::timeout(super::HANDSHAKE_TIMEOUT, client.session(outbound)) => r,
+    };
+    let inbound = opened
+        .map_err(|_| {
+            NodesError::Protocol(format!(
+                "the agent did not open the {lane:?} stream in time"
+            ))
+        })?
         .map_err(|s| {
             NodesError::Protocol(format!(
                 "the agent refused the {lane:?} stream: {}",

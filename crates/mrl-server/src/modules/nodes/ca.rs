@@ -194,6 +194,19 @@ impl Ca {
         &self.sha256
     }
 
+    /// SHA-256 (hex) of the public key a certificate request asks to certify.
+    pub fn csr_key_sha256(csr_der: &[u8]) -> Result<String, NodesError> {
+        use rcgen::PublicKeyData;
+        let csr =
+            CertificateSigningRequestParams::from_der(&CertificateSigningRequestDer::from(csr_der))
+                .map_err(|_| {
+                    NodesError::Certificate(
+                        "the certificate request is damaged or its signature is wrong".into(),
+                    )
+                })?;
+        Ok(sha256_hex(csr.public_key.der_bytes()))
+    }
+
     /// Signs a node certificate for the key in `csr_der` (ECDSA P-256 only). Every name in
     /// the request is ignored: the CA sets the names.
     pub fn issue_node(

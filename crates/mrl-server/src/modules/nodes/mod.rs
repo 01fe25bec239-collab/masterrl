@@ -320,6 +320,13 @@ impl Sessions {
             revoked: CancellationToken::new(),
             wake: Arc::new(Notify::new()),
         });
+        if entry.epoch > epoch {
+            // A newer session registered first (its open committed later but ran faster): this
+            // one is already stale and must not cancel it.
+            let stale = CancellationToken::new();
+            stale.cancel();
+            return (stale, entry.revoked.clone(), entry.wake.clone());
+        }
         if entry.revoked.is_cancelled() {
             entry.revoked = CancellationToken::new();
         }
@@ -426,6 +433,11 @@ pub struct Gateway {
     pub(crate) known_hosts: PathBuf,
     /// Revoked, unexpired certificate fingerprints; the TLS verifiers refuse them.
     pub(crate) revoked: Arc<RwLock<std::collections::HashSet<String>>>,
+    /// Held while the revocation list is reloaded (one reload at a time).
+    pub(crate) revocation_refresh: tokio::sync::Mutex<()>,
+    /// Revocations made on this replica, with their generation (see [`revocation_list`]).
+    pub(crate) local_revocations: Mutex<Vec<(u64, String)>>,
+    pub(crate) revocation_gen: std::sync::atomic::AtomicU64,
 }
 
 impl Gateway {
@@ -479,24 +491,55 @@ impl Gateway {
     }
 
     /// Reloads the revocation list the TLS verifiers use (revoked and not yet expired).
+    /// Refreshes run one at a time, so an older snapshot never replaces a newer one, and a
+    /// certificate revoked here while the snapshot was read is kept (see [`revocation_list`]).
     pub async fn refresh_revocations(&self) -> Result<(), NodesError> {
-        let list: Vec<String> = sqlx::query_scalar(
+        let _one = self.revocation_refresh.lock().await;
+        let mark = self
+            .revocation_gen
+            .load(std::sync::atomic::Ordering::SeqCst);
+        let snapshot: Vec<String> = sqlx::query_scalar(
             "SELECT sha256 FROM node_certificates WHERE revoked_at IS NOT NULL AND not_after > now()",
         )
         .fetch_all(self.db.pool())
         .await?;
-        if let Ok(mut set) = self.revoked.write() {
-            *set = list.into_iter().collect();
+        if let (Ok(mut set), Ok(mut local)) = (self.revoked.write(), self.local_revocations.lock())
+        {
+            *set = revocation_list(snapshot, &mut local, mark);
         }
         Ok(())
     }
 
-    /// Adds certificates this replica just revoked, so handshakes refuse them at once.
+    /// Adds certificates this replica just revoked (after the revocation committed), so
+    /// handshakes refuse them at once.
     pub(crate) fn revoked_locally(&self, shas: &[String]) {
-        if let Ok(mut set) = self.revoked.write() {
-            set.extend(shas.iter().cloned());
+        if let (Ok(mut set), Ok(mut local)) = (self.revoked.write(), self.local_revocations.lock())
+        {
+            for sha in shas {
+                let g = self
+                    .revocation_gen
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                local.push((g, sha.clone()));
+                set.insert(sha.clone());
+            }
         }
     }
+}
+
+/// The revocation list from a database `snapshot` read after generation `mark`: local
+/// revocations up to `mark` committed before the read (they are in it) and are forgotten;
+/// later ones may be missing from it and are kept.
+fn revocation_list(
+    snapshot: Vec<String>,
+    local: &mut Vec<(u64, String)>,
+    mark: u64,
+) -> std::collections::HashSet<String> {
+    local.retain(|(g, _)| *g > mark);
+    snapshot
+        .into_iter()
+        .chain(local.iter().map(|(_, s)| s.clone()))
+        .collect()
 }
 
 /// The `nodes` module.
@@ -599,6 +642,9 @@ impl NodesModule {
                 addr: OnceLock::new(),
                 known_hosts,
                 revoked: Arc::default(),
+                revocation_refresh: tokio::sync::Mutex::new(()),
+                local_revocations: Mutex::default(),
+                revocation_gen: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }
@@ -774,12 +820,28 @@ mod tests {
     }
 
     #[test]
+    fn a_reload_keeps_revocations_made_while_it_read() {
+        let mut local = vec![(1, "old".to_owned()), (3, "new".to_owned())];
+        // The reload started at generation 2: "old" was committed before its read, "new" after.
+        let set = revocation_list(vec!["old".into(), "other".into()], &mut local, 2);
+        assert!(set.contains("new"), "revoked here during the read: kept");
+        assert!(set.contains("old") && set.contains("other"));
+        assert_eq!(local, vec![(3, "new".to_owned())]);
+        let set = revocation_list(vec!["new".into()], &mut local, 3);
+        assert_eq!(set.len(), 1);
+        assert!(local.is_empty());
+    }
+
+    #[test]
     fn sessions_supersede_and_revoke() {
         let s = Sessions::default();
         let node = Uuid::now_v7();
         let (c1, r1, _) = s.open_control(node, 1, 7);
         let (c2, _, _) = s.open_control(node, 2, 8);
         assert!(c1.is_cancelled() && !c2.is_cancelled());
+        // An older open that registers late is stale at once and leaves the newer one alone.
+        let (late, _, _) = s.open_control(node, 1, 9);
+        assert!(late.is_cancelled() && !c2.is_cancelled());
         assert!(s.has_control(node));
         assert_eq!(s.control_of(node, 8).map(|c| c.0), Some(2));
         assert!(

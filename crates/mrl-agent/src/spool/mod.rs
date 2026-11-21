@@ -146,6 +146,29 @@ impl Spool {
         Ok(to)
     }
 
+    /// Replaces the message `seq` with `body` under the same seq, after copying the original to
+    /// `<dir>/oversized/` (for diagnosis). A crash leaves the original or the replacement in
+    /// place, never neither; running it again is harmless.
+    pub fn swap(&mut self, seq: u64, body: Body) -> Result<(AgentMessage, PathBuf)> {
+        let aside = self.dir.join("oversized");
+        std::fs::create_dir_all(&aside).map_err(|e| AgentError::state(&aside, e))?;
+        let kept = aside.join(format!("{seq:020}.pb"));
+        let path = self.file(seq);
+        std::fs::copy(&path, &kept).map_err(|e| AgentError::state(&path, e))?;
+        let msg = AgentMessage {
+            seq,
+            body: Some(body),
+            ..AgentMessage::default()
+        };
+        let bytes = msg.encode_to_vec();
+        atomic_write(&path, &bytes).map_err(|e| AgentError::state(&path, e))?;
+        if let Some(len) = self.entries.get_mut(&seq) {
+            self.bytes = self.bytes - *len + bytes.len() as u64;
+            *len = bytes.len() as u64;
+        }
+        Ok((msg, kept))
+    }
+
     /// The core durably accepted everything up to `upto`: delete those files.
     pub fn ack(&mut self, upto: u64) -> Result<()> {
         let done: Vec<u64> = self.entries.range(..=upto).map(|(s, _)| *s).collect();

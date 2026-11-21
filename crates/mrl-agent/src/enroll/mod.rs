@@ -288,10 +288,99 @@ impl Identity {
 /// A new P-256 key and a certificate request for it (DER).
 pub fn new_key() -> Result<(rcgen::KeyPair, Vec<u8>), LinkError> {
     let key = rcgen::KeyPair::generate().map_err(|e| LinkError::Certificate(e.to_string()))?;
-    let csr = rcgen::CertificateParams::new(Vec::<String>::new())
-        .and_then(|p| p.serialize_request(&key))
-        .map_err(|e| LinkError::Certificate(e.to_string()))?;
-    Ok((key, csr.der().to_vec()))
+    let csr = csr_for(&key)?;
+    Ok((key, csr))
+}
+
+/// A certificate request for `key` (DER).
+fn csr_for(key: &rcgen::KeyPair) -> Result<Vec<u8>, LinkError> {
+    rcgen::CertificateParams::new(Vec::<String>::new())
+        .and_then(|p| p.serialize_request(key))
+        .map(|c| c.der().to_vec())
+        .map_err(|e| LinkError::Certificate(e.to_string()))
+}
+
+/// `identity/pending.json`: the key of an enrollment under way, kept (in the key store) until
+/// the identity is saved, so a retry with the same token proves it is the same machine.
+#[derive(Serialize, Deserialize)]
+struct Pending {
+    token_sha256: String,
+    key: keys::KeyRef,
+}
+
+const PENDING_FILE: &str = "pending.json";
+
+/// The enrollment key for `token`: the one kept from an earlier try with this token, else a
+/// new one, stored durably before it is used.
+fn pending_key(ctx: &AgentContext, token: &str) -> Result<(rcgen::KeyPair, Vec<u8>), LinkError> {
+    pending_key_in(
+        &identity_dir(ctx.state.root()),
+        ctx.config.gateway.key_store,
+        token,
+    )
+}
+
+fn pending_key_in(
+    dir: &Path,
+    store: keys::KeyStoreChoice,
+    token: &str,
+) -> Result<(rcgen::KeyPair, Vec<u8>), LinkError> {
+    let dir = dir.to_path_buf();
+    std::fs::create_dir_all(&dir).map_err(io_err(&dir))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(io_err(&dir))?;
+    }
+    let token_sha256 = sha256_hex(token.as_bytes());
+    let path = dir.join(PENDING_FILE);
+    if let Some(p) = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Pending>(&b).ok())
+    {
+        if p.token_sha256 == token_sha256 {
+            let kept = keys::get(&dir, &p.key)
+                .ok()
+                .and_then(|der| rcgen::KeyPair::try_from(der.as_slice()).ok());
+            if let Some(key) = kept {
+                let csr = csr_for(&key)?;
+                return Ok((key, csr));
+            }
+        }
+        keys::delete(&dir, &p.key); // another token's key: not needed any more
+    }
+    let key = rcgen::KeyPair::generate().map_err(|e| LinkError::Certificate(e.to_string()))?;
+    let key_ref = keys::put(
+        &dir,
+        store,
+        &format!("pending-{}", &token_sha256[..16]),
+        &key.serialize_der(),
+    )?;
+    let bytes = serde_json::to_vec(&Pending {
+        token_sha256,
+        key: key_ref,
+    })
+    .map_err(|e| LinkError::Protocol(e.to_string()))?;
+    atomic_write(&path, &bytes).map_err(io_err(&path))?;
+    let csr = csr_for(&key)?;
+    Ok((key, csr))
+}
+
+/// Forgets the pending enrollment key (the identity now holds its own copy).
+fn clear_pending(ctx: &AgentContext) {
+    clear_pending_in(&identity_dir(ctx.state.root()));
+}
+
+fn clear_pending_in(dir: &Path) {
+    let path = dir.join(PENDING_FILE);
+    if let Some(p) = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<Pending>(&b).ok())
+    {
+        keys::delete(dir, &p.key);
+    }
+    let _ = std::fs::remove_file(&path);
 }
 
 /// A stable fingerprint of this machine's hardware (host name, CPU, GPU UUIDs).
@@ -392,8 +481,9 @@ pub async fn enroll_dial(
     force: bool,
 ) -> Result<Identity, LinkError> {
     check_not_enrolled(ctx, force)?;
+    let raw = token;
     let token = JoinToken::parse(token)?;
-    let (key, csr) = new_key()?;
+    let (key, csr) = pending_key(ctx, raw)?;
     let t = link::dial_transport(&ctx.config.gateway, transport, server);
     let io = t.connect().await?;
     let tls_io = match link::connect_tls(tls::enroll_client(&token.ca_sha256)?, io, &CancellationToken::new()).await {
@@ -424,7 +514,9 @@ pub async fn enroll_dial(
         .into_inner();
     let result = wait_result(&mut inbound).await?;
     drop(tx);
-    finish(ctx, result, &key, Some(server.to_owned()), None, transport)
+    let id = finish(ctx, result, &key, Some(server.to_owned()), None, transport)?;
+    clear_pending(ctx);
+    Ok(id)
 }
 
 async fn wait_result<S>(inbound: &mut S) -> Result<EnrollResult, LinkError>
@@ -499,8 +591,9 @@ pub async fn enroll_listen(
     cancel: CancellationToken,
 ) -> Result<Identity, LinkError> {
     check_not_enrolled(ctx, force)?;
+    let raw = token;
     let token = JoinToken::parse(token)?;
-    let (key, csr) = new_key()?;
+    let (key, csr) = pending_key(ctx, raw)?;
     let l = crate::transports::Listen::new(listen, transport);
     let bound = l.bind().await?;
     tracing_line(&format!("waiting for the app to connect on {bound}"));
@@ -532,7 +625,9 @@ pub async fn enroll_listen(
         };
         stop.cancel();
         if let Some(r) = result {
-            return finish(ctx, r?, &key, None, Some(bound), transport);
+            let id = finish(ctx, r?, &key, None, Some(bound), transport)?;
+            clear_pending(ctx);
+            return Ok(id);
         }
     }
 }
@@ -570,6 +665,30 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    #[test]
+    fn a_retry_with_the_same_token_reuses_the_kept_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = keys::KeyStoreChoice::File;
+        let (a, _) = pending_key_in(dir.path(), file, "tok-1").unwrap();
+        let (again, csr) = pending_key_in(dir.path(), file, "tok-1").unwrap();
+        assert_eq!(
+            a.serialize_der(),
+            again.serialize_der(),
+            "the same machine key"
+        );
+        assert!(!csr.is_empty());
+        let (other, _) = pending_key_in(dir.path(), file, "tok-2").unwrap();
+        assert_ne!(
+            a.serialize_der(),
+            other.serialize_der(),
+            "a new token, a new key"
+        );
+        clear_pending_in(dir.path());
+        assert!(!dir.path().join(PENDING_FILE).exists());
+        let (fresh, _) = pending_key_in(dir.path(), file, "tok-2").unwrap();
+        assert_ne!(other.serialize_der(), fresh.serialize_der());
     }
 
     #[test]

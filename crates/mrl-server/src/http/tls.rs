@@ -145,6 +145,10 @@ pub fn grpc_acceptor(
             operator,
         }));
     config.alpn_protocols = vec![b"h2".to_vec()];
+    // Every connection runs the module's verifier: no session resumption, which would reuse a
+    // cached client chain without it (a revoked certificate could come back that way).
+    config.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+    config.send_tls13_tickets = 0;
     Ok(TlsAcceptor::from(Arc::new(config)))
 }
 

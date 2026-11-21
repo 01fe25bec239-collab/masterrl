@@ -218,9 +218,11 @@ pub fn kind_name(kind: Option<&command::Kind>) -> &'static str {
 struct Queue {
     items: VecDeque<AgentMessage>,
     cap: usize,
+    /// METRICS: items decimated away.
     dropped: u64,
     decimate: bool,
-    last_relay: Option<(Option<AttemptRef>, String)>,
+    /// LOGS: chunks dropped, per relay (attempt and role), in the order they were first lost.
+    lost: Vec<(Option<AttemptRef>, String, u64)>,
 }
 
 impl Queue {
@@ -230,17 +232,13 @@ impl Queue {
             cap: cap.max(2),
             dropped: 0,
             decimate,
-            last_relay: None,
+            lost: Vec::new(),
         }
     }
 
     fn push(&mut self, msg: AgentMessage) {
         if self.items.len() < self.cap {
-            if !self.decimate && self.dropped > 0 {
-                let marker = self.marker();
-                self.items.push_back(marker);
-                self.dropped = 0;
-            }
+            self.flush_markers();
             self.items.push_back(msg);
             return;
         }
@@ -255,41 +253,48 @@ impl Queue {
             self.dropped += (before - self.items.len()) as u64;
             self.items.push_back(msg);
         } else {
-            if let Some(agent_message::Body::Worker(w)) = &msg.body {
-                self.last_relay = Some((w.attempt.clone(), w.role_id.clone()));
+            let (attempt, role) = match &msg.body {
+                Some(agent_message::Body::Worker(w)) => (w.attempt.clone(), w.role_id.clone()),
+                _ => (None, String::new()),
+            };
+            match self
+                .lost
+                .iter_mut()
+                .find(|(a, r, _)| *a == attempt && *r == role)
+            {
+                Some((_, _, n)) => *n += 1,
+                None => self.lost.push((attempt, role, 1)),
             }
-            self.dropped += 1;
         }
     }
 
-    fn marker(&self) -> AgentMessage {
-        let (attempt, role_id) = self.last_relay.clone().unwrap_or_default();
-        AgentMessage {
-            body: Some(agent_message::Body::Worker(WorkerRelay {
-                attempt,
-                role_id,
-                message: Some(WorkerMessage {
-                    body: Some(worker_message::Body::Log(LogChunk {
-                        stream: LogStream::Harness as i32,
-                        data: format!(
-                            "[mrl-agent: {} log chunk(s) dropped: the link was too slow]\n",
-                            self.dropped
-                        )
-                        .into_bytes(),
-                        ..LogChunk::default()
-                    })),
-                    ..WorkerMessage::default()
-                }),
-            })),
-            ..AgentMessage::default()
+    /// LOGS: one marker per relay that lost chunks, in that relay's own log.
+    fn flush_markers(&mut self) {
+        for (attempt, role_id, n) in std::mem::take(&mut self.lost) {
+            self.items.push_back(AgentMessage {
+                body: Some(agent_message::Body::Worker(WorkerRelay {
+                    attempt,
+                    role_id,
+                    message: Some(WorkerMessage {
+                        body: Some(worker_message::Body::Log(LogChunk {
+                            stream: LogStream::Harness as i32,
+                            data: format!(
+                                "[mrl-agent: {n} log chunk(s) dropped: the link was too slow]\n"
+                            )
+                            .into_bytes(),
+                            ..LogChunk::default()
+                        })),
+                        ..WorkerMessage::default()
+                    }),
+                })),
+                ..AgentMessage::default()
+            });
         }
     }
 
     fn take(&mut self) -> Vec<AgentMessage> {
-        if !self.decimate && self.dropped > 0 && self.items.len() < self.cap {
-            let m = self.marker();
-            self.items.push_back(m);
-            self.dropped = 0;
+        if self.items.len() < self.cap {
+            self.flush_markers();
         }
         self.items.drain(..).collect()
     }
@@ -650,37 +655,41 @@ impl Link {
     }
 
     /// The spooled `msgs` that can be sent. One too large to send (spooled before sizes were
-    /// checked) would fail on every replay and block the rest, so it is set aside instead.
+    /// checked) would fail on every replay and block the rest: a command result is swapped for a
+    /// small FAILED `result_too_large` one under the same seq (so the command still finishes);
+    /// anything else is set aside. Either way the original is kept on disk for diagnosis.
     fn sendable(&self, msgs: Vec<AgentMessage>) -> Result<Vec<AgentMessage>, LinkError> {
         let mut out = Vec::with_capacity(msgs.len());
         for m in msgs {
-            match &m.body {
-                Some(body) if envelope_len(body) > MAX_MESSAGE_BYTES => {
-                    self.set_aside(m.seq, body)?
+            let Some(body) = m
+                .body
+                .as_ref()
+                .filter(|b| envelope_len(b) > MAX_MESSAGE_BYTES)
+            else {
+                out.push(m);
+                continue;
+            };
+            let size = envelope_len(body);
+            let mut spool = self
+                .spool
+                .lock()
+                .map_err(|_| LinkError::Protocol("spool lock poisoned".into()))?;
+            let kept = match body {
+                agent_message::Body::CommandResult(r) => {
+                    let (replacement, kept) =
+                        spool.swap(m.seq, too_large_result(&r.command_id, size))?;
+                    out.push(replacement);
+                    kept
                 }
-                _ => out.push(m),
-            }
+                _ => spool.set_aside(m.seq)?,
+            };
+            eprintln!(
+                "mrl-agent: CONTROL message {} is {size} bytes, over the {MAX_MESSAGE_BYTES}-byte limit; it was not sent and is kept at {}",
+                m.seq,
+                kept.display()
+            );
         }
         Ok(out)
-    }
-
-    /// Moves spooled message `seq` (too large to send) out of the way, keeping it on disk for
-    /// diagnosis; a command result is replaced by a small FAILED `result_too_large` one.
-    fn set_aside(&self, seq: u64, body: &agent_message::Body) -> Result<(), LinkError> {
-        let kept = self
-            .spool
-            .lock()
-            .map_err(|_| LinkError::Protocol("spool lock poisoned".into()))?
-            .set_aside(seq)?;
-        eprintln!(
-            "mrl-agent: CONTROL message {seq} is {} bytes, over the {MAX_MESSAGE_BYTES}-byte limit; it was not sent and is kept at {}",
-            envelope_len(body),
-            kept.display()
-        );
-        if let agent_message::Body::CommandResult(r) = body {
-            self.send_control(too_large_result(&r.command_id, envelope_len(body)))?;
-        }
-        Ok(())
     }
 
     /// Journals the outcome of `seq` unless the link was bound to another node since
@@ -989,10 +998,20 @@ async fn wait_hello(inbound: &mut CoreIn) -> Result<CoreHello, LinkError> {
     }
 }
 
+/// Longest one message may wait for room on a stream (a core that stopped reading).
+const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
 async fn put(out: &mpsc::Sender<AgentMessage>, m: AgentMessage) -> Result<(), LinkError> {
-    out.send(m)
-        .await
-        .map_err(|_| LinkError::Unreachable("the connection to the core closed".into()))
+    match tokio::time::timeout(SEND_TIMEOUT, out.send(m)).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(LinkError::Unreachable(
+            "the connection to the core closed".into(),
+        )),
+        Err(_) => Err(LinkError::Unreachable(format!(
+            "the core stopped reading for {} s",
+            SEND_TIMEOUT.as_secs()
+        ))),
+    }
 }
 
 fn now_ts() -> Option<prost_types::Timestamp> {
@@ -1188,9 +1207,16 @@ async fn run_lane(
     out: mpsc::Sender<AgentMessage>,
     stop: CancellationToken,
 ) -> Result<Outcome, LinkError> {
-    match lane {
-        Lane::Control => control_lane(&l, inbound, out, stop).await,
-        _ => data_lane(&l, lane, inbound, out, stop).await,
+    let run = async {
+        match lane {
+            Lane::Control => control_lane(&l, inbound, out, stop.clone()).await,
+            _ => data_lane(&l, lane, inbound, out, stop.clone()).await,
+        }
+    };
+    // `stop` ends the lane even while it waits to send (state is durable: spool and journal).
+    tokio::select! {
+        r = run => r,
+        () = stop.cancelled() => Ok(Outcome::Stopped),
     }
 }
 
@@ -1209,9 +1235,15 @@ async fn dialed(l: Arc<LaneCtx>, io: BoxIo, stop: CancellationToken) -> Result<O
         let (l, stop, mut c) = (l.clone(), stop.clone(), client.clone());
         async move {
             let (tx, rx) = mpsc::channel(256);
+            let opened = tokio::select! {
+                () = stop.cancelled() => return Err(LinkError::Unreachable("stopped".into())),
+                r = tokio::time::timeout(HANDSHAKE_TIMEOUT, c.session(ReceiverStream::new(rx))) => r,
+            };
             let inbound: CoreIn = Box::pin(
-                c.session(ReceiverStream::new(rx))
-                    .await
+                opened
+                    .map_err(|_| {
+                        LinkError::Unreachable(format!("the core did not open the {lane:?} stream in time"))
+                    })?
                     .map_err(|s| status_error(&s))?
                     .into_inner(),
             );
@@ -1353,9 +1385,11 @@ pub async fn accept_tls(
         tokio::select! {
             () = stop.cancelled() => return Ok(None),
             io = listen.connect() => {
+                // Can't listen (port taken, say): back to the caller's reconnect backoff.
+                let io = io?;
                 let acceptor = acceptor.clone();
                 handshakes.spawn(async move {
-                    tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(io?))
+                    tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(io))
                         .await
                         .map_err(|_| LinkError::Unreachable("the peer did not finish the TLS handshake in time".into()))?
                         .map_err(|e| LinkError::Certificate(format!("TLS with the connecting peer failed: {e}")))
@@ -1609,15 +1643,49 @@ mod tests {
         l2.items.pop_front();
         let out = l2.take();
         let marker = out.last().unwrap();
-        let Some(agent_message::Body::Worker(w)) = &marker.body else {
+        let (role, text) = log_of(marker);
+        assert!(text.contains("2 log chunk(s) dropped"), "{text}");
+        assert_eq!(role, "trainer");
+    }
+
+    fn log_of(m: &AgentMessage) -> (String, String) {
+        let Some(agent_message::Body::Worker(w)) = &m.body else {
             panic!("marker")
         };
         let Some(worker_message::Body::Log(c)) = w.message.as_ref().and_then(|m| m.body.as_ref())
         else {
             panic!("log")
         };
-        assert!(String::from_utf8_lossy(&c.data).contains("2 log chunk(s) dropped"));
-        assert_eq!(w.role_id, "trainer");
+        (
+            w.role_id.clone(),
+            String::from_utf8_lossy(&c.data).into_owned(),
+        )
+    }
+
+    #[test]
+    fn each_relay_gets_its_own_loss_marker() {
+        let log = |role: &str| AgentMessage {
+            body: Some(agent_message::Body::Worker(WorkerRelay {
+                role_id: role.into(),
+                message: Some(WorkerMessage {
+                    body: Some(worker_message::Body::Log(LogChunk::default())),
+                    ..WorkerMessage::default()
+                }),
+                ..WorkerRelay::default()
+            })),
+            ..AgentMessage::default()
+        };
+        let mut q = Queue::new(2, false);
+        for role in ["a", "b", "trainer", "trainer", "rollout"] {
+            q.push(log(role));
+        }
+        q.items.clear(); // sent
+        let markers: Vec<(String, String)> = q.take().iter().map(log_of).collect();
+        assert_eq!(markers.len(), 2);
+        assert_eq!(markers[0].0, "trainer");
+        assert!(markers[0].1.contains("2 log chunk(s)"));
+        assert_eq!(markers[1].0, "rollout");
+        assert!(markers[1].1.contains("1 log chunk(s)"));
     }
 
     struct Count(std::sync::atomic::AtomicUsize);
@@ -1823,7 +1891,7 @@ mod tests {
     }
 
     #[test]
-    fn a_message_spooled_too_large_is_set_aside_and_the_next_one_goes() {
+    fn a_result_spooled_too_large_is_swapped_durably_and_the_next_one_goes() {
         let dir = tempfile::tempdir().unwrap();
         let link = Link::open(dir.path(), &GatewaySettings::default()).unwrap();
         // Spooled by an older agent, before sizes were checked.
@@ -1845,21 +1913,31 @@ mod tests {
             .unwrap();
         let (msgs, _) = link.spool.lock().unwrap().pending(0, false).unwrap();
         let sent = link.sendable(msgs).unwrap();
-        assert_eq!(sent.len(), 1);
+        // The result is swapped in place (same seq): the command still finishes, nothing waits
+        // for spool space, and the next message follows.
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].seq, big);
+        assert!(matches!(&sent[0].body,
+            Some(agent_message::Body::CommandResult(r)) if r.command_id == "big"
+                && r.failure.as_ref().is_some_and(|f| f.sub_code == "result_too_large")));
         assert!(matches!(
-            sent[0].body,
+            sent[1].body,
             Some(agent_message::Body::AttemptStatus(_))
         ));
         let kept = dir
             .path()
             .join(format!("gateway/spool/oversized/{big:020}.pb"));
         assert!(kept.exists(), "kept for diagnosis");
-        // Never again, and the command still gets a (small) result.
+        // Durable: after a restart the spool holds the small result, not the original.
+        drop(link);
+        let link = Link::open(dir.path(), &GatewaySettings::default()).unwrap();
         let (msgs, _) = link.spool.lock().unwrap().pending(0, false).unwrap();
-        assert!(msgs.iter().all(|m| m.seq != big));
-        assert!(msgs.iter().any(|m| matches!(&m.body,
-            Some(agent_message::Body::CommandResult(r)) if r.command_id == "big"
-                && r.failure.as_ref().is_some_and(|f| f.sub_code == "result_too_large"))));
+        assert_eq!(
+            link.sendable(msgs.clone()).unwrap(),
+            msgs,
+            "nothing left to swap"
+        );
+        assert_eq!(msgs.len(), 2);
     }
 
     /// Runs until `go` is notified.
@@ -1977,6 +2055,22 @@ mod tests {
         .expect("supervise returns when TELEMETRY ends");
         assert!(matches!(r, Err(LinkError::Unreachable(_))));
         assert!(stop.is_cancelled(), "the other streams were stopped");
+    }
+
+    #[tokio::test]
+    async fn a_port_that_cannot_be_listened_on_returns_to_the_backoff() {
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let listen =
+            crate::transports::Listen::new(taken.local_addr().unwrap(), TransportKind::Direct);
+        let (server, _) = tls_pair();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
+        let r = tokio::time::timeout(
+            Duration::from_secs(5),
+            accept_tls(&listen, acceptor, |_| true, &CancellationToken::new()),
+        )
+        .await
+        .expect("returns at once instead of retrying");
+        assert!(r.is_err());
     }
 
     #[tokio::test]

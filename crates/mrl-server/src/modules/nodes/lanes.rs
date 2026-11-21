@@ -222,6 +222,16 @@ impl LaneMetrics {
     }
 }
 
+/// The session a lane's items belong to: node and session epoch.
+pub(crate) struct Owner {
+    /// Where the current epoch is read.
+    pub db: crate::db::Db,
+    /// The node.
+    pub node: Uuid,
+    /// The session epoch the items came under.
+    pub epoch: i64,
+}
+
 /// A bounded METRICS or LOGS queue for one stream, drained into the sink by its own task.
 ///
 /// - METRICS, when full: every other queued item is dropped (oldest first), so the series stays
@@ -256,7 +266,8 @@ impl Queue {
         let (mut run, mut dropped) = (self.gap, 0);
         for (i, mut item) in self.items.drain(..).enumerate() {
             if i % 2 == 0 {
-                run += 1;
+                // The dropped item's own gap carries over to the next kept one.
+                run += 1 + item.dropped_before;
                 dropped += 1;
             } else {
                 item.dropped_before += run;
@@ -274,12 +285,16 @@ impl LossyLane {
     /// A queue of `capacity` items feeding `router`'s sink for `lane` (none: discard), for one
     /// CONTROL session: once `session` is cancelled (it ended or was taken over) nothing more
     /// is queued or delivered.
-    // ponytail: items still queued when their session ends are dropped (lossy lanes, D-04-05).
+    /// With `owner`, each item is delivered only while that session is still the node's in the
+    /// database (a takeover on another replica stops delivery before this stream hears of it).
+    // ponytail: items still queued when their session ends are dropped (lossy lanes, D-04-05);
+    // one epoch read per item, batch it if lane rates get high.
     pub fn start(
         router: &LaneRouter,
         lane: LaneKind,
         capacity: usize,
         session: tokio_util::sync::CancellationToken,
+        owner: Option<Owner>,
     ) -> Self {
         let shared = router.sink_for(lane).map(|sink| {
             let shared = Arc::new(Shared {
@@ -301,6 +316,17 @@ impl LossyLane {
                     };
                     match next {
                         Some(item) => {
+                            if let Some(o) = &owner {
+                                match super::store::is_current(&o.db, o.node, o.epoch).await {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        session.cancel();
+                                        return;
+                                    }
+                                    // Can't tell: fail closed, this item is dropped.
+                                    Err(_) => continue,
+                                }
+                            }
                             if let Err(e) = sink.deliver(item).await {
                                 tracing::warn!(lane = lane.as_str(), error = %e, "lane sink failed; item dropped");
                             }
@@ -463,6 +489,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_second_decimation_keeps_the_gaps_of_the_items_it_drops() {
+        let mut q = Queue::default();
+        q.items.extend((1..=4).map(|s| item(s, LaneKind::Metrics)));
+        assert_eq!(q.decimate(), 2); // drops 1, 3
+        q.items.extend((5..=6).map(|s| item(s, LaneKind::Metrics)));
+        assert_eq!(q.decimate(), 2); // drops 2 (gap 1), 5
+        let kept: Vec<(u64, u64)> = q.items.iter().map(|i| (i.seq, i.dropped_before)).collect();
+        assert_eq!(kept, [(4, 3), (6, 1)], "1, 2, 3 before 4; 5 before 6");
+        assert_eq!(q.gap, 0);
+    }
+
     async fn drain(gate: &Gate, n: usize) -> Vec<(u64, u64)> {
         for _ in 0..n {
             gate.open.notify_one();
@@ -489,6 +527,7 @@ mod tests {
             LaneKind::Metrics,
             4,
             tokio_util::sync::CancellationToken::new(),
+            None,
         );
         lane.offer(item(1, LaneKind::Metrics)); // taken by the sink task, held at the gate
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -510,6 +549,7 @@ mod tests {
             LaneKind::Logs,
             2,
             tokio_util::sync::CancellationToken::new(),
+            None,
         );
         lane.offer(item(1, LaneKind::Logs));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -530,6 +570,7 @@ mod tests {
             LaneKind::Logs,
             4,
             tokio_util::sync::CancellationToken::new(),
+            None,
         );
         let before = LaneMetrics::get().discarded_count(LaneKind::Logs);
         lane.offer(item(1, LaneKind::Logs));

@@ -153,7 +153,10 @@ impl GatewayHarness {
         let seams = match mode {
             Mode::Solo => crate::seams::build(crate::seams::solo(TEST_SECRET), Mode::Solo),
             Mode::Team => crate::seams::build(
-                crate::seams::team(&[(TEAM_TOKEN, crate::seams::user("u-gateway", "org-gateway"))]),
+                crate::seams::team(&[(
+                    TEAM_TOKEN,
+                    crate::seams::user("u-gateway", &mrl_domain::ids::OrgId::new().to_string()),
+                )]),
                 Mode::Team,
             ),
         };
@@ -652,6 +655,419 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn every_gateway_connection_is_a_full_handshake_so_revocation_is_always_checked() {
+        use mrl_agent::transports::Transport;
+        let gw = GatewayHarness::start(TestDb::new().await).await;
+        let a = TestAgent::new(1, |_| {});
+        a.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
+        let id = mrl_agent::enroll::Identity::load(a.ctx.state.root())
+            .unwrap()
+            .unwrap();
+        // One client config (one session cache) for both connections: a resumable server would
+        // resume the second one and skip the certificate check.
+        let config = mrl_agent::session::tls::client(&id.ca, id.chain(), id.key()).unwrap();
+        let mut kinds = Vec::new();
+        for _ in 0..2 {
+            let io = mrl_agent::transports::Direct::new(&gw.addr().to_string())
+                .connect()
+                .await
+                .unwrap();
+            let tls =
+                mrl_agent::session::connect_tls(config.clone(), io, &CancellationToken::new())
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut tls = tls;
+            kinds.push(tls.get_ref().1.handshake_kind());
+            // Reading takes in any session tickets the server sends after the handshake.
+            let mut buf = [0u8; 64];
+            let _ = tokio::time::timeout(
+                Duration::from_millis(300),
+                tokio::io::AsyncReadExt::read(&mut tls, &mut buf),
+            )
+            .await;
+        }
+        assert_eq!(
+            kinds,
+            vec![Some(tokio_rustls::rustls::HandshakeKind::Full); 2],
+            "no resumption"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn a_machine_with_a_work_start_in_flight_is_not_removed() {
+        let gw = GatewayHarness::start(TestDb::new().await).await;
+        let a = TestAgent::new(1, |_| {});
+        let node_s = a.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
+        let node = NodeId::from_str(&node_s).unwrap();
+        let launches = CommandSender::new(&gw.gw, &[CommandKind::LaunchAttempt]);
+        let launch = launches
+            .send(
+                node,
+                NewCommand::new(Kind::LaunchAttempt(
+                    mrl_proto::agent::v1::LaunchAttempt::default(),
+                )),
+            )
+            .await
+            .unwrap();
+        // The agent got it just before the drain; no heartbeat shows the attempt yet.
+        sqlx::query("UPDATE agent_commands SET state = 'RECEIVED' WHERE id = $1")
+            .bind(launch.id)
+            .execute(gw.db.pool())
+            .await
+            .unwrap();
+        let link = a.run();
+        gw.wait_status(&node_s, "ONLINE").await;
+        gw.post(&format!("/api/v1/nodes/{node_s}:drain"), json!({}))
+            .await;
+        tokio::time::sleep(Duration::from_secs(2)).await; // heartbeats with 0 running arrive
+        let r = gw
+            .post(&format!("/api/v1/nodes/{node_s}:decommission"), json!({}))
+            .await;
+        assert_eq!(r.status, 422, "{}", r.text());
+        assert!(r.text().contains("work start"), "{}", r.text());
+        // The launch finished (the attempt started); only a heartbeat after that counts.
+        sqlx::query("UPDATE agent_commands SET state = 'COMPLETED', updated_at = now() + interval '1 hour' WHERE id = $1")
+            .bind(launch.id)
+            .execute(gw.db.pool())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let r = gw
+            .post(&format!("/api/v1/nodes/{node_s}:decommission"), json!({}))
+            .await;
+        assert_eq!(
+            r.status,
+            422,
+            "a heartbeat must follow the started work: {}",
+            r.text()
+        );
+        link.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn a_long_running_attempt_keeps_its_lease_across_retention() {
+        let gw = GatewayHarness::start(TestDb::new().await).await;
+        let a = TestAgent::new(1, |_| {});
+        let node_s = a.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
+        let node = NodeId::from_str(&node_s).unwrap();
+        let attempt = mrl_domain::ids::AttemptId::new();
+        let launch = CommandSender::new(&gw.gw, &[CommandKind::LaunchAttempt])
+            .send(
+                node,
+                NewCommand::new(Kind::LaunchAttempt(
+                    mrl_proto::agent::v1::LaunchAttempt::default(),
+                ))
+                .attempt(attempt, 1),
+            )
+            .await
+            .unwrap();
+        // Launched 31 days ago and still running.
+        sqlx::query(
+            "UPDATE agent_commands SET state = 'COMPLETED', updated_at = now() - interval '31 days' WHERE id = $1",
+        )
+        .bind(launch.id)
+        .execute(gw.db.pool())
+        .await
+        .unwrap();
+        let running = [mrl_proto::common::v1::AttemptRef {
+            attempt_id: attempt.to_string(),
+            fencing_epoch: 1,
+            ..Default::default()
+        }];
+        let leases =
+            || mrl_server::modules::nodes::store::leases(gw.db.db(), uuid_of(&node_s), &running);
+        assert_eq!(leases().await.unwrap().len(), 1, "a heartbeat renews it");
+        mrl_server::modules::nodes::health::retention(&gw.gw)
+            .await
+            .unwrap();
+        assert_eq!(
+            leases().await.unwrap().len(),
+            1,
+            "the launch a live attempt renews from is kept"
+        );
+    }
+
+    /// Hides anything owned by another org than the caller's (platform resources: allowed).
+    struct OrgScoped;
+
+    #[async_trait::async_trait]
+    impl mrl_server::seams::Authorizer for OrgScoped {
+        async fn authorize(
+            &self,
+            ctx: &mrl_server::seams::RequestContext,
+            _: &str,
+            resource: &mrl_server::seams::Resource,
+        ) -> Result<mrl_server::seams::Decision, mrl_server::seams::SeamError> {
+            Ok(match &resource.org {
+                Some(o) if Some(o) != ctx.org.as_ref() => mrl_server::seams::Decision::Hide,
+                _ => mrl_server::seams::Decision::Allow,
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn private_pools_of_two_orgs_stay_apart() {
+        let db = TestDb::new().await;
+        let (org_a, org_b) = (
+            mrl_domain::ids::OrgId::new().to_string(),
+            mrl_domain::ids::OrgId::new().to_string(),
+        );
+        let cfg = server_config(fast_config(), Mode::Team, 0);
+        let module = NodesModule::new(
+            db.db().clone(),
+            &cfg,
+            Arc::new(InMemorySecretStore::default()),
+            LaneRouter::new(),
+        );
+        let gw = module.gateway();
+        let seams = crate::seams::build(
+            crate::seams::team(&[
+                ("tok-a", crate::seams::user("u-a", &org_a)),
+                ("tok-b", crate::seams::user("u-b", &org_b)),
+            ])
+            .authorizer(OrgScoped),
+            Mode::Team,
+        );
+        let server = TestServer::start(cfg, seams, vec![Box::new(module)])
+            .await
+            .unwrap_or_else(|e| panic!("{}", e.explain()));
+        let call = |who: &'static str, method: Method, path: String, body: Value| {
+            let server = &server;
+            async move {
+                let auth = format!("Bearer {who}");
+                server
+                    .request(
+                        method,
+                        &path,
+                        &[
+                            ("authorization", auth.as_str()),
+                            ("content-type", "application/json"),
+                        ],
+                        Body::from(body.to_string()),
+                    )
+                    .await
+            }
+        };
+        let pa = call(
+            "tok-a",
+            Method::POST,
+            "/api/v1/pools".into(),
+            json!({"name": "gpus"}),
+        )
+        .await;
+        assert_eq!(pa.status, 201, "{}", pa.text());
+        let pa = pa.json()["id"].as_str().unwrap().to_owned();
+        let pb = call(
+            "tok-b",
+            Method::POST,
+            "/api/v1/pools".into(),
+            json!({"name": "gpus"}),
+        )
+        .await;
+        assert_eq!(pb.status, 201, "same name, other org: {}", pb.text());
+        let pb = pb.json()["id"].as_str().unwrap().to_owned();
+        let listed = call("tok-b", Method::GET, "/api/v1/pools".into(), json!({}))
+            .await
+            .json();
+        let ids: Vec<&str> = listed["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|p| p["id"].as_str())
+            .collect();
+        assert_eq!(ids, vec![pb.as_str()], "only org B's pool");
+        for (m, path) in [
+            (Method::GET, format!("/api/v1/pools/{pa}/nodes")),
+            (
+                Method::POST,
+                format!("/api/v1/pools/{pa}/enrollment-tokens"),
+            ),
+        ] {
+            assert_eq!(
+                call("tok-b", m, path.clone(), json!({})).await.status,
+                404,
+                "{path}"
+            );
+        }
+        // A machine in org A's pool is invisible to org B.
+        let token = call(
+            "tok-a",
+            Method::POST,
+            format!("/api/v1/pools/{pa}/enrollment-tokens"),
+            json!({}),
+        )
+        .await;
+        assert_eq!(token.status, 201, "{}", token.text());
+        let token = token.json()["token"].as_str().unwrap().to_owned();
+        let agent = TestAgent::new(1, |_| {});
+        let node = mrl_agent::enroll::enroll_dial(
+            &agent.ctx,
+            &gw.addr().unwrap().to_string(),
+            &token,
+            mrl_agent::transports::TransportKind::Direct,
+            false,
+        )
+        .await
+        .unwrap()
+        .link
+        .node_id;
+        assert_eq!(
+            call(
+                "tok-a",
+                Method::GET,
+                format!("/api/v1/nodes/{node}"),
+                json!({})
+            )
+            .await
+            .status,
+            200
+        );
+        assert_eq!(
+            call(
+                "tok-b",
+                Method::GET,
+                format!("/api/v1/nodes/{node}"),
+                json!({})
+            )
+            .await
+            .status,
+            404
+        );
+        assert_eq!(
+            call(
+                "tok-b",
+                Method::POST,
+                format!("/api/v1/nodes/{node}:drain"),
+                json!({})
+            )
+            .await
+            .status,
+            404
+        );
+        server.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn a_machine_that_lost_the_enrollment_answer_gets_it_again_with_the_same_key() {
+        let gw = GatewayHarness::start(TestDb::new().await).await;
+        let token = gw.token(json!({})).await;
+        let pki = gw.gw.pki().unwrap();
+        let (key, csr) = mrl_agent::enroll::new_key().unwrap();
+        let req = |csr: Vec<u8>| mrl_proto::agent::v1::EnrollRequest {
+            join_token: token.clone(),
+            csr_der: csr,
+            hostname: "gpu-box".into(),
+            ..Default::default()
+        };
+        let enroll = |r: mrl_proto::agent::v1::EnrollRequest| {
+            let (db, pki) = (gw.db.db().clone(), pki.clone());
+            async move { mrl_server::modules::nodes::store::enroll(&db, pki, &fast_config(), &r).await }
+        };
+        let first = enroll(req(csr.clone())).await.unwrap();
+        // The answer was lost: the same machine (same key, same token) asks again.
+        let again = enroll(req(csr)).await.unwrap();
+        assert_eq!(again.node, first.node, "the same node, not a second one");
+        assert_ne!(again.cert.sha256, first.cert.sha256);
+        assert_eq!(gw.db.count("compute_nodes").await, 1);
+        // Another key with the same token is still refused.
+        let (_, other) = mrl_agent::enroll::new_key().unwrap();
+        assert_eq!(enroll(req(other)).await.unwrap_err().code(), "MRL-NODE-180");
+        // Once the machine has connected, the token is spent for good.
+        sqlx::query("UPDATE compute_nodes SET status = 'ONLINE' WHERE id = $1")
+            .bind(first.node)
+            .execute(gw.db.pool())
+            .await
+            .unwrap();
+        let csr = rcgen::CertificateParams::new(Vec::<String>::new())
+            .unwrap()
+            .serialize_request(&key)
+            .unwrap()
+            .der()
+            .to_vec();
+        assert_eq!(enroll(req(csr)).await.unwrap_err().code(), "MRL-NODE-180");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn a_join_token_never_lands_in_the_idempotency_cache() {
+        let gw = GatewayHarness::start(TestDb::new().await).await;
+        let r = gw
+            .server
+            .request(
+                Method::POST,
+                &format!("/api/v1/pools/{}/enrollment-tokens", gw.pool),
+                &[
+                    (LAUNCH_SECRET_HEADER, TEST_SECRET),
+                    ("content-type", "application/json"),
+                    ("idempotency-key", "tok-key-1"),
+                ],
+                Body::from("{}"),
+            )
+            .await;
+        assert_eq!(r.status, 422, "{}", r.text());
+        assert!(!r.text().contains("mrlj_"));
+        let kept: Vec<String> =
+            sqlx::query_scalar("SELECT row_to_json(k)::text FROM idempotency_keys k")
+                .fetch_all(gw.db.pool())
+                .await
+                .unwrap();
+        assert!(kept.iter().all(|row| !row.contains("mrlj_")), "{kept:?}");
+        // Without a key the token is made, and only its hash is stored.
+        let token = gw.token(json!({})).await;
+        let hashes: Vec<String> =
+            sqlx::query_scalar("SELECT row_to_json(t)::text FROM node_enrollment_tokens t")
+                .fetch_all(gw.db.pool())
+                .await
+                .unwrap();
+        assert!(
+            hashes.iter().all(|row| !row.contains(&token)),
+            "the raw token is not stored"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn a_command_that_expired_undelivered_is_never_marked_received() {
+        // The health pass (expiry sweep) runs once at start and then not for an hour.
+        let gw = GatewayHarness::start_with(
+            TestDb::new().await,
+            GatewayConfig {
+                health_check_seconds: 3600,
+                ..fast_config()
+            },
+            Arc::new(InMemorySecretStore::default()),
+            LaneRouter::new(),
+        )
+        .await;
+        let a = TestAgent::new(1, |_| {});
+        let node =
+            NodeId::from_str(&a.enroll(&gw, &gw.token(json!({})).await).await.unwrap()).unwrap();
+        let probes = CommandSender::new(&gw.gw, &[CommandKind::Probe]);
+        // Claimed (SENT), then the connection dropped before the agent got it.
+        let lost = probes
+            .send(node, probe().deadline(Duration::from_secs(1)))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_commands SET state = 'SENT', sent_at = now() WHERE id = $1")
+            .bind(lost.id)
+            .execute(gw.db.pool())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await; // past its deadline
+        let next = probes.send(node, probe()).await.unwrap();
+        let link = a.run();
+        wait_state(&gw, next.id, "FAILED").await; // delivered and acked (no Probe handler)
+        assert_eq!(state_of(&gw, lost.id).await, "EXPIRED", "never RECEIVED");
+        link.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
     async fn a_stored_command_too_large_to_send_fails_and_the_next_one_goes() {
         use prost::Message;
         let gw = GatewayHarness::start(TestDb::new().await).await;
@@ -939,9 +1355,22 @@ mod tests {
                 .json()["status"],
             "DRAINING"
         );
+        // Right after the drain no heartbeat has shown that nothing runs: not yet.
         let r = gw
             .post(&format!("/api/v1/nodes/{node}:decommission"), json!({}))
             .await;
+        assert_eq!(r.status, 422, "{}", r.text());
+        assert!(r.text().contains("heartbeat"), "{}", r.text());
+        let mut r = r;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            r = gw
+                .post(&format!("/api/v1/nodes/{node}:decommission"), json!({}))
+                .await;
+            if r.status == 200 {
+                break;
+            }
+        }
         assert_eq!(r.json()["status"], "DECOMMISSIONED", "{}", r.text());
         tokio::time::sleep(Duration::from_millis(500)).await;
         let open: i64 = sqlx::query_scalar(
@@ -1506,7 +1935,8 @@ mod tests {
                 state_of(&gw, c2.id).await,
                 state_of(&gw, c3.id).await
             ),
-            ("SUPERSEDED".into(), "PENDING".into(), "SENT".into())
+            // Past its deadline and above the claim point: expired by the claim itself.
+            ("SUPERSEDED".into(), "EXPIRED".into(), "SENT".into())
         );
         assert!(
             !store::commands_received(gw.db.db(), node.as_uuid(), 4, 10)
@@ -1766,6 +2196,75 @@ mod tests {
         assert_eq!(kept, 0, "the stale stream recorded nothing");
         s2.cancel();
         let _ = new.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn metrics_stop_the_moment_a_takeover_commits_before_the_old_stream_hears() {
+        let router = LaneRouter::new();
+        let seen = Arc::new(Seen(std::sync::Mutex::new(Vec::new())));
+        router.register(seen.clone());
+        let gw = GatewayHarness::start_with(
+            TestDb::new().await,
+            fast_config(),
+            Arc::new(InMemorySecretStore::default()),
+            router,
+        )
+        .await;
+        let a = TestAgent::new(1, |_| {});
+        let node = a.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
+        let id = mrl_agent::enroll::Identity::load(a.ctx.state.root())
+            .unwrap()
+            .unwrap();
+        let mut conn = raw_client(&gw.addr().to_string(), &id).await;
+        let (_ctl, _ctl_in) = raw_stream(&mut conn, &id, mrl_proto::agent::v1::Lane::Control).await;
+        gw.wait(
+            &node,
+            |n| n["session_epoch"].as_i64() >= Some(1),
+            "a session",
+        )
+        .await;
+        let (bulk, _bulk_in) = raw_stream(&mut conn, &id, mrl_proto::agent::v1::Lane::Bulk).await;
+        let metrics = |seq: u64| mrl_proto::agent::v1::AgentMessage {
+            seq,
+            body: Some(agent_message::Body::Worker(
+                mrl_proto::agent::v1::WorkerRelay {
+                    message: Some(mrl_proto::worker::v1::WorkerMessage {
+                        body: Some(mrl_proto::worker::v1::worker_message::Body::Metrics(
+                            Default::default(),
+                        )),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        };
+        bulk.send(metrics(1)).await.unwrap();
+        for _ in 0..100 {
+            if !seen.0.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            seen.0.lock().unwrap().len(),
+            1,
+            "the current session's metrics arrive"
+        );
+        // Another replica takes over: committed, but this replica is not woken (no notify), so
+        // its streams stay open until their next check.
+        sqlx::query("UPDATE compute_nodes SET session_epoch = session_epoch + 1 WHERE id = $1")
+            .bind(uuid_of(&node))
+            .execute(gw.db.pool())
+            .await
+            .unwrap();
+        let _ = bulk.send(metrics(888_888)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            seen.0.lock().unwrap().iter().all(|(_, s)| *s != 888_888),
+            "nothing from the old session reaches the sink"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2235,27 +2734,27 @@ mod tests {
                 .fetch_one(gw.db.pool())
                 .await
                 .unwrap();
-        store::telemetry(
-            gw.db.db(),
-            id,
-            epoch,
-            &reading(ts(now, 500_000_000), 51, 2),
-            90,
-        )
-        .await
-        .unwrap();
-        store::telemetry(
-            gw.db.db(),
-            id,
-            epoch,
-            &reading(ts(now, 100_000_000), 77, 1),
-            90,
-        )
-        .await
-        .unwrap();
+        let ahead = time::Duration::minutes(5);
+        let save = |t: mrl_proto::agent::v1::NodeTelemetry| {
+            let db = gw.db.db().clone();
+            async move { store::telemetry(&db, id, epoch, &t, 90, ahead).await }
+        };
+        assert!(save(reading(ts(now, 500_000_000), 51, 2)).await.unwrap());
+        assert!(
+            !save(reading(ts(now, 100_000_000), 77, 1)).await.unwrap(),
+            "older: not saved, so no sink sees it"
+        );
         let n = gw.node(&node).await;
         assert_eq!(n["gpus"][0]["temperature_c"], 51);
         assert_eq!(n["telemetry"]["ram_used_bytes"], 2);
+        // A clock a day ahead can't hold back the readings after it: that reading counts as
+        // taken now (older than the stored one here), and the next real one is saved.
+        assert!(!save(reading(ts(now + 86_400, 0), 60, 3)).await.unwrap());
+        assert!(save(reading(ts(now + 120, 0), 61, 4)).await.unwrap());
+        assert_eq!(gw.node(&node).await["telemetry"]["ram_used_bytes"], 4);
+        let later = reading(ts(now + 300, 0), 62, 5);
+        let other_session = store::telemetry(gw.db.db(), id, epoch + 7, &later, 90, ahead).await;
+        assert!(!other_session.unwrap(), "only the current session writes");
     }
 
     #[tokio::test(flavor = "multi_thread")]

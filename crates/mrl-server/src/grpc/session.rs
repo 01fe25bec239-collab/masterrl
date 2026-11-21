@@ -55,7 +55,12 @@ pub async fn run(
     out: Outbound,
     shutdown: CancellationToken,
 ) {
-    if let Err(status) = drive(&gw, &peer, &mut inbound, &out, &shutdown).await {
+    // Shutdown ends the stream even while it waits to send.
+    let driven = tokio::select! {
+        r = drive(&gw, &peer, &mut inbound, &out, &shutdown) => r,
+        () = shutdown.cancelled() => Ok(()),
+    };
+    if let Err(status) = driven {
         tracing::info!(code = ?status.code(), message = status.message(), "gateway stream closed");
         let _ = out.send(Err(status)).await;
     }
@@ -89,31 +94,50 @@ fn protocol(msg: &str) -> Status {
     Status::invalid_argument(NodesError::Protocol(msg.to_owned()).explain())
 }
 
+/// Longest one message may wait for room on a stream (an agent that stopped reading): then the
+/// stream closes, so revocation, takeover and shutdown are never held up by a stuck peer.
+pub const SEND_TIMEOUT: Duration = Duration::from_secs(30);
+
+async fn put(out: &Outbound, m: CoreMessage) -> Result<(), Status> {
+    match tokio::time::timeout(SEND_TIMEOUT, out.send(Ok(m))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(_)) => Err(Status::cancelled("the agent closed the stream")),
+        Err(_) => Err(Status::deadline_exceeded(format!(
+            "the agent stopped reading for {} s",
+            SEND_TIMEOUT.as_secs()
+        ))),
+    }
+}
+
 async fn send(
     out: &Outbound,
     body: core_message::Body,
     seq: u64,
     ack_seq: u64,
 ) -> Result<(), Status> {
-    out.send(Ok(CoreMessage {
-        seq,
-        ack_seq,
-        sent_at: now_ts(),
-        body: Some(body),
-    }))
+    put(
+        out,
+        CoreMessage {
+            seq,
+            ack_seq,
+            sent_at: now_ts(),
+            body: Some(body),
+        },
+    )
     .await
-    .map_err(|_| Status::cancelled("the agent closed the stream"))
 }
 
 async fn ack(out: &Outbound, ack_seq: u64) -> Result<(), Status> {
-    out.send(Ok(CoreMessage {
-        seq: 0,
-        ack_seq,
-        sent_at: now_ts(),
-        body: None,
-    }))
+    put(
+        out,
+        CoreMessage {
+            seq: 0,
+            ack_seq,
+            sent_at: now_ts(),
+            body: None,
+        },
+    )
     .await
-    .map_err(|_| Status::cancelled("the agent closed the stream"))
 }
 
 async fn drive(
@@ -313,6 +337,11 @@ impl Lossy {
         stream: Lane,
         session: &CancellationToken,
     ) -> Self {
+        let owner = || crate::modules::nodes::lanes::Owner {
+            db: gw.db.clone(),
+            node,
+            epoch,
+        };
         let (tx, mut rx) = watch::channel::<Option<AgentMessage>>(None);
         let gw2 = gw.clone();
         let s = session.clone();
@@ -320,11 +349,21 @@ impl Lossy {
             while rx.changed().await.is_ok() && !s.is_cancelled() {
                 let msg = rx.borrow_and_update().clone();
                 let Some(msg) = msg else { continue };
-                if let Some(agent_message::Body::Telemetry(t)) = &msg.body {
-                    if let Err(e) =
-                        store::telemetry(&gw2.db, node, epoch, t, gw2.config.gpu_hot_celsius).await
-                    {
+                let Some(agent_message::Body::Telemetry(t)) = &msg.body else {
+                    continue;
+                };
+                let ahead = time::Duration::seconds(
+                    i64::try_from(gw2.config.max_clock_skew_seconds).unwrap_or(i64::MAX),
+                );
+                // The sink gets a reading only when this session saved it (current, newer).
+                match store::telemetry(&gw2.db, node, epoch, t, gw2.config.gpu_hot_celsius, ahead)
+                    .await
+                {
+                    Ok(true) => {}
+                    Ok(false) => continue,
+                    Err(e) => {
                         tracing::debug!(code = e.code(), error = %e, "telemetry not saved");
+                        continue;
                     }
                 }
                 if s.is_cancelled() {
@@ -352,12 +391,14 @@ impl Lossy {
                 LaneKind::Metrics,
                 gw.config.lane_buffer,
                 session.clone(),
+                Some(owner()),
             ),
             logs: LossyLane::start(
                 &gw.lanes,
                 LaneKind::Logs,
                 gw.config.lane_buffer,
                 session.clone(),
+                Some(owner()),
             ),
             telemetry: tx,
         }
@@ -574,15 +615,19 @@ async fn control(
     .await
     .map_err(unavailable)?;
     let (superseded, revoked, wake) = gw.sessions.open_control(node, epoch, connection);
-    // This certificate authenticated: certificates issued before it are retired now (rotation
-    // keeps the old one valid until the new one is proven to work).
-    let retired = store::retire_older(&gw.db, node, sha)
-        .await
-        .map_err(unavailable)?;
-    gw.revoked_locally(&retired);
     let mut rx_seq = rx.max(0) as u64;
     tracing::info!(node = %NodeId::from_uuid(node), epoch, "machine connected");
+    // Every exit from here on (errors included) goes through the cleanup below.
     let result = async {
+        if superseded.is_cancelled() {
+            return Err(taken_over());
+        }
+        // This certificate authenticated: certificates issued before it are retired now
+        // (rotation keeps the old one valid until the new one is proven to work).
+        let retired = store::retire_older(&gw.db, node, sha)
+            .await
+            .map_err(unavailable)?;
+        gw.revoked_locally(&retired);
         send(out, hello(gw, Lane::Control, rx_seq + 1), 0, rx_seq).await?;
         let resume = h.resume_from_seq.max(1);
         if !store::commands_received(&gw.db, node, epoch, resume - 1).await.map_err(unavailable)? {

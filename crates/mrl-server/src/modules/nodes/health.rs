@@ -165,7 +165,9 @@ pub async fn settle(gw: &Gateway, node: Uuid) -> Result<(), NodesError> {
     Ok(())
 }
 
-async fn retention(gw: &Gateway) -> Result<(), NodesError> {
+/// Deletes old node events, final commands and used tokens. A launch whose attempt still
+/// renews its lease stays (every lease grant refreshes the launch row, see `store::leases`).
+pub async fn retention(gw: &Gateway) -> Result<(), NodesError> {
     let p = gw.db.pool();
     sqlx::query("DELETE FROM node_events WHERE at < now() - interval '180 days'")
         .execute(p)

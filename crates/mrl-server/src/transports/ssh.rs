@@ -247,7 +247,7 @@ impl Ssh {
     }
 
     fn host_port(&self) -> String {
-        format!("{}:{}", self.target.hostname, self.target.port)
+        host_port(&self.target.hostname, self.target.port)
     }
 
     /// Records the host's key as trusted, after the user confirmed `expected` (the fingerprint
@@ -502,8 +502,25 @@ impl Transport for Ssh {
     }
 }
 
+/// `host:port`, with an IPv6 address in brackets (`[fd7a::5]:22`).
+fn host_port(host: &str, port: u16) -> String {
+    if host.contains(':') && !host.starts_with('[') {
+        format!("[{host}]:{port}")
+    } else {
+        format!("{host}:{port}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ipv6_hosts_are_bracketed() {
+        assert_eq!(host_port("gpu-box", 22), "gpu-box:22");
+        assert_eq!(host_port("10.0.0.5", 2222), "10.0.0.5:2222");
+        assert_eq!(host_port("fd7a:115c::5", 22), "[fd7a:115c::5]:22");
+        assert!(super::super::split_host_port(&host_port("fd7a:115c::5", 22)).is_some());
+    }
+
     use super::*;
 
     const CONFIG: &str = "

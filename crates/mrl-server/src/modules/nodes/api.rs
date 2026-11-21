@@ -248,6 +248,69 @@ fn node_id(s: &str) -> Result<Uuid, ApiError> {
         .map_err(|_| ApiError::new(ErrorCode::NotFound, "No machine with this id exists."))
 }
 
+/// The caller's org as a database id (`None`: no org, like the solo owner). An org id the
+/// app can't read is refused rather than treated as no org.
+fn caller_org(ctx: &RequestContext) -> Result<Option<Uuid>, ApiError> {
+    ctx.org
+        .as_deref()
+        .map(|o| {
+            mrl_domain::ids::OrgId::from_str(o)
+                .map(|o| o.as_uuid())
+                .map_err(|_| {
+                    ApiError::new(
+                        ErrorCode::Forbidden,
+                        "Your account's organization can't be read.",
+                    )
+                })
+        })
+        .transpose()
+}
+
+/// What the authorizer sees: the kind, its id and the org that owns it (none: platform).
+fn scoped(kind: &str, id: Option<String>, org: Option<Uuid>) -> Resource {
+    Resource {
+        id,
+        org: org.map(|o| mrl_domain::ids::OrgId::from_uuid(o).to_string()),
+        ..Resource::kind(kind)
+    }
+}
+
+/// Authorizes `action` on the pool, scoped by its org (404 when there is no such pool).
+async fn authorize_pool(
+    s: &AppState,
+    gw: &Gateway,
+    ctx: &RequestContext,
+    action: &str,
+    pool: Uuid,
+) -> Result<(), ApiError> {
+    let missing = || ApiError::new(ErrorCode::NotFound, "No pool with this id exists.");
+    let org = store::pool_org(&gw.db, pool)
+        .await
+        .map_err(internal)?
+        .ok_or_else(missing)?;
+    let id = PoolId::from_uuid(pool).to_string();
+    s.authorize(ctx, action, &scoped("pool", Some(id), org))
+        .await
+}
+
+/// Authorizes `action` on the node, scoped by its pool's org (404 when there is no such node).
+async fn authorize_node(
+    s: &AppState,
+    gw: &Gateway,
+    ctx: &RequestContext,
+    action: &str,
+    node: Uuid,
+) -> Result<(), ApiError> {
+    let missing = || ApiError::new(ErrorCode::NotFound, "No machine with this id exists.");
+    let org = store::node_org(&gw.db, node)
+        .await
+        .map_err(internal)?
+        .ok_or_else(missing)?;
+    let id = NodeId::from_uuid(node).to_string();
+    s.authorize(ctx, action, &scoped("node", Some(id), org))
+        .await
+}
+
 fn after(
     cursor: Option<String>,
     parse: fn(&str) -> Result<Uuid, ApiError>,
@@ -269,12 +332,18 @@ async fn list_pools(
     ctx: RequestContext,
     Query(q): Query<PageQuery>,
 ) -> Result<Json<Page<PoolView>>, ApiError> {
-    s.authorize(&ctx, "compute.read", &Resource::kind("pool"))
+    let org = caller_org(&ctx)?;
+    s.authorize(&ctx, "compute.read", &scoped("pool", None, org))
         .await?;
     let page = q.resolve()?;
-    let rows = store::list_pools(&gw.db, after(page.after.clone(), pool_id)?, page.fetch())
-        .await
-        .map_err(internal)?;
+    let rows = store::list_pools(
+        &gw.db,
+        org,
+        after(page.after.clone(), pool_id)?,
+        page.fetch(),
+    )
+    .await
+    .map_err(internal)?;
     Ok(Json(Page::from_overfetch(rows, &page, |p| p.id.clone())))
 }
 
@@ -287,7 +356,9 @@ async fn create_pool(
     ctx: RequestContext,
     Json(body): Json<CreatePool>,
 ) -> Result<(StatusCode, Json<PoolView>), ApiError> {
-    s.authorize(&ctx, "compute.manage", &Resource::kind("pool"))
+    // A pool belongs to the caller's org (a caller without one makes a platform pool).
+    let org = caller_org(&ctx)?;
+    s.authorize(&ctx, "compute.manage", &scoped("pool", None, org))
         .await?;
     let name = body.name.trim();
     if name.is_empty() || name.chars().count() > 100 {
@@ -304,7 +375,7 @@ async fn create_pool(
     if !(10..=3600).contains(&ttl) {
         return Err(field("/attempt_lease_ttl_seconds", "Use 10–3600 seconds."));
     }
-    match store::create_pool(&gw.db, name, kind, ttl, &body.flags)
+    match store::create_pool(&gw.db, org, name, kind, ttl, &body.flags)
         .await
         .map_err(internal)?
     {
@@ -326,15 +397,8 @@ async fn list_nodes(
     Path(pool): Path<String>,
     Query(q): Query<PageQuery>,
 ) -> Result<Json<Page<NodeView>>, ApiError> {
-    s.authorize(&ctx, "compute.read", &Resource::kind("pool"))
-        .await?;
     let pool = pool_id(&pool)?;
-    if !store::pool_exists(&gw.db, pool).await.map_err(internal)? {
-        return Err(ApiError::new(
-            ErrorCode::NotFound,
-            "No pool with this id exists.",
-        ));
-    }
+    authorize_pool(&s, &gw, &ctx, "compute.read", pool).await?;
     let page = q.resolve()?;
     let rows = store::list_nodes(
         &gw.db,
@@ -364,21 +428,21 @@ async fn create_token(
     State(s): State<AppState>,
     Extension(gw): Extension<Arc<Gateway>>,
     ctx: RequestContext,
+    headers: axum::http::HeaderMap,
     Path(pool): Path<String>,
     Json(body): Json<CreateToken>,
 ) -> Result<(StatusCode, Json<TokenCreated>), ApiError> {
-    s.authorize(&ctx, "compute.manage", &Resource::kind("pool"))
-        .await?;
     let pool_uuid = pool_id(&pool)?;
-    if !store::pool_exists(&gw.db, pool_uuid)
-        .await
-        .map_err(internal)?
-    {
-        return Err(ApiError::new(
-            ErrorCode::NotFound,
-            "No pool with this id exists.",
+    authorize_pool(&s, &gw, &ctx, "compute.manage", pool_uuid).await?;
+    // The response holds the join token itself, and the idempotency layer keeps responses as
+    // plain text to replay them: with a key, no token is made (only this refusal is kept).
+    if headers.contains_key("idempotency-key") {
+        return Err(field(
+            "/Idempotency-Key",
+            "A join token can't be created with an Idempotency-Key (its response holds the secret); send the request without one, and revoke any token you don't use.",
         ));
     }
+
     let ttl = body.ttl_seconds.unwrap_or(3600);
     if !(60..=7 * 86_400).contains(&ttl) {
         return Err(field("/ttl_seconds", "Use 60 seconds to 7 days."));
@@ -427,8 +491,10 @@ async fn create_token(
             format!("mrl-agent enroll --listen 127.0.0.1:{agent_port} --token {token}")
         }
         Some(Endpoint::Direct { address } | Endpoint::Tailscale { address }) => {
-            let port = crate::transports::split_host_port(address).map_or(7443, |(_, p)| p);
-            format!("mrl-agent enroll --listen 0.0.0.0:{port} --token {token}")
+            format!(
+                "mrl-agent enroll --listen {} --token {token}",
+                listen_for(address)
+            )
         }
         Some(Endpoint::CloudflareTunnel { .. }) => {
             format!("mrl-agent enroll --listen 127.0.0.1:7443 --token {token}")
@@ -457,9 +523,9 @@ async fn get_node(
     ctx: RequestContext,
     Path(node): Path<String>,
 ) -> Result<Json<NodeDetail>, ApiError> {
-    s.authorize(&ctx, "compute.read", &Resource::kind("node"))
-        .await?;
-    store::get_node(&gw.db, node_id(&node)?)
+    let node = node_id(&node)?;
+    authorize_node(&s, &gw, &ctx, "compute.read", node).await?;
+    store::get_node(&gw.db, node)
         .await
         .map_err(internal)?
         .map(Json)
@@ -498,9 +564,8 @@ async fn node_action(
             "Use :drain or :decommission.",
         ));
     }
-    s.authorize(&ctx, "compute.manage", &Resource::kind("node"))
-        .await?;
     let node = node_id(id)?;
+    authorize_node(&s, &gw, &ctx, "compute.manage", node).await?;
     let decommission = action == "decommission";
     let outcome = gw
         .db
@@ -544,6 +609,10 @@ async fn node_action(
                         format!("{running} attempt(s) still run on this machine; wait for them or cancel them."),
                     )));
                 }
+                // Work started just before the drain may not show in any heartbeat yet.
+                if let Some(why) = store::decommission_blocker(tx, node).await.map_err(to_db)? {
+                    return Ok(Err(field("/running_attempts", format!("{why}."))));
+                }
                 store::transition(tx, node, NodeEvent::Decommission, Some("operator")).await.map_err(to_db)?;
                 store::revoke_all(tx, node, "decommissioned").await.map_err(to_db)?;
                 store::event(tx, node, "decommissioned", "info", json!({ "by": "operator" }))
@@ -568,8 +637,29 @@ async fn node_action(
     Ok(Json(detail.node))
 }
 
+/// The address an agent listens on so the core can dial `address`: every interface of the
+/// same family (`[::]` for an IPv6 address), on its port (7443 when it has none).
+fn listen_for(address: &str) -> String {
+    let port = crate::transports::split_host_port(address).map_or(7443, |(_, p)| p);
+    let v6 = address
+        .parse::<std::net::SocketAddr>()
+        .is_ok_and(|a| a.is_ipv6());
+    if v6 {
+        format!("[::]:{port}")
+    } else {
+        format!("0.0.0.0:{port}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_listen_command_keeps_the_address_family() {
+        assert_eq!(super::listen_for("192.168.1.5:7443"), "0.0.0.0:7443");
+        assert_eq!(super::listen_for("[fd7a:115c::5]:7500"), "[::]:7500");
+        assert_eq!(super::listen_for("gpu-box.lan:7600"), "0.0.0.0:7600");
+    }
+
     use super::*;
 
     #[test]

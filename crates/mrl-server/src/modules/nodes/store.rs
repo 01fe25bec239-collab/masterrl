@@ -75,14 +75,15 @@ const POOL_COLS: &str =
 /// Creates a pool. `Ok(None)` when the name is taken.
 pub async fn create_pool(
     db: &Db,
+    org: Option<Uuid>,
     name: &str,
     provider_kind: &str,
     lease_ttl_seconds: u32,
     flags: &[String],
 ) -> Result<Option<PoolView>, NodesError> {
     let row = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "INSERT INTO compute_pools (id, name, provider_kind, flags, attempt_lease_ttl)
-         VALUES ($1, $2, $3, $4, make_interval(secs => $5))
+        "INSERT INTO compute_pools (id, name, provider_kind, flags, attempt_lease_ttl, org_id)
+         VALUES ($1, $2, $3, $4, make_interval(secs => $5), $6)
          ON CONFLICT (org_id, name) DO NOTHING RETURNING {POOL_COLS}"
     )))
     .bind(Uuid::now_v7())
@@ -90,6 +91,7 @@ pub async fn create_pool(
     .bind(provider_kind)
     .bind(flags)
     .bind(f64::from(lease_ttl_seconds))
+    .bind(org)
     .fetch_optional(db.pool())
     .await?;
     Ok(row.as_ref().map(pool_view).transpose()?)
@@ -98,26 +100,43 @@ pub async fn create_pool(
 /// Pools ordered by id, after `after`.
 pub async fn list_pools(
     db: &Db,
+    org: Option<Uuid>,
     after: Option<Uuid>,
     limit: usize,
 ) -> Result<Vec<PoolView>, NodesError> {
+    // Platform pools (no org) and the caller's own org's pools only.
     let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-        "SELECT {POOL_COLS} FROM compute_pools WHERE ($1::uuid IS NULL OR id > $1) ORDER BY id LIMIT $2"
+        "SELECT {POOL_COLS} FROM compute_pools
+         WHERE ($1::uuid IS NULL OR id > $1) AND (org_id IS NULL OR org_id = $3)
+         ORDER BY id LIMIT $2"
     )))
     .bind(after)
     .bind(limit as i64)
+    .bind(org)
     .fetch_all(db.pool())
     .await?;
     Ok(rows.iter().map(pool_view).collect::<Result<_, _>>()?)
 }
 
 /// True when the pool exists.
-pub async fn pool_exists(db: &Db, pool: Uuid) -> Result<bool, NodesError> {
-    Ok(sqlx::query("SELECT 1 FROM compute_pools WHERE id = $1")
-        .bind(pool)
-        .fetch_optional(db.pool())
-        .await?
-        .is_some())
+/// The org that owns `pool` (`Some(None)`: a platform pool; `None`: no such pool).
+pub async fn pool_org(db: &Db, pool: Uuid) -> Result<Option<Option<Uuid>>, NodesError> {
+    Ok(
+        sqlx::query_scalar("SELECT org_id FROM compute_pools WHERE id = $1")
+            .bind(pool)
+            .fetch_optional(db.pool())
+            .await?,
+    )
+}
+
+/// The org that owns `node`, through its pool (`None`: no such node).
+pub async fn node_org(db: &Db, node: Uuid) -> Result<Option<Option<Uuid>>, NodesError> {
+    Ok(sqlx::query_scalar(
+        "SELECT p.org_id FROM compute_nodes n JOIN compute_pools p ON p.id = n.pool_id WHERE n.id = $1",
+    )
+    .bind(node)
+    .fetch_optional(db.pool())
+    .await?)
 }
 
 // ---------- nodes ----------
@@ -346,7 +365,8 @@ pub async fn enroll(
         Box::pin(async move {
             let ca = &pki.ca;
             let row = sqlx::query(
-                "SELECT id, pool_id, labels, lifecycle, endpoint, expires_at, used_at
+                "SELECT id, pool_id, labels, lifecycle, endpoint, expires_at, used_at, used_by_node_id,
+                        used_key_sha256
                  FROM node_enrollment_tokens WHERE token_hash = $1 FOR UPDATE",
             )
             .bind(&hash)
@@ -355,20 +375,56 @@ pub async fn enroll(
             let Some(row) = row else {
                 return Ok(Err(NodesError::Token("this token is not known; create a new one".into())));
             };
-            if row.try_get::<Option<OffsetDateTime>, _>("used_at")?.is_some() {
-                return Ok(Err(NodesError::Token(
-                    "this token was already used; each token adds one machine".into(),
-                )));
-            }
-            if row.try_get::<OffsetDateTime, _>("expires_at")? <= OffsetDateTime::now_utc() {
-                return Ok(Err(NodesError::Token("this token has expired; create a new one".into())));
-            }
+            let key_sha = match super::ca::Ca::csr_key_sha256(&req.csr_der) {
+                Ok(k) => k,
+                Err(e) => return Ok(Err(e)),
+            };
+            let expired = row.try_get::<OffsetDateTime, _>("expires_at")? <= OffsetDateTime::now_utc();
             let lifecycle = Lifecycle::parse(row.try_get::<&str, _>("lifecycle")?);
-            let node = Uuid::now_v7();
             let lifetime = match lifecycle {
                 Lifecycle::Static => lifetimes.0,
                 Lifecycle::Ephemeral => lifetimes.1,
             };
+            if row.try_get::<Option<OffsetDateTime>, _>("used_at")?.is_some() {
+                // The same machine asking again (it lost the answer): same token, same key, the
+                // token still valid and the node never connected. It gets a certificate for the
+                // node it already is.
+                let same_key = row
+                    .try_get::<Option<String>, _>("used_key_sha256")?
+                    .is_some_and(|k| k == key_sha);
+                let node: Option<Uuid> = row.try_get("used_by_node_id")?;
+                if let (true, false, Some(node)) = (same_key, expired, node) {
+                    let status: Option<String> = sqlx::query_scalar(
+                        "SELECT status FROM compute_nodes WHERE id = $1 FOR UPDATE",
+                    )
+                    .bind(node)
+                    .fetch_optional(&mut **tx)
+                    .await?;
+                    if status.as_deref() == Some("ENROLLING") {
+                        let cert = match ca.issue_node(&req.csr_der, node, lifetime) {
+                            Ok(c) => c,
+                            Err(e) => return Ok(Err(e)),
+                        };
+                        insert_cert(tx, node, &cert).await.map_err(db_of)?;
+                        sqlx::query(
+                            "UPDATE compute_nodes SET cert_serial = $2, cert_expires_at = $3 WHERE id = $1",
+                        )
+                        .bind(node)
+                        .bind(&cert.serial)
+                        .bind(cert.not_after)
+                        .execute(&mut **tx)
+                        .await?;
+                        return Ok(Ok(Enrolled { node, cert }));
+                    }
+                }
+                return Ok(Err(NodesError::Token(
+                    "this token was already used; each token adds one machine".into(),
+                )));
+            }
+            if expired {
+                return Ok(Err(NodesError::Token("this token has expired; create a new one".into())));
+            }
+            let node = Uuid::now_v7();
             let cert = match ca.issue_node(&req.csr_der, node, lifetime) {
                 Ok(c) => c,
                 Err(e) => return Ok(Err(e)),
@@ -396,9 +452,13 @@ pub async fn enroll(
             .execute(&mut **tx)
             .await?;
             insert_cert(tx, node, &cert).await.map_err(db_of)?;
-            sqlx::query("UPDATE node_enrollment_tokens SET used_at = now(), used_by_node_id = $2 WHERE id = $1")
+            sqlx::query(
+                "UPDATE node_enrollment_tokens SET used_at = now(), used_by_node_id = $2, used_key_sha256 = $3
+                 WHERE id = $1",
+            )
                 .bind(row.try_get::<Uuid, _>("id")?)
                 .bind(node)
+                .bind(&key_sha)
                 .execute(&mut **tx)
                 .await?;
             let e = NewEvent::new(
@@ -682,6 +742,16 @@ pub async fn accept(tx: &mut Tx, node: Uuid, epoch: i64, seq: u64) -> Result<Acc
     Ok(Accept::New)
 }
 
+/// True when `epoch` is the node's session right now (no lock kept).
+pub async fn is_current(db: &Db, node: Uuid, epoch: i64) -> Result<bool, NodesError> {
+    let current: Option<i64> =
+        sqlx::query_scalar("SELECT session_epoch FROM compute_nodes WHERE id = $1")
+            .bind(node)
+            .fetch_optional(db.pool())
+            .await?;
+    Ok(current == Some(epoch))
+}
+
 /// True when `epoch` is still the node's session; locks the row (shared) until `tx` ends.
 pub async fn holds(tx: &mut Tx, node: Uuid, epoch: i64) -> Result<bool, NodesError> {
     let current: Option<i64> =
@@ -708,7 +778,8 @@ pub async fn heartbeat(
         i64::try_from((agent - OffsetDateTime::now_utc()).whole_milliseconds()).ok()
     });
     sqlx::query(
-        "UPDATE compute_nodes SET last_heartbeat_at = now(), running_attempts = $2, clock_skew_ms = $3 WHERE id = $1",
+        "UPDATE compute_nodes SET last_heartbeat_at = now(), running_reported_at = now(),
+            running_attempts = $2, clock_skew_ms = $3 WHERE id = $1",
     )
     .bind(node)
     .bind(i32::try_from(running).unwrap_or(i32::MAX))
@@ -817,14 +888,16 @@ pub async fn inventory(tx: &mut Tx, node: Uuid, inv: &pb::Inventory) -> Result<(
 /// Latest-wins node telemetry and per-GPU readings. A reading older than the stored one is
 /// ignored (two writers, e.g. across a reconnect, can't move a reading back in time). GPU
 /// health follows the reading: OK, DEGRADED at `hot_c` or above, FAILED for a present GPU the
-/// reading leaves out (lost).
+/// reading leaves out (lost). Only the node's current session (`epoch`) writes. `Ok(true)`
+/// when this reading was saved (a sink gets only those).
 pub async fn telemetry(
     db: &Db,
     node: Uuid,
     epoch: i64,
     t: &pb::NodeTelemetry,
     hot_c: u32,
-) -> Result<(), NodesError> {
+    max_ahead: time::Duration,
+) -> Result<bool, NodesError> {
     let at = t
         .time
         .as_ref()
@@ -835,6 +908,10 @@ pub async fn telemetry(
             .ok()
         })
         .unwrap_or_else(OffsetDateTime::now_utc);
+    // A reading from a clock running ahead would hold back every later one until real time
+    // caught up: past `max_ahead` it counts as taken now.
+    let now = OffsetDateTime::now_utc();
+    let at = if at > now + max_ahead { now } else { at };
     let doc = json!({
         "ram_used_bytes": t.ram_used_bytes, "swap_used_bytes": t.swap_used_bytes,
         "disk_free_bytes": t.disk_free_bytes, "memory_pressure": t.memory_pressure,
@@ -854,7 +931,7 @@ pub async fn telemetry(
     if fresh.rows_affected() == 0 {
         // An older (or repeated) reading, or one from a session that was taken over (the node
         // row stays locked until commit, so a takeover can't slip in between): keep what is there.
-        return Ok(());
+        return Ok(false);
     }
     let mut seen = Vec::new();
     for g in &t.gpus {
@@ -901,7 +978,7 @@ pub async fn telemetry(
     .execute(&mut *tx)
     .await?;
     tx.commit().await?;
-    Ok(())
+    Ok(true)
 }
 
 /// Journals a CONTROL message no sink takes yet (`node_events.kind = control_unrouted`).
@@ -1138,6 +1215,16 @@ pub async fn claim_commands(
     .bind(draining_failure())
     .execute(&mut *tx)
     .await?;
+    // Commands above `after` past their deadline are never sent: they become EXPIRED here, so an
+    // ack of a later command can't mark them RECEIVED (the health pass may not have run yet).
+    sqlx::query(
+        "UPDATE agent_commands SET state = 'EXPIRED', updated_at = now()
+         WHERE node_id = $1 AND state IN ('PENDING','SENT') AND seq > $2 AND deadline_at <= now()",
+    )
+    .bind(node)
+    .bind(i64::try_from(after).unwrap_or(i64::MAX))
+    .execute(&mut *tx)
+    .await?;
     let rows = sqlx::query(
         "UPDATE agent_commands SET state = 'SENT', sent_at = now(), updated_at = now()
          WHERE id IN (SELECT id FROM agent_commands
@@ -1182,6 +1269,39 @@ pub async fn fail_unsendable(db: &Db, id: Uuid, size: usize) -> Result<(), Nodes
     Ok(())
 }
 
+/// Why a draining node can't be removed yet, if it can't: a work start still in flight
+/// (pending, sent or received), or no heartbeat since the drain and since the last finished
+/// work start that shows no running attempts. Reads with the node row locked by the caller.
+pub async fn decommission_blocker(tx: &mut Tx, node: Uuid) -> Result<Option<String>, NodesError> {
+    let in_flight: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent_commands
+         WHERE node_id = $1 AND kind = ANY($2) AND state IN ('PENDING','SENT','RECEIVED')",
+    )
+    .bind(node)
+    .bind(&super::commands::STARTS_WORK[..])
+    .fetch_one(&mut **tx)
+    .await?;
+    if in_flight > 0 {
+        return Ok(Some(format!(
+            "{in_flight} work start(s) sent before the drain have not finished yet; wait for them"
+        )));
+    }
+    let settled: bool = sqlx::query_scalar(
+        "SELECT n.running_attempts = 0 AND n.running_reported_at IS NOT NULL
+                AND n.running_reported_at > COALESCE(n.drained_at, '-infinity')
+                AND n.running_reported_at > COALESCE((SELECT max(c.updated_at) FROM agent_commands c
+                     WHERE c.node_id = n.id AND c.kind = ANY($2) AND c.state = 'COMPLETED'), '-infinity')
+         FROM compute_nodes n WHERE n.id = $1",
+    )
+    .bind(node)
+    .bind(&super::commands::STARTS_WORK[..])
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok((!settled).then(|| {
+        "the machine has not yet reported, after the drain, that nothing runs on it; wait for its next heartbeat".to_owned()
+    }))
+}
+
 /// The result of a work-starting command the agent never got because the node drains.
 fn draining_failure() -> Value {
     json!({ "accepted": false, "failure": {
@@ -1193,6 +1313,10 @@ fn draining_failure() -> Value {
 /// senders see FAILED `node_draining` and can place the work elsewhere.
 pub async fn refuse_new_work(tx: &mut Tx, node: Uuid) -> Result<u64, NodesError> {
     let failure = draining_failure();
+    sqlx::query("UPDATE compute_nodes SET drained_at = now() WHERE id = $1")
+        .bind(node)
+        .execute(&mut **tx)
+        .await?;
     Ok(sqlx::query(
         "UPDATE agent_commands SET state = 'FAILED', result = $3, updated_at = now()
          WHERE node_id = $1 AND state = 'PENDING' AND kind = ANY($2)",
@@ -1275,6 +1399,17 @@ pub async fn leases(
         .fetch_one(db.pool())
         .await?;
         if ok {
+            // A running attempt keeps the launch that proves it alive: retention keys on
+            // `updated_at`, so a launch renewed here is never deleted while it runs.
+            sqlx::query(
+                "UPDATE agent_commands SET updated_at = now() WHERE node_id = $1 AND kind = 'LaunchAttempt'
+                   AND attempt_id = $2 AND epoch = $3 AND state = 'COMPLETED' AND updated_at < now() - interval '1 day'",
+            )
+            .bind(node)
+            .bind(attempt.as_uuid())
+            .bind(i64::try_from(a.fencing_epoch).unwrap_or(i64::MAX))
+            .execute(db.pool())
+            .await?;
             out.push(pb::AttemptLease {
                 attempt: Some(a.clone()),
                 duration_s: ttl,
