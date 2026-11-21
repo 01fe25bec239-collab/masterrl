@@ -4110,6 +4110,26 @@ async fn a_token_held_to_a_project_never_reaches_setup_sync() {
         call(Method::GET, "/api/v1/sync/status", &unbound, None).await,
         200
     );
+    let restricted = post(
+        "/api/v1/auth/tokens".into(),
+        json!({"name":"reader","scopes":["runs:read"]}),
+    )
+    .await;
+    let login = Some(json!({"provider":"github","redirect_uri":"masterrl://auth/callback"}));
+    for token in [&bound, &restricted] {
+        assert_eq!(
+            call(Method::POST, "/api/v1/auth/login", token, login.clone()).await,
+            403
+        );
+        assert_eq!(
+            call(Method::DELETE, "/api/v1/auth/session", token, None).await,
+            403
+        );
+    }
+    assert_eq!(
+        call(Method::POST, "/api/v1/auth/login", &unbound, login).await,
+        200
+    );
     assert_eq!(
         call(Method::POST, "/api/v1/auth/logout", &bound, None).await,
         204

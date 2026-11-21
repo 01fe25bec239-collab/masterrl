@@ -985,25 +985,33 @@ async fn authorize_self_shared(
     acting(shared, ctx).await
 }
 
-/// The org and project a token caller is held to; `(None, None)` for people. Account-wide
-/// lists and changes stay inside these bounds.
-async fn token_bounds(
+async fn caller_grant(
     shared: &Shared,
     ctx: &RequestContext,
-) -> Result<(Option<OrgId>, Option<ProjectId>), ApiError> {
+) -> Result<Option<credentials::TokenGrant>, ApiError> {
     if ctx.principal.kind != PrincipalKind::Service {
-        return Ok((None, None));
+        return Ok(None);
     }
-    let grant = credentials::token_grant(&shared.db, &ctx.principal.id)
+    credentials::token_grant(&shared.db, &ctx.principal.id)
         .await
         .map_err(db_error)?
+        .map(Some)
         .ok_or_else(|| {
             ApiError::new(
                 ErrorCode::Unauthenticated,
                 "This access token no longer works.",
             )
-        })?;
-    Ok((grant.org, grant.project))
+        })
+}
+
+/// The org and project a token caller is held to. People have no token bounds.
+async fn token_bounds(
+    shared: &Shared,
+    ctx: &RequestContext,
+) -> Result<(Option<OrgId>, Option<ProjectId>), ApiError> {
+    Ok(caller_grant(shared, ctx)
+        .await?
+        .map_or((None, None), |grant| (grant.org, grant.project)))
 }
 
 async fn reject_scoped_session(
@@ -1011,8 +1019,11 @@ async fn reject_scoped_session(
     ctx: Option<&RequestContext>,
 ) -> Result<(), ApiError> {
     if let Some(ctx) = ctx {
-        let (org, project) = token_bounds(shared, ctx).await?;
-        if org.is_some() || project.is_some() {
+        if caller_grant(shared, ctx).await?.is_some_and(|grant| {
+            grant.org.is_some()
+                || grant.project.is_some()
+                || !grant.scopes.iter().any(|scope| scope == "*")
+        }) {
             return Err(ApiError::new(
                 ErrorCode::Forbidden,
                 "A scoped access token cannot change the app's sign-in or browser session.",
