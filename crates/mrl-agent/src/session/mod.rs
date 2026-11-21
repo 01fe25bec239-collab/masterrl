@@ -372,6 +372,8 @@ pub struct Link {
     leases: broadcast::Sender<LeaseGrant>,
     reconcile: broadcast::Sender<ReconcileResult>,
     running: Mutex<Vec<AttemptRef>>,
+    /// Send times of recent heartbeats (seq, monotonic time just before sending), for leases.
+    heartbeats: Mutex<VecDeque<(u64, std::time::Instant)>>,
     work_starts: Mutex<WorkStarts>,
     reporting: Mutex<()>,
     data_seq: Mutex<DataSeq>,
@@ -478,6 +480,7 @@ impl Link {
             leases: broadcast::channel(64).0,
             reconcile: broadcast::channel(16).0,
             running: Mutex::default(),
+            heartbeats: Mutex::default(),
             work_starts: Mutex::default(),
             reporting: Mutex::default(),
             data_seq: Mutex::new(data_seq),
@@ -602,6 +605,17 @@ impl Link {
     /// Lease grants from the core (answers to heartbeats).
     pub fn leases(&self) -> broadcast::Receiver<LeaseGrant> {
         self.leases.subscribe()
+    }
+
+    /// When heartbeat `seq` was sent (taken just before sending, never later), so a LeaseGrant's
+    /// deadline counts from it. `None` once it is older than the last 64 heartbeats.
+    pub fn heartbeat_sent(&self, seq: u64) -> Option<std::time::Instant> {
+        self.heartbeats
+            .lock()
+            .ok()?
+            .iter()
+            .find(|(s, _)| *s == seq)
+            .map(|(_, at)| *at)
     }
 
     /// Reconciliation results from the core.
@@ -1241,7 +1255,13 @@ async fn control_lane(
                     drain_pending = false;
                 }
                 let running = l.link.running.lock().map(|r| r.clone()).unwrap_or_default();
-                flush(l, &out, &mut last, Some(agent_message::Body::Heartbeat(Heartbeat { time: now_ts(), running }))).await?;
+                flush(l, &out, &mut last, None).await?;
+                let at = std::time::Instant::now();
+                let seq = flush(l, &out, &mut last, Some(agent_message::Body::Heartbeat(Heartbeat { time: now_ts(), running }))).await?;
+                if let Ok(mut h) = l.link.heartbeats.lock() {
+                    if h.len() == 64 { h.pop_front(); }
+                    h.push_back((seq, at));
+                }
             }
             () = &mut renew, if pending_key.is_none() => {
                 let (key, csr) = crate::enroll::new_key()?;
@@ -2309,5 +2329,75 @@ mod tests {
             status_error(&tonic::Status::unavailable("x")).code(),
             codes::UNREACHABLE
         );
+    }
+
+    #[tokio::test]
+    async fn each_heartbeat_keeps_its_send_time_for_the_last_64() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = crate::config::AgentConfig {
+            state_dir: dir.path().join("state"),
+            ..crate::config::AgentConfig::default()
+        };
+        let ctx = Arc::new(AgentContext::with_hw(cfg, Vec::new()).unwrap());
+        let id_dir = crate::enroll::identity_dir(ctx.state.root());
+        std::fs::create_dir_all(&id_dir).unwrap();
+        let identity = serde_json::json!({
+            "link": {"node_id": "node_1", "server": null, "listen": null, "transport": "direct",
+                     "installation_id": "i", "issued_at": 0, "not_after": i64::MAX / 4},
+            "cert": "00", "ca": "00", "key": "00",
+        });
+        std::fs::write(
+            id_dir.join(crate::enroll::IDENTITY_FILE),
+            identity.to_string(),
+        )
+        .unwrap();
+        let id = Identity::load(ctx.state.root()).unwrap().unwrap();
+        let link = Arc::new(Link::open(ctx.state.root(), &ctx.config.gateway).unwrap());
+        let l = LaneCtx {
+            ctx,
+            link: link.clone(),
+            id,
+            transport: TransportKind::Direct,
+        };
+        let (core_tx, core_rx) = mpsc::channel::<Result<CoreMessage, tonic::Status>>(8);
+        let inbound: CoreIn = Box::pin(ReceiverStream::new(core_rx));
+        let (out, mut sent) = mpsc::channel(256);
+        core_tx
+            .send(Ok(CoreMessage {
+                body: Some(core_message::Body::Hello(CoreHello {
+                    heartbeat_interval_s: 1,
+                    resume_from_seq: 1,
+                    ..CoreHello::default()
+                })),
+                ..CoreMessage::default()
+            }))
+            .await
+            .unwrap();
+        // 64 earlier heartbeats; the tick's heartbeat pushes the oldest out.
+        link.heartbeats
+            .lock()
+            .unwrap()
+            .extend((1_000..1_064).map(|s| (s, std::time::Instant::now())));
+        let stop = CancellationToken::new();
+        let lane = tokio::spawn({
+            let stop = stop.clone();
+            async move { control_lane(&l, inbound, out, stop).await }
+        });
+        let seq = loop {
+            let m = sent.recv().await.expect("the lane keeps running");
+            if matches!(m.body, Some(agent_message::Body::Heartbeat(_))) {
+                break m.seq;
+            }
+        };
+        stop.cancel();
+        assert_eq!(lane.await.unwrap().unwrap(), Outcome::Stopped);
+        let at = link.heartbeat_sent(seq).expect("send time kept");
+        assert!(at <= std::time::Instant::now());
+        assert!(
+            link.heartbeat_sent(1_000).is_none(),
+            "older than 64 heartbeats"
+        );
+        assert!(link.heartbeat_sent(1_001).is_some());
+        assert!(link.heartbeat_sent(1_063).is_some());
     }
 }

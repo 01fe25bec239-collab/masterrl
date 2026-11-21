@@ -3253,6 +3253,17 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-NODE-207")),
+            ("title", Value::Str("The agent was stopping and did not run the command.")),
+            ("why", Value::Str("The agent on this machine was shutting down, for example for a restart or an update. Training that was already running keeps running and is picked up again when the agent is back.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Wait for the machine to come back online, then try the action again."),
+                    Value::Str("If the machine stays offline, start the agent with `mrl-agent run` or restart its service."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-PERM-001")),
             ("title", Value::Str("Your role doesn't allow this action.")),
             ("why", Value::Str("Each project role can do a set list of things. This action needs a different role.")),

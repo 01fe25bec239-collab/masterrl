@@ -19,6 +19,7 @@ pub mod files;
 pub mod local;
 pub mod record;
 pub mod runner;
+pub mod service;
 pub mod spec;
 
 pub use error::AttemptError;
