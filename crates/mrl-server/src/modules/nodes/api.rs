@@ -615,6 +615,8 @@ async fn node_action(
                 }
                 store::transition(tx, node, NodeEvent::Decommission, Some("operator")).await.map_err(to_db)?;
                 store::revoke_all(tx, node, "decommissioned").await.map_err(to_db)?;
+                // Streams on every replica end now, not at their next revocation re-check.
+                store::end_sessions(tx, node).await.map_err(to_db)?;
                 store::event(tx, node, "decommissioned", "info", json!({ "by": "operator" }))
                     .await
                     .map_err(to_db)?;

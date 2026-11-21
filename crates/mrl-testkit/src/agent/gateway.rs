@@ -1391,6 +1391,89 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn a_decommission_ends_streams_on_every_replica_and_refuses_later_sessions() {
+        // Re-checks five minutes apart: only the decommission itself can end the stream in time.
+        let gw = GatewayHarness::start_with(
+            TestDb::new().await,
+            GatewayConfig {
+                revocation_check_seconds: 300,
+                ..fast_config()
+            },
+            Arc::new(InMemorySecretStore::default()),
+            LaneRouter::new(),
+        )
+        .await;
+        let (_replica, b) = gw.replica().await;
+        let a = TestAgent::new(1, |_| {});
+        let node = a.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
+        let id = mrl_agent::enroll::Identity::load(a.ctx.state.root())
+            .unwrap()
+            .unwrap();
+        // The agent's session runs on replica B; the operator's request goes to replica A.
+        let stop = CancellationToken::new();
+        let conn = {
+            let (ctx, link, id, s) = (
+                a.ctx.clone(),
+                Link::of(&a.ctx).unwrap(),
+                id.clone(),
+                stop.clone(),
+            );
+            let addr = b.addr().unwrap().to_string();
+            tokio::spawn(async move {
+                mrl_agent::session::connect_once(
+                    ctx,
+                    link,
+                    id,
+                    &mrl_agent::transports::Direct::new(&addr),
+                    s,
+                )
+                .await
+            })
+        };
+        gw.wait_status(&node, "ONLINE").await;
+        let r = gw
+            .post(&format!("/api/v1/nodes/{node}:drain"), json!({}))
+            .await;
+        assert_eq!(r.json()["status"], "DRAINING", "{}", r.text());
+        let mut r = r;
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            r = gw
+                .post(&format!("/api/v1/nodes/{node}:decommission"), json!({}))
+                .await;
+            if r.status == 200 {
+                break;
+            }
+        }
+        assert_eq!(r.json()["status"], "DECOMMISSIONED", "{}", r.text());
+        let ended = tokio::time::timeout(Duration::from_secs(10), conn)
+            .await
+            .expect("the stream on the other replica ended at once, not at its next re-check")
+            .unwrap();
+        assert!(ended.is_err(), "{ended:?}");
+        // A session the handshake let through just before the decommission committed is
+        // refused when it opens.
+        let opened = mrl_server::modules::nodes::store::open_control(
+            gw.gw.db(),
+            uuid_of(&node),
+            &id.cert_sha256(),
+            "core-test",
+            &mrl_proto::agent::v1::AgentHello::default(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(
+                opened,
+                Err(mrl_server::modules::nodes::NodesError::Certificate(_))
+            ),
+            "{opened:?}"
+        );
+        stop.cancel();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
     async fn control_messages_without_a_sink_are_journaled() {
         let gw = GatewayHarness::start(TestDb::new().await).await;
         let a = TestAgent::new(1, |_| {});
@@ -1623,7 +1706,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let mut channel = mrl_agent::session::channel_over(tls).await.unwrap();
+        let mut channel = mrl_agent::session::channel_over(tls, &CancellationToken::new())
+            .await
+            .unwrap();
         let mut req = axum::http::Request::builder()
             .method("POST")
             .uri("http://core.masterrl.internal/mrl.testkit.Ping/Ping")
@@ -1977,7 +2062,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        RawClient::new(mrl_agent::session::channel_over(tls).await.unwrap())
+        RawClient::new(
+            mrl_agent::session::channel_over(tls, &CancellationToken::new())
+                .await
+                .unwrap(),
+        )
     }
 
     /// A bare stream on `lane` of `client`'s connection, past the hellos.
@@ -2308,7 +2397,9 @@ mod tests {
             .unwrap();
         let mut client =
             mrl_proto::agent::v1::agent_gateway_service_client::AgentGatewayServiceClient::new(
-                mrl_agent::session::channel_over(tls).await.unwrap(),
+                mrl_agent::session::channel_over(tls, &CancellationToken::new())
+                    .await
+                    .unwrap(),
             );
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         tx.send(mrl_proto::agent::v1::AgentMessage {

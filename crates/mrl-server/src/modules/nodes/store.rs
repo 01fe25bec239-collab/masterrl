@@ -612,24 +612,50 @@ pub async fn revoke_all(tx: &mut Tx, node: Uuid, reason: &str) -> Result<(), Nod
 
 // ---------- sessions ----------
 
-/// A new CONTROL session: bumps `session_epoch`, records who holds it; OFFLINE → ONLINE.
-/// Returns `(epoch, control_rx_seq)`.
+/// A new CONTROL session for the machine certificate `cert_sha256`: bumps `session_epoch`,
+/// records who holds it; OFFLINE → ONLINE. Returns `(epoch, control_rx_seq)`.
+///
+/// The certificate and the node are re-checked here, with the node row locked, in the same
+/// transaction that opens the session (the handshake's check was an earlier read): a
+/// decommission or revocation that committed since then refuses the session
+/// ([`NodesError::Certificate`]), and one that commits later ends it ([`end_sessions`]).
 pub async fn open_control(
     db: &Db,
     node: Uuid,
+    cert_sha256: &str,
     holder: &str,
     hello: &pb::AgentHello,
     transport: Option<&str>,
 ) -> Result<(i64, i64), NodesError> {
-    let (holder, hello, transport) = (
+    let (sha, holder, hello, transport) = (
+        cert_sha256.to_owned(),
         holder.to_owned(),
         hello.clone(),
         transport.map(str::to_owned),
     );
-    Ok(db
-        .transaction(move |tx| {
-            let (holder, hello, transport) = (holder.clone(), hello.clone(), transport.clone());
+    db.transaction(move |tx| {
+            let (sha, holder, hello, transport) =
+                (sha.clone(), holder.clone(), hello.clone(), transport.clone());
             Box::pin(async move {
+                sqlx::query("SELECT 1 FROM compute_nodes WHERE id = $1 FOR UPDATE")
+                    .bind(node)
+                    .execute(&mut **tx)
+                    .await?;
+                // Read after the lock: sees every decommission or revocation committed before.
+                let valid: Option<bool> = sqlx::query_scalar(
+                    "SELECT c.revoked_at IS NULL AND c.not_after > now() AND n.status <> 'DECOMMISSIONED'
+                     FROM node_certificates c JOIN compute_nodes n ON n.id = c.node_id
+                     WHERE c.sha256 = $1 AND c.node_id = $2",
+                )
+                .bind(&sha)
+                .bind(node)
+                .fetch_optional(&mut **tx)
+                .await?;
+                if valid != Some(true) {
+                    return Ok(Err(NodesError::Certificate(
+                        "this machine's certificate was revoked or the machine was removed".into(),
+                    )));
+                }
                 let row = sqlx::query(
                     "UPDATE compute_nodes SET session_epoch = session_epoch + 1, session_holder = $2,
                         last_heartbeat_at = now(), agent_version = $3, protocol_version = $4, transport = $5
@@ -654,10 +680,28 @@ pub async fn open_control(
                 event(tx, node, "connected", "info", json!({ "session_epoch": epoch, "core": holder }))
                     .await
                     .map_err(db_of)?;
-                Ok((epoch, row.try_get::<i64, _>("control_rx_seq")?))
+                Ok(Ok((epoch, row.try_get::<i64, _>("control_rx_seq")?)))
             })
         })
-        .await?)
+        .await?
+}
+
+/// Ends every session of `node` on every replica, like a takeover does: `session_epoch` moves
+/// on, so each stream's next fenced step (ack, message, claim, telemetry) finds itself stale,
+/// and the wake-up makes each holder check at once. For decommission, in its transaction.
+pub async fn end_sessions(tx: &mut Tx, node: Uuid) -> Result<(), NodesError> {
+    sqlx::query(
+        "UPDATE compute_nodes SET session_epoch = session_epoch + 1, session_holder = NULL WHERE id = $1",
+    )
+    .bind(node)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query("SELECT pg_notify($1, $2)")
+        .bind(super::commands::WAKE_CHANNEL)
+        .bind(node.to_string())
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 /// The epoch of the node's CONTROL session. A data stream may open first, so this waits (up to

@@ -496,7 +496,7 @@ pub async fn enroll_dial(
         }
         Err(e) => return Err(e),
     };
-    let channel = link::channel_over(tls_io).await?;
+    let channel = link::channel_over(tls_io, &CancellationToken::new()).await?;
     let mut client = AgentGatewayServiceClient::new(channel);
     let (tx, rx) = mpsc::channel(4);
     tx.send(AgentMessage {
@@ -505,13 +505,19 @@ pub async fn enroll_dial(
     })
     .await
     .map_err(|_| LinkError::Protocol("stream closed".into()))?;
-    let mut inbound = client
-        .session(ReceiverStream::new(rx))
-        .await
-        .map_err(|s| {
+    let open = async {
+        client.session(ReceiverStream::new(rx)).await.map_err(|s| {
             LinkError::Unreachable(format!("the core refused the connection: {}", s.message()))
-        })?
-        .into_inner();
+        })
+    };
+    let mut inbound = link::bounded(
+        "opening the enrollment stream",
+        link::HANDSHAKE_TIMEOUT,
+        &CancellationToken::new(),
+        open,
+    )
+    .await?
+    .into_inner();
     let result = wait_result(&mut inbound).await?;
     drop(tx);
     let id = finish(ctx, result, &key, Some(server.to_owned()), None, transport)?;

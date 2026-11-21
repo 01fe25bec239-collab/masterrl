@@ -608,12 +608,16 @@ async fn control(
     let (epoch, rx) = store::open_control(
         &gw.db,
         node,
+        sha,
         &gw.core_id,
         h,
         transport.map(TransportKind::as_str),
     )
     .await
-    .map_err(unavailable)?;
+    .map_err(|e| match e {
+        NodesError::Certificate(_) => denied(e),
+        e => unavailable(e),
+    })?;
     let (superseded, revoked, wake) = gw.sessions.open_control(node, epoch, connection);
     let mut rx_seq = rx.max(0) as u64;
     tracing::info!(node = %NodeId::from_uuid(node), epoch, "machine connected");

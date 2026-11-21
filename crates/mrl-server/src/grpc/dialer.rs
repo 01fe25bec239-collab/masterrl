@@ -164,8 +164,32 @@ async fn scan(
     Ok(())
 }
 
-/// An HTTP/2 channel over one already-open stream (no reconnects: the dialer does that).
-async fn channel_over<T>(io: T) -> Result<tonic::transport::Channel, NodesError>
+/// Runs `step`, a wait on the machine, for at most `limit`; `stop` (leadership lost, shutdown)
+/// ends it at once. Every wait on the machine in the dialer goes through this or has a limit of
+/// its own, so a machine that stops answering never holds a dial. `what` names the step.
+async fn bounded<T>(
+    what: &str,
+    limit: Duration,
+    stop: &CancellationToken,
+    step: impl std::future::Future<Output = Result<T, NodesError>>,
+) -> Result<T, NodesError> {
+    tokio::select! {
+        () = stop.cancelled() => Err(NodesError::Protocol(format!("stopped during {what}"))),
+        r = tokio::time::timeout(limit, step) => r.unwrap_or_else(|_| {
+            Err(NodesError::Protocol(format!(
+                "the machine did not finish {what} within {} s",
+                limit.as_secs()
+            )))
+        }),
+    }
+}
+
+/// An HTTP/2 channel over one already-open stream (no reconnects: the dialer does that), set
+/// up within the handshake limit; `stop` ends the setup.
+async fn channel_over<T>(
+    io: T,
+    stop: &CancellationToken,
+) -> Result<tonic::transport::Channel, NodesError>
 where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
@@ -180,12 +204,15 @@ where
                 .ok_or_else(|| std::io::Error::other("this connection was already used"))
         }
     });
-    tonic::transport::Endpoint::from_static("http://agent.masterrl.internal")
-        .http2_keep_alive_interval(KEEPALIVE)
-        .keep_alive_while_idle(true)
-        .connect_with_connector(connector)
-        .await
-        .map_err(|e| NodesError::Protocol(format!("HTTP/2 to the agent failed: {e}")))
+    let connect = async {
+        tonic::transport::Endpoint::from_static("http://agent.masterrl.internal")
+            .http2_keep_alive_interval(KEEPALIVE)
+            .keep_alive_while_idle(true)
+            .connect_with_connector(connector)
+            .await
+            .map_err(|e| NodesError::Protocol(format!("HTTP/2 to the agent failed: {e}")))
+    };
+    bounded("the HTTP/2 setup", super::HANDSHAKE_TIMEOUT, stop, connect).await
 }
 
 async fn open(gw: &Gateway, endpoint: &Endpoint) -> Result<BoxIo, NodesError> {
@@ -213,22 +240,17 @@ async fn lane(
         .await
         .map_err(|_| NodesError::Protocol("stream closed".into()))?;
     let outbound = ReceiverStream::new(rx).map_while(Result::ok);
-    let opened = tokio::select! {
-        () = stop.cancelled() => return Err(NodesError::Protocol("stopped".into())),
-        r = tokio::time::timeout(super::HANDSHAKE_TIMEOUT, client.session(outbound)) => r,
-    };
-    let inbound = opened
-        .map_err(|_| {
-            NodesError::Protocol(format!(
-                "the agent did not open the {lane:?} stream in time"
-            ))
-        })?
-        .map_err(|s| {
+    let open = async {
+        client.session(outbound).await.map_err(|s| {
             NodesError::Protocol(format!(
                 "the agent refused the {lane:?} stream: {}",
                 s.message()
             ))
-        })?
+        })
+    };
+    let what = format!("opening the {lane:?} stream");
+    let inbound = bounded(&what, super::HANDSHAKE_TIMEOUT, &stop, open)
+        .await?
         .into_inner();
     Ok(tokio::spawn(session::run(
         gw.clone(),
@@ -250,13 +272,13 @@ async fn dial_node(
     let pki = gw.pki()?;
     let name =
         ServerName::try_from(node_name(node)).map_err(|e| NodesError::Protocol(e.to_string()))?;
-    let tls = TlsConnector::from(pki.dial_tls.clone()).connect(name, io);
-    let tls = tokio::time::timeout(super::HANDSHAKE_TIMEOUT, tls)
-        .await
-        .map_err(|_| {
-            NodesError::Protocol("the machine did not finish the TLS handshake in time".into())
-        })?
-        .map_err(|e| NodesError::Certificate(format!("TLS with the machine failed: {e}")))?;
+    let tls = async {
+        TlsConnector::from(pki.dial_tls.clone())
+            .connect(name, io)
+            .await
+            .map_err(|e| NodesError::Certificate(format!("TLS with the machine failed: {e}")))
+    };
+    let tls = bounded("the TLS handshake", super::HANDSHAKE_TIMEOUT, lead, tls).await?;
     let peer = PeerInfo {
         cert_sha256: super::tls::peer_sha256(tls.get_ref().1.peer_certificates()),
         remote: None,
@@ -264,7 +286,7 @@ async fn dial_node(
         dialed_node: Some(node),
         connection: PeerInfo::new_connection(),
     };
-    let channel = channel_over(tls).await?;
+    let channel = channel_over(tls, lead).await?;
     let client = AgentEndpointServiceClient::new(channel)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -321,18 +343,16 @@ async fn dial_enroll(
     let pki = gw.pki()?;
     let name = ServerName::try_from("enroll.masterrl.internal")
         .map_err(|e| NodesError::Protocol(e.to_string()))?;
-    let tls = TlsConnector::from(pki.enroll_tls.clone()).connect(name, io);
-    let tls = tokio::time::timeout(super::HANDSHAKE_TIMEOUT, tls)
-        .await
-        .map_err(|_| {
-            NodesError::Protocol(
-                "the waiting machine did not finish the TLS handshake in time".into(),
-            )
-        })?
-        .map_err(|e| {
-            NodesError::Certificate(format!("TLS with the waiting machine failed: {e}"))
-        })?;
-    let channel = channel_over(tls).await?;
+    let tls = async {
+        TlsConnector::from(pki.enroll_tls.clone())
+            .connect(name, io)
+            .await
+            .map_err(|e| {
+                NodesError::Certificate(format!("TLS with the waiting machine failed: {e}"))
+            })
+    };
+    let tls = bounded("the TLS handshake", super::HANDSHAKE_TIMEOUT, lead, tls).await?;
+    let channel = channel_over(tls, lead).await?;
     let mut client = AgentEndpointServiceClient::new(channel);
     // No machine certificate on this connection: the session accepts only an EnrollRequest.
     let peer = PeerInfo {
@@ -370,6 +390,33 @@ mod tests {
         assert!(r.is_err());
         assert!(stop.is_cancelled());
         assert_eq!(ended.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn http2_setup_with_a_machine_that_never_reads_is_bounded_and_stop_ends_it() {
+        // The machine's end stays open and never reads: the HTTP/2 preface can't be written.
+        let (io, _machine) = tokio::io::duplex(1);
+        let stop = CancellationToken::new();
+        let started = std::time::Instant::now();
+        let limit = super::super::HANDSHAKE_TIMEOUT;
+        let r = tokio::time::timeout(limit * 2, channel_over(io, &stop))
+            .await
+            .expect("the HTTP/2 setup has a time limit");
+        assert!(r.is_err());
+        assert!(started.elapsed() <= limit + Duration::from_secs(2));
+        let (io, _machine) = tokio::io::duplex(1);
+        let s = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            s.cancel();
+        });
+        let started = std::time::Instant::now();
+        let r = tokio::time::timeout(limit * 2, channel_over(io, &stop)).await;
+        assert!(matches!(r, Ok(Err(_))));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "stop ended the wait"
+        );
     }
 
     #[test]

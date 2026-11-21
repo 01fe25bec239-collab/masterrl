@@ -806,28 +806,55 @@ pub fn transport_for(g: &GatewaySettings, id: &Identity) -> Result<Box<dyn Trans
     Ok(dial_transport(g, kind, &server))
 }
 
-/// An HTTP/2 channel over one open stream (no reconnects: the session loop does that).
-pub async fn channel_over<T>(io: T) -> Result<tonic::transport::Channel, LinkError>
+/// Runs `step`, a wait on the peer, for at most `limit`; `stop` ends it at once. Every wait on
+/// the peer goes through this (or has a limit of its own), so a peer that stops answering never
+/// holds a connection, an enrollment or a shutdown. `what` names the step in the error.
+pub async fn bounded<T>(
+    what: &str,
+    limit: Duration,
+    stop: &CancellationToken,
+    step: impl std::future::Future<Output = Result<T, LinkError>>,
+) -> Result<T, LinkError> {
+    tokio::select! {
+        () = stop.cancelled() => Err(LinkError::Unreachable(format!("stopped during {what}"))),
+        r = tokio::time::timeout(limit, step) => r.unwrap_or_else(|_| {
+            Err(LinkError::Unreachable(format!(
+                "the core did not finish {what} within {} s",
+                limit.as_secs()
+            )))
+        }),
+    }
+}
+
+/// An HTTP/2 channel over one open stream (no reconnects: the session loop does that), set up
+/// within [`HANDSHAKE_TIMEOUT`]; `stop` ends the setup.
+pub async fn channel_over<T>(
+    io: T,
+    stop: &CancellationToken,
+) -> Result<tonic::transport::Channel, LinkError>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let connector = OneShot(Arc::new(Mutex::new(Some(io))));
-    tonic::transport::Endpoint::from_static("http://core.masterrl.internal")
-        .http2_keep_alive_interval(KEEPALIVE)
-        .keep_alive_while_idle(true)
-        .connect_with_connector(connector)
-        .await
-        .map_err(|e| {
-            // With TLS 1.3 the core's verdict on our certificate arrives after the handshake.
-            let detail = format!("{e:?}");
-            if detail.contains("CertificateRevoked") {
-                LinkError::Certificate(
-                    "the core refused this machine's certificate: it was revoked".into(),
-                )
-            } else {
-                LinkError::Unreachable(format!("HTTP/2 to the core failed: {e}"))
-            }
-        })
+    let connect = async {
+        tonic::transport::Endpoint::from_static("http://core.masterrl.internal")
+            .http2_keep_alive_interval(KEEPALIVE)
+            .keep_alive_while_idle(true)
+            .connect_with_connector(connector)
+            .await
+            .map_err(|e| {
+                // With TLS 1.3 the core's verdict on our certificate arrives after the handshake.
+                let detail = format!("{e:?}");
+                if detail.contains("CertificateRevoked") {
+                    LinkError::Certificate(
+                        "the core refused this machine's certificate: it was revoked".into(),
+                    )
+                } else {
+                    LinkError::Unreachable(format!("HTTP/2 to the core failed: {e}"))
+                }
+            })
+    };
+    bounded("the HTTP/2 setup", HANDSHAKE_TIMEOUT, stop, connect).await
 }
 
 struct OneShot<T>(Arc<Mutex<Option<T>>>);
@@ -1226,7 +1253,7 @@ async fn dialed(l: Arc<LaneCtx>, io: BoxIo, stop: CancellationToken) -> Result<O
     let Some(tls_io) = connect_tls(config, io, &stop).await? else {
         return Ok(Outcome::Stopped);
     };
-    let channel = channel_over(tls_io).await?;
+    let channel = channel_over(tls_io, &stop).await?;
     let client = AgentGatewayServiceClient::new(channel)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
         .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -1235,16 +1262,15 @@ async fn dialed(l: Arc<LaneCtx>, io: BoxIo, stop: CancellationToken) -> Result<O
         let (l, stop, mut c) = (l.clone(), stop.clone(), client.clone());
         async move {
             let (tx, rx) = mpsc::channel(256);
-            let opened = tokio::select! {
-                () = stop.cancelled() => return Err(LinkError::Unreachable("stopped".into())),
-                r = tokio::time::timeout(HANDSHAKE_TIMEOUT, c.session(ReceiverStream::new(rx))) => r,
+            let open = async {
+                c.session(ReceiverStream::new(rx))
+                    .await
+                    .map_err(|s| status_error(&s))
             };
+            let what = format!("opening the {lane:?} stream");
             let inbound: CoreIn = Box::pin(
-                opened
-                    .map_err(|_| {
-                        LinkError::Unreachable(format!("the core did not open the {lane:?} stream in time"))
-                    })?
-                    .map_err(|s| status_error(&s))?
+                bounded(&what, HANDSHAKE_TIMEOUT, &stop, open)
+                    .await?
                     .into_inner(),
             );
             Ok::<_, LinkError>(tokio::spawn(run_lane(l, lane, inbound, tx, stop)))
@@ -1304,6 +1330,24 @@ pub async fn supervise(
     }
 }
 
+/// The lane a core that dialed in offers on a new stream (its first message), within
+/// [`HANDSHAKE_TIMEOUT`].
+async fn lane_offer(inbound: &mut CoreIn, stop: &CancellationToken) -> Result<Lane, tonic::Status> {
+    let offer = bounded("the lane offer", HANDSHAKE_TIMEOUT, stop, next(inbound))
+        .await
+        .map_err(|e| tonic::Status::cancelled(e.explain()))?;
+    let lane = match offer.body {
+        Some(core_message::Body::Hello(h)) => Lane::try_from(h.lane).unwrap_or(Lane::Unspecified),
+        _ => Lane::Unspecified,
+    };
+    if lane == Lane::Unspecified {
+        return Err(tonic::Status::invalid_argument(
+            "the first message must offer a lane",
+        ));
+    }
+    Ok(lane)
+}
+
 /// `AgentEndpointService` for a core that dialed in.
 struct EndpointSvc {
     lane_ctx: Arc<LaneCtx>,
@@ -1321,21 +1365,7 @@ impl AgentEndpointService for EndpointSvc {
         request: tonic::Request<tonic::Streaming<CoreMessage>>,
     ) -> Result<tonic::Response<Self::SessionStream>, tonic::Status> {
         let mut inbound: CoreIn = Box::pin(request.into_inner());
-        let offer = match inbound.next().await {
-            Some(Ok(m)) => m,
-            _ => return Err(tonic::Status::cancelled("closed before the lane offer")),
-        };
-        let lane = match offer.body {
-            Some(core_message::Body::Hello(h)) => {
-                Lane::try_from(h.lane).unwrap_or(Lane::Unspecified)
-            }
-            _ => Lane::Unspecified,
-        };
-        if lane == Lane::Unspecified {
-            return Err(tonic::Status::invalid_argument(
-                "the first message must offer a lane",
-            ));
-        }
+        let lane = lane_offer(&mut inbound, &self.stop).await?;
         let (tx, rx) = mpsc::channel(256);
         let (l, stop, done) = (
             self.lane_ctx.clone(),
@@ -1821,6 +1851,49 @@ mod tests {
             .unwrap()
             .is_none());
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn http2_setup_with_a_peer_that_never_reads_is_bounded_and_stop_ends_it() {
+        // The peer end stays open and never reads: the HTTP/2 preface can't be written.
+        let (io, _peer) = tokio::io::duplex(1);
+        let stop = CancellationToken::new();
+        let started = tokio::time::Instant::now();
+        let r = tokio::time::timeout(HANDSHAKE_TIMEOUT * 2, channel_over(io, &stop))
+            .await
+            .expect("the HTTP/2 setup has a time limit");
+        assert!(matches!(r, Err(LinkError::Unreachable(_))), "{r:?}");
+        assert!(started.elapsed() <= HANDSHAKE_TIMEOUT + Duration::from_secs(2));
+        let (io, _peer) = tokio::io::duplex(1);
+        let s = stop.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            s.cancel();
+        });
+        let started = tokio::time::Instant::now();
+        let r = tokio::time::timeout(HANDSHAKE_TIMEOUT * 2, channel_over(io, &stop)).await;
+        assert!(matches!(r, Ok(Err(_))), "{r:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "stop ended the wait"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_core_that_never_offers_a_lane_is_dropped_in_time() {
+        let mut silent: CoreIn = Box::pin(futures::stream::pending());
+        let stop = CancellationToken::new();
+        let started = std::time::Instant::now();
+        let r = tokio::time::timeout(HANDSHAKE_TIMEOUT * 2, lane_offer(&mut silent, &stop))
+            .await
+            .expect("the lane offer has a time limit");
+        assert_eq!(r.unwrap_err().code(), tonic::Code::Cancelled);
+        assert!(started.elapsed() <= HANDSHAKE_TIMEOUT + Duration::from_secs(2));
+        stop.cancel();
+        assert!(
+            lane_offer(&mut silent, &stop).await.is_err(),
+            "stop ends the wait"
+        );
     }
 
     #[test]
