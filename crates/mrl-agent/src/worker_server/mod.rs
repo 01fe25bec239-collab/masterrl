@@ -100,6 +100,8 @@ type Outbox = mpsc::Sender<Result<AgentMessage, Status>>;
 struct Shared {
     attempt_id: String,
     nonce: Secret,
+    /// The worker ids of this attempt: no other role gets a session.
+    roles: Vec<String>,
     inbound: mpsc::Sender<Inbound>,
     dedup: Mutex<Dedup>,
     seq_file: PathBuf,
@@ -209,6 +211,19 @@ impl WorkerControlService for Svc {
                 .await;
             return Err(Status::permission_denied("wrong attempt or nonce"));
         }
+        if !shared.roles.contains(&role_id) {
+            let _ = shared
+                .inbound
+                .send(Inbound::Refused {
+                    role_id: role_id.clone(),
+                    reason: format!(
+                        "a worker connected as {role_id}, which this attempt does not run"
+                    ),
+                    env_mismatch: false,
+                })
+                .await;
+            return Err(Status::permission_denied("unknown role"));
+        }
         let (tx, rx) = mpsc::channel(64);
         let durable = shared.durable(&role_id);
         let chosen = negotiate(&hello.protocol_versions);
@@ -291,6 +306,14 @@ async fn read_loop(
                     let _ = push(&tx, &fence, Err(twice)).await;
                     break;
                 }
+                // Only heartbeats go without a seq: anything else must be numbered, saved and
+                // deduplicated.
+                if !matches!(msg.body, Some(WorkerBody::Heartbeat(_))) {
+                    let unnumbered =
+                        Status::failed_precondition("only Heartbeat may be sent with seq 0");
+                    let _ = push(&tx, &fence, Err(unnumbered)).await;
+                    break;
+                }
                 let live = Inbound::Live {
                     role_id: role_id.clone(),
                     msg,
@@ -370,6 +393,7 @@ impl WorkerServer {
         socket: &Path,
         attempt_id: &str,
         nonce: Secret,
+        roles: Vec<String>,
         seq_file: PathBuf,
         inbound: mpsc::Sender<Inbound>,
     ) -> Result<Self, AttemptError> {
@@ -384,6 +408,7 @@ impl WorkerServer {
         let shared = Arc::new(Shared {
             attempt_id: attempt_id.to_owned(),
             nonce,
+            roles,
             inbound,
             dedup: Mutex::new(dedup),
             seq_file,

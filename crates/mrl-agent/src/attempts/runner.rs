@@ -78,8 +78,13 @@ pub enum Control {
         /// One authorized target per file.
         targets: Vec<UploadTarget>,
     },
-    /// Lease renewed: `duration_s` from now, stop `kill_budget_s` before it ends.
+    /// Lease renewed by a `LeaseGrant`: it runs `duration_s` from when the acknowledged
+    /// heartbeat was sent, and the attempt is stopped `kill_budget_s` before it ends.
     Lease {
+        /// The acknowledged heartbeat's seq; grants for older heartbeats are ignored.
+        heartbeat_seq: u64,
+        /// When that heartbeat was sent (this agent's monotonic clock).
+        heartbeat_sent: std::time::Instant,
         /// Lease length.
         duration_s: u32,
         /// Safety margin.
@@ -89,6 +94,28 @@ pub enum Control {
     Hw(Vec<HwEvent>),
     /// The agent is shutting down: leave the workers running for the next agent.
     Detach(oneshot::Sender<()>),
+    /// `inner`, then `saved` gets whether the attempt record holding its effect was saved: a
+    /// command is answered as accepted only once it survives a restart.
+    Acked {
+        /// The control.
+        inner: Box<Control>,
+        /// Told after the save.
+        saved: oneshot::Sender<bool>,
+    },
+}
+
+/// Unwraps [`Control::Acked`].
+fn split_ack(c: Option<Control>) -> (Option<Control>, Option<oneshot::Sender<bool>>) {
+    match c {
+        Some(Control::Acked { inner, saved }) => (Some(*inner), Some(saved)),
+        c => (c, None),
+    }
+}
+
+fn ack_with(ack: Option<oneshot::Sender<bool>>, saved: bool) {
+    if let Some(a) = ack {
+        let _ = a.send(saved);
+    }
 }
 
 /// Why a launch stopped before its workers ran.
@@ -228,6 +255,10 @@ pub struct Runner {
     adhoc: HashMap<String, tokio::task::JoinHandle<()>>,
     /// Checkpoint uploads running now, by checkpoint id.
     ck_tasks: HashMap<String, tokio::task::JoinHandle<()>>,
+    /// Results sent and waiting for the gateway's receipt.
+    in_transit: HashSet<String>,
+    receipts_tx: mpsc::Sender<(String, bool)>,
+    receipts_rx: mpsc::Receiver<(String, bool)>,
 }
 
 /// Folders of an attempt.
@@ -312,6 +343,7 @@ impl Runner {
         let (inbound_tx, inbound_rx) = mpsc::channel(256);
         let (exits_tx, exits_rx) = mpsc::channel(16);
         let (uploads_tx, uploads_rx) = mpsc::channel(16);
+        let (receipts_tx, receipts_rx) = mpsc::channel(64);
         Self {
             sh,
             job_dir,
@@ -344,6 +376,9 @@ impl Runner {
             unsaved: HashMap::new(),
             adhoc: HashMap::new(),
             ck_tasks: HashMap::new(),
+            in_transit: HashSet::new(),
+            receipts_tx,
+            receipts_rx,
         }
     }
 
@@ -443,20 +478,28 @@ impl Runner {
         self.lease.is_some_and(|at| Instant::now() >= at)
     }
 
-    /// Sends an event. Waits while the channel is full, but never past the next deadline
+    /// Queues an event. Waits while the channel is full, but never past the next deadline
     /// (lease, cancel/pause stop), so a slow reader can't keep the attempt running past either.
-    async fn emit(&self, ev: AttemptEvent) -> Delivery {
-        let Some(at) = self.next_deadline() else {
+    /// `Ok`: queued, with the receipt that resolves once the gateway saved it.
+    async fn queue(&self, ev: AttemptEvent) -> Result<oneshot::Receiver<()>, Delivery> {
+        let send = super::send_event(&self.sh.events, ev);
+        let queued = match self.next_deadline() {
             // Nothing to enforce: wait for the reader.
-            return match self.sh.events.send(ev).await {
-                Ok(()) => Delivery::Sent,
-                Err(_) => Delivery::Closed,
-            };
+            None => send.await,
+            Some(at) => tokio::select! {
+                biased;
+                r = send => r,
+                () = tokio::time::sleep_until(at) => return Err(Delivery::DeadlinePassed),
+            },
         };
-        tokio::select! {
-            biased;
-            r = self.sh.events.send(ev) => if r.is_ok() { Delivery::Sent } else { Delivery::Closed },
-            () = tokio::time::sleep_until(at) => Delivery::DeadlinePassed,
+        queued.ok_or(Delivery::Closed)
+    }
+
+    /// Queues an event whose loss costs nothing (statuses: the next reconcile repeats them).
+    async fn emit(&self, ev: AttemptEvent) -> Delivery {
+        match self.queue(ev).await {
+            Ok(_) => Delivery::Sent,
+            Err(d) => d,
         }
     }
 
@@ -469,6 +512,29 @@ impl Runner {
     }
 
     /// Records and arms a new lease deadline.
+    /// Applies a lease grant: the deadline counts from the acknowledged heartbeat's send
+    /// time (as the core does), never from when the grant arrived. A grant for a heartbeat
+    /// older than the last applied one is ignored. True when applied.
+    fn apply_lease(
+        &mut self,
+        heartbeat_seq: u64,
+        heartbeat_sent: std::time::Instant,
+        duration_s: u32,
+        kill_budget_s: u32,
+    ) -> bool {
+        if heartbeat_seq <= self.rec.lease_heartbeat_seq {
+            return false;
+        }
+        let ago = std::time::Instant::now().saturating_duration_since(heartbeat_sent);
+        let ago = i64::try_from(ago.as_millis()).unwrap_or(i64::MAX);
+        let sent_ms = now_ms().saturating_sub(ago);
+        let hard = sent_ms + i64::from(duration_s) * 1000;
+        self.rec.lease_heartbeat_seq = heartbeat_seq;
+        self.rec.lease_hard_deadline_unix_ms = Some(hard);
+        self.set_lease(hard - i64::from(kill_budget_s.min(duration_s)) * 1000);
+        true
+    }
+
     fn set_lease(&mut self, deadline_ms: i64) {
         self.rec.lease_deadline_unix_ms = Some(deadline_ms);
         self.arm_lease(deadline_ms);
@@ -556,21 +622,23 @@ impl Runner {
                 () = tokio::time::sleep_until(self.stop_at.unwrap_or_else(far)), if self.stop_at.is_some() => {
                     return Err(if self.pause_requested && !self.rec.cancel_requested { Early::Paused } else { Early::Cancelled });
                 }
-                c = control.recv() => match c {
+                c = control.recv() => { let (c, ack) = split_ack(c); match c {
                     Some(Control::Cancel { .. }) | None => {
                         self.rec.cancel_requested = true;
+                        let saved = self.save();
+                        ack_with(ack, saved);
                         return Err(Early::Cancelled);
                     }
                     Some(Control::Detach(done)) => {
+                        ack_with(ack, true);
                         let _ = done.send(());
                         return Err(Early::Detached);
                     }
                     Some(Control::Start(reply)) => {
                         let _ = reply.send(Err(AttemptError::state(self.id(), "is still staging its inputs")));
                     }
-                    Some(Control::Lease { duration_s, kill_budget_s }) => {
-                        let margin = i64::from(duration_s.saturating_sub(kill_budget_s)) * 1000;
-                        self.set_lease(now_ms() + margin);
+                    Some(Control::Lease { heartbeat_seq, heartbeat_sent, duration_s, kill_budget_s }) => {
+                        self.apply_lease(heartbeat_seq, heartbeat_sent, duration_s, kill_budget_s);
                     }
                     Some(Control::Pause { request_id, deadline_s, reason }) => {
                         // Sent to the workers when they connect (they pause at once); its
@@ -592,7 +660,10 @@ impl Runner {
                     Some(Control::Hw(events)) => {
                         self.hw_events.extend(events.into_iter().filter(|e| self.gpu_uuids.contains(&e.uuid)));
                     }
-                },
+                    Some(Control::Acked { .. }) => {}
+                }
+                let saved = self.save();
+                ack_with(ack, saved); },
                 r = &mut work => break r.map_err(Early::Failed)?,
             }
         };
@@ -633,6 +704,12 @@ impl Runner {
             &self.rec.socket,
             self.id(),
             Secret::new(self.rec.nonce.clone()),
+            self.rec
+                .spec
+                .workers()
+                .into_iter()
+                .map(|(id, _, _)| id)
+                .collect(),
             self.job_dir.join(super::record::SEQ_FILE),
             self.inbound_tx.clone(),
         )
@@ -774,21 +851,35 @@ impl Runner {
         };
         std::fs::create_dir_all(inputs_dir(&self.job_dir))
             .map_err(|e| AgentError::state(inputs_dir(&self.job_dir), e))?;
-        let exec = self.sh.ctx.executor.spawn(spec).await?;
-        let identity = match &container {
-            Some(name) => Some(ProcIdentity::Container {
-                name: name.clone(),
-                id: None,
-            }),
-            None => exec.pid().and_then(ProcIdentity::of_pid),
-        };
-        if let Some(identity) = identity {
+        // A container is recorded (by name, carrying the launch token) before it starts: if
+        // the agent dies right after `docker run`, the next one still finds and stops it.
+        if let Some(name) = &container {
             self.rec.workers.push(WorkerProc {
                 role_id: role_id.to_owned(),
                 primary,
-                identity,
+                identity: ProcIdentity::Container {
+                    name: name.clone(),
+                    id: None,
+                },
                 cgroup: None,
             });
+            if !self.save() {
+                return Err(AttemptError::state(
+                    self.id(),
+                    "could not save the worker before starting it",
+                ));
+            }
+        }
+        let exec = self.sh.ctx.executor.spawn(spec).await?;
+        if container.is_none() {
+            if let Some(identity) = exec.pid().and_then(ProcIdentity::of_pid) {
+                self.rec.workers.push(WorkerProc {
+                    role_id: role_id.to_owned(),
+                    primary,
+                    identity,
+                    cgroup: None,
+                });
+            }
         }
         let watched = container.map(|name| (name, attempt_token(&self.rec.nonce)));
         let stop = spawn_exec(role_id.to_owned(), exec, watched, self.exits_tx.clone());
@@ -837,11 +928,19 @@ impl Runner {
                         let _ = done.send(());
                         return None;
                     }
-                    Some(c) => self.on_control(c).await,
+                    Some(c) => {
+                        let (c, ack) = split_ack(Some(c));
+                        if let Some(c) = c {
+                            self.on_control(c).await;
+                        }
+                        let saved = self.save();
+                        ack_with(ack, saved);
+                    }
                     // The manager is gone without a detach: stop the attempt.
                     None => self.stop_all().await,
                 },
                 Some(u) = self.uploads_rx.recv() => self.on_upload(u).await,
+                Some((id, saved)) = self.receipts_rx.recv() => self.on_receipt(&id, saved),
                 _ = stall_tick.tick() => {
                     self.retry_commits().await;
                     if !self.stalled
@@ -862,7 +961,12 @@ impl Runner {
 
     async fn stop_all(&mut self) {
         self.agent_stopped = true;
-        let grace = Duration::from_secs(self.sh.ctx.config.exec.kill_grace_secs);
+        // Never past the lease's hard end: by then the core may run the attempt elsewhere.
+        let mut grace = Duration::from_secs(self.sh.ctx.config.exec.kill_grace_secs);
+        if let Some(hard) = self.rec.lease_hard_deadline_unix_ms {
+            let left = u64::try_from(hard.saturating_sub(now_ms())).unwrap_or(0);
+            grace = grace.min(Duration::from_millis(left));
+        }
         for w in self.workers.values() {
             let _ = w.stop.send(StopMsg::Stop(grace)).await;
         }
@@ -952,16 +1056,24 @@ impl Runner {
         })
     }
 
-    async fn relay(&self, role_id: &str, msg: WorkerMessage) -> Delivery {
+    /// Relays a worker message. `Ok`: queued, with the receipt that resolves once the
+    /// gateway saved it (a message with no lane needs none and resolves at once).
+    async fn relay(
+        &self,
+        role_id: &str,
+        msg: WorkerMessage,
+    ) -> Result<oneshot::Receiver<()>, Delivery> {
         let Some(lane) = crate::lanes::lane_for(&msg) else {
-            return Delivery::Sent;
+            let (done, saved) = oneshot::channel();
+            let _ = done.send(());
+            return Ok(saved);
         };
         let relay = WorkerRelay {
             attempt: Some(self.rec.spec.attempt.to_proto()),
             role_id: role_id.to_owned(),
             message: Some(msg),
         };
-        self.emit(AttemptEvent::Relay { lane, relay }).await
+        self.queue(AttemptEvent::Relay { lane, relay }).await
     }
 
     /// The role of a worker id, from the exact worker list the launch expanded.
@@ -975,7 +1087,13 @@ impl Runner {
     }
 
     async fn on_inbound(&mut self, inb: Inbound) {
-        self.last_seen = Instant::now();
+        // Only traffic from admitted workers counts as a sign of life.
+        if matches!(
+            inb,
+            Inbound::Hello { .. } | Inbound::Message { .. } | Inbound::Live { .. }
+        ) {
+            self.last_seen = Instant::now();
+        }
         match inb {
             Inbound::Hello { role_id, hello } => {
                 let Some(role) = self.role_spec(&role_id) else {
@@ -1006,12 +1124,17 @@ impl Runner {
             }
             Inbound::Message { role_id, msg, done } => {
                 // Not saved: `done` is dropped, so the message is not acked and comes again.
-                // Acked only when relayed too: a closed or stuck event channel leaves the
-                // message with the worker, which replays it.
-                if self.on_message(&role_id, &msg).await
-                    && self.relay(&role_id, msg).await == Delivery::Sent
-                {
-                    let _ = done.send(());
+                // Acked only once the gateway saved the relay too: until then (or if it never
+                // does) the worker keeps the message and replays it after a reconnect. The
+                // wait runs beside the runner, which goes on with its loop.
+                if self.on_message(&role_id, &msg).await {
+                    if let Ok(saved) = self.relay(&role_id, msg).await {
+                        tokio::spawn(async move {
+                            if saved.await.is_ok() {
+                                let _ = done.send(());
+                            }
+                        });
+                    }
                 }
             }
             Inbound::Live { role_id, msg } => {
@@ -1152,13 +1275,27 @@ impl Runner {
     }
 
     /// Keeps a control request so a reconnecting worker gets it again.
+    /// A request with a request id already kept is kept once.
     fn remember(&mut self, body: &AgentBody) {
+        let id = request_id(body);
+        if id.is_some() && self.kept_requests().any(|b| request_id(&b) == id) {
+            return;
+        }
         let msg = mrl_proto::worker::v1::AgentMessage {
             ack_seq: 0,
             body: Some(body.clone()),
         };
         self.rec.requests.push(msg.encode_to_vec());
         self.save();
+    }
+
+    /// The control requests kept for reconnecting workers.
+    fn kept_requests(&self) -> impl Iterator<Item = AgentBody> + '_ {
+        self.rec.requests.iter().filter_map(|raw| {
+            mrl_proto::worker::v1::AgentMessage::decode(raw.as_slice())
+                .ok()
+                .and_then(|m| m.body)
+        })
     }
 
     /// Handles one sequenced worker message. False when what it changed could not be saved.
@@ -1202,6 +1339,57 @@ impl Runner {
                     self.stop_all().await;
                     return true;
                 }
+                // A replay of a checkpoint already known keeps its saved state: the grant (or
+                // the decided outcome) is sent again, nothing is replaced.
+                if let Some(known) = self.rec.checkpoints.get(&s.checkpoint_id).cloned() {
+                    match known.state.and_then(|st| CommitState::try_from(st).ok()) {
+                        Some(st) => {
+                            self.send(role_id, commit_ack(&s.checkpoint_id, st, ""))
+                                .await;
+                        }
+                        None => {
+                            self.send(role_id, grant(&s.checkpoint_id, &known)).await;
+                        }
+                    }
+                    return true;
+                }
+                // The checkpoint is bound to one manifest file whose content hash is the
+                // digest the commit names; the upload then verifies that file like any other.
+                let manifests: Vec<_> = s.files.iter().filter(|f| f.role == "manifest").collect();
+                let invalid = if manifests.len() != 1 {
+                    Some(format!(
+                        "it lists {} manifest files; exactly one is needed",
+                        manifests.len()
+                    ))
+                } else if !super::spec::is_sha256(&s.manifest_sha256)
+                    || manifests[0].sha256 != s.manifest_sha256
+                {
+                    Some("its manifest file does not have the manifest digest".to_owned())
+                } else {
+                    None
+                };
+                if let Some(why) = invalid {
+                    let ck = StagedCheckpoint {
+                        step: s.step,
+                        is_final: s.is_final,
+                        manifest_sha256: s.manifest_sha256.clone(),
+                        files: Vec::new(),
+                        commit_requested: false,
+                        state: Some(CommitState::Corrupt as i32),
+                    };
+                    self.rec.checkpoints.insert(s.checkpoint_id.clone(), ck);
+                    if !self.save() {
+                        return false;
+                    }
+                    let reason = format!("checkpoint {} can't be used: {why}", s.checkpoint_id);
+                    self.send(
+                        role_id,
+                        commit_ack(&s.checkpoint_id, CommitState::Corrupt, &reason),
+                    )
+                    .await;
+                    self.answer_plan(&s.checkpoint_id, Some(reason)).await;
+                    return true;
+                }
                 let ck = StagedCheckpoint {
                     step: s.step,
                     is_final: s.is_final,
@@ -1222,6 +1410,13 @@ impl Runner {
                 self.rec
                     .checkpoints
                     .insert(s.checkpoint_id.clone(), ck.clone());
+                // Saved in the same write as the checkpoint.
+                self.rec.requests.retain(|raw| {
+                    !mrl_proto::worker::v1::AgentMessage::decode(raw.as_slice())
+                        .ok()
+                        .and_then(|m| m.body)
+                        .is_some_and(|b| matches!(b, AgentBody::CheckpointRequest(_)))
+                });
                 if !self.save() {
                     return false;
                 }
@@ -1467,18 +1662,28 @@ impl Runner {
             .rec
             .results
             .iter()
+            .filter(|(k, _)| !self.in_transit.contains(*k))
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
-        let mut sent = false;
         for (command_id, failure) in pending {
             let ev = AttemptEvent::CommandDone(upload_result(command_id.clone(), failure));
-            if !matches!(self.emit(ev).await, Delivery::Sent) {
+            let Ok(saved) = self.queue(ev).await else {
                 break;
-            }
-            self.rec.results.remove(&command_id);
-            sent = true;
+            };
+            // Forgotten when the gateway's receipt comes back (in the main loop); sent again
+            // by the retry tick if it never does.
+            self.in_transit.insert(command_id.clone());
+            let back = self.receipts_tx.clone();
+            tokio::spawn(async move {
+                let _ = back.send((command_id, saved.await.is_ok())).await;
+            });
         }
-        if sent {
+    }
+
+    /// The gateway saved (or dropped) the result of `command_id`.
+    fn on_receipt(&mut self, command_id: &str, saved: bool) {
+        self.in_transit.remove(command_id);
+        if saved && self.rec.results.remove(command_id).is_some() {
             self.save();
         }
     }
@@ -1565,10 +1770,11 @@ impl Runner {
                     reason,
                 });
                 self.remember(&body);
+                // Armed on receipt, before the (bounded) send.
+                self.set_stop_deadline(Duration::from_secs(deadline_s.into()) + DEADLINE_MARGIN);
                 if let Some(role) = self.primary_role() {
                     self.send(&role, body).await;
                 }
-                self.set_stop_deadline(Duration::from_secs(deadline_s.into()) + DEADLINE_MARGIN);
             }
             Control::Checkpoint {
                 request_id,
@@ -1652,13 +1858,15 @@ impl Runner {
                 }
             }
             Control::Lease {
+                heartbeat_seq,
+                heartbeat_sent,
                 duration_s,
                 kill_budget_s,
             } => {
-                let margin = i64::from(duration_s.saturating_sub(kill_budget_s)) * 1000;
-                self.set_lease(now_ms() + margin);
-                if let Some(l) = self.lease_deadline() {
-                    self.send_all(l).await;
+                if self.apply_lease(heartbeat_seq, heartbeat_sent, duration_s, kill_budget_s) {
+                    if let Some(l) = self.lease_deadline() {
+                        self.send_all(l).await;
+                    }
                 }
             }
             Control::Hw(events) => {
@@ -1677,6 +1885,10 @@ impl Runner {
             Control::Detach(done) => {
                 self.detach().await;
                 let _ = done.send(());
+            }
+            // Unwrapped by the caller (`split_ack`); never nested.
+            Control::Acked { saved, .. } => {
+                let _ = saved.send(false);
             }
         }
     }
@@ -1784,6 +1996,16 @@ impl Runner {
         let line = serde_json::to_string(&report).unwrap_or_default();
         let _ = std::fs::write(self.job_dir.join("cleanup.json"), line);
         decision
+    }
+}
+
+/// The request id of a cancel, pause or checkpoint request.
+fn request_id(body: &AgentBody) -> Option<&str> {
+    match body {
+        AgentBody::Cancel(c) => Some(&c.request_id),
+        AgentBody::Pause(p) => Some(&p.request_id),
+        AgentBody::CheckpointRequest(c) => Some(&c.request_id),
+        _ => None,
     }
 }
 

@@ -26,6 +26,7 @@ async fn cleanup_refuses_an_attempt_id_that_leaves_the_state_folder() {
     };
     let ctx = Arc::new(AgentContext::with_hw(config, Vec::new()).unwrap());
     let (tx, _rx) = mrl_agent::attempts::attempt_events(8);
+    let _rx = mrl_agent::attempts::auto_saved(_rx);
     let attempts = Attempts::new(ctx, tx, None).unwrap();
     // `<state>/jobs/../../victim` is `<dir>/agent/victim`.
     let victim = dir.path().join("agent").join("victim").join("work");
@@ -60,7 +61,7 @@ fn manager(
 ) -> (
     Arc<AgentContext>,
     Arc<Attempts>,
-    mrl_agent::attempts::AttemptEvents,
+    tokio::task::JoinHandle<()>,
 ) {
     let config = AgentConfig {
         state_dir: dir.join("state"),
@@ -77,7 +78,7 @@ fn manager(
     let ctx = Arc::new(AgentContext::with_hw(config, Vec::new()).unwrap());
     let (tx, rx) = mrl_agent::attempts::attempt_events(256);
     let attempts = Attempts::new(Arc::clone(&ctx), tx, None).unwrap();
-    (ctx, attempts, rx)
+    (ctx, attempts, mrl_agent::attempts::auto_saved(rx))
 }
 
 /// A spec whose runtime lock never matches (it fails right after staging, without uv).
@@ -155,6 +156,7 @@ async fn inputs_are_read_only_and_ended_attempts_are_reconciled() {
 
     // A new agent on the same state: the ended attempt is reported, its epoch remembered.
     let (tx, _rx2) = mrl_agent::attempts::attempt_events(16);
+    let _rx2 = mrl_agent::attempts::auto_saved(_rx2);
     let second = Attempts::new(Arc::clone(&ctx), tx, None).unwrap();
     let older = bad_lock_spec(dir.path(), "att_e2", "job_e", 3, serde_json::json!({}));
     assert_eq!(
@@ -216,6 +218,7 @@ async fn a_second_manager_leaves_a_running_attempt_alone() {
     let spec = bad_lock_spec(dir.path(), "att_own", "job_o", 1, slow_input(&url));
     first.launch(spec.clone()).unwrap();
     let (tx, _rx2) = mrl_agent::attempts::attempt_events(16);
+    let _rx2 = mrl_agent::attempts::auto_saved(_rx2);
     let second = Attempts::new(Arc::clone(&ctx), tx, None).unwrap();
     assert!(
         second.readopt().await.is_empty(),
@@ -476,6 +479,7 @@ async fn a_rejected_launch_keeps_its_inputs_and_an_id_launches_once() {
                 gpu_indices: Vec::new(),
                 runtime_ref: rt.clone(),
             }],
+            lease_duration_s: 600,
             ..Default::default()
         })),
     };
@@ -569,6 +573,7 @@ async fn a_stage_racing_its_launch_is_kept_or_refused() {
                 gpu_indices: Vec::new(),
                 runtime_ref: rt.clone(),
             }],
+            lease_duration_s: 600,
             ..Default::default()
         })),
     };
@@ -864,6 +869,8 @@ async fn windows_reports_a_surviving_worker_lost() {
         exit: None,
         staged_paths: Default::default(),
         lease_deadline_unix_ms: None,
+        lease_hard_deadline_unix_ms: None,
+        lease_heartbeat_seq: 0,
         stop_deadline_unix_ms: None,
         exit_report: None,
         requests: Vec::new(),
@@ -875,6 +882,7 @@ async fn windows_reports_a_surviving_worker_lost() {
     std::fs::create_dir_all(&job).unwrap();
     rec.save(&job).unwrap();
     let (tx, _rx2) = mrl_agent::attempts::attempt_events(16);
+    let _rx2 = mrl_agent::attempts::auto_saved(_rx2);
     let restarted = Attempts::new(Arc::clone(&ctx), tx, None).unwrap();
     let statuses = restarted.readopt().await;
     let s = statuses
@@ -1002,4 +1010,240 @@ async fn a_second_daemon_leaves_the_first_alone() {
     );
     first.kill().unwrap();
     first.wait().unwrap();
+}
+
+/// Targeted commands must fit the attempt's whole AttemptRef: a Cleanup naming another job
+/// (or an older epoch) is refused and touches nothing, and an attempt without an id is not
+/// read as "the whole node".
+#[tokio::test(flavor = "multi_thread")]
+async fn cleanup_checks_the_whole_attempt_ref() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, attempts, _rx) = manager(dir.path());
+    attempts
+        .launch(bad_lock_spec(
+            dir.path(),
+            "att_ref",
+            "job_r",
+            4,
+            serde_json::json!({}),
+        ))
+        .unwrap();
+    tokio::time::timeout(WAIT, attempts.wait("att_ref"))
+        .await
+        .unwrap();
+    let cleanup = |job: &str, id: &str, epoch: u64| Command {
+        command_id: "clean".into(),
+        kind: Some(Kind::Cleanup(Cleanup {
+            attempt: Some(AttemptRef {
+                job_id: job.into(),
+                attempt_id: id.into(),
+                fencing_epoch: epoch,
+            }),
+            purge_scratch: true,
+            ..Default::default()
+        })),
+    };
+    let job = ctx.state.job_dir("att_ref");
+    std::fs::create_dir_all(job.join("work")).unwrap();
+    assert!(
+        !attempts
+            .handle(&cleanup("job_other", "att_ref", 4))
+            .await
+            .unwrap()
+            .accepted
+    );
+    assert!(
+        !attempts
+            .handle(&cleanup("job_r", "att_ref", 3))
+            .await
+            .unwrap()
+            .accepted
+    );
+    assert!(
+        !attempts
+            .handle(&cleanup("job_r", "", 4))
+            .await
+            .unwrap()
+            .accepted
+    );
+    assert!(job.join("work").exists(), "nothing purged");
+    assert!(
+        attempts
+            .handle(&cleanup("job_r", "att_ref", 4))
+            .await
+            .unwrap()
+            .accepted
+    );
+    assert!(!job.join("work").exists());
+}
+
+/// Transfer errors quote the ticket URL; nothing the agent reports may carry it. A failed
+/// upload and a failed download with a sentinel in the link: the sentinel never shows up.
+#[tokio::test(flavor = "multi_thread")]
+async fn signed_links_never_reach_error_text() {
+    use mrl_agent::attempts::files::{send, Destination};
+    let dir = tempfile::tempdir().unwrap();
+    let config = AgentConfig {
+        state_dir: dir.path().join("state"),
+        transfer: mrl_agent::config::TransferConfig {
+            retries: 0,
+            ..Default::default()
+        },
+        ..AgentConfig::default()
+    };
+    let ctx = Arc::new(AgentContext::with_hw(config, Vec::new()).unwrap());
+    let ticket = |method| mrl_storage::TransferTicket {
+        method,
+        key: "k".into(),
+        max_size: 7,
+        expires_at: time::OffsetDateTime::now_utc() + time::Duration::minutes(10),
+        // Port 9: nothing listens, so the request fails with a connection error.
+        url: "http://127.0.0.1:9/obj/SENTINEL_PATH?X-Sig=SENTINEL_SIG".into(),
+        presigned: true,
+        headers: Default::default(),
+    };
+    let staging = dir.path().join("job").join("staging");
+    std::fs::create_dir_all(&staging).unwrap();
+    std::fs::write(staging.join("w.bin"), b"weights").unwrap();
+    let sha = mrl_storage::sha256_hex(b"weights");
+    let up = send(
+        &ctx,
+        &staging,
+        "w.bin",
+        7,
+        &sha,
+        &Destination::Ticket(ticket(mrl_storage::TicketMethod::Put)),
+    )
+    .await
+    .unwrap_err()
+    .explain();
+    let down = mrl_agent::attempts::AttemptError::from(
+        ctx.transfer
+            .download(
+                &ticket(mrl_storage::TicketMethod::Get),
+                &dir.path().join("in"),
+                Some(&sha),
+            )
+            .await
+            .unwrap_err(),
+    )
+    .explain();
+    for text in [&up, &down] {
+        assert!(!text.contains("SENTINEL"), "{text}");
+    }
+}
+
+/// An accepted StageArtifacts survives an agent restart (its inputs reach the launch sent to
+/// the next agent), and sending it twice stages the input once.
+#[tokio::test(flavor = "multi_thread")]
+async fn staged_inputs_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, first, _rx) = manager(dir.path());
+    let url = stuck_link().await;
+    let stage = Command {
+        command_id: "stage".into(),
+        kind: Some(Kind::StageArtifacts(mrl_proto::agent::v1::StageArtifacts {
+            attempt: attempt_ref("job_p", "att_p"),
+            items: vec![mrl_proto::agent::v1::StageItem {
+                name: "model".into(),
+                url,
+                sha256: "d".repeat(64),
+                size: 4,
+                local_path: "model/w.bin".into(),
+                expires_at: Some(prost_types::Timestamp {
+                    seconds: time::OffsetDateTime::now_utc().unix_timestamp() + 600,
+                    nanos: 0,
+                }),
+            }],
+        })),
+    };
+    assert!(first.handle(&stage).await.unwrap().accepted);
+    assert!(first.handle(&stage).await.unwrap().accepted, "a retry");
+    drop(first);
+    let (tx, _rx2) = mrl_agent::attempts::attempt_events(16);
+    let _rx2 = mrl_agent::attempts::auto_saved(_rx2);
+    let second = Attempts::new(Arc::clone(&ctx), tx, None).unwrap();
+    let rt = format!("uv:sha256:{}", "e".repeat(64));
+    let project = ctx.state.root().join("runtimes").join(rt.replace(':', "-"));
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("uv.lock"), b"version = 1\n").unwrap();
+    let launch = Command {
+        command_id: "launch".into(),
+        kind: Some(Kind::LaunchAttempt(mrl_proto::agent::v1::LaunchAttempt {
+            attempt: attempt_ref("job_p", "att_p"),
+            engine_name: "fake".into(),
+            job_spec_json: "{}".into(),
+            roles: vec![mrl_proto::agent::v1::RoleLaunch {
+                role_id: "trainer".into(),
+                kind: "trainer".into(),
+                primary: true,
+                count: 1,
+                gpu_indices: Vec::new(),
+                runtime_ref: rt.clone(),
+            }],
+            lease_duration_s: 600,
+            ..Default::default()
+        })),
+    };
+    assert!(second.handle(&launch).await.unwrap().accepted);
+    let rec = mrl_agent::attempts::record::AttemptRecord::load(&ctx.state.job_dir("att_p"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        rec.spec.inputs.len(),
+        1,
+        "staged once, and still there after the restart"
+    );
+    assert!(
+        !ctx.state
+            .root()
+            .join("pending")
+            .join("att_p.stage")
+            .exists(),
+        "used by the launch"
+    );
+    second.handle(&cancel_cmd("job_p", "att_p")).await.unwrap();
+    tokio::time::timeout(WAIT, second.wait("att_p"))
+        .await
+        .unwrap();
+}
+
+/// Another reservation keeps evicting every unpinned cache entry while inputs are staged:
+/// an entry evicted between its fill and its pin is filled again, and staging succeeds.
+#[tokio::test(flavor = "multi_thread")]
+async fn staging_survives_concurrent_eviction() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, _attempts, _rx) = manager(dir.path());
+    let data = dir.path().join("in.bin");
+    std::fs::write(&data, b"input bytes").unwrap();
+    let sha = mrl_storage::sha256_hex(b"input bytes");
+    let spec = bad_lock_spec(
+        dir.path(),
+        "att_ev",
+        "job_ev",
+        1,
+        serde_json::json!({"inputs": [{
+            "name": "model", "local_path": "model/w.bin", "sha256": sha, "size": 11, "file": data
+        }]}),
+    );
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (c, s) = (Arc::clone(&ctx), Arc::clone(&stop));
+    // Asks for the whole budget, over and over: every unpinned entry goes.
+    let evictor = std::thread::spawn(move || {
+        while !s.load(std::sync::atomic::Ordering::Relaxed) {
+            let _ = c.cache.reserve(c.cache.budget().max_bytes);
+            // Lets the stager take the cache lock too (a std mutex is not fair).
+            std::thread::sleep(std::time::Duration::from_micros(200));
+        }
+    });
+    for n in 0..10 {
+        let holder = format!("att_ev{n}");
+        let inputs = dir.path().join(format!("inputs{n}"));
+        mrl_agent::attempts::files::stage_inputs(&ctx, &spec, &inputs, &holder)
+            .await
+            .unwrap_or_else(|e| panic!("round {n}: {}", e.explain()));
+        ctx.cache.unpin_all(&holder).unwrap();
+    }
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    evictor.join().unwrap();
 }

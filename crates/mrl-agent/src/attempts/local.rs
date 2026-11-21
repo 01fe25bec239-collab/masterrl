@@ -127,7 +127,9 @@ async fn run_cli(config: Option<&Path>, cmd: AttemptCommand) -> Result<ExitCode,
     let ctx = Arc::new(AgentContext::from_config(cfg)?);
     let (tx, mut rx) = super::attempt_events(256);
     let printer = tokio::spawn(async move {
+        // A local run keeps no journal: printed counts as saved.
         while let Some(e) = rx.recv().await {
+            let e = e.saved();
             if let Some(line) = describe(&e) {
                 eprintln!("mrl-agent: {line}");
             }
@@ -201,9 +203,9 @@ async fn stop_all(config: Option<&Path>) -> Result<ExitCode, AttemptError> {
     let (cfg, _) = AgentConfig::load(config)?;
     let _writer = crate::envs::lock_state(&cfg.state_dir)?;
     let ctx = Arc::new(AgentContext::from_config(cfg)?);
-    let (tx, mut rx) = super::attempt_events(256);
+    let (tx, rx) = super::attempt_events(256);
     // Nobody to tell: events are dropped as they come.
-    let drain = tokio::spawn(async move { while rx.recv().await.is_some() {} });
+    let drain = super::auto_saved(rx);
     let attempts = Attempts::new(ctx, tx, None)?;
     attempts.readopt().await;
     let running = attempts.running();

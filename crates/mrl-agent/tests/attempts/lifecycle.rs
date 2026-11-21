@@ -99,8 +99,9 @@ impl Seen {
         let seen = Self::default();
         let s = seen.clone();
         tokio::spawn(async move {
+            // The test is the journal: seen counts as saved.
             while let Some(e) = rx.recv().await {
-                s.0.lock().unwrap().push(e);
+                s.0.lock().unwrap().push(e.saved());
             }
         });
         seen
@@ -671,6 +672,8 @@ async fn orphaned_job(
         exit: None,
         staged_paths: Default::default(),
         lease_deadline_unix_ms: None,
+        lease_hard_deadline_unix_ms: None,
+        lease_heartbeat_seq: 0,
         stop_deadline_unix_ms: None,
         exit_report: None,
         requests: Vec::new(),
@@ -1001,6 +1004,8 @@ fn old_record(
         exit: None,
         staged_paths: Default::default(),
         lease_deadline_unix_ms: None,
+        lease_hard_deadline_unix_ms: None,
+        lease_heartbeat_seq: 0,
         stop_deadline_unix_ms: None,
         exit_report: None,
         requests: Vec::new(),
@@ -1308,6 +1313,111 @@ async fn stop_all_ends_workers_the_service_left_running() {
     );
     let rec = AttemptRecord::load(&job).unwrap().unwrap();
     assert!(rec.exit.is_some(), "its outcome is recorded");
+}
+
+/// The agent died after starting the primary of a two-worker attempt but before the second:
+/// the restart can't complete the barrier, so it stops the primary, reports the attempt lost
+/// and fails the upload command that was still waiting.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_half_started_attempt_is_closed_on_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), None);
+    let mut primary = std::process::Command::new("sleep")
+        .arg("300")
+        .spawn()
+        .unwrap();
+    let identity = ProcIdentity::of_pid(primary.id()).unwrap();
+    let mut rec = old_record(ctx.state.root(), "att_half", "half-launch", identity, None);
+    rec.spec.roles[0].count = 2;
+    rec.spec.barrier = true;
+    rec.workers[0].role_id = "trainer.0".into();
+    rec.phase = AttemptPhase::Preparing as i32;
+    rec.socket = mrl_agent::attempts::runner::socket_path(ctx.state.root(), "att_half");
+    rec.uploads.insert(
+        "ckpt_1".into(),
+        mrl_agent::attempts::record::UploadPlan {
+            command_id: "up-wait".into(),
+            targets: Vec::new(),
+            answered: false,
+        },
+    );
+    let job = ctx.state.job_dir("att_half");
+    std::fs::create_dir_all(&job).unwrap();
+    rec.save(&job).unwrap();
+    let (attempts, seen) = manager(&ctx);
+    let statuses = attempts.readopt().await;
+    let st = statuses
+        .iter()
+        .find(|s| {
+            s.attempt
+                .as_ref()
+                .is_some_and(|a| a.attempt_id == "att_half")
+        })
+        .unwrap();
+    let f = st.failure.as_ref().unwrap();
+    assert_eq!(f.sub_code, "WORKER_LOST");
+    assert!(f.message.contains("starting the training workers"), "{f:?}");
+    assert!(attempts.running().is_empty(), "not re-adopted");
+    seen.until("the waiting command's result", |evs| {
+        evs.iter().any(|e| {
+            matches!(e, AttemptEvent::CommandDone(r)
+            if r.command_id == "up-wait" && r.failure.is_some())
+        })
+    })
+    .await;
+    let mut stopped = false;
+    for _ in 0..50 {
+        if primary.try_wait().unwrap().is_some() {
+            stopped = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(stopped, "the primary was stopped");
+}
+
+/// The janitor's own sweep (not a Cleanup command): an attempt ended 4 days ago loses its
+/// scratch but is still reported; one ended 15 days ago is removed and no longer reported.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_sweep_retires_old_attempts_on_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), None);
+    let ended = |id: &str, days: u64| {
+        let gone = ProcIdentity::Pid {
+            pid: u32::MAX - 7,
+            start_time: 1,
+        };
+        let mut rec = old_record(ctx.state.root(), id, "n", gone, None);
+        rec.exit = Some(mrl_agent::attempts::exit::decide(&Default::default()));
+        let job = ctx.state.job_dir(id);
+        std::fs::create_dir_all(job.join("work")).unwrap();
+        rec.save(&job).unwrap();
+        let file = job.join(mrl_agent::attempts::record::RECORD_FILE);
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(days * 24 * 3600))
+            .unwrap();
+        job
+    };
+    let (recent, ancient) = (ended("att_4d", 4), ended("att_15d", 15));
+    let envs = mrl_agent::envs::Envs::open(ctx.state.root(), Arc::clone(&ctx.cache)).unwrap();
+    let report = mrl_agent::janitor::sweep(&ctx, &envs, &Default::default())
+        .await
+        .unwrap();
+    assert_eq!(report.purged, ["att_4d"]);
+    assert_eq!(report.retired, ["att_15d"]);
+    assert!(!recent.join("work").exists() && recent.join("attempt.json").exists());
+    assert!(!ancient.exists());
+    let (attempts, _seen) = manager(&ctx);
+    let ids: Vec<String> = attempts
+        .readopt()
+        .await
+        .into_iter()
+        .filter_map(|s| s.attempt.map(|a| a.attempt_id))
+        .collect();
+    assert_eq!(ids, ["att_4d"], "only the attempt still kept is reported");
 }
 
 /// The lease runs out while the event reader is stuck: the launch ends fenced and no worker

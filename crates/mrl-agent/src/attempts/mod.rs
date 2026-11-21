@@ -83,15 +83,76 @@ impl AttemptEvent {
     }
 }
 
+/// One event for the gateway and the receipt it signs once the event is saved (journaled).
+/// A worker message is acknowledged to the worker, and a saved upload result forgotten, only
+/// after [`Envelope::saved`]. An envelope dropped unsaved leaves the event to come again (the
+/// worker replays the message; the result is sent again).
+#[derive(Debug)]
+pub struct Envelope {
+    event: AttemptEvent,
+    receipt: oneshot::Sender<()>,
+}
+
+impl Envelope {
+    /// The event.
+    pub fn event(&self) -> &AttemptEvent {
+        &self.event
+    }
+
+    /// Takes the event and tells the runtime it is saved. Call it once the event is durable
+    /// on the gateway's side (written to its journal), not before.
+    pub fn saved(self) -> AttemptEvent {
+        let _ = self.receipt.send(());
+        self.event
+    }
+
+    /// The event and its receipt, for a gateway that saves later.
+    pub fn into_parts(self) -> (AttemptEvent, Receipt) {
+        (self.event, Receipt(self.receipt))
+    }
+}
+
+/// The receipt of an [`Envelope`] taken apart.
+#[derive(Debug)]
+pub struct Receipt(oneshot::Sender<()>);
+
+impl Receipt {
+    /// The event is saved.
+    pub fn saved(self) {
+        let _ = self.0.send(());
+    }
+}
+
 /// The receiving end of the attempt runtime's events (the gateway drains it).
-pub type AttemptEvents = mpsc::Receiver<AttemptEvent>;
+pub type AttemptEvents = mpsc::Receiver<Envelope>;
 /// The sending end.
-pub type AttemptEventSender = mpsc::Sender<AttemptEvent>;
+pub type AttemptEventSender = mpsc::Sender<Envelope>;
 
 /// A bounded event channel. When the receiver falls behind, workers are acked later and spool
 /// on their side, so nothing is lost.
 pub fn attempt_events(capacity: usize) -> (AttemptEventSender, AttemptEvents) {
     mpsc::channel(capacity)
+}
+
+/// Queues `event`; the returned receiver resolves when the consumer saved it (an error when
+/// it was dropped unsaved). `None`: the channel is closed.
+pub(crate) async fn send_event(
+    tx: &AttemptEventSender,
+    event: AttemptEvent,
+) -> Option<oneshot::Receiver<()>> {
+    let (receipt, saved) = oneshot::channel();
+    tx.send(Envelope { event, receipt }).await.ok()?;
+    Some(saved)
+}
+
+/// Marks every event saved as it arrives, for local tools and tests that keep no journal
+/// (`attempt run`, `attempt stop-all`). The gateway must not use it.
+pub fn auto_saved(mut rx: AttemptEvents) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while let Some(e) = rx.recv().await {
+            e.saved();
+        }
+    })
 }
 
 struct Live {
@@ -147,6 +208,25 @@ impl Attempts {
             draining: AtomicBool::new(false),
             launching: Mutex::new(()),
         };
+        // Inputs staged before a restart, for launches still to come.
+        if let Ok(rd) = std::fs::read_dir(me.shared.ctx.state.root().join("pending")) {
+            for f in rd.flatten() {
+                let staged = std::fs::read(f.path()).ok().and_then(|b| {
+                    <mrl_proto::agent::v1::StageArtifacts as prost::Message>::decode(b.as_slice())
+                        .ok()
+                });
+                if let Some(a) = staged.and_then(|s| Some((s.attempt?, s.items))) {
+                    lock(&me.pending).insert(
+                        a.0.attempt_id.clone(),
+                        Pending {
+                            attempt: Some(a.0),
+                            items: a.1,
+                            creds: BTreeMap::new(),
+                        },
+                    );
+                }
+            }
+        }
         // Every job's highest epoch is known before the first launch is accepted.
         if let Ok(rd) = std::fs::read_dir(me.shared.ctx.state.root().join("jobs")) {
             for dir in rd.flatten() {
@@ -233,6 +313,9 @@ impl Attempts {
             // Fixed now: staging and environment installs count against the lease.
             lease_deadline_unix_ms: (rec_lease_s > 0)
                 .then(|| runner::now_ms() + i64::from(rec_lease_s) * 1000),
+            lease_hard_deadline_unix_ms: (rec_lease_s > 0)
+                .then(|| runner::now_ms() + i64::from(rec_lease_s) * 1000),
+            lease_heartbeat_seq: 0,
             stop_deadline_unix_ms: None,
             exit_report: None,
             requests: Vec::new(),
@@ -244,6 +327,7 @@ impl Attempts {
         rec.save(&job_dir)?;
         // Used: the staged inputs are in the spec, the credentials in `secrets`.
         lock(&self.pending).remove(&id);
+        let _ = std::fs::remove_file(self.pending_path(&id));
         let runner = Runner::new(Arc::clone(&self.shared), rec.clone(), secrets);
         self.spawn(&rec, false, runner, claim);
         Ok(())
@@ -347,7 +431,15 @@ impl Attempts {
             .collect()
     }
 
-    async fn control(&self, attempt: Option<&AttemptRef>, c: Control) -> Result<(), AttemptError> {
+    /// Hands a command to its attempt's runner and returns once the runner saved its effect.
+    /// The command must name the attempt's job and its fencing epoch; with `newer_ok` (a
+    /// cancel), a newer epoch of the same job may also stop it.
+    async fn control(
+        &self,
+        attempt: Option<&AttemptRef>,
+        c: Control,
+        newer_ok: bool,
+    ) -> Result<(), AttemptError> {
         let r = attempt.ok_or_else(|| AttemptError::Spec("the command names no attempt".into()))?;
         let tx = {
             let live = lock(&self.live);
@@ -360,32 +452,64 @@ impl Attempts {
                     format!("belongs to job {}, not {}", l.attempt.job_id, r.job_id),
                 ));
             }
-            if r.fencing_epoch < l.attempt.fencing_epoch {
+            let epoch_ok = if newer_ok {
+                r.fencing_epoch >= l.attempt.fencing_epoch
+            } else {
+                r.fencing_epoch == l.attempt.fencing_epoch
+            };
+            if !epoch_ok {
                 return Err(AttemptError::state(
                     &r.attempt_id,
-                    format!("the command's fencing epoch {} is stale", r.fencing_epoch),
+                    format!(
+                        "runs under fencing epoch {}, not the command's {}",
+                        l.attempt.fencing_epoch, r.fencing_epoch
+                    ),
                 ));
             }
             l.control.clone()
         };
-        tx.send(c)
-            .await
-            .map_err(|_| AttemptError::state(&r.attempt_id, "has just ended"))
+        let ended = || AttemptError::state(&r.attempt_id, "has just ended");
+        // Start answers on its own channel once the barrier opened.
+        if matches!(c, Control::Start(_)) {
+            return tx.send(c).await.map_err(|_| ended());
+        }
+        let (saved, done) = oneshot::channel();
+        tx.send(Control::Acked {
+            inner: Box::new(c),
+            saved,
+        })
+        .await
+        .map_err(|_| ended())?;
+        match done.await {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(AttemptError::state(
+                &r.attempt_id,
+                "could not save the command; send it again",
+            )),
+            Err(_) => Err(ended()),
+        }
     }
 
-    /// Renews a lease (from the gateway's `LeaseGrant`).
+    /// Renews a lease from the gateway's `LeaseGrant`: `heartbeat_seq` is the grant's
+    /// `heartbeat_seq` and `heartbeat_sent` when the gateway sent that heartbeat (its
+    /// monotonic clock). The deadline runs from that send time; older grants are ignored.
     pub async fn renew_lease(
         &self,
         attempt: &AttemptRef,
+        heartbeat_seq: u64,
+        heartbeat_sent: std::time::Instant,
         duration_s: u32,
         kill_budget_s: u32,
     ) -> Result<(), AttemptError> {
         self.control(
             Some(attempt),
             Control::Lease {
+                heartbeat_seq,
+                heartbeat_sent,
                 duration_s,
                 kill_budget_s,
             },
+            false,
         )
         .await
     }
@@ -505,92 +629,106 @@ impl Attempts {
                 .iter()
                 .find(|w| w.primary)
                 .is_some_and(|w| w.identity.alive());
+            // Every worker the launch expanded must have been started (and recorded): an
+            // agent that died halfway through starting them leaves an attempt that can never
+            // get past its barrier, so it is stopped and reported lost.
+            let complete = rec
+                .spec
+                .workers()
+                .iter()
+                .all(|(id, _, _)| rec.workers.iter().any(|w| &w.role_id == id));
             // Windows: the worker server is TCP on a port picked at start, which a restarted
             // agent can't get back, so a surviving worker could never reconnect. It is stopped
-            // (by the release below) and reported lost instead of re-adopted.
-            let readoptable = primary_alive && cfg!(unix);
-            // A container that ended while the agent was down still has its exit code and
-            // OOM flag (read by its verified id, before cleanup removes it).
-            let (exit_code, oom_killed) = match rec.workers.iter().find(|w| w.primary) {
-                Some(w) if !readoptable => match &w.identity {
-                    record::ProcIdentity::Container { id: Some(cid), .. } => {
-                        runner::container_exit(cid).await
-                    }
-                    _ => (None, false),
-                },
-                _ => (None, false),
-            };
-            let report = rec
-                .exit_report
-                .as_deref()
-                .and_then(|b| <ExitReport as prost::Message>::decode(b).ok());
+            // (by the recovery below) and reported lost instead of re-adopted.
+            let readoptable = primary_alive && complete && cfg!(unix);
             let status = if readoptable {
                 let runner = Runner::new(Arc::clone(&self.shared), rec.clone(), Vec::new());
                 self.spawn(&rec, true, runner, claim);
                 status_of(&rec, None)
-            } else if report.is_some() || oom_killed {
-                // The worker ended after its report was saved (or was OOM-killed): the report
-                // and the container's own status decide.
-                let d = exit::decide(&exit::ExitEvidence {
-                    report,
-                    exit_code,
-                    oom_killed,
-                    readopted: true,
-                    cancel_requested: rec.cancel_requested,
-                    final_committed: rec.final_committed(),
-                    needs_final_checkpoint: rec.needs_final_checkpoint(),
-                    ..exit::ExitEvidence::default()
-                });
-                rec.phase = d.phase;
-                rec.exit = Some(d.clone());
-                let _ = rec.save(&dir);
-                let _ = crate::janitor::release(
-                    &self.shared.ctx,
-                    &self.shared.envs,
-                    &rec,
-                    &HashSet::new(),
-                )
-                .await;
-                status_of(&rec, Some(&d))
             } else {
-                let d = ExitDecision {
-                    phase: AttemptPhase::Exited as i32,
-                    exit_kind: mrl_proto::worker::v1::ExitKind::Failed as i32,
-                    exit_code: -1,
-                    failure: Some(Failure {
-                        class: FailureClass::NodeLost as i32,
-                        sub_code: "WORKER_LOST".into(),
-                        message: if primary_alive {
-                            "The agent restarted; on Windows it can't reconnect to a running training worker, so it stopped it.".into()
-                        } else {
-                            "The agent restarted and the training worker was no longer running."
-                                .into()
-                        },
-                        retryable_hint: true,
-                        classified_by: ClassifiedBy::Agent as i32,
-                        ..Failure::default()
-                    }),
+                let why = if !complete && primary_alive {
+                    "The agent stopped while it was starting the training workers, so the attempt can't continue; its workers were stopped."
+                } else if primary_alive {
+                    "The agent restarted; on Windows it can't reconnect to a running training worker, so it stopped it."
+                } else {
+                    "The agent restarted and the training worker was no longer running."
                 };
-                rec.phase = d.phase;
-                rec.exit = Some(d.clone());
-                let _ = rec.save(&dir);
-                let _ = crate::janitor::release(
-                    &self.shared.ctx,
-                    &self.shared.envs,
-                    &rec,
-                    &HashSet::new(),
-                )
-                .await;
-                status_of(&rec, Some(&d))
+                let st = self.recover_ended(&dir, &mut rec, why).await;
+                drop(claim);
+                st
             };
-            let _ = self
-                .shared
-                .events
-                .send(AttemptEvent::Status(status.clone()))
-                .await;
+            let _ = send_event(&self.shared.events, AttemptEvent::Status(status.clone())).await;
             out.push(status);
         }
         out
+    }
+
+    /// The one way an attempt that ended (or can't go on) while no agent ran it is closed:
+    /// the exit evidence that survived (the saved ExitReport, a container's exit code and OOM
+    /// flag, a job cgroup's OOM count) decides; without any, it is WORKER_LOST with `lost_why`.
+    /// Every upload command still waiting is failed, the outcome saved, the workers stopped
+    /// and cleaned up, and the saved results sent.
+    async fn recover_ended(
+        &self,
+        dir: &std::path::Path,
+        rec: &mut AttemptRecord,
+        lost_why: &str,
+    ) -> AttemptStatus {
+        let (mut exit_code, mut oom_killed) = (None, false);
+        for w in &rec.workers {
+            if let record::ProcIdentity::Container { id: Some(cid), .. } = &w.identity {
+                let (code, oom) = runner::container_exit(cid).await;
+                if w.primary {
+                    exit_code = code;
+                }
+                oom_killed |= oom;
+            }
+            oom_killed |= w.cgroup.as_deref().is_some_and(cgroup_oom_killed);
+        }
+        let report = rec
+            .exit_report
+            .as_deref()
+            .and_then(|b| <ExitReport as prost::Message>::decode(b).ok());
+        let d = if report.is_some() || oom_killed {
+            exit::decide(&exit::ExitEvidence {
+                report,
+                exit_code,
+                oom_killed,
+                readopted: true,
+                cancel_requested: rec.cancel_requested,
+                final_committed: rec.final_committed(),
+                needs_final_checkpoint: rec.needs_final_checkpoint(),
+                ..exit::ExitEvidence::default()
+            })
+        } else {
+            ExitDecision {
+                phase: AttemptPhase::Exited as i32,
+                exit_kind: mrl_proto::worker::v1::ExitKind::Failed as i32,
+                exit_code: -1,
+                failure: Some(Failure {
+                    class: FailureClass::NodeLost as i32,
+                    sub_code: "WORKER_LOST".into(),
+                    message: lost_why.to_owned(),
+                    retryable_hint: true,
+                    classified_by: ClassifiedBy::Agent as i32,
+                    ..Failure::default()
+                }),
+            }
+        };
+        for plan in rec.uploads.values_mut().filter(|p| !p.answered) {
+            plan.answered = true;
+            rec.results.insert(
+                plan.command_id.clone(),
+                Some("the attempt ended before its checkpoint was uploaded".into()),
+            );
+        }
+        rec.phase = d.phase;
+        rec.exit = Some(d.clone());
+        let _ = rec.save(dir);
+        let _ = crate::janitor::release(&self.shared.ctx, &self.shared.envs, rec, &HashSet::new())
+            .await;
+        self.replay_results(dir, rec).await;
+        status_of(rec, Some(&d))
     }
 
     /// Sends the upload results an ended attempt saved but never got out (its agent stopped
@@ -603,22 +741,26 @@ impl Attempts {
                 Some("the agent stopped during the upload".into()),
             );
         }
-        if rec.results.is_empty() {
-            return;
-        }
-        for (command_id, failure) in std::mem::take(&mut rec.results) {
-            let r = runner::upload_result(command_id.clone(), failure.clone());
-            if self
-                .shared
-                .events
-                .send(AttemptEvent::CommandDone(r))
-                .await
-                .is_err()
-            {
-                rec.results.insert(command_id, failure);
-            }
-        }
         let _ = rec.save(dir);
+        // Handed over without waiting (the gateway may drain events only after `readopt`
+        // returns); each is removed from the record once the gateway saved it.
+        for (command_id, failure) in rec.results.clone() {
+            let r = runner::upload_result(command_id.clone(), failure);
+            let Some(receipt) = send_event(&self.shared.events, AttemptEvent::CommandDone(r)).await
+            else {
+                break;
+            };
+            let dir = dir.to_path_buf();
+            tokio::spawn(async move {
+                if receipt.await.is_ok() {
+                    if let Ok(Some(mut saved)) = AttemptRecord::load(&dir) {
+                        if saved.results.remove(&command_id).is_some() {
+                            let _ = saved.save(&dir);
+                        }
+                    }
+                }
+            });
+        }
     }
 
     /// Handles an attempt command. `None` for commands this runtime does not own (deployments).
@@ -644,14 +786,20 @@ impl Attempts {
                 // Under the launch lock: a stage either lands before a launch copies the list,
                 // or sees the launch's record and is refused.
                 let _one_launch = lock(&self.launching);
+                // A repeat of the same input (by name) replaces it: retries are harmless.
                 self.add_pending(s.attempt.as_ref(), |p| {
+                    p.items
+                        .retain(|have| !s.items.iter().any(|new| new.name == have.name));
                     p.items.extend(s.items.iter().cloned());
                     Ok(())
                 })
             }
             Kind::StartAttempt(s) => {
                 let (tx, rx) = oneshot::channel();
-                match self.control(s.attempt.as_ref(), Control::Start(tx)).await {
+                match self
+                    .control(s.attempt.as_ref(), Control::Start(tx), false)
+                    .await
+                {
                     Ok(()) => rx
                         .await
                         .unwrap_or_else(|_| Err(AttemptError::state("", "ended"))),
@@ -666,6 +814,7 @@ impl Attempts {
                         grace_s: c.grace_s,
                         reason: c.reason.clone(),
                     },
+                    true,
                 )
                 .await
             }
@@ -677,6 +826,7 @@ impl Attempts {
                         deadline_s: p.deadline_s,
                         reason: p.reason,
                     },
+                    false,
                 )
                 .await
             }
@@ -688,6 +838,7 @@ impl Attempts {
                         deadline_s: c.deadline_s,
                         reason: c.reason.clone(),
                     },
+                    false,
                 )
                 .await
             }
@@ -706,6 +857,7 @@ impl Attempts {
                                 checkpoint_id: u.checkpoint_id.clone(),
                                 targets,
                             },
+                            false,
                         )
                         .await
                     }
@@ -729,6 +881,7 @@ impl Attempts {
                                     .unwrap_or(10),
                                     reason: d.reason.clone(),
                                 },
+                                true,
                             )
                             .await;
                     }
@@ -756,7 +909,7 @@ impl Attempts {
                     &facts.inventory,
                     self.shared.ctx.state.root(),
                 );
-                let _ = self.shared.events.send(AttemptEvent::Probe(result)).await;
+                let _ = send_event(&self.shared.events, AttemptEvent::Probe(result)).await;
                 Ok(())
             }
             Kind::LaunchDeployment(_) | Kind::StopDeployment(_) => return None,
@@ -770,11 +923,17 @@ impl Attempts {
 
     async fn cleanup(&self, c: &mrl_proto::agent::v1::Cleanup) -> Result<(), AttemptError> {
         let ctx = &self.shared.ctx;
+        // Node-wide only when no attempt is named at all.
         let id = c
             .attempt
             .as_ref()
             .map(|a| a.attempt_id.clone())
             .unwrap_or_default();
+        if c.attempt.is_some() && id.is_empty() {
+            return Err(AttemptError::Spec(
+                "the cleanup names an attempt without an id; leave the attempt out for a node-wide cleanup".into(),
+            ));
+        }
         // The id names a folder: anything but a plain name (like `../x`) is refused.
         if !id.is_empty() && !spec::safe_name(&id) {
             return Err(AttemptError::Spec(format!(
@@ -826,8 +985,22 @@ impl Attempts {
                 )
             })?;
             let dir = ctx.state.job_dir(&id);
-            if let Some(rec) = AttemptRecord::load(&dir)? {
-                crate::janitor::release(ctx, &self.shared.envs, &rec, &HashSet::new()).await;
+            let rec = AttemptRecord::load(&dir)?;
+            if let (Some(rec), Some(r)) = (&rec, c.attempt.as_ref()) {
+                // The whole AttemptRef must fit what is saved: the same job, no older epoch.
+                let saved = &rec.spec.attempt;
+                if r.job_id != saved.job_id || r.fencing_epoch < saved.fencing_epoch {
+                    return Err(AttemptError::state(
+                        &id,
+                        format!(
+                            "is job {} epoch {}, not job {} epoch {}",
+                            saved.job_id, saved.fencing_epoch, r.job_id, r.fencing_epoch
+                        ),
+                    ));
+                }
+            }
+            if let Some(rec) = &rec {
+                crate::janitor::release(ctx, &self.shared.envs, rec, &HashSet::new()).await;
             }
             if c.purge_scratch {
                 crate::janitor::purge(ctx.state.root(), &dir)?;
@@ -847,6 +1020,16 @@ impl Attempts {
             .or_default()
             .creds
             .insert(name.to_owned(), value);
+    }
+
+    /// Where an attempt's staged inputs wait for its launch.
+    fn pending_path(&self, attempt_id: &str) -> std::path::PathBuf {
+        self.shared
+            .ctx
+            .state
+            .root()
+            .join("pending")
+            .join(format!("{attempt_id}.stage"))
     }
 
     /// True once `attempt_id` was launched here (running, or its record exists).
@@ -911,9 +1094,32 @@ impl Attempts {
         };
         next.attempt = Some(r.clone());
         add(&mut next)?;
+        // Staged inputs are saved before the command is accepted, so a restarted agent still
+        // has them for the launch. Credentials are never written down: after a restart the
+        // core sends them again.
+        let saved = mrl_proto::agent::v1::StageArtifacts {
+            attempt: next.attempt.clone(),
+            items: next.items.clone(),
+        };
+        let path = self.pending_path(id);
+        record::private_dir(path.parent().unwrap_or(&path))
+            .and_then(|()| record::write_private(&path, &prost::Message::encode_to_vec(&saved)))
+            .map_err(|e| crate::AgentError::state(&path, e))?;
         pending.insert(id.to_owned(), next);
         Ok(())
     }
+}
+
+/// True when the kernel OOM-killed something in the job cgroup at `cg` (Linux
+/// `memory.events`); false when it can't tell.
+fn cgroup_oom_killed(cg: &std::path::Path) -> bool {
+    std::fs::read_to_string(cg.join("memory.events")).is_ok_and(|t| {
+        t.lines().any(|l| {
+            l.strip_prefix("oom_kill ")
+                .and_then(|n| n.trim().parse::<u64>().ok())
+                .is_some_and(|n| n > 0)
+        })
+    })
 }
 
 fn status_of(rec: &AttemptRecord, d: Option<&ExitDecision>) -> AttemptStatus {

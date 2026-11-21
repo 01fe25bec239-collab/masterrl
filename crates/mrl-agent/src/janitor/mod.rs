@@ -7,8 +7,9 @@
 //! - [`purge`] wipes an ended attempt's scratch (work, staging, inputs, upload snapshots and its socket); the
 //!   saved record and logs stay for diagnosis.
 //! - [`sweep`] runs every few minutes ([`JanitorService`]): it repeats `release` for ended
-//!   attempts whose processes are somehow still alive, purges ended attempts older than
-//!   [`KEEP_ENDED`], drops stale partial downloads, and evicts unpinned cache entries and
+//!   attempts whose processes are somehow still alive, purges ended attempts' scratch after
+//!   [`KEEP_ENDED`] and removes their folders (record and logs) after [`KEEP_RECORDS`], drops
+//!   stale partial downloads, and evicts unpinned cache entries and
 //!   environments (least recently used first) when the disk gets low.
 
 use std::collections::HashSet;
@@ -28,6 +29,9 @@ use crate::{AgentContext, AgentError, Result};
 pub const GPU_RESIDUE_BYTES: u64 = 512 << 20;
 /// Ended attempts' scratch is wiped after this long.
 pub const KEEP_ENDED: Duration = Duration::from_secs(3 * 24 * 3600);
+/// Ended attempts' folders (record and logs) are removed after this long; until then each
+/// reconcile reports the outcome again (the core dedups).
+pub const KEEP_RECORDS: Duration = Duration::from_secs(14 * 24 * 3600);
 /// How often [`JanitorService`] sweeps.
 pub const SWEEP_EVERY: Duration = Duration::from_secs(300);
 
@@ -328,6 +332,8 @@ pub struct SweepReport {
     pub killed: usize,
     /// Attempt folders whose scratch was wiped.
     pub purged: Vec<String>,
+    /// Ended attempts removed entirely (record and logs too).
+    pub retired: Vec<String>,
     /// Stale partial downloads removed.
     pub incoming_removed: usize,
     /// Cache entries evicted.
@@ -370,7 +376,15 @@ pub async fn sweep(ctx: &AgentContext, envs: &Envs, live: &HashSet<String>) -> R
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.elapsed().ok());
-        if age.is_some_and(|a| a > KEEP_ENDED) && purge(ctx.state.root(), &dir)? {
+        if age.is_some_and(|a| a > KEEP_RECORDS) {
+            // Retired: the scratch, the record, the logs and its lock all go.
+            purge(ctx.state.root(), &dir)?;
+            make_writable(&dir);
+            std::fs::remove_dir_all(&dir).map_err(|e| AgentError::state(&dir, e))?;
+            let _ =
+                std::fs::remove_file(ctx.state.root().join("locks").join(format!("{name}.lock")));
+            report.retired.push(name);
+        } else if age.is_some_and(|a| a > KEEP_ENDED) && purge(ctx.state.root(), &dir)? {
             report.purged.push(name);
         }
     }

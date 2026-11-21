@@ -12,6 +12,8 @@ use serde::{Deserialize, Serialize};
 use super::AttemptError;
 use crate::exec::Limits;
 
+/// Most workers (replicas over all roles) one attempt may run on a machine.
+pub const MAX_WORKERS: u64 = 256;
 /// One attempt, ready to run.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -356,7 +358,15 @@ impl AttemptSpec {
                 .collect::<Result<_, _>>()?,
             secrets: Vec::new(),
             limits: Limits::default(),
-            lease_s: launch.lease_duration_s,
+            // A launch from the core always runs under a lease.
+            lease_s: match launch.lease_duration_s {
+                0 => {
+                    return Err(AttemptError::Spec(
+                        "the launch has no lease (lease_duration_s is 0)".into(),
+                    ))
+                }
+                s => s,
+            },
             barrier: launch.barrier,
             dry_run: launch.dry_run,
             smoke_steps: launch.smoke_steps,
@@ -393,6 +403,13 @@ impl AttemptSpec {
         }
         if self.roles.is_empty() {
             return bad("the attempt has no roles".into());
+        }
+        // Checked before anything expands the roles into worker ids.
+        let total: u64 = self.roles.iter().map(|r| u64::from(r.count.max(1))).sum();
+        if total > MAX_WORKERS {
+            return bad(format!(
+                "the attempt asks for {total} workers; one machine runs at most {MAX_WORKERS}"
+            ));
         }
         if self.roles.iter().filter(|r| r.primary).count() != 1 {
             return bad("exactly one role must be primary".into());
@@ -724,5 +741,23 @@ mod tests {
         });
         assert_eq!(spec.secret_envs()["hf-hub"], "MRL_CREDENTIAL_HF_HUB");
         assert_eq!(format!("{:?}", Secret::new("tok")), "Secret(..)");
+    }
+
+    #[test]
+    fn core_launches_need_a_lease_and_a_bounded_worker_count() {
+        let mut l = launch();
+        l.lease_duration_s = 0;
+        assert!(
+            AttemptSpec::from_launch(&l, &[], Path::new("/s")).is_err(),
+            "no lease"
+        );
+        let mut l = launch();
+        l.roles[0].count = u32::MAX;
+        let e = AttemptSpec::from_launch(&l, &[], Path::new("/s")).unwrap_err();
+        assert!(
+            e.explain().contains("at most"),
+            "refused before expanding: {}",
+            e.explain()
+        );
     }
 }

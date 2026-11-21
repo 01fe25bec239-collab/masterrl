@@ -228,6 +228,7 @@ impl ServerFixture {
             &self.dir.path().join("w.sock"),
             &self.attempt_id,
             Secret::new(self.nonce.clone()),
+            ["trainer", "a", "b"].map(String::from).to_vec(),
             self.dir.path().join("seq.json"),
             tx,
         )
@@ -264,14 +265,37 @@ fn short_tmp() -> PathBuf {
     }
 }
 
+/// Plays the gateway with a journal: marks each event saved and passes it on to the test.
+#[cfg(unix)]
+fn consume(
+    mut raw: mrl_agent::attempts::AttemptEvents,
+) -> mpsc::Receiver<mrl_agent::attempts::AttemptEvent> {
+    let (tx, rx) = mpsc::channel(1024);
+    tokio::spawn(async move {
+        while let Some(e) = raw.recv().await {
+            // Saved only once the test has it.
+            let (event, receipt) = e.into_parts();
+            if tx.send(event).await.is_err() {
+                return;
+            }
+            receipt.saved();
+        }
+    });
+    rx
+}
+
 /// An attempt runner re-adopting a saved record, with sleeping stand-in processes as its
 /// workers (Unix): connect [`FakeWorker`]s to drive it as a restarted agent would see them.
 #[cfg(unix)]
 pub struct RunnerFixture {
     /// The fake agent (its state folder holds the record).
     pub agent: super::FakeAgent,
-    /// Events the runner sends.
-    pub events: mrl_agent::attempts::AttemptEvents,
+    /// Events the runner sends, each already marked saved (the test plays the gateway's
+    /// journal). Empty with [`Self::readopt_with`], where nobody reads the runner's channel.
+    pub events: mpsc::Receiver<mrl_agent::attempts::AttemptEvent>,
+    /// The runner's own channel when nobody reads it ([`Self::readopt_with`]); drop it to
+    /// close the gateway's side.
+    pub unread: Option<mrl_agent::attempts::AttemptEvents>,
     /// Commands to the runner.
     pub control: mpsc::Sender<mrl_agent::attempts::runner::Control>,
     /// The runner task; its result is the attempt's outcome (`None`: detached).
@@ -289,14 +313,24 @@ impl RunnerFixture {
         spec: serde_json::Value,
         edit: impl FnOnce(&mut mrl_agent::attempts::record::AttemptRecord),
     ) -> Self {
-        Self::readopt_with(spec, 256, edit).await
+        Self::start(spec, 256, edit, true).await
     }
 
-    /// [`Self::readopt`] with an event channel of `capacity` (to test a slow reader).
+    /// [`Self::readopt`] with an event channel of `capacity` that nobody reads (a stuck
+    /// gateway): nothing is ever saved, so no worker message is acknowledged.
     pub async fn readopt_with(
         spec: serde_json::Value,
         capacity: usize,
         edit: impl FnOnce(&mut mrl_agent::attempts::record::AttemptRecord),
+    ) -> Self {
+        Self::start(spec, capacity, edit, false).await
+    }
+
+    async fn start(
+        spec: serde_json::Value,
+        capacity: usize,
+        edit: impl FnOnce(&mut mrl_agent::attempts::record::AttemptRecord),
+        read: bool,
     ) -> Self {
         use mrl_agent::attempts::record::{AttemptRecord, ProcIdentity, WorkerProc};
         use mrl_agent::attempts::runner::{socket_path, Runner, Shared};
@@ -335,6 +369,8 @@ impl RunnerFixture {
             exit: None,
             staged_paths: Default::default(),
             lease_deadline_unix_ms: None,
+            lease_hard_deadline_unix_ms: None,
+            lease_heartbeat_seq: 0,
             stop_deadline_unix_ms: None,
             exit_report: None,
             requests: Vec::new(),
@@ -348,7 +384,12 @@ impl RunnerFixture {
         record
             .save(&job)
             .unwrap_or_else(|e| panic!("{}", e.explain()));
-        let (tx, events) = mrl_agent::attempts::attempt_events(capacity);
+        let (tx, raw) = mrl_agent::attempts::attempt_events(capacity);
+        let (events, unread) = if read {
+            (consume(raw), None)
+        } else {
+            (mpsc::channel(1).1, Some(raw))
+        };
         let envs =
             mrl_agent::envs::Envs::open(agent.ctx.state.root(), Arc::clone(&agent.ctx.cache))
                 .unwrap_or_else(|e| panic!("{}", e.explain()));
@@ -364,6 +405,7 @@ impl RunnerFixture {
         Self {
             agent,
             events,
+            unread,
             control,
             task,
             record,
@@ -378,7 +420,8 @@ impl RunnerFixture {
         self.task.abort();
         let _ = (&mut self.task).await;
         let record = self.saved();
-        let (tx, events) = mrl_agent::attempts::attempt_events(256);
+        let (tx, raw) = mrl_agent::attempts::attempt_events(256);
+        let events = consume(raw);
         let envs = mrl_agent::envs::Envs::open(
             self.agent.ctx.state.root(),
             Arc::clone(&self.agent.ctx.cache),
@@ -522,6 +565,40 @@ mod tests {
                 .is_err()
         );
         assert!(matches!(fx.received()[0], Received::Refused(_, false)));
+    }
+
+    /// Admission checks the role, and unnumbered messages other than heartbeats end the
+    /// stream instead of skipping dedup.
+    #[tokio::test]
+    async fn unknown_roles_and_unnumbered_messages_are_refused() {
+        let fx = ServerFixture::start("att_1", "n").await;
+        let e = FakeWorker::connect(fx.target(), hello("att_1", "n", "intruder"))
+            .await
+            .err()
+            .expect("an unknown role is refused");
+        assert_eq!(e.code(), tonic::Code::PermissionDenied);
+        let (mut w, _) = FakeWorker::connect(fx.target(), hello("att_1", "n", "trainer"))
+            .await
+            .unwrap();
+        w.send_raw(WorkerMessage {
+            seq: 0,
+            sent_at: None,
+            body: Some(Body::Progress(Progress {
+                step: 1,
+                ..Progress::default()
+            })),
+        })
+        .await;
+        let r = w.recv().await;
+        assert!(
+            matches!(&r, Err(s) if s.code() == tonic::Code::FailedPrecondition),
+            "{r:?}"
+        );
+        let got = fx.received();
+        assert!(
+            !got.iter().any(|r| matches!(r, Received::Live(_))),
+            "{got:?}"
+        );
     }
 
     #[tokio::test]
@@ -860,7 +937,8 @@ mod runner_tests {
         fx.control.send(Control::Detach(tx)).await.unwrap();
         rx.await.unwrap();
         fx.end_workers();
-        let (etx, _erx) = mrl_agent::attempts::attempt_events(64);
+        let (etx, erx) = mrl_agent::attempts::attempt_events(64);
+        let _erx = mrl_agent::attempts::auto_saved(erx);
         let next =
             mrl_agent::attempts::Attempts::new(Arc::clone(&fx.agent.ctx), etx, None).unwrap();
         let statuses = next.readopt().await;
@@ -1023,9 +1101,10 @@ mod runner_tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_closed_event_channel_leaves_messages_unacked() {
-        let mut fx = RunnerFixture::readopt(spec("att_cl", serde_json::json!({})), |_| {}).await;
-        let (_, closed) = mrl_agent::attempts::attempt_events(1);
-        drop(std::mem::replace(&mut fx.events, closed));
+        let mut fx =
+            RunnerFixture::readopt_with(spec("att_cl", serde_json::json!({})), 1, |_| {}).await;
+        // The gateway is gone: the runner's channel is closed.
+        drop(fx.unread.take());
         let (mut w, _) = fx.worker("trainer").await;
         w.send(Body::Progress(mrl_proto::worker::v1::Progress {
             step: 1,
@@ -1172,13 +1251,14 @@ mod runner_tests {
         .await;
         let (_a, _) = fx.worker("trainer.0").await;
         let (_b, _) = fx.worker("trainer.1").await;
-        let started = std::time::Instant::now();
         // Each renewal goes to both workers and sets the lease to 3 s from now; the queues
         // fill after a few dozen.
         let control = fx.control.clone();
         tokio::spawn(async move {
-            for _ in 0..200 {
+            for n in 1..=200 {
                 let lease = Control::Lease {
+                    heartbeat_seq: n,
+                    heartbeat_sent: std::time::Instant::now(),
                     duration_s: 3,
                     kill_budget_s: 0,
                 };
@@ -1194,16 +1274,26 @@ mod runner_tests {
                 })
                 .await;
         });
+        // Termination starts (STOPPING) when the last saved lease runs out, not seconds later.
+        let stopping_at = fx
+            .event(|e| match e {
+                AttemptEvent::Status(st) if st.phase == AttemptPhase::Stopping as i32 => {
+                    Some(now_ms())
+                }
+                _ => None,
+            })
+            .await;
         let d = tokio::time::timeout(Duration::from_secs(60), &mut fx.task)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
         assert_eq!(d.phase, AttemptPhase::SelfFenced as i32, "{d:?}");
+        let deadline = fx.saved().lease_deadline_unix_ms.unwrap();
+        let late = stopping_at - deadline;
         assert!(
-            started.elapsed() < Duration::from_secs(8),
-            "fenced late: {:?}",
-            started.elapsed()
+            late < 2000,
+            "stopping began {late} ms after the lease ran out"
         );
     }
 
@@ -1256,14 +1346,14 @@ mod runner_tests {
         let mut fx =
             RunnerFixture::readopt_with(spec("att_fe", serde_json::json!({})), 1, |_| {}).await;
         let (mut w, _) = fx.worker("trainer").await;
-        // One relayed message fills the channel (capacity 1); its ack says it was relayed.
-        let seq = w
-            .send(Body::Progress(mrl_proto::worker::v1::Progress {
-                step: 1,
-                ..Default::default()
-            }))
-            .await;
-        w.wait_ack(seq).await.unwrap();
+        // One relayed message fills the channel (capacity 1); nobody saves it, so it is never
+        // acked, but the runner goes on.
+        w.send(Body::Progress(mrl_proto::worker::v1::Progress {
+            step: 1,
+            ..Default::default()
+        }))
+        .await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
         let started = std::time::Instant::now();
         fx.control
             .send(Control::Cancel {
@@ -1282,6 +1372,48 @@ mod runner_tests {
         // here, so it stays a zombie until then).
         let bound = Duration::from_secs(6 + fx.agent.ctx.config.exec.kill_grace_secs + 8);
         assert!(started.elapsed() < bound, "{:?}", started.elapsed());
+    }
+
+    /// A lease runs from the acknowledged heartbeat's send time: a 120 s grant (30 s kill
+    /// budget) for a heartbeat sent 90 s ago arrives already due, and the attempt stops at
+    /// once. A grant for an older heartbeat changes nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn leases_count_from_the_heartbeat_and_stale_grants_are_ignored() {
+        let lease = |seq, ago_s: u64| Control::Lease {
+            heartbeat_seq: seq,
+            heartbeat_sent: std::time::Instant::now() - Duration::from_secs(ago_s),
+            duration_s: 120,
+            kill_budget_s: 30,
+        };
+        let fx = RunnerFixture::readopt(spec("att_hb", serde_json::json!({})), |_| {}).await;
+        fx.control.send(lease(7, 0)).await.unwrap();
+        fx.control.send(lease(6, 100)).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let rec = fx.saved();
+        assert_eq!(rec.lease_heartbeat_seq, 7, "the older grant was ignored");
+        let left = rec.lease_deadline_unix_ms.unwrap() - now_ms();
+        assert!((85_000..=90_500).contains(&left), "{left}");
+
+        let mut late = RunnerFixture::readopt(spec("att_hb2", serde_json::json!({})), |_| {}).await;
+        let started = std::time::Instant::now();
+        late.control.send(lease(1, 90)).await.unwrap();
+        let d = tokio::time::timeout(Duration::from_secs(30), &mut late.task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(d.phase, AttemptPhase::SelfFenced as i32);
+        let rec = late.saved();
+        let hard_left = rec.lease_hard_deadline_unix_ms.unwrap() - now_ms();
+        assert!(
+            hard_left > 0 && hard_left <= 30_500,
+            "hard end from the heartbeat: {hard_left}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     /// A PUT sink that answers after `delay`.
@@ -1478,6 +1610,58 @@ mod runner_tests {
         assert!(got.lock().unwrap().is_empty(), "nothing was uploaded");
     }
 
+    /// The agent crashes after a worker message (and a saved upload result) entered the event
+    /// channel but before the gateway saved them: nothing was acknowledged or forgotten, so
+    /// after the restart the worker replays the message and the result is sent again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_crash_before_the_gateway_saved_loses_nothing() {
+        let mut fx = RunnerFixture::readopt_with(spec("att_dur", serde_json::json!({})), 16, |r| {
+            r.results.insert("up-7".into(), None);
+        })
+        .await;
+        let (mut w, ack) = fx.worker("trainer").await;
+        assert_eq!(ack.resume_from_seq, 1);
+        let seq = w
+            .send(Body::Progress(mrl_proto::worker::v1::Progress {
+                step: 1,
+                ..Default::default()
+            }))
+            .await;
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        // Queued, never saved: not acked, and the result is still on disk.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), w.wait_ack(seq))
+                .await
+                .is_err(),
+            "acked before the gateway saved it"
+        );
+        assert!(fx.saved().results.contains_key("up-7"));
+        // The crash; the restarted runner's gateway saves what it gets.
+        drop(w);
+        fx.restart().await;
+        let (mut w, ack) = fx.worker("trainer").await;
+        assert_eq!(
+            ack.resume_from_seq, 1,
+            "the worker is asked for the message again"
+        );
+        let seq = w
+            .send(Body::Progress(mrl_proto::worker::v1::Progress {
+                step: 1,
+                ..Default::default()
+            }))
+            .await;
+        w.wait_ack(seq).await.unwrap();
+        let r = done(&mut fx).await;
+        assert_eq!(r.command_id, "up-7");
+        for _ in 0..40 {
+            if fx.saved().results.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(fx.saved().results.is_empty(), "forgotten once saved");
+    }
+
     /// A result saved but not sent before a crash is sent after the restart: by the re-adopted
     /// runner, and for an attempt that had ended, by the next manager.
     #[tokio::test(flavor = "multi_thread")]
@@ -1503,12 +1687,139 @@ mod runner_tests {
         next.readopt().await;
         let mut got = None;
         while let Ok(e) = erx.try_recv() {
-            if let AttemptEvent::CommandDone(r) = e {
+            if let AttemptEvent::CommandDone(r) = e.saved() {
                 got = Some(r);
             }
         }
         assert_eq!(got.unwrap().command_id, "up-10");
+        // Removed from the record once the gateway saved it (just now).
+        for _ in 0..40 {
+            if fx.saved().results.is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
         assert!(fx.saved().results.is_empty());
+    }
+
+    /// A checkpoint needs exactly one manifest file with the manifest digest: an empty final
+    /// checkpoint is CORRUPT, never COMMITTED. A replay of a committed checkpoint keeps it
+    /// committed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn checkpoints_are_bound_to_their_manifest() {
+        let path = "checkpoints/ckpt_1/w.bin";
+        let sha = sha_hex(b"weights");
+        let fx = RunnerFixture::readopt(
+            spec("att_mf", serde_json::json!({"upload_dir": "/nowhere"})),
+            |r| {
+                r.checkpoints.insert(
+                    "ckpt_done".into(),
+                    staged(path, &sha, 7, Some(CommitState::Committed as i32)),
+                );
+            },
+        )
+        .await;
+        let (mut w, _) = fx.worker("trainer").await;
+        let staged_msg = |id: &str| {
+            Body::CheckpointStaged(mrl_proto::worker::v1::CheckpointStaged {
+                checkpoint_id: id.into(),
+                step: 9,
+                is_final: true,
+                manifest_sha256: SHA.into(),
+                files: Vec::new(),
+                ..Default::default()
+            })
+        };
+        w.send(staged_msg("ckpt_empty")).await;
+        let acks = read_until(
+            &mut w,
+            |b| matches!(b, AgentBody::CheckpointCommitAck(a) if a.checkpoint_id == "ckpt_empty"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(acks.last(),
+            Some(AgentBody::CheckpointCommitAck(a)) if a.state == CommitState::Corrupt as i32));
+        w.send(staged_msg("ckpt_done")).await;
+        let acks = read_until(
+            &mut w,
+            |b| matches!(b, AgentBody::CheckpointCommitAck(a) if a.checkpoint_id == "ckpt_done"),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(acks.last(),
+            Some(AgentBody::CheckpointCommitAck(a)) if a.state == CommitState::Committed as i32));
+        let rec = fx.saved();
+        assert_eq!(
+            rec.checkpoints["ckpt_done"].state,
+            Some(CommitState::Committed as i32)
+        );
+        assert_eq!(rec.checkpoints["ckpt_done"].files.len(), 1, "not replaced");
+        assert_eq!(
+            rec.checkpoints["ckpt_empty"].state,
+            Some(CommitState::Corrupt as i32)
+        );
+    }
+
+    /// A checkpoint request is kept once per request id, and a staged checkpoint retires it:
+    /// a reconnecting worker is not asked to checkpoint again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn fulfilled_checkpoint_requests_are_not_sent_again() {
+        let fx = RunnerFixture::readopt(spec("att_cq", serde_json::json!({})), |_| {}).await;
+        let (mut w, _) = fx.worker("trainer").await;
+        for _ in 0..2 {
+            fx.control
+                .send(Control::Checkpoint {
+                    request_id: "req-1".into(),
+                    deadline_s: 60,
+                    reason: "test".into(),
+                })
+                .await
+                .unwrap();
+        }
+        read_until(&mut w, |b| matches!(b, AgentBody::CheckpointRequest(_)))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(fx.saved().requests.len(), 1, "kept once");
+        let manifest = sha_hex(b"manifest");
+        w.send(Body::CheckpointStaged(
+            mrl_proto::worker::v1::CheckpointStaged {
+                checkpoint_id: "ckpt_q".into(),
+                step: 3,
+                manifest_sha256: manifest.clone(),
+                files: vec![mrl_proto::worker::v1::FileEntry {
+                    path: "checkpoints/ckpt_q/checkpoint-manifest.json".into(),
+                    size: 8,
+                    sha256: manifest,
+                    role: "manifest".into(),
+                }],
+                ..Default::default()
+            },
+        ))
+        .await;
+        read_until(&mut w, |b| matches!(b, AgentBody::UploadGrant(_)))
+            .await
+            .unwrap();
+        assert!(fx.saved().requests.is_empty(), "retired by the checkpoint");
+        drop(w);
+        let (mut again, _) = fx.worker("trainer").await;
+        // Everything the agent sends on the reconnect (Prepare and whatever is pending).
+        let mut seen = Vec::new();
+        while let Ok(Ok(Some(m))) =
+            tokio::time::timeout(Duration::from_millis(700), again.recv()).await
+        {
+            seen.extend(m.body);
+        }
+        assert!(
+            seen.iter().any(|b| matches!(b, AgentBody::Prepare(_))),
+            "{seen:?}"
+        );
+        assert!(
+            !seen
+                .iter()
+                .any(|b| matches!(b, AgentBody::CheckpointRequest(_))),
+            "{seen:?}"
+        );
     }
 
     /// The agent stopped right after saving a committed upload (outcome and result in one

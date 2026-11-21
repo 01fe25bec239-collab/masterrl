@@ -69,6 +69,40 @@ pub enum AttemptError {
     Agent(#[from] AgentError),
 }
 
+/// `text` with every link cut to its host (`https://host/…`) and every proxied transfer token
+/// (`/transfer/<token>`) hidden: transfer errors quote the ticket URL, which stays valid for
+/// minutes and must not reach logs, statuses or results.
+pub fn redact_links(text: &str) -> String {
+    let stop = |c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ')' | '>' | ',' | ';');
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(i) = rest.find("://") {
+        let tail = &rest[i + 3..];
+        let end = tail.find(stop).unwrap_or(tail.len());
+        let url = &tail[..end];
+        let host = url.find(['/', '?', '#']).unwrap_or(url.len());
+        out.push_str(&rest[..i + 3]);
+        out.push_str(&url[..host]);
+        if host < url.len() {
+            out.push_str("/…");
+        }
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    const PROXIED: &str = "/transfer/";
+    let mut done = String::with_capacity(out.len());
+    let mut rest = out.as_str();
+    while let Some(i) = rest.find(PROXIED) {
+        let tail = &rest[i + PROXIED.len()..];
+        let end = tail.find(stop).unwrap_or(tail.len());
+        done.push_str(&rest[..i + PROXIED.len()]);
+        done.push('…');
+        rest = &tail[end..];
+    }
+    done.push_str(rest);
+    done
+}
+
 impl From<mrl_storage::StorageError> for AttemptError {
     fn from(e: mrl_storage::StorageError) -> Self {
         Self::Agent(AgentError::Storage(e))
@@ -94,7 +128,9 @@ impl AttemptError {
 
     /// The code and the message, for logs and the command line.
     pub fn explain(&self) -> String {
-        format!("{} {self}", self.code())
+        // Every message that leaves the agent goes through here: links are cut to their host,
+        // since a signed ticket's path and query are what grant access.
+        redact_links(&format!("{} {self}", self.code()))
     }
 
     /// The failure class an attempt gets when this error stops it.
@@ -147,6 +183,23 @@ impl AttemptError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn links_are_cut_to_their_host() {
+        let t = redact_links(
+            "PUT https://bucket.example/obj/key?X-Sig=SECRET failed (http://h:9/api/v1/transfer/TOKEN)",
+        );
+        assert!(
+            !t.contains("SECRET") && !t.contains("TOKEN") && !t.contains("obj/key"),
+            "{t}"
+        );
+        assert!(
+            t.contains("https://bucket.example/…") && t.contains("http://h:9/…"),
+            "{t}"
+        );
+        assert_eq!(redact_links("no links here"), "no links here");
+        assert!(!redact_links("relative /api/v1/transfer/TOKEN2 x").contains("TOKEN2"));
+    }
 
     #[test]
     fn codes_and_classes() {

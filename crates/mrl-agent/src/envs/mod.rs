@@ -349,29 +349,43 @@ impl Envs {
                 + install.as_ref().map_or(0, |(_, plan)| plan.install_bytes);
             self.make_room(dir, incoming)?;
         }
-        // The verified lock is kept in the node cache, pinned while the attempt runs.
-        if !lock_cached {
-            // A file of its own per insert: two packages of one lock install under different
-            // environment locks and may both fill the cache at once.
-            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let tmp = self
-                .cache
-                .incoming_dir()
-                .join(format!("{lock_sha256}.{}-{n}.lock", std::process::id()));
-            let inserted = async {
-                tokio::fs::write(&tmp, &lock)
-                    .await
-                    .map_err(|e| AgentError::state(&tmp, e))?;
-                self.cache.insert_file(&tmp, lock_sha256).await
+        // The verified lock is kept in the node cache, pinned while the attempt runs. Filled
+        // again if another reservation evicts it before the pin (see files::PIN_TRIES).
+        let mut tries = 0;
+        let mut cached = lock_cached;
+        loop {
+            if !cached {
+                // A file of its own per insert: two packages of one lock install under different
+                // environment locks and may both fill the cache at once.
+                static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let tmp = self
+                    .cache
+                    .incoming_dir()
+                    .join(format!("{lock_sha256}.{}-{n}.lock", std::process::id()));
+                let inserted = async {
+                    tokio::fs::write(&tmp, &lock)
+                        .await
+                        .map_err(|e| AgentError::state(&tmp, e))?;
+                    self.cache.insert_file(&tmp, lock_sha256).await
+                }
+                .await;
+                if inserted.is_err() {
+                    let _ = std::fs::remove_file(&tmp);
+                }
+                inserted?;
             }
-            .await;
-            if inserted.is_err() {
-                let _ = std::fs::remove_file(&tmp);
+            match self.cache.pin(lock_sha256, holder) {
+                Ok(()) => break,
+                Err(AgentError::UnknownName { .. })
+                    if tries < crate::attempts::files::PIN_TRIES =>
+                {
+                    tries += 1;
+                    cached = false;
+                }
+                Err(e) => return Err(e.into()),
             }
-            inserted?;
         }
-        self.cache.pin(lock_sha256, holder)?;
 
         if let Some((uv, plan)) = install {
             // Install from an agent-owned copy holding the verified lock, never the live
@@ -381,8 +395,22 @@ impl Envs {
             // one lock installing at once never share a copy.
             let snap = ScopedDir(self.snapshot_dir(dir));
             let dirs: Vec<PathBuf> = plan.local.iter().map(|p| p.dir.clone()).collect();
-            let copy = snapshot_project(project, &dirs, &lock, &snap.0, &self.root)
-                .map_err(|e| install_err(format!("the project could not be copied ({e})")))?;
+            // Off the async runtime, and stopped if the install is cancelled (the lease ran
+            // out): a large project never holds the attempt past its deadline.
+            let stop = crate::attempts::files::StopOnDrop::new();
+            let (p, l, snap_dir, root, flag) = (
+                project.to_path_buf(),
+                lock.clone(),
+                snap.0.clone(),
+                self.root.clone(),
+                stop.flag(),
+            );
+            let copy = tokio::task::spawn_blocking(move || {
+                snapshot_project(&p, &dirs, &l, &snap_dir, &root, &flag)
+            })
+            .await
+            .map_err(|e| install_err(format!("the project copy stopped ({e})")))?
+            .map_err(|e| install_err(format!("the project could not be copied ({e})")))?;
             let uv_version = uv_version(&uv).await.map_err(install_err)?;
             plan.check_build_backends(&copy, &uv_version)
                 .map_err(install_err)?;
@@ -808,6 +836,7 @@ fn snapshot_project(
     lock: &[u8],
     snap: &Path,
     exclude: &Path,
+    stop: &std::sync::atomic::AtomicBool,
 ) -> std::io::Result<Snapshot> {
     let project = std::fs::canonicalize(project)?;
     let exclude = std::fs::canonicalize(exclude).unwrap_or_else(|_| exclude.to_path_buf());
@@ -833,7 +862,7 @@ fn snapshot_project(
             continue;
         }
         let rel = d.strip_prefix(&root).unwrap_or(Path::new(""));
-        copy_tree(&d, &snap.join(rel), &exclude)?;
+        copy_tree(&d, &snap.join(rel), &exclude, stop)?;
         copied.push(d);
     }
     let snap_project = snap.join(project.strip_prefix(&root).unwrap_or(Path::new("")));
@@ -845,9 +874,20 @@ fn snapshot_project(
     })
 }
 
-fn copy_tree(from: &Path, to: &Path, exclude: &Path) -> std::io::Result<()> {
+fn copy_tree(
+    from: &Path,
+    to: &Path,
+    exclude: &Path,
+    stop: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<()> {
     std::fs::create_dir_all(to)?;
     for e in std::fs::read_dir(from)? {
+        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "the install was cancelled",
+            ));
+        }
         let e = e?;
         let src = e.path();
         let name = e.file_name();
@@ -857,7 +897,7 @@ fn copy_tree(from: &Path, to: &Path, exclude: &Path) -> std::io::Result<()> {
             if SNAPSHOT_SKIP.iter().any(|s| name == *s) || src.starts_with(exclude) {
                 continue;
             }
-            copy_tree(&src, &to.join(&name), exclude)?;
+            copy_tree(&src, &to.join(&name), exclude, stop)?;
         } else if t.is_file() {
             std::fs::copy(&src, to.join(&name))?;
         }
@@ -876,29 +916,28 @@ async fn container(
         AttemptError::DockerMissing("no `docker` program was found on PATH".into())
     })?;
     let digest = image.rsplit_once('@').map_or("", |(_, d)| d);
-    let has_digest = |docker: &Path| {
-        std::process::Command::new(docker)
-            .args([
+    let has_digest = |docker: PathBuf| async move {
+        probe(
+            &docker,
+            &[
                 "image",
                 "inspect",
                 "--format",
                 "{{json .RepoDigests}}",
                 image,
-            ])
-            .stderr(Stdio::null())
-            .output()
-            .is_ok_and(|o| {
-                o.status.success() && String::from_utf8_lossy(&o.stdout).contains(digest)
-            })
+            ],
+        )
+        .await
+        .is_some_and(|out| String::from_utf8_lossy(&out).contains(digest))
     };
-    let hit = has_digest(&docker);
+    let hit = has_digest(docker.clone()).await;
     if !hit {
-        make_room(image_bytes(&docker, image))?;
+        make_room(image_bytes(&docker, image).await)?;
         let mut cmd = tokio::process::Command::new(&docker);
         cmd.args(["pull", image]);
         run_streaming(cmd, &rt.runtime_ref, "installing", say).await?;
         say("verifying", format!("checking the image digest {digest}"));
-        if !has_digest(&docker) {
+        if !has_digest(docker.clone()).await {
             return Err(AttemptError::EnvInstall {
                 runtime_ref: rt.runtime_ref.clone(),
                 reason: "the pulled image does not have the expected digest".into(),
@@ -916,14 +955,26 @@ async fn container(
     })
 }
 
+/// How long a Docker query may take (a registry can stall).
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Runs a Docker query without blocking the runtime, killed if it outlives [`PROBE_TIMEOUT`]
+/// or the caller is cancelled. Its stdout when it succeeded.
+async fn probe(docker: &Path, args: &[&str]) -> Option<Vec<u8>> {
+    let run = tokio::process::Command::new(docker)
+        .args(args)
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(PROBE_TIMEOUT, run).await.ok()?.ok()?;
+    out.status.success().then_some(out.stdout)
+}
+
 /// The image's compressed layer sizes (`docker manifest inspect -v`), times three for the
 /// unpacked image; 0 when the registry can't be asked.
-fn image_bytes(docker: &Path, image: &str) -> u64 {
-    let Ok(out) = std::process::Command::new(docker)
-        .args(["manifest", "inspect", "-v", image])
-        .stderr(Stdio::null())
-        .output()
-    else {
+async fn image_bytes(docker: &Path, image: &str) -> u64 {
+    let Some(out) = probe(docker, &["manifest", "inspect", "-v", image]).await else {
         return 0;
     };
     fn sum(v: &serde_json::Value) -> u64 {
@@ -942,7 +993,7 @@ fn image_bytes(docker: &Path, image: &str) -> u64 {
             _ => 0,
         }
     }
-    serde_json::from_slice::<serde_json::Value>(&out.stdout).map_or(0, |v| sum(&v) * 3)
+    serde_json::from_slice::<serde_json::Value>(&out).map_or(0, |v| sum(&v) * 3)
 }
 
 /// Runs `cmd`, passing each output line to `say`. Fails with the last lines on a non-zero exit.
@@ -1158,7 +1209,15 @@ source = { registry = "https://pypi.org/simple" }
         assert_eq!(plan.local.len(), 2);
         let dirs: Vec<PathBuf> = plan.local.iter().map(|p| p.dir.clone()).collect();
         let snap = dir.path().join("snap");
-        let sp = snapshot_project(&project, &dirs, lock, &snap, &dir.path().join("state")).unwrap();
+        let sp = snapshot_project(
+            &project,
+            &dirs,
+            lock,
+            &snap,
+            &dir.path().join("state"),
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(
             std::fs::read(sp.project.join("uv.lock")).unwrap(),
             lock,

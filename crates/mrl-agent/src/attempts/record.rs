@@ -50,6 +50,13 @@ pub struct AttemptRecord {
     /// kill budget already taken off). Kept across restarts so a restart never extends a lease.
     #[serde(default)]
     pub lease_deadline_unix_ms: Option<i64>,
+    /// The lease's hard end (Unix ms): workers must be gone by then, so teardown after a
+    /// self-fence never runs past it.
+    #[serde(default)]
+    pub lease_hard_deadline_unix_ms: Option<i64>,
+    /// The heartbeat seq of the last lease grant applied; an older grant is ignored.
+    #[serde(default)]
+    pub lease_heartbeat_seq: u64,
     /// The primary worker's ExitReport (protobuf bytes), saved before it is acknowledged.
     #[serde(default)]
     pub exit_report: Option<Vec<u8>>,

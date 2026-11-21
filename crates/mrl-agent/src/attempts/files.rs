@@ -47,28 +47,37 @@ pub async fn stage_inputs(
             Arc::clone(fills.entry(input.sha256.clone()).or_default())
         };
         let _filling = fill.lock().await;
-        let object = match ctx.cache.get(&input.sha256)? {
-            Some(p) => p,
-            None => {
-                ctx.cache.reserve(input.size)?;
-                // Named by hash, so an interrupted download resumes from `<tmp>.part`.
-                let tmp = ctx
-                    .cache
-                    .incoming_dir()
-                    .join(format!("{}.in", input.sha256));
-                if let Some(ticket) = input.ticket() {
-                    ctx.transfer
-                        .download(&ticket, &tmp, Some(&input.sha256))
-                        .await?;
-                } else if let Some(file) = &input.file {
-                    tokio::fs::copy(file, &tmp)
-                        .await
-                        .map_err(|e| AgentError::state(file, e))?;
+        let mut tries = 0;
+        let object = loop {
+            let object = match ctx.cache.get(&input.sha256)? {
+                Some(p) => p,
+                None => {
+                    ctx.cache.reserve(input.size)?;
+                    // Named by hash, so an interrupted download resumes from `<tmp>.part`.
+                    let tmp = ctx
+                        .cache
+                        .incoming_dir()
+                        .join(format!("{}.in", input.sha256));
+                    if let Some(ticket) = input.ticket() {
+                        ctx.transfer
+                            .download(&ticket, &tmp, Some(&input.sha256))
+                            .await?;
+                    } else if let Some(file) = &input.file {
+                        copy_stoppable(file, &tmp, false).await?;
+                    }
+                    ctx.cache.insert_file(&tmp, &input.sha256).await?
                 }
-                ctx.cache.insert_file(&tmp, &input.sha256).await?
+            };
+            // ponytail: the node cache has no "get and pin" in one step, so another
+            // reservation can evict the entry in between; it is then filled again. Ceiling:
+            // PIN_TRIES rounds under constant eviction. A pinning lookup on NodeCache
+            // (state/cache.rs) would remove the gap.
+            match ctx.cache.pin(&input.sha256, holder) {
+                Ok(()) => break object,
+                Err(AgentError::UnknownName { .. }) if tries < PIN_TRIES => tries += 1,
+                Err(e) => return Err(e.into()),
             }
         };
-        ctx.cache.pin(&input.sha256, holder)?;
         drop(_filling);
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent).map_err(|e| AgentError::state(parent, e))?;
@@ -87,10 +96,8 @@ pub async fn stage_inputs(
                 )));
             }
         } else {
-            if shared_ok {
-                link_or_copy(&object, &dest)?;
-            } else {
-                copy_new(&object, &dest)?;
+            if !(shared_ok && hard_link(&object, &dest)?) {
+                copy_stoppable(&object, &dest, true).await?;
             }
         }
         read_only(&dest)?;
@@ -99,41 +106,100 @@ pub async fn stage_inputs(
     Ok(staged)
 }
 
+/// How often a fill is repeated when its entry was evicted before it could be pinned.
+pub(crate) const PIN_TRIES: u32 = 5;
+
 /// Cache fills in progress, by sha256.
 static FILLS: std::sync::LazyLock<
     std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 > = std::sync::LazyLock::new(Default::default);
 
-/// Copies `from` to a new file `to` (fails if `to` exists). On Linux the copy goes through
-/// `copy_file_range`, which shares blocks on filesystems that support it.
-fn copy_new(from: &Path, to: &Path) -> Result<(), AttemptError> {
-    let mut src = std::fs::File::open(from).map_err(|e| AgentError::state(from, e))?;
-    let mut dst = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(to)
-        .map_err(|e| AgentError::state(to, e))?;
-    std::io::copy(&mut src, &mut dst).map_err(|e| AgentError::state(to, e))?;
-    Ok(())
-}
+/// A flag that is set when this value is dropped. Blocking work started for an async task
+/// checks it, so it stops soon after the task is cancelled (lease expiry, cancel) instead of
+/// running on in the background.
+pub struct StopOnDrop(Arc<std::sync::atomic::AtomicBool>);
 
-/// Unix: a hard link to the (read-only) cache object (container workers only).
-#[cfg(unix)]
-fn link_or_copy(object: &Path, dest: &Path) -> Result<(), AttemptError> {
-    match std::fs::hard_link(object, dest) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            Err(AgentError::state(dest, e).into())
-        }
-        Err(_) => copy_new(object, dest),
+impl StopOnDrop {
+    /// A new, unset flag.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        Self(Arc::default())
+    }
+
+    /// The flag, for the blocking side.
+    pub fn flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.0)
     }
 }
 
-/// Windows: always a private copy, so a worker can never change the shared cache object
-/// through a writable link.
+impl Drop for StopOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Copies `from` to `to` off the async runtime, 1 MiB at a time, stopping (and removing the
+/// partial copy) as soon as the calling task is cancelled. `create_new`: fail if `to` exists.
+async fn copy_stoppable(from: &Path, to: &Path, create_new: bool) -> Result<(), AttemptError> {
+    use std::io::{Read, Write};
+    let stop = StopOnDrop::new();
+    let flag = stop.flag();
+    let (src, dst) = (from.to_path_buf(), to.to_path_buf());
+    let copied = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+        let mut input = std::fs::File::open(&src)?;
+        let mut output = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .create_new(create_new)
+            .truncate(true)
+            .open(&dst)?;
+        let mut buf = vec![0u8; 1 << 20];
+        let result = loop {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                break Err(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "the attempt stopped during the copy",
+                ));
+            }
+            match input.read(&mut buf) {
+                Ok(0) => break output.sync_all(),
+                Ok(n) => {
+                    if let Err(e) = output.write_all(&buf[..n]) {
+                        break Err(e);
+                    }
+                }
+                Err(e) => break Err(e),
+            }
+        };
+        if result.is_err() {
+            drop(output);
+            let _ = std::fs::remove_file(&dst);
+        }
+        result
+    })
+    .await
+    .map_err(|e| AgentError::state(to, std::io::Error::other(e.to_string())))?;
+    drop(stop);
+    copied.map_err(|e| AgentError::state(to, e).into())
+}
+
+/// Unix: a hard link to the (read-only) cache object, for container workers only. False when
+/// linking isn't possible here (another disk, or not Unix): the caller copies.
+#[cfg(unix)]
+fn hard_link(object: &Path, dest: &Path) -> Result<bool, AttemptError> {
+    match std::fs::hard_link(object, dest) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            Err(AgentError::state(dest, e).into())
+        }
+        Err(_) => Ok(false),
+    }
+}
+
+/// Windows: never a link, so a worker can never change the shared cache object.
 #[cfg(not(unix))]
-fn link_or_copy(object: &Path, dest: &Path) -> Result<(), AttemptError> {
-    copy_new(object, dest)
+fn hard_link(_object: &Path, _dest: &Path) -> Result<bool, AttemptError> {
+    Ok(false)
 }
 
 #[cfg(unix)]
@@ -166,10 +232,12 @@ fn open_beneath(staging: &Path, rel: &Path) -> std::io::Result<std::fs::File> {
     for c in dirs {
         dir = openat(&dir, c.as_os_str(), dir_flags, Mode::empty())?;
     }
+    // Non-blocking: a named pipe placed by the worker opens at once (and is then refused as
+    // not a regular file) instead of hanging this thread; regular files read normally.
     let fd = openat(
         &dir,
         last.as_os_str(),
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK,
         Mode::empty(),
     )?;
     Ok(std::fs::File::from(fd))
@@ -413,6 +481,54 @@ mod tests {
             assert!(snapshot(&staging, "junction/w.bin", 7, &sha).await.is_err());
             assert!(snapshot(&staging, "ckpt/w.bin", 7, &sha).await.is_ok());
         }
+    }
+
+    /// A named pipe staged in place of a file is refused at once (opening it never waits for
+    /// a writer).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_named_pipe_is_refused_without_blocking() {
+        let dir = tempfile::tempdir().unwrap();
+        let staging = dir.path().join("staging");
+        std::fs::create_dir_all(&staging).unwrap();
+        let made = std::process::Command::new("mkfifo")
+            .arg(staging.join("pipe"))
+            .status()
+            .unwrap();
+        assert!(made.success());
+        let r = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            snapshot(&staging, "pipe", 7, &"0".repeat(64)),
+        )
+        .await
+        .expect("returned without waiting for a writer");
+        assert!(r.is_err());
+    }
+
+    /// A copy whose task is cancelled stops and removes its partial file.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_copy_stops_and_cleans_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = dir.path().join("big");
+        // Sparse: costs no disk, takes a while to copy.
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(2 << 30)
+            .unwrap();
+        let dest = dir.path().join("copy");
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            copy_stoppable(&big, &dest, true),
+        )
+        .await;
+        assert!(cancelled.is_err(), "still copying when cancelled");
+        for _ in 0..100 {
+            if !dest.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(!dest.exists(), "the partial copy was removed");
     }
 
     /// Windows: a replacement raced into the walk fails. While the folders are held, the
