@@ -2341,9 +2341,14 @@ mod tests {
         let ctx = Arc::new(AgentContext::with_hw(cfg, Vec::new()).unwrap());
         let id_dir = crate::enroll::identity_dir(ctx.state.root());
         std::fs::create_dir_all(&id_dir).unwrap();
+        // A 30-day certificate issued now (a far-off end overflows `SystemTime` on Windows).
+        let now = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
         let identity = serde_json::json!({
             "link": {"node_id": "node_1", "server": null, "listen": null, "transport": "direct",
-                     "installation_id": "i", "issued_at": 0, "not_after": i64::MAX / 4},
+                     "installation_id": "i", "issued_at": now, "not_after": now + 30 * 86_400},
             "cert": "00", "ca": "00", "key": "00",
         });
         std::fs::write(
