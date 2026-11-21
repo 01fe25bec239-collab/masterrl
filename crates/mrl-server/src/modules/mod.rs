@@ -5,8 +5,15 @@
 pub mod events;
 
 // <mrl:modules P16> P16 `pub mod` lines go right below this line.
+pub mod audit;
+pub mod auth;
+pub mod keychain;
+pub mod sync;
+pub mod tenancy;
 
 // <mrl:modules P17> P17 `pub mod` lines go right below this line.
+pub mod jobs;
+pub mod runs;
 
 // <mrl:modules P18> P18 `pub mod` lines go right below this line.
 pub mod nodes;
