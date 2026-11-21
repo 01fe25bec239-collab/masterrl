@@ -3816,3 +3816,90 @@ async fn a_cold_key_cache_backs_off_while_the_sign_in_service_is_down() {
     assert_eq!(sb.jwks_requests(), 1, "one failed fetch, then backoff");
     db.pool().close().await;
 }
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_solo_owners_token_reads_the_whole_audit_log() {
+    let sb = MockSupabase::start().await;
+    let core = solo(&sb).await;
+    let made = core
+        .call(
+            Method::POST,
+            "/api/v1/auth/tokens",
+            &Auth::Launch,
+            Some(json!({"name": "sdk", "scopes": ["*"]})),
+        )
+        .await;
+    assert_eq!(made.status, 201, "{}", made.text());
+    let token = Auth::Bearer(made.json()["token"].as_str().unwrap().to_owned());
+    let read = |auth: Auth| {
+        let core = &core;
+        async move {
+            let r = core.call(Method::GET, "/api/v1/audit", &auth, None).await;
+            assert_eq!(r.status, 200, "{}", r.text());
+            r.json()["items"].as_array().unwrap().len()
+        }
+    };
+    let by_owner = read(Auth::Launch).await;
+    assert!(by_owner > 0);
+    assert_eq!(read(token).await, by_owner, "the owner's token sees what the owner sees");
+    core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
+async fn a_token_held_to_a_project_never_reaches_setup_sync() {
+    let sb = MockSupabase::start().await;
+    let core = sync_ready(&sb).await;
+    let post = |path: String, body: Value| {
+        let core = &core;
+        async move {
+            let r = core.call(Method::POST, &path, &Auth::Launch, Some(body)).await;
+            assert_eq!(r.status, 201, "{}", r.text());
+            r.json()
+        }
+    };
+    let org = post("/api/v1/orgs".into(), json!({"slug": "lab", "name": "Lab"})).await;
+    let ws = post(
+        format!("/api/v1/orgs/{}/workspaces", org["id"].as_str().unwrap()),
+        json!({"slug": "main", "name": "Main"}),
+    )
+    .await;
+    let prj = post(
+        format!("/api/v1/workspaces/{}/projects", ws["id"].as_str().unwrap()),
+        json!({"slug": "p", "name": "P"}),
+    )
+    .await;
+    let bound = post(
+        "/api/v1/auth/tokens".into(),
+        json!({"name": "p", "scopes": ["*"], "project_id": prj["id"]}),
+    )
+    .await;
+    let unbound = post(
+        "/api/v1/auth/tokens".into(),
+        json!({"name": "all", "scopes": ["*"]}),
+    )
+    .await;
+    let call = |method: Method, path: &'static str, token: &Value, body: Option<Value>| {
+        let core = &core;
+        let auth = Auth::Bearer(token["token"].as_str().unwrap().to_owned());
+        async move { core.call(method, path, &auth, body).await.status }
+    };
+    for (method, path, body) in [
+        (Method::GET, "/api/v1/sync/profile", None),
+        (Method::PUT, "/api/v1/sync/profile", Some(profile())),
+        (Method::POST, "/api/v1/sync/setup", Some(json!({"passphrase": PASSPHRASE}))),
+        (Method::POST, "/api/v1/sync/push", None),
+        (Method::POST, "/api/v1/sync/restore", Some(json!({"passphrase": PASSPHRASE}))),
+        (Method::GET, "/api/v1/sync/status", None),
+    ] {
+        assert_eq!(
+            call(method.clone(), path, &bound, body).await,
+            403,
+            "{method} {path}"
+        );
+    }
+    assert_eq!(call(Method::GET, "/api/v1/sync/profile", &unbound, None).await, 200);
+    assert_eq!(call(Method::GET, "/api/v1/sync/status", &unbound, None).await, 200);
+    core.stop().await;
+}

@@ -291,11 +291,24 @@ async fn list(
             })
         })
         .transpose()?;
-    // Solo has one person; team mode shows only the caller's org.
-    let org = match ctx.principal.kind {
-        crate::seams::PrincipalKind::LocalOwner => None,
-        _ => Some(ctx.org.clone().unwrap_or_default()),
+    // Solo has one person: the owner, and the owner's tokens not held to an org, see the whole
+    // log. Everyone else (team mode, org-bound tokens) sees only the caller's org.
+    let whole_log = match ctx.principal.kind {
+        crate::seams::PrincipalKind::LocalOwner => true,
+        crate::seams::PrincipalKind::Service
+            if state.config.server.mode == crate::config::Mode::Solo =>
+        {
+            let grant = crate::modules::auth::credentials::token_grant(&db, &ctx.principal.id)
+                .await
+                .map_err(db_error)?;
+            let owner = crate::modules::tenancy::local_owner(&db)
+                .await
+                .map_err(db_error)?;
+            grant.is_some_and(|g| g.org.is_none() && owner.is_some_and(|o| o.id == g.user))
+        }
+        _ => false,
     };
+    let org = (!whole_log).then(|| ctx.org.clone().unwrap_or_default());
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT id, at, org_id, project_id, actor, action, target, outcome, details, trace_id FROM audit_events \
          WHERE ($1::text IS NULL OR org_id = $1) AND ($2::text IS NULL OR action = $2) AND ($3::text IS NULL OR actor = $3) \

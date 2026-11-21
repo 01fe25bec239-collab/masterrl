@@ -193,6 +193,10 @@ pub async fn upsert_supabase_user_in(tx: &mut Tx, profile: &Profile) -> Result<U
 /// users with `platform_admin` pass.
 pub const PLATFORM: &str = "platform";
 
+/// Resource kind of setup sync (the person's own setup profile and sync keys). Tokens bound
+/// to an org or a project are refused it.
+pub const SETUP_PROFILE: &str = "setup_profile";
+
 /// Whether `user` holds the platform grant (`users.platform_admin`).
 pub async fn is_platform_admin(db: &Db, user: UserId) -> Result<bool, DbError> {
     let flag: Option<bool> = sqlx::query_scalar("SELECT platform_admin FROM users WHERE id = $1")
@@ -411,6 +415,11 @@ impl Rbac {
                 }
                 // Token limits apply before any role, the solo owner's included.
                 if !credentials::scopes_allow(&g.scopes, action) {
+                    return Ok(Decision::Deny);
+                }
+                // The setup profile holds the person's whole setup, outside every org, so a
+                // token held to an org or a project never reaches it.
+                if resource.kind == SETUP_PROFILE && (g.org.is_some() || g.project.is_some()) {
                     return Ok(Decision::Deny);
                 }
                 let personal = matches!(action, Action::AuthSession | Action::AuthManageTokens);

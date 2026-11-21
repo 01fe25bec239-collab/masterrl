@@ -565,7 +565,7 @@ async fn caller(state: &AppState, shared: &Shared, ctx: &RequestContext) -> Resu
         .into());
     }
     state
-        .authorize(ctx, "auth.session", &Resource::kind("setup_profile"))
+        .authorize(ctx, "auth.session", &Resource::kind(tenancy::SETUP_PROFILE))
         .await?;
     let user = tenancy::acting_user(&shared.db, &ctx.principal)
         .await
