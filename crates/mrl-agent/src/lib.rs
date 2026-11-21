@@ -20,6 +20,11 @@ pub mod state;
 pub mod transfer;
 
 // <mrl:lib P18> P18 `pub mod` lines go right below this line.
+pub mod enroll;
+pub mod journal;
+pub mod session;
+pub mod spool;
+pub mod transports;
 
 // <mrl:lib P20> P20 `pub mod` lines go right below this line.
 pub mod attempts;

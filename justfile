@@ -39,6 +39,14 @@ gen:
 
 # Start Postgres, SeaweedFS (S3) and the OpenTelemetry collector; waits until healthy
 dev:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # One stack is shared by every worktree. Its config mounts resolve to the worktree that
+    # started it, so `up` from another worktree would recreate containers mid-test: skip it
+    # while all services run. Use `just dev-down` then `just dev` to apply compose changes.
+    running=$({{compose}} ps --status running --services 2>/dev/null | wc -l | tr -d ' ')
+    total=$({{compose}} config --services | wc -l | tr -d ' ')
+    if [ "$running" -ge "$total" ]; then echo "local stack already running"; exit 0; fi
     {{compose}} up -d --build --wait
 
 # Stop the local stack (data volumes are kept)

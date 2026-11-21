@@ -8,13 +8,14 @@ use std::path::{Path, PathBuf};
 
 /// Environment variables with this prefix and a `__` override settings.
 pub const ENV_PREFIX: &str = "MRL_";
-const SECTIONS: [&str; 5] = [
-    "server",
-    "database",
-    "pgbundle",
-    "object_store",
-    "telemetry",
-];
+
+/// Top-level settings sections: read from [`Config`] itself, so every part's section
+/// (added below its `<mrl:config>` marker) can be set from the environment too.
+fn sections() -> Vec<String> {
+    toml::Table::try_from(Config::default())
+        .map(|t| t.keys().cloned().collect())
+        .unwrap_or_default()
+}
 
 /// How the server runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, clap::ValueEnum)]
@@ -73,11 +74,15 @@ pub struct Config {
     /// Logs and traces.
     pub telemetry: TelemetryConfig,
     // <mrl:config P16> P16 settings fields go right below this line.
-
+    /// Sign-in (Supabase) and access tokens.
+    pub auth: crate::modules::auth::AuthConfig,
+    /// Where secrets are kept (`backend = "auto" | "file"`).
+    pub keychain: crate::modules::keychain::KeychainConfig,
     // <mrl:config P17> P17 settings fields go right below this line.
 
     // <mrl:config P18> P18 settings fields go right below this line.
-
+    /// The agent gateway and node health.
+    pub gateway: crate::modules::nodes::GatewayConfig,
     // <mrl:config P19> P19 settings fields go right below this line.
 }
 
@@ -256,7 +261,8 @@ impl Default for PgBundleConfig {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ObjectStoreConfig {
-    /// `s3://bucket/prefix` or `file:///absolute/path`.
+    /// `s3://bucket` (objects go under `orgs/` at the bucket root; a path after the bucket is
+    /// refused) or `file:///absolute/path`.
     pub url: Option<String>,
     /// Endpoint for S3-compatible stores, like `http://127.0.0.1:8333`.
     pub endpoint: Option<String>,
@@ -459,12 +465,32 @@ impl Config {
             }
         }
         // <mrl:validate P16> P16 checks (push to `problems`) go right below this line.
+        problems.extend(self.auth.problems());
 
         // <mrl:validate P17> P17 checks (push to `problems`) go right below this line.
 
         // <mrl:validate P18> P18 checks (push to `problems`) go right below this line.
+        problems.extend(self.gateway.problems(&self.server));
 
         // <mrl:validate P19> P19 checks (push to `problems`) go right below this line.
+        if let Some(url) = &self.object_store.url {
+            if let Some(rest) = url.strip_prefix("s3://") {
+                let (bucket, path) = rest.split_once('/').unwrap_or((rest, ""));
+                if bucket.is_empty() {
+                    problems.push(
+                        "object_store.url: an s3:// address needs a bucket name, like s3://masterrl"
+                            .to_owned(),
+                    );
+                }
+                // Objects live under `orgs/` at the bucket root; a path would be silently
+                // ignored, so two deployments sharing a bucket would mix their data.
+                if !path.trim_matches('/').is_empty() {
+                    problems.push(format!(
+                        "object_store.url: {url:?} has a path after the bucket; MasterRL stores objects at the bucket root, so use s3://{bucket} (or a bucket of its own per deployment)"
+                    ));
+                }
+            }
+        }
         if problems.is_empty() {
             Ok(())
         } else {
@@ -540,11 +566,12 @@ fn set_path(table: &mut toml::Table, name: &str, rest: &str, raw: &str) -> Resul
             "use MRL_SECTION__KEY, with two underscores between parts",
         ));
     }
-    if !SECTIONS.contains(&parts[0].as_str()) {
+    let sections = sections();
+    if !sections.contains(&parts[0]) {
         return Err(env_err(&format!(
             "{:?} is not a settings section; use one of {}",
             parts[0],
-            SECTIONS.join(", ")
+            sections.join(", ")
         )));
     }
     let (last, path) = parts.split_last().ok_or_else(|| env_err("empty name"))?;
@@ -882,8 +909,12 @@ mod tests {
     #[test]
     fn object_store_values() {
         assert!(
-            parse("[object_store]\nurl = \"s3://b/p\"\nendpoint = \"http://127.0.0.1:8333\"")
-                .is_ok()
+            parse("[object_store]\nurl = \"s3://b\"\nendpoint = \"http://127.0.0.1:8333\"").is_ok()
+        );
+        assert!(parse("[object_store]\nurl = \"s3://b/\"").is_ok());
+        assert_eq!(
+            code(parse("[object_store]\nurl = \"s3://b/p\"")),
+            ErrorCode::ConfigValue
         );
         assert!(parse("[object_store]\nurl = \"file:///var/mrl\"").is_ok());
         assert_eq!(
@@ -944,6 +975,23 @@ mod tests {
             let r = Config::from_toml_with_env("[server]\nmode = \"solo\"", env(&[(k, v)]));
             assert_eq!(code(r), ErrorCode::ConfigEnv, "{k}");
         }
+    }
+
+    #[test]
+    fn every_settings_section_takes_env_overrides() {
+        // Parts add sections below their markers, so check a superset.
+        let found = sections();
+        for s in [
+            "server",
+            "database",
+            "pgbundle",
+            "object_store",
+            "telemetry",
+        ] {
+            assert!(found.iter().any(|f| f == s), "{s} missing from {found:?}");
+        }
+        let c = Config::from_toml_with_env("", env(&[("MRL_TELEMETRY__LOG_LEVEL", "debug")]));
+        assert!(c.is_ok(), "{c:?}");
     }
 
     #[test]

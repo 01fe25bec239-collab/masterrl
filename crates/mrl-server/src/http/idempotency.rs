@@ -2,7 +2,11 @@
 //!
 //! Same key + same body → the stored response is replayed (`idempotent-replayed: true`).
 //! Same key + different body → 422 MRL-IDEM-002. Key still running → 409 MRL-IDEM-001.
-//! 5xx responses are not stored, so the client can retry with the same key.
+//! 5xx responses are not stored, so the client can retry with the same key. Keys are scoped
+//! per principal and org. A response carrying [`NotReplayable`] is not stored either: the
+//! key is released, and a retry runs the handler again (with fresh authorization). Modules
+//! whose answers go stale (tickets) or depend on current permissions use it and dedupe
+//! retries themselves.
 
 use super::BODY_LIMIT;
 use crate::app::AppState;
@@ -23,7 +27,15 @@ pub const REPLAYED: HeaderName = HeaderName::from_static("idempotent-replayed");
 const MAX_STORED_BODY: usize = 8 * 1024 * 1024;
 const KEPT_HEADERS: [HeaderName; 3] = [header::CONTENT_TYPE, header::LOCATION, header::ETAG];
 
-/// The middleware. Runs after authentication (keys are scoped per principal).
+/// Paths whose handlers check and replay their own durable submission records.
+#[derive(Clone)]
+pub(super) struct HandlerOwned(pub std::sync::Arc<std::collections::HashSet<&'static str>>);
+
+/// Response extension: never store this response for replay (see the module docs).
+#[derive(Debug, Clone, Copy)]
+pub struct NotReplayable;
+
+/// The middleware. Runs after authentication (keys are scoped per principal and org).
 pub async fn middleware(State(state): State<AppState>, req: Request, next: Next) -> Response {
     if req.method() != Method::POST {
         return next.run(req).await;
@@ -41,8 +53,25 @@ pub async fn middleware(State(state): State<AppState>, req: Request, next: Next)
             .into_response()
         }
     };
+    if let (Some(owned), Some(path)) = (
+        req.extensions().get::<HandlerOwned>(),
+        req.extensions().get::<axum::extract::MatchedPath>(),
+    ) {
+        let path = path.as_str();
+        if owned
+            .0
+            .contains(path.strip_prefix(super::API_PREFIX).unwrap_or(path))
+        {
+            return next.run(req).await;
+        }
+    }
     let scope = match req.extensions().get::<RequestContext>() {
-        Some(ctx) => ctx.principal.id.clone(),
+        // The unit separator can't appear in ids, so scopes never collide.
+        Some(ctx) => format!(
+            "{}\u{1f}{}",
+            ctx.principal.id,
+            ctx.org.as_deref().unwrap_or_default()
+        ),
         None => return ApiError::new(ErrorCode::Unauthenticated, "Sign in first.").into_response(),
     };
     let (parts, body) = req.into_parts();
@@ -84,7 +113,7 @@ pub async fn middleware(State(state): State<AppState>, req: Request, next: Next)
             let res = next
                 .run(Request::from_parts(parts, Body::from(bytes)))
                 .await;
-            if res.status().is_server_error() {
+            if res.status().is_server_error() || res.extensions().get::<NotReplayable>().is_some() {
                 return res;
             }
             let (res_parts, res_body) = res.into_parts();

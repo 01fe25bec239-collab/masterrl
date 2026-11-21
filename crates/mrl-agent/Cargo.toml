@@ -27,6 +27,15 @@ reqwest = { version = "=0.13.5", default-features = false, features = ["rustls",
 tokio-util = { version = "=0.7.20", features = ["io"] }
 toml = "=1.2.0"
 # <mrl:deps P18> P18 dependencies go right below this line.
+keyring = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+rcgen = { workspace = true }
+sha2 = { workspace = true }
+tokio-rustls = { version = "=0.26.6", default-features = false, features = ["ring", "tls12"] }
+webpki = { package = "rustls-webpki", version = "=0.103.17", default-features = false, features = ["ring", "std"] }
+tokio-stream = "=0.1.19"
+hyper-util = { version = "=0.1.21", features = ["tokio"] }
 
 # <mrl:deps P20> P20 dependencies go right below this line.
 getrandom = "=0.3.4"

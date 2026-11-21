@@ -23,7 +23,7 @@ pub fn services() -> Vec<Box<dyn AgentService>> {
     vec![
         // <mrl:register>
         // <mrl:register P18> P18 services go right below this line.
-
+        Box::new(crate::session::GatewayService::new()),
         // <mrl:register P20> P20 services go right below this line.
         Box::new(crate::janitor::JanitorService),
         Box::new(crate::doctor::DoctorService),

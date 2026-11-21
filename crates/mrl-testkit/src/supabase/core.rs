@@ -1,0 +1,307 @@
+//! A core wired like production: P16's seams (`production_seams`) and every registered
+//! module, on its own [`TestDb`], signing in through a [`MockSupabase`]. Secrets are in
+//! memory so tests can share them across a "wiped" data folder.
+//!
+//! ```text
+//! let sb = MockSupabase::start().await;
+//! let core = CoreServer::start(Mode::Solo, &sb, TestDb::new().await, secrets).await;
+//! let me = core.call(Method::GET, "/api/v1/auth/me", &Auth::Launch, None).await;
+//! ```
+
+use super::MockSupabase;
+use crate::pg::TestDb;
+use crate::seams::InMemorySecretStore;
+use crate::server::{TestResponse, TestServer, TEST_SECRET};
+use axum::body::Body;
+use axum::http::Method;
+use mrl_server::config::{Config, Mode};
+use mrl_server::seams::{SeamError, Secret, SecretStore, LAUNCH_SECRET_HEADER};
+use mrl_server::{registry, ServerError};
+use serde_json::Value;
+use std::net::{Ipv4Addr, SocketAddr};
+use std::sync::Arc;
+
+/// How a test request signs in.
+#[derive(Debug, Clone)]
+pub enum Auth {
+    /// No credentials.
+    None,
+    /// The solo launch secret.
+    Launch,
+    /// `Authorization: Bearer …` (an access token or a Supabase JWT).
+    Bearer(String),
+    /// The launch secret and a bearer token together, as the CLI sends them in solo mode.
+    LaunchAndBearer(String),
+    /// The renderer session cookie, with the CSRF header or `Sec-Fetch-Site: same-origin`.
+    Cookie {
+        /// Cookie value.
+        cookie: String,
+        /// `x-csrf-token`.
+        csrf: Option<String>,
+        /// Send `Sec-Fetch-Site: same-origin`.
+        same_origin: bool,
+    },
+}
+
+/// A production-wired core for tests.
+pub struct CoreServer {
+    /// The running server.
+    pub server: TestServer,
+    /// Its database.
+    pub db: TestDb,
+    /// Its secret store (stands in for the OS keychain).
+    pub secrets: Arc<InMemorySecretStore>,
+    /// Its settings.
+    pub config: Config,
+    /// What the server writes secrets through (the store above, plus a failure switch).
+    keychain: Arc<Keychain>,
+}
+
+/// The test keychain: `secrets` plus one switch that makes the next write of a name fail,
+/// like a cancelled keychain prompt.
+struct Keychain {
+    inner: Arc<InMemorySecretStore>,
+    fail: std::sync::Mutex<Option<(String, String)>>,
+    pause: std::sync::Mutex<Option<(String, Arc<PauseRead>)>>,
+}
+
+/// A gate after one test keychain read, for interleaving a restore with a push.
+#[derive(Default)]
+pub struct PauseRead {
+    /// Fires after the key was read.
+    pub read: tokio::sync::Notify,
+    /// Continues the blocked reader.
+    pub resume: tokio::sync::Notify,
+}
+
+#[async_trait::async_trait]
+impl SecretStore for Keychain {
+    async fn get(&self, name: &str) -> Result<Option<Secret>, SeamError> {
+        let secret = self.inner.get(name).await?;
+        let paused = {
+            let mut pause = self.pause.lock().unwrap_or_else(|p| p.into_inner());
+            if pause.as_ref().is_some_and(|(key, _)| key == name) {
+                pause.take().map(|(_, gate)| gate)
+            } else {
+                None
+            }
+        };
+        if let Some(gate) = paused {
+            gate.read.notify_one();
+            gate.resume.notified().await;
+        }
+        Ok(secret)
+    }
+    async fn set(&self, name: &str, value: Secret) -> Result<(), SeamError> {
+        let failing = {
+            let mut fail = self.fail.lock().unwrap_or_else(|p| p.into_inner());
+            match fail.take() {
+                Some((n, detail)) if n == name => Some(detail),
+                other => {
+                    *fail = other;
+                    None
+                }
+            }
+        };
+        match failing {
+            Some(detail) => Err(SeamError::new("secrets", detail)),
+            None => self.inner.set(name, value).await,
+        }
+    }
+    async fn delete(&self, name: &str) -> Result<(), SeamError> {
+        self.inner.delete(name).await
+    }
+}
+
+/// Settings for a test core in `mode` that signs in through `sb`.
+pub fn config(mode: Mode, sb: &MockSupabase) -> Config {
+    let mut c = Config::default();
+    c.server.mode = mode;
+    let any = SocketAddr::from((Ipv4Addr::LOCALHOST, 0));
+    c.server.listeners.api = any;
+    c.server.listeners.grpc = any;
+    c.server.listeners.internal = any;
+    c.auth = sb.auth_config();
+    c.database = crate::pg::test_config();
+    c
+}
+
+impl CoreServer {
+    /// Starts a core. Panics with the catalogued error if it does not start.
+    pub async fn start(
+        mode: Mode,
+        sb: &MockSupabase,
+        db: TestDb,
+        secrets: Arc<InMemorySecretStore>,
+    ) -> Self {
+        match Self::try_start(config(mode, sb), db, secrets).await {
+            Ok(c) => c,
+            Err(e) => panic!("test core did not start: {}", e.explain()),
+        }
+    }
+
+    /// Starts a core with these settings.
+    pub async fn try_start(
+        config: Config,
+        db: TestDb,
+        secrets: Arc<InMemorySecretStore>,
+    ) -> Result<Self, ServerError> {
+        let keychain = Arc::new(Keychain {
+            inner: secrets.clone(),
+            fail: std::sync::Mutex::new(None),
+            pause: std::sync::Mutex::new(None),
+        });
+        let store: Arc<dyn SecretStore> = keychain.clone();
+        let app_db = if config.database.max_connections == crate::pg::test_config().max_connections
+        {
+            db.db().clone()
+        } else {
+            db.replica_with(&config.database)
+        };
+        let seams =
+            mrl_server::modules::auth::production_seams(&config, &app_db, store, TEST_SECRET)
+                .await?
+                .build(config.server.mode)?;
+        let modules = registry::modules(&app_db, &config);
+        let server = TestServer::start(config.clone(), seams, modules).await?;
+        Ok(Self {
+            server,
+            db,
+            secrets,
+            config,
+            keychain,
+        })
+    }
+
+    /// The next write of secret `name` fails with `detail` (like `MRL-ENV-162: …`).
+    pub fn fail_next_write(&self, name: &str, detail: &str) {
+        *self.keychain.fail.lock().unwrap_or_else(|p| p.into_inner()) =
+            Some((name.to_owned(), detail.to_owned()));
+    }
+
+    /// Pauses the next read of a key immediately after fetching its value.
+    pub fn pause_next_read(&self, key: String) -> Arc<PauseRead> {
+        let gate = Arc::new(PauseRead::default());
+        *self
+            .keychain
+            .pause
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some((key, gate.clone()));
+        gate
+    }
+
+    /// Stops the server and closes its connections, so dropping the database is quick.
+    /// Call it at the end of a test.
+    pub async fn stop(self) {
+        if let Err(e) = self.server.shutdown().await {
+            panic!("test core did not stop cleanly: {}", e.explain());
+        }
+        self.db.pool().close().await;
+    }
+
+    /// Stops the server and starts it again with `config` on the same database and secret
+    /// store (a settings change, or a switch between solo and team mode).
+    pub async fn restart(self, config: Config) -> Self {
+        if let Err(e) = self.server.shutdown().await {
+            panic!("test core did not stop cleanly: {}", e.explain());
+        }
+        match Self::try_start(config, self.db, self.secrets).await {
+            Ok(c) => c,
+            Err(e) => panic!("test core did not restart: {}", e.explain()),
+        }
+    }
+
+    /// Sends a JSON request (or none) with `auth`.
+    pub async fn call(
+        &self,
+        method: Method,
+        path: &str,
+        auth: &Auth,
+        body: Option<Value>,
+    ) -> TestResponse {
+        self.call_with(method, path, auth, body, &[]).await
+    }
+
+    /// Like [`CoreServer::call`], with extra request headers (like `Idempotency-Key`).
+    pub async fn call_with(
+        &self,
+        method: Method,
+        path: &str,
+        auth: &Auth,
+        body: Option<Value>,
+        extra: &[(&str, &str)],
+    ) -> TestResponse {
+        let bearer;
+        let cookie;
+        let mut headers: Vec<(&str, &str)> = vec![("content-type", "application/json")];
+        match auth {
+            Auth::None => {}
+            Auth::Launch => headers.push((LAUNCH_SECRET_HEADER, TEST_SECRET)),
+            Auth::Bearer(t) => {
+                bearer = format!("Bearer {t}");
+                headers.push(("authorization", &bearer));
+            }
+            Auth::LaunchAndBearer(t) => {
+                headers.push((LAUNCH_SECRET_HEADER, TEST_SECRET));
+                bearer = format!("Bearer {t}");
+                headers.push(("authorization", &bearer));
+            }
+            Auth::Cookie {
+                cookie: c,
+                csrf,
+                same_origin,
+            } => {
+                cookie = format!("mrl_session={c}");
+                headers.push(("cookie", &cookie));
+                if let Some(t) = csrf {
+                    headers.push(("x-csrf-token", t));
+                }
+                if *same_origin {
+                    headers.push(("sec-fetch-site", "same-origin"));
+                }
+            }
+        }
+        headers.extend_from_slice(extra);
+        let body = match body {
+            Some(v) => Body::from(v.to_string()),
+            None => Body::empty(),
+        };
+        self.server.request(method, path, &headers, body).await
+    }
+
+    /// Signs in through the mock (the browser step included) and returns the callback answer.
+    /// `issue_token` asks for a CLI access token.
+    pub async fn sign_in(&self, sb: &MockSupabase, auth: &Auth, issue_token: bool) -> TestResponse {
+        let started = self
+            .call(
+                Method::POST,
+                "/api/v1/auth/login",
+                auth,
+                Some(serde_json::json!({ "provider": "github", "redirect_uri": "http://127.0.0.1:53111/callback" })),
+            )
+            .await;
+        assert_eq!(started.status, 200, "login: {}", started.text());
+        let started = started.json();
+        let back = match sb.approve(started["authorize_url"].as_str().unwrap_or_default()) {
+            Ok(b) => b,
+            Err(e) => panic!("mock refused the authorize URL: {e}"),
+        };
+        let q: std::collections::HashMap<String, String> = match reqwest::Url::parse(&back) {
+            Ok(u) => u.query_pairs().into_owned().collect(),
+            Err(e) => panic!("bad redirect {back}: {e}"),
+        };
+        assert_eq!(
+            q.get("flow").map(String::as_str),
+            started["flow_id"].as_str()
+        );
+        self.call(
+            Method::POST,
+            "/api/v1/auth/callback",
+            auth,
+            Some(serde_json::json!({
+                "flow_id": q.get("flow"), "code": q.get("code"), "issue_token": issue_token, "token_name": "test CLI",
+            })),
+        )
+        .await
+    }
+}

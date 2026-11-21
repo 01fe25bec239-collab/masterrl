@@ -1,0 +1,75 @@
+name: ci-keychain
+
+# The OS keychain behind P16's SecretStore: macOS Keychain, Windows Credential Manager,
+# Linux Secret Service (GNOME Keyring on a D-Bus session), and the encrypted-file fallback
+# on a Linux box with no Secret Service.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-keychain-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  keychain:
+    name: keychain (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+      - name: OS keychain round trip
+        run: cargo test --locked -p mrl-server --lib modules::keychain::tests::os_keychain_round_trips -- --ignored --exact --test-threads=1
+        env:
+          MRL_EXPECT_KEYCHAIN: "1"
+
+  secret-service:
+    name: keychain (linux, Secret Service)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+      - name: install GNOME Keyring
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends gnome-keyring dbus-x11
+      - name: build tests
+        run: cargo test --locked -p mrl-server --lib --no-run
+      - name: Secret Service round trip
+        env:
+          MRL_EXPECT_KEYCHAIN: "1"
+        run: |
+          dbus-run-session -- bash -euo pipefail -c '
+            echo -n "ci-only-keyring-password" | gnome-keyring-daemon --unlock --components=secrets >/dev/null
+            cargo test --locked -p mrl-server --lib modules::keychain::tests::os_keychain_round_trips -- --ignored --exact --test-threads=1
+          '
+
+  fallback:
+    name: keychain (linux, no Secret Service)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+      - name: encrypted-file fallback
+        env:
+          MRL_EXPECT_NO_KEYCHAIN: "1"
+          DBUS_SESSION_BUS_ADDRESS: "unix:path=/nonexistent"
+        run: cargo test --locked -p mrl-server --lib modules::keychain::tests::os_keychain_round_trips -- --ignored --exact --test-threads=1

@@ -29,12 +29,24 @@ mrl-agent = { path = "../mrl-agent" }
 tempfile = "=3.27.0"
 
 # <mrl:deps P16> P16 dependencies go right below this line.
+base64 = "=0.22.1"
+jsonwebtoken = { version = "=11.1.0", default-features = false, features = ["aws_lc_rs"] }
+mrl-domain = { path = "../mrl-domain" }
+rcgen = { workspace = true }
+reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "json", "query"] }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["fmt"] }
 
 # <mrl:deps P17> P17 dependencies go right below this line.
 
 # <mrl:deps P18> P18 dependencies go right below this line.
+mrl-proto = { path = "../mrl-proto" }
+prost = { workspace = true }
+prost-types = "=0.14.6"
 
 # <mrl:deps P19> P19 dependencies go right below this line.
+mrl-storage = { path = "../mrl-storage" }
+object_store = { workspace = true, features = ["aws"] }
 
 # <mrl:deps P20> P20 dependencies go right below this line.
 mrl-proto = { path = "../mrl-proto" }

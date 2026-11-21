@@ -30,7 +30,7 @@ burst = 200
 url = "postgres://mrl:mrl-dev-only@127.0.0.1:55432/masterrl"
 
 [object_store]
-url = "s3://masterrl-dev/artifacts"
+url = "s3://masterrl-dev"
 endpoint = "http://127.0.0.1:8333"
 
 [telemetry]
