@@ -465,19 +465,21 @@ impl ArtifactStore {
             }
             other => other?,
         };
+        let mut reservation = Reservation {
+            db: self.db.clone(),
+            id,
+            armed: true,
+        };
         let done = match self.snapshot(&store, &manifest, sources).await {
             Ok(()) => self.commit(&org, id, &links).await,
             Err(e) => Err(e),
         };
         if let Err(e) = done {
-            sqlx::query(
-                "UPDATE artifacts SET state = 'FAILED' WHERE id = $1 AND state = 'PENDING'",
-            )
-            .bind(id)
-            .execute(self.db.pool())
-            .await?;
+            fail_pending(&self.db, id).await?;
+            reservation.settled();
             return Err(e);
         }
+        reservation.settled();
         self.get(&org, id)
             .await?
             .ok_or_else(|| not_found("artifact"))
@@ -486,8 +488,9 @@ impl ArtifactStore {
     /// Stores the checked local file `tmp` (`size` bytes hashing to `sha256`) at `blob`, its
     /// content address. An object already there is reused only when its bytes hash to
     /// `sha256`; one that is missing, another size or corrupted is rewritten from `tmp`.
-    /// Before writing, an intent is recorded, so a blob whose referencing commit never
-    /// happens (the server stopped) is deleted by the cleanup job.
+    /// An intent is recorded first, also when the blob is reused: the cleanup job keeps a
+    /// blob with a fresh intent, so it can't delete one a commit is about to reference, and
+    /// deletes it after 24 hours when that commit never happens (the server stopped).
     pub(crate) async fn put_blob(
         &self,
         st: &Store,
@@ -496,20 +499,25 @@ impl ArtifactStore {
         size: u64,
         sha256: &str,
     ) -> Result<(), Error> {
+        self.intend(st.keys().org_id(), blob, Some(sha256)).await?;
         if crate::modules::uploads::blob_intact(st, blob, size, sha256).await? {
             return Ok(());
         }
-        self.intend(st.keys().org_id(), blob, Some(sha256)).await?;
         crate::modules::uploads::store_file(st, tmp, blob, size).await
     }
 
-    /// Records that P19 is about to write `key` of `org` (a blob when `sha256` is given).
+    /// Records that P19 is about to write or rely on `key` of `org` (a blob when `sha256` is
+    /// given). Recorded under the key's lock ([`lock_key`]), which the cleanup job holds
+    /// while it checks and deletes that key: the intent is either seen by a pass, or lands
+    /// after the pass deleted the object, so the caller's own check finds it missing.
     pub(crate) async fn intend(
         &self,
         org: &str,
         key: &str,
         sha256: Option<&str>,
     ) -> Result<(), Error> {
+        let mut tx = self.db.pool().begin().await?;
+        lock_key(&mut tx, org, key).await?;
         sqlx::query(
             "INSERT INTO storage_intents (id, org_id, key, sha256) VALUES ($1, $2, $3, $4)",
         )
@@ -517,8 +525,9 @@ impl ArtifactStore {
         .bind(org)
         .bind(key)
         .bind(sha256)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -776,6 +785,50 @@ impl ArtifactStore {
     }
 }
 
+/// Marks the artifact `id` FAILED if it is still PENDING, which frees its name.
+async fn fail_pending(db: &Db, id: Uuid) -> Result<(), Error> {
+    sqlx::query("UPDATE artifacts SET state = 'FAILED' WHERE id = $1 AND state = 'PENDING'")
+        .bind(id)
+        .execute(db.pool())
+        .await?;
+    Ok(())
+}
+
+/// A PENDING artifact row this registration reserved. Dropped before [`Reservation::settled`]
+/// (the request was cancelled, like a client that went away), it marks the row FAILED in a
+/// task of its own, so the name is free at once instead of after the cleanup job's 24 hours.
+struct Reservation {
+    db: Db,
+    id: Uuid,
+    armed: bool,
+}
+
+impl Reservation {
+    /// The row reached COMMITTED or FAILED; nothing is left to do.
+    fn settled(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Reservation {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (db, id) = (self.db.clone(), self.id);
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move {
+                if let Err(e) = fail_pending(&db, id).await {
+                    tracing::warn!(
+                        code = e.code(),
+                        "could not free a cancelled registration; the cleanup job will"
+                    );
+                }
+            });
+        }
+    }
+}
+
 /// Finds items of one kind for lineage graphs. The module that owns the kind implements it
 /// and registers it with [`ArtifactStore::add_lineage_lookup`].
 #[async_trait::async_trait]
@@ -1017,6 +1070,21 @@ fn immutable() -> Error {
         "Stored files can't be overwritten; upload to a new place instead.",
     )
     .into()
+}
+
+/// Takes the transaction-scoped lock on object `key` of `org`. Writers recording an intent
+/// ([`ArtifactStore::intend`]) and the cleanup job deleting a blob take it, so a deletion
+/// never falls between a writer's intent and its check of the object.
+pub(crate) async fn lock_key(
+    conn: &mut sqlx::PgConnection,
+    org: &str,
+    key: &str,
+) -> Result<(), Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("mrl.object:{org}:{key}"))
+        .execute(conn)
+        .await?;
+    Ok(())
 }
 
 /// The ticket signing key. With a `SecretStore` it is shared there: created once, under a

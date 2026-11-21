@@ -942,6 +942,10 @@ pub async fn sweep_at(store: &ArtifactStore, now: OffsetDateTime) -> Result<Swep
     .await?;
     let mut blobs = 0;
     for (org, key, sha) in intents {
+        // Checked and deleted under the key's lock: a writer's fresh intent is either seen
+        // here, or recorded after the delete (and its own check then finds no object).
+        let mut tx = pool.begin().await?;
+        crate::modules::artifacts::lock_key(&mut tx, &org, &key).await?;
         let used: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM uploads WHERE org_id = $1 AND blob_key = $2 AND state = 'COMPLETED')
                  OR EXISTS (SELECT 1 FROM artifacts a, jsonb_array_elements(a.manifest -> 'files') f
@@ -953,12 +957,13 @@ pub async fn sweep_at(store: &ArtifactStore, now: OffsetDateTime) -> Result<Swep
         .bind(&key)
         .bind(&sha)
         .bind(cutoff)
-        .fetch_one(pool)
+        .fetch_one(&mut *tx)
         .await?;
         if !used {
             backend.org(&org)?.delete(&key).await?;
             blobs += 1;
         }
+        tx.commit().await?;
     }
     // Kept a second day so the org stays visible until its staging is old enough to go.
     sqlx::query("DELETE FROM storage_intents WHERE created_at < $1")

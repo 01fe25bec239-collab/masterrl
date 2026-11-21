@@ -3688,3 +3688,108 @@ async fn secret_changes_audit_first_and_grants_check_the_secret() {
     drop(tx);
     assert_eq!(e.db.count("run_secret_grants").await, 0);
 }
+
+/// A cleanup pass that runs while `:complete` reuses a stored blob (left by a commit that
+/// never happened, its intent two days old) keeps it: the completion recorded a fresh
+/// intent under the blob's lock before it checked the blob.
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn cleanup_keeps_a_blob_a_completion_is_reusing() {
+    let Some(e) = Env::start(Kind::Fs).await else {
+        return;
+    };
+    let bytes = format!("reused {}", uuid::Uuid::new_v4());
+    let sha = sha256_hex(bytes.as_bytes());
+    let st = e.backend.org("org-a").unwrap();
+    let blob = st.keys().blob(&sha).unwrap();
+    st.put(&blob, bytes.clone().into_bytes().into())
+        .await
+        .unwrap();
+    e.db.seed(&format!(
+        "INSERT INTO storage_intents (id, org_id, key, sha256, created_at)
+         VALUES ('{}', 'org-a', '{blob}', '{sha}', now() - interval '48 hours')",
+        uuid::Uuid::new_v4()
+    ))
+    .await;
+    let r = e
+        .call(
+            Method::POST,
+            "/api/v1/uploads",
+            A,
+            Some(json!({"filename": "f", "size": bytes.len(), "sha256": sha})),
+        )
+        .await;
+    let up = r.json()["id"].as_str().unwrap().to_owned();
+    let r = e
+        .put_bytes(
+            &format!("/api/v1/uploads/{up}/parts/0"),
+            Some(A),
+            bytes.clone().into_bytes(),
+            &[],
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    // The completion waits 3 s right before it records COMPLETED; the pass runs meanwhile.
+    e.db.seed(
+        "CREATE FUNCTION p19_wait() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(3); RETURN NEW; END $$;
+         CREATE TRIGGER p19_wait BEFORE UPDATE ON uploads FOR EACH ROW
+           WHEN (NEW.state = 'COMPLETED') EXECUTE FUNCTION p19_wait();",
+    )
+    .await;
+    let complete = format!("/api/v1/uploads/{up}:complete");
+    let (r, swept) = tokio::join!(
+        e.call(Method::POST, &complete, A, None),
+        async {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            mrl_server::modules::uploads::sweep(&e.store).await.unwrap()
+        }
+    );
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert_eq!(r.json()["blob_key"], json!(blob));
+    assert_eq!(
+        st.get(&blob).await.map(|b| b.to_vec()).ok(),
+        Some(bytes.into_bytes()),
+        "the completed upload's file is still stored ({swept:?})"
+    );
+}
+
+/// A registration cancelled after it reserved its name (the client went away) frees the
+/// name at once: the row becomes FAILED and the name can be registered again.
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn a_cancelled_registration_frees_its_name() {
+    let Some(e) = Env::start(Kind::Fs).await else {
+        return;
+    };
+    let manifest = put_files(&e, "exports/cancel/", &[("r.json", b"{}")]).await;
+    e.db.seed(
+        "CREATE FUNCTION p19_wait() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM pg_sleep(2); RETURN NEW; END $$;
+         CREATE TRIGGER p19_wait BEFORE UPDATE ON artifacts FOR EACH ROW
+           WHEN (NEW.state = 'COMMITTED') EXECUTE FUNCTION p19_wait();",
+    )
+    .await;
+    let cancelled = tokio::time::timeout(
+        Duration::from_millis(700),
+        e.register_from("cancelled", "exports/cancel/", manifest.clone()),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the registration was still running");
+    let mut state = String::new();
+    for _ in 0..100 {
+        state = sqlx::query_scalar("SELECT state FROM artifacts WHERE name = 'cancelled'")
+            .fetch_one(e.db.pool())
+            .await
+            .unwrap();
+        if state != "PENDING" {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(state, "FAILED");
+    e.db.seed("DROP TRIGGER p19_wait ON artifacts;").await;
+    let art = e
+        .register_from("cancelled", "exports/cancel/", manifest)
+        .await
+        .unwrap();
+    assert_eq!(art["state"], "COMMITTED");
+}
