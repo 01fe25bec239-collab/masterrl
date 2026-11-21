@@ -8,23 +8,23 @@
 //! exponential backoff 1 s → 60 s with full jitter. Leader-elected, so one replica dials.
 
 use super::session;
-use super::{KEEPALIVE, MAX_MESSAGE_BYTES, PeerInfo};
+use super::{PeerInfo, KEEPALIVE, MAX_MESSAGE_BYTES};
 use crate::db::LeaderElection;
 use crate::modules::nodes::ca::node_name;
 use crate::modules::nodes::{Gateway, NodesError};
 use crate::transports::{BoxIo, Endpoint};
 use hyper_util::rt::TokioIo;
 use mrl_proto::agent::v1::agent_endpoint_service_client::AgentEndpointServiceClient;
-use mrl_proto::agent::v1::{CoreHello, CoreMessage, Lane, core_message};
+use mrl_proto::agent::v1::{core_message, CoreHello, CoreMessage, Lane};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-use tokio_rustls::TlsConnector;
 use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_stream::StreamExt;
+use tokio_rustls::TlsConnector;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 

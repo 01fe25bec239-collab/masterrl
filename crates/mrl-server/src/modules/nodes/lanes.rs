@@ -15,7 +15,7 @@
 //! and METRICS/LOGS are acked and discarded (counter). TELEMETRY always updates
 //! `node_telemetry_latest` here, and also reaches a sink that takes it.
 
-use mrl_proto::agent::v1::{AgentMessage, agent_message::Body};
+use mrl_proto::agent::v1::{agent_message::Body, AgentMessage};
 use mrl_proto::worker::v1::worker_message::Body as WorkerBody;
 use prometheus::{IntCounterVec, Opts};
 use std::sync::{Arc, OnceLock, RwLock};

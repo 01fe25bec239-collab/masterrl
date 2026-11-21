@@ -5,14 +5,14 @@
 //! the outbox in the same transaction.
 
 use super::api::{GpuView, NodeDetail, NodeView, PoolView};
-use super::ca::{Issued, sha256_hex};
+use super::ca::{sha256_hex, Issued};
 use super::{NodesError, Pki};
 use crate::db::{Db, Tx};
 use crate::modules::events::{NewEvent, OutboxWriter};
 use mrl_domain::ids::{AttemptId, GpuId, NodeId, PoolId};
 use mrl_domain::state::{Node, NodeEvent, NodeState, StateMachine};
 use mrl_proto::agent::v1 as pb;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use sqlx::Row;
 use std::str::FromStr;
 use time::OffsetDateTime;

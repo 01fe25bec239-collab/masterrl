@@ -15,15 +15,15 @@
 //! 5. Every stream re-checks its certificate every `revocation_check_seconds` and closes at
 //!    once when this replica revokes the node.
 
-use super::{PROTOCOL_VERSION, PeerInfo};
-use crate::modules::nodes::lanes::{LaneItem, LaneKind, LaneMetrics, LossyLane, body_name};
+use super::{PeerInfo, PROTOCOL_VERSION};
+use crate::modules::nodes::lanes::{body_name, LaneItem, LaneKind, LaneMetrics, LossyLane};
 use crate::modules::nodes::store::{self, Accept, CertIdentity};
-use crate::modules::nodes::{Gateway, NodesError, commands};
+use crate::modules::nodes::{commands, Gateway, NodesError};
 use crate::transports::TransportKind;
 use mrl_domain::ids::NodeId;
 use mrl_proto::agent::v1::{
-    AgentHello, AgentMessage, CoreHello, CoreMessage, EnrollRequest, EnrollResult, Lane,
-    LeaseGrant, RenewCertificateRequest, RenewCertificateResult, agent_message, core_message,
+    agent_message, core_message, AgentHello, AgentMessage, CoreHello, CoreMessage, EnrollRequest,
+    EnrollResult, Lane, LeaseGrant, RenewCertificateRequest, RenewCertificateResult,
 };
 use mrl_proto::common::v1::{Failure, FailureClass};
 use std::pin::Pin;

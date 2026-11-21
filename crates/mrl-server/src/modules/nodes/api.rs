@@ -4,12 +4,12 @@
 //! and `:decommission` share the `/nodes/{node}` route (the router has no suffix patterns).
 
 use super::store::{self, Lifecycle};
-use super::{Gateway, NodesError, ca::hex};
-use crate::AppState;
+use super::{ca::hex, Gateway, NodesError};
 use crate::error::{ApiError, ErrorCode};
 use crate::http::pagination::{Page, PageQuery};
 use crate::seams::{RequestContext, Resource};
 use crate::transports::Endpoint;
+use crate::AppState;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post};
@@ -17,7 +17,7 @@ use axum::{Extension, Json, Router};
 use mrl_domain::ids::{NodeId, PoolId};
 use mrl_domain::state::NodeEvent;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::str::FromStr;
 use std::sync::Arc;
 use time::OffsetDateTime;

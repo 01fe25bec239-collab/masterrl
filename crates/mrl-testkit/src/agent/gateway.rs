@@ -16,20 +16,20 @@
 
 use crate::pg::TestDb;
 use crate::seams::InMemorySecretStore;
-use crate::server::{TEST_SECRET, TestResponse, TestServer};
+use crate::server::{TestResponse, TestServer, TEST_SECRET};
 use axum::body::Body;
 use axum::http::Method;
-use mrl_agent::AgentContext;
 use mrl_agent::config::{AgentConfig, CacheConfig, SandboxChoice, SandboxConfig};
-use mrl_agent::hw::HwBackend;
 use mrl_agent::hw::fake::FakeHw;
+use mrl_agent::hw::HwBackend;
 use mrl_agent::registry::AgentService;
 use mrl_agent::session::{GatewayService, LinkError};
+use mrl_agent::AgentContext;
 use mrl_server::config::{Config, Mode};
 use mrl_server::modules::nodes::lanes::LaneRouter;
 use mrl_server::modules::nodes::{Gateway, GatewayConfig, NodesModule};
-use mrl_server::seams::{LAUNCH_SECRET_HEADER, SecretStore};
-use serde_json::{Value, json};
+use mrl_server::seams::{SecretStore, LAUNCH_SECRET_HEADER};
+use serde_json::{json, Value};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -365,7 +365,7 @@ mod tests {
     use mrl_agent::session::{CommandHandler, Link};
     use mrl_domain::ids::NodeId;
     use mrl_proto::agent::v1::{
-        AttemptStatus, Command, Drain, Probe, agent_message, command::Kind,
+        agent_message, command::Kind, AttemptStatus, Command, Drain, Probe,
     };
     use mrl_proto::common::v1::Failure;
     use mrl_server::modules::nodes::commands::{CommandKind, CommandSender, NewCommand};
@@ -448,13 +448,12 @@ mod tests {
 
         let pin = gw.gw.ca_fingerprint().unwrap();
         let unknown = format!("mrlj_{}_{pin}", "0".repeat(64));
-        assert!(
-            b.enroll(&gw, &unknown)
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("not known")
-        );
+        assert!(b
+            .enroll(&gw, &unknown)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("not known"));
 
         // A token whose CA pin is not this server's is never sent.
         let wrong_pin = format!("mrlj_{}_{}", "0".repeat(64), "f".repeat(64));
@@ -891,11 +890,9 @@ mod tests {
             .unwrap();
         let grant = leases();
         tokio::pin!(grant);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), &mut grant)
-                .await
-                .is_err()
-        );
+        assert!(tokio::time::timeout(Duration::from_millis(200), &mut grant)
+            .await
+            .is_err());
         sweep.commit().await.unwrap();
         assert!(grant.await.unwrap().is_empty());
     }
@@ -1639,7 +1636,7 @@ mod tests {
     #[ignore = "needs PostgreSQL (just test-integration)"]
     async fn cancelling_a_control_send_cleans_up_the_session() {
         use mrl_proto::agent::v1::{AgentHello, AgentMessage, CoreMessage, Lane};
-        use mrl_server::grpc::{PeerInfo, session};
+        use mrl_server::grpc::{session, PeerInfo};
         let gw = GatewayHarness::start(TestDb::new().await).await;
         let a = TestAgent::new(1, |_| {});
         let node = a.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
@@ -3160,12 +3157,10 @@ mod tests {
             let db = gw.db.db().clone();
             async move { store::telemetry(&db, id, epoch, &t, 90, ahead).await }
         };
-        assert!(
-            save(reading(ts(now, 500_000_000), 51, 2))
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(save(reading(ts(now, 500_000_000), 51, 2))
+            .await
+            .unwrap()
+            .is_some());
         assert!(
             save(reading(ts(now, 100_000_000), 77, 1))
                 .await
@@ -3178,18 +3173,14 @@ mod tests {
         assert_eq!(n["telemetry"]["ram_used_bytes"], 2);
         // A clock a day ahead can't hold back the readings after it: that reading counts as
         // taken now (older than the stored one here), and the next real one is saved.
-        assert!(
-            save(reading(ts(now + 86_400, 0), 60, 3))
-                .await
-                .unwrap()
-                .is_none()
-        );
-        assert!(
-            save(reading(ts(now + 120, 0), 61, 4))
-                .await
-                .unwrap()
-                .is_some()
-        );
+        assert!(save(reading(ts(now + 86_400, 0), 60, 3))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(save(reading(ts(now + 120, 0), 61, 4))
+            .await
+            .unwrap()
+            .is_some());
         assert_eq!(gw.node(&node).await["telemetry"]["ram_used_bytes"], 4);
         let later = reading(ts(now + 300, 0), 62, 5);
         let other_session = store::telemetry(gw.db.db(), id, epoch + 7, &later, 90, ahead).await;

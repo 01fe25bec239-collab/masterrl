@@ -8,17 +8,17 @@
 
 pub mod keys;
 
-use crate::AgentContext;
 use crate::session::tls::{self, sha256_hex};
 use crate::session::{self as link, LinkError, PROTOCOL_VERSION};
 use crate::state::atomic_write;
 use crate::transports::TransportKind;
+use crate::AgentContext;
 use mrl_proto::agent::v1::agent_endpoint_service_server::{
     AgentEndpointService, AgentEndpointServiceServer,
 };
 use mrl_proto::agent::v1::agent_gateway_service_client::AgentGatewayServiceClient;
 use mrl_proto::agent::v1::{
-    AgentMessage, CoreMessage, EnrollRequest, EnrollResult, agent_message, core_message,
+    agent_message, core_message, AgentMessage, CoreMessage, EnrollRequest, EnrollResult,
 };
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
@@ -27,8 +27,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::mpsc;
 use tokio_rustls::rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use tokio_stream::StreamExt;
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 use tokio_util::sync::CancellationToken;
 
 /// A parsed join token.

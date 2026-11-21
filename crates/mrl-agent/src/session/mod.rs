@@ -30,12 +30,12 @@ use mrl_proto::agent::v1::agent_endpoint_service_server::{
 };
 use mrl_proto::agent::v1::agent_gateway_service_client::AgentGatewayServiceClient;
 use mrl_proto::agent::v1::{
-    AgentHello, AgentMessage, Command, CommandResult, CoreHello, CoreMessage, Heartbeat, Lane,
-    LeaseGrant, ReconcileResult, RenewCertificateRequest, WorkerRelay, agent_message, command,
-    core_message,
+    agent_message, command, core_message, AgentHello, AgentMessage, Command, CommandResult,
+    CoreHello, CoreMessage, Heartbeat, Lane, LeaseGrant, ReconcileResult, RenewCertificateRequest,
+    WorkerRelay,
 };
 use mrl_proto::common::v1::{AttemptRef, Failure, FailureClass};
-use mrl_proto::worker::v1::{LogChunk, LogStream, WorkerMessage, worker_message};
+use mrl_proto::worker::v1::{worker_message, LogChunk, LogStream, WorkerMessage};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, SystemTime};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{Notify, broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, Notify};
 use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::{Stream, StreamExt};
@@ -1952,12 +1952,10 @@ mod tests {
             s2.cancel();
         });
         let started = std::time::Instant::now();
-        assert!(
-            accept_tls(&listen, acceptor, |_| true, &stop)
-                .await
-                .unwrap()
-                .is_none()
-        );
+        assert!(accept_tls(&listen, acceptor, |_| true, &stop)
+            .await
+            .unwrap()
+            .is_none());
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
