@@ -78,9 +78,6 @@ pub(super) async fn upload(
     )
     .await?;
     super::scratch::close(dir)?;
-    if let Some(p) = &part {
-        p.fence(&store, &st).await?;
-    }
     Ok(Json(
         serde_json::json!({ "key": claims.key, "size": size, "sha256": sha }),
     ))
@@ -137,6 +134,9 @@ async fn receive(
     }
     if let Some(p) = part {
         p.check_len(size)?;
+        let data = tokio::fs::read(tmp).await.map_err(io)?;
+        p.publish(store, st, data.into(), &sha).await?;
+        return Ok((size, sha));
     }
     // Large bodies go up in parts (staged under `uploads/` on some backends): the intent
     // lets the cleanup job find this org's leftovers if the server stops halfway.
