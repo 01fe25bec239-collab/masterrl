@@ -231,6 +231,15 @@ pub async fn run_agent(
     ctx.state
         .write_atomic(PID_FILE, std::process::id().to_string().as_bytes())?;
 
+    // Commands that arrive before their service registers wait for it instead of failing.
+    let kinds: Vec<&'static str> = services
+        .iter()
+        .flat_map(|s| s.command_kinds().iter().copied())
+        .collect();
+    if !kinds.is_empty() {
+        session::Link::of(&ctx)?.expect(&kinds);
+    }
+
     let mut tasks = tokio::task::JoinSet::new();
     for service in services {
         let ctx = Arc::clone(&ctx);

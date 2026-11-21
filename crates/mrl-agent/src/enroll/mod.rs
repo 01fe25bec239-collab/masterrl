@@ -464,18 +464,71 @@ fn random_id() -> String {
     sha256_hex(&k.serialize_der())[..32].to_owned()
 }
 
-/// Refuses to replace an identity unless `force`.
-fn check_not_enrolled(ctx: &AgentContext, force: bool) -> Result<(), LinkError> {
-    if force {
-        return Ok(());
-    }
-    if let Some(i) = Identity::load(ctx.state.root())? {
+/// Refuses to replace an identity unless `force`. Replacing one needs the agent stopped (the
+/// returned state lock is held until enrollment ends) and no attempt still running for the old
+/// identity, so nothing of it reaches the new one.
+fn check_not_enrolled(
+    ctx: &AgentContext,
+    force: bool,
+) -> Result<Option<std::sync::Arc<std::fs::File>>, LinkError> {
+    let Some(i) = Identity::load(ctx.state.root())? else {
+        return Ok(None);
+    };
+    if !force {
         return Err(LinkError::Token(format!(
             "this machine already joined as {}; run enroll with --force to join again with a new token",
             i.link.node_id
         )));
     }
-    Ok(())
+    let lock = crate::envs::lock_state(ctx.state.root())?;
+    let running = old_attempts(ctx.state.root())
+        .into_iter()
+        .filter(|(_, ended)| !ended)
+        .count();
+    if running > 0 {
+        return Err(LinkError::Token(format!(
+            "{running} attempt(s) of {} still run on this machine; end them with `mrl-agent attempt stop-all`, then enroll again",
+            i.link.node_id
+        )));
+    }
+    Ok(Some(lock))
+}
+
+/// Attempt folders in the state folder, each with whether its attempt has ended (a folder
+/// without a readable record, like inputs staged for a launch that never came, counts as ended).
+fn old_attempts(state_root: &Path) -> Vec<(PathBuf, bool)> {
+    let Ok(rd) = std::fs::read_dir(state_root.join("jobs")) else {
+        return Vec::new();
+    };
+    rd.flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .map(|p| {
+            let ended = !matches!(
+                crate::attempts::record::AttemptRecord::load(&p),
+                Ok(Some(r)) if r.exit.is_none()
+            );
+            (p, ended)
+        })
+        .collect()
+}
+
+/// After joining again: removes the old identity's ended attempts and saved probe results,
+/// so they are never reported to the new one.
+fn forget_old_attempts(state_root: &Path) -> Result<(), LinkError> {
+    for (dir, ended) in old_attempts(state_root) {
+        if ended {
+            crate::janitor::purge(state_root, &dir)?;
+            std::fs::remove_dir_all(&dir).map_err(|e| crate::AgentError::state(&dir, e))?;
+        }
+    }
+    let probes = state_root.join("probes");
+    match std::fs::remove_dir_all(&probes) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            Err(crate::AgentError::state(&probes, e).into())
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Enrolls by dialing the core at `server` over `transport`.
@@ -486,7 +539,7 @@ pub async fn enroll_dial(
     transport: TransportKind,
     force: bool,
 ) -> Result<Identity, LinkError> {
-    check_not_enrolled(ctx, force)?;
+    let replacing = check_not_enrolled(ctx, force)?;
     let token = JoinToken::parse(token)?;
     let (key, csr) = pending_key(ctx, &token.token)?;
     let t = link::dial_transport(&ctx.config.gateway, transport, server);
@@ -532,6 +585,9 @@ pub async fn enroll_dial(
     let result = wait_result(&mut inbound).await?;
     drop(tx);
     let id = finish(ctx, result, &key, Some(server.to_owned()), None, transport)?;
+    if replacing.is_some() {
+        forget_old_attempts(ctx.state.root())?;
+    }
     clear_pending(ctx);
     Ok(id)
 }
@@ -607,7 +663,7 @@ pub async fn enroll_listen(
     force: bool,
     cancel: CancellationToken,
 ) -> Result<Identity, LinkError> {
-    check_not_enrolled(ctx, force)?;
+    let replacing = check_not_enrolled(ctx, force)?;
     let token = JoinToken::parse(token)?;
     let (key, csr) = pending_key(ctx, &token.token)?;
     let l = crate::transports::Listen::new(listen, transport);
@@ -642,6 +698,9 @@ pub async fn enroll_listen(
         stop.cancel();
         if let Some(r) = result {
             let id = finish(ctx, r?, &key, None, Some(bound), transport)?;
+            if replacing.is_some() {
+                forget_old_attempts(ctx.state.root())?;
+            }
             clear_pending(ctx);
             return Ok(id);
         }
@@ -728,6 +787,100 @@ mod tests {
         std::fs::write(path_to_key, saved).unwrap();
         let (retry, _) = pending_key_in(dir.path(), store, &token).unwrap();
         assert_eq!(retry.serialize_der(), key.serialize_der());
+    }
+
+    fn record(exit: bool) -> crate::attempts::record::AttemptRecord {
+        let spec = serde_json::json!({
+            "attempt": {"job_id": "job_t", "attempt_id": "att_t", "fencing_epoch": 1},
+            "engine": "fake",
+            "job_spec": {
+                "run_id": "run_t", "job_kind": "TRAIN", "algorithm": "x-fake.steps",
+                "common": {"seed": 7}, "engine": {}, "switch": {},
+                "base_model_sha256": "0".repeat(64)
+            },
+            "runtimes": [{"runtime_ref": format!("uv:sha256:{}", "0".repeat(64)), "project": "/p", "package": "mrl-runtime"}],
+            "roles": [{"role_id": "trainer", "kind": "trainer", "primary": true, "runtime_ref": format!("uv:sha256:{}", "0".repeat(64))}]
+        });
+        crate::attempts::record::AttemptRecord {
+            spec: crate::attempts::spec::AttemptSpec::from_json(&spec.to_string()).unwrap(),
+            nonce: "n".into(),
+            socket: PathBuf::from("/nowhere"),
+            phase: 0,
+            workers: Vec::new(),
+            prepared: Vec::new(),
+            started: Vec::new(),
+            last_step: 0,
+            checkpoints: Default::default(),
+            cancel_requested: false,
+            exit: exit.then_some(crate::attempts::exit::ExitDecision {
+                phase: 0,
+                exit_kind: 0,
+                exit_code: 0,
+                failure: None,
+            }),
+            staged_paths: Default::default(),
+            lease_deadline_unix_ms: None,
+            lease_hard_deadline_unix_ms: None,
+            lease_heartbeat_seq: 0,
+            stop_deadline_unix_ms: None,
+            exit_report: None,
+            requests: Vec::new(),
+            uploads: Default::default(),
+            results: Default::default(),
+            adhoc_uploads: Default::default(),
+            hw_events: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn joining_again_needs_old_attempts_ended_and_then_forgets_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = AgentContext::with_hw(
+            crate::config::AgentConfig {
+                state_dir: dir.path().to_path_buf(),
+                ..Default::default()
+            },
+            Vec::new(),
+        )
+        .unwrap();
+        // Not enrolled: nothing to check.
+        assert!(check_not_enrolled(&ctx, false).unwrap().is_none());
+        let (key, _) = new_key().unwrap();
+        Identity {
+            link: LinkFile {
+                node_id: "node_old".into(),
+                server: Some("core:9443".into()),
+                listen: None,
+                transport: TransportKind::Direct,
+                installation_id: "i".into(),
+                issued_at: 3000,
+                not_after: 6000,
+            },
+            cert: CertificateDer::from(vec![1u8, 2]),
+            ca: CertificateDer::from(vec![3u8]),
+            key: key.serialize_der(),
+            key_ref: None,
+            key_store: keys::KeyStoreChoice::File,
+        }
+        .save(dir.path())
+        .unwrap();
+        let jobs = dir.path().join("jobs");
+        let (running, ended, staged) = (jobs.join("att_r"), jobs.join("att_e"), jobs.join("att_s"));
+        for d in [&running, &ended, &staged.join("inputs")] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        record(false).save(&running).unwrap();
+        record(true).save(&ended).unwrap();
+        std::fs::create_dir_all(dir.path().join("probes")).unwrap();
+
+        assert!(check_not_enrolled(&ctx, false).is_err());
+        let e = check_not_enrolled(&ctx, true).unwrap_err().to_string();
+        assert!(e.contains("1 attempt(s) of node_old"), "{e}");
+
+        std::fs::remove_dir_all(&running).unwrap();
+        assert!(check_not_enrolled(&ctx, true).unwrap().is_some());
+        forget_old_attempts(dir.path()).unwrap();
+        assert!(!ended.exists() && !staged.exists() && !dir.path().join("probes").exists());
     }
 
     #[test]

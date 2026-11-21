@@ -253,6 +253,10 @@ impl crate::registry::AgentService for AttemptsService {
         "attempts"
     }
 
+    fn command_kinds(&self) -> &'static [&'static str] {
+        KINDS
+    }
+
     async fn run(&self, ctx: Arc<AgentContext>, shutdown: CancellationToken) -> crate::Result<()> {
         // Register every handler before re-adoption yields.
         let link = Link::of(&ctx)?;
