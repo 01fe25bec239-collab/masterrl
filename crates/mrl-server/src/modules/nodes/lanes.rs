@@ -10,7 +10,11 @@
 //! | LOGS | worker log chunks | new chunks dropped; the first chunk after the gap counts them (truncation marker) | on receipt |
 //! | TELEMETRY | node telemetry | latest wins, never queued | on receipt |
 //!
-//! Later parts consume lanes through a [`LaneSink`] registered on a [`LaneRouter`]. With no
+//! Later parts consume lanes through a [`LaneSink`] registered on a [`LaneRouter`]. CONTROL is
+//! shared by message kind: each sink names the kinds it takes ([`LaneSink::control_kinds`],
+//! names from [`control_kind`], like `attempt_status` or `worker.checkpoint_staged`); a sink
+//! naming none takes every kind no other sink names. The node's
+//! kept CONTROL messages still go out one at a time, in order, each to its own sink. With no
 //! sink, CONTROL messages are journaled to `node_events` (`control_unrouted`, warning metric)
 //! and METRICS/LOGS are acked and discarded (counter). TELEMETRY always updates
 //! `node_telemetry_latest` here, and also reaches a sink that takes it.
@@ -104,8 +108,15 @@ pub struct SinkError {
 pub trait LaneSink: Send + Sync {
     /// Short name for logs and metrics.
     fn name(&self) -> &'static str;
-    /// The lanes this sink takes (the first registered sink for a lane wins).
+    /// The lanes this sink takes. For METRICS, LOGS and TELEMETRY the first registered sink for
+    /// a lane wins; CONTROL goes by [`LaneSink::control_kinds`].
     fn lanes(&self) -> &'static [LaneKind];
+    /// For CONTROL: the message kinds this sink takes, like `"attempt_status"` or
+    /// `"worker.checkpoint_staged"` (see [`control_kind`]). The first sink naming a kind gets it.
+    /// Empty (the default): every CONTROL kind that no registered sink names.
+    fn control_kinds(&self) -> &'static [&'static str] {
+        &[]
+    }
     /// Handles one item. Must be idempotent per `(node_id, stream, seq)`. Lossy delivery
     /// holds the node session fence. Keep lossy callbacks short and finish their writes before
     /// returning. A lossy callback cannot change session ownership for its own node.
@@ -139,14 +150,77 @@ impl LaneRouter {
         }
     }
 
-    /// The sink for `lane`, if any.
+    /// The sink for `lane`, if any. For CONTROL this hands each item to the sink that takes its
+    /// kind ([`LaneRouter::control_sink`]).
     pub fn sink_for(&self, lane: LaneKind) -> Option<Arc<dyn LaneSink>> {
-        self.sinks
+        let sinks: Vec<Arc<dyn LaneSink>> = self
+            .sinks
             .read()
             .ok()?
             .iter()
-            .find(|s| s.lanes().contains(&lane))
+            .filter(|s| s.lanes().contains(&lane))
             .cloned()
+            .collect();
+        if lane != LaneKind::Control {
+            return sinks.into_iter().next();
+        }
+        if sinks.is_empty() {
+            return None;
+        }
+        Some(Arc::new(ControlFanout(sinks)))
+    }
+
+    /// The CONTROL sink that takes messages of this kind (a [`control_kind`]), if any.
+    pub fn control_sink(&self, kind: &str) -> Option<Arc<dyn LaneSink>> {
+        let sinks = self.sinks.read().ok()?;
+        pick(
+            sinks
+                .iter()
+                .filter(|s| s.lanes().contains(&LaneKind::Control)),
+            kind,
+        )
+    }
+}
+
+/// The first sink naming `kind`, else the first naming no kind.
+fn pick<'a>(
+    sinks: impl Iterator<Item = &'a Arc<dyn LaneSink>> + Clone,
+    kind: &str,
+) -> Option<Arc<dyn LaneSink>> {
+    sinks
+        .clone()
+        .find(|s| s.control_kinds().contains(&kind))
+        .or_else(|| sinks.clone().find(|s| s.control_kinds().is_empty()))
+        .cloned()
+}
+
+/// The CONTROL sinks, as one: each item goes to the sink that takes its kind.
+struct ControlFanout(Vec<Arc<dyn LaneSink>>);
+
+#[async_trait::async_trait]
+impl LaneSink for ControlFanout {
+    fn name(&self) -> &'static str {
+        "control"
+    }
+
+    fn lanes(&self) -> &'static [LaneKind] {
+        &[LaneKind::Control]
+    }
+
+    async fn deliver(&self, item: LaneItem) -> Result<(), SinkError> {
+        let kind = control_kind(&item.message);
+        match pick(self.0.iter(), kind) {
+            Some(sink) => sink.deliver(item).await,
+            // Only reachable if a build kept messages for a sink this build no longer has.
+            None => {
+                tracing::warn!(
+                    kind,
+                    "no sink takes this kept CONTROL message any more; dropped"
+                );
+                LaneMetrics::get().unrouted(kind);
+                Ok(())
+            }
+        }
     }
 }
 
@@ -422,6 +496,30 @@ impl Drop for LossyLane {
     }
 }
 
+/// The CONTROL kind of a message, which picks its sink: the body name, or
+/// `worker.<body>` for a relayed worker message (like `worker.checkpoint_staged`).
+pub fn control_kind(msg: &AgentMessage) -> &'static str {
+    let Some(Body::Worker(w)) = &msg.body else {
+        return body_name(msg);
+    };
+    match w.message.as_ref().and_then(|m| m.body.as_ref()) {
+        None => "worker",
+        Some(WorkerBody::Hello(_)) => "worker.hello",
+        Some(WorkerBody::Prepared(_)) => "worker.prepared",
+        Some(WorkerBody::Progress(_)) => "worker.progress",
+        Some(WorkerBody::Metrics(_)) => "worker.metrics",
+        Some(WorkerBody::Log(_)) => "worker.log",
+        Some(WorkerBody::Samples(_)) => "worker.samples",
+        Some(WorkerBody::CheckpointStaged(_)) => "worker.checkpoint_staged",
+        Some(WorkerBody::CheckpointCommit(_)) => "worker.checkpoint_commit",
+        Some(WorkerBody::Heartbeat(_)) => "worker.heartbeat",
+        Some(WorkerBody::Exit(_)) => "worker.exit",
+        Some(WorkerBody::PolicyVersion(_)) => "worker.policy_version",
+        Some(WorkerBody::RolloutBatch(_)) => "worker.rollout_batch",
+        Some(WorkerBody::RewardBatchStats(_)) => "worker.reward_batch_stats",
+    }
+}
+
 /// The body name of a message, for metrics and the journal.
 pub(crate) fn body_name(msg: &AgentMessage) -> &'static str {
     match &msg.body {
@@ -610,5 +708,111 @@ mod tests {
         let after = LaneMetrics::get().discarded_count(LaneKind::Logs);
         assert_eq!(after - before, 2);
         assert!(router.sink_for(LaneKind::Control).is_none());
+    }
+
+    /// A CONTROL sink taking `bodies` that records what it got.
+    struct Taker(
+        &'static str,
+        &'static [&'static str],
+        Arc<Mutex<Vec<(&'static str, u64)>>>,
+    );
+
+    #[async_trait::async_trait]
+    impl LaneSink for Taker {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+        fn lanes(&self) -> &'static [LaneKind] {
+            &[LaneKind::Control]
+        }
+        fn control_kinds(&self) -> &'static [&'static str] {
+            self.1
+        }
+        async fn deliver(&self, item: LaneItem) -> Result<(), SinkError> {
+            self.2.lock().unwrap().push((self.0, item.seq));
+            Ok(())
+        }
+    }
+
+    fn control(seq: u64, body: Body) -> LaneItem {
+        LaneItem {
+            message: AgentMessage {
+                seq,
+                body: Some(body),
+                ..Default::default()
+            },
+            ..item(seq, LaneKind::Control)
+        }
+    }
+
+    #[tokio::test]
+    async fn control_messages_go_to_the_sink_that_names_their_body() {
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let router = LaneRouter::new();
+        router.register(Arc::new(Taker("rest", &[], got.clone())));
+        router.register(Arc::new(Taker(
+            "attempts",
+            &["attempt_status"],
+            got.clone(),
+        )));
+        router.register(Arc::new(Taker("probes", &["probe_result"], got.clone())));
+        router.register(Arc::new(Taker(
+            "checkpoints",
+            &["worker.checkpoint_staged"],
+            got.clone(),
+        )));
+        let sink = router.sink_for(LaneKind::Control).unwrap();
+        sink.deliver(control(1, Body::AttemptStatus(Default::default())))
+            .await
+            .unwrap();
+        sink.deliver(control(2, Body::ProbeResult(Default::default())))
+            .await
+            .unwrap();
+        sink.deliver(control(3, Body::Guard(Default::default())))
+            .await
+            .unwrap();
+        let staged = WorkerRelay {
+            message: Some(WorkerMessage {
+                body: Some(WorkerBody::CheckpointStaged(Default::default())),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        sink.deliver(control(4, Body::Worker(staged)))
+            .await
+            .unwrap();
+        assert_eq!(
+            *got.lock().unwrap(),
+            vec![
+                ("attempts", 1),
+                ("probes", 2),
+                ("rest", 3),
+                ("checkpoints", 4)
+            ]
+        );
+        assert_eq!(
+            router.control_sink("probe_result").unwrap().name(),
+            "probes"
+        );
+        assert_eq!(router.control_sink("guard").unwrap().name(), "rest");
+    }
+
+    #[tokio::test]
+    async fn a_control_body_no_sink_names_has_no_sink() {
+        let got = Arc::new(Mutex::new(Vec::new()));
+        let router = LaneRouter::new();
+        router.register(Arc::new(Taker(
+            "attempts",
+            &["attempt_status"],
+            got.clone(),
+        )));
+        assert!(router.control_sink("guard").is_none());
+        assert!(router.control_sink("attempt_status").is_some());
+        // Kept before a build change: dropped with a warning, never stuck.
+        let sink = router.sink_for(LaneKind::Control).unwrap();
+        sink.deliver(control(1, Body::Guard(Default::default())))
+            .await
+            .unwrap();
+        assert!(got.lock().unwrap().is_empty());
     }
 }
