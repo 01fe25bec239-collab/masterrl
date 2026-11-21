@@ -70,7 +70,31 @@ pub struct Target {
     pub distro: Option<String>,
     /// Where launchd writes the agent's stdout/stderr.
     pub log_dir: PathBuf,
+    /// The systemd version (`systemctl --version`), when systemd is here.
+    pub systemd_version: Option<u32>,
 }
+
+/// systemd's version, from the first line of `systemctl --version` (`systemd 255 (255.4-1)`).
+fn systemd_version() -> Option<u32> {
+    let out = std::process::Command::new("systemctl")
+        .arg("--version")
+        .output()
+        .ok()?;
+    parse_systemd_version(&String::from_utf8_lossy(&out.stdout))
+}
+
+fn parse_systemd_version(text: &str) -> Option<u32> {
+    text.lines()
+        .next()?
+        .strip_prefix("systemd ")?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// The first systemd with `DelegateSubgroup=`.
+const DELEGATE_SUBGROUP_SINCE: u32 = 254;
 
 impl Target {
     /// This program, run by this user.
@@ -93,6 +117,7 @@ impl Target {
             uid,
             distro: std::env::var("WSL_DISTRO_NAME").ok(),
             log_dir: log_dir.to_path_buf(),
+            systemd_version: systemd_version(),
         })
     }
 
@@ -181,6 +206,21 @@ pub fn systemd_unit(t: &Target) -> String {
     .map(|w| systemd_quote(w))
     .collect::<Vec<_>>()
     .join(" ");
+    // cgroup v2 allows no process in a cgroup that hands controllers to its job cgroups, so
+    // the agent itself must start in a leaf, or a restart can't attach the new agent while
+    // jobs run (219/CGROUP). Older systemd can't start it in a leaf: no delegation there,
+    // so jobs run without cgroup limits but restarts keep them.
+    let delegate = if t
+        .systemd_version
+        .is_some_and(|v| v >= DELEGATE_SUBGROUP_SINCE)
+    {
+        "# Lets the agent create job cgroups next to its own `agent` leaf (cgroup v2).\n\
+         Delegate=yes\n\
+         DelegateSubgroup=agent\n"
+    } else {
+        "# systemd before 254 can't start the agent in a leaf of a delegated cgroup, so\n\
+         # jobs run without cgroup limits here (and a restart still keeps them).\n"
+    };
     format!(
         "[Unit]\n\
          Description=MasterRL agent\n\
@@ -190,8 +230,7 @@ pub fn systemd_unit(t: &Target) -> String {
          ExecStart={exec}\n\
          Restart=on-failure\n\
          RestartSec=5\n\
-         # Lets the agent create job cgroups under its own (cgroup v2).\n\
-         Delegate=yes\n\
+         {delegate}\
          # Stop only the agent: running workers outlive a restart and the next agent\n\
          # re-adopts them (`service uninstall` stops them itself).\n\
          KillMode=process\n\
@@ -531,7 +570,27 @@ mod tests {
             uid: 501,
             distro: Some("Ubuntu".into()),
             log_dir: "/home/me/state/logs".into(),
+            systemd_version: Some(255),
         }
+    }
+
+    #[test]
+    fn the_agent_starts_in_a_leaf_only_where_systemd_can_do_that() {
+        let mut t = target();
+        let unit = systemd_unit(&t);
+        assert!(
+            unit.contains("Delegate=yes\nDelegateSubgroup=agent\n"),
+            "{unit}"
+        );
+        t.systemd_version = Some(249);
+        let unit = systemd_unit(&t);
+        assert!(!unit.contains("Delegate"), "{unit}");
+        assert!(unit.contains("KillMode=process"));
+        assert_eq!(
+            parse_systemd_version("systemd 255 (255.4-1ubuntu8.18)\n+PAM"),
+            Some(255)
+        );
+        assert_eq!(parse_systemd_version("not systemd"), None);
     }
 
     #[test]
