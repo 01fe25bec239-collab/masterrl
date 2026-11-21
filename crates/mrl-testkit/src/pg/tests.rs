@@ -206,9 +206,10 @@ async fn idempotency_keys_replay_refuse_and_expire() {
 }
 
 /// Ends the database sessions holding the owner locks of `scope`'s keys.
+/// Waits (up to 5 s) for the backend to exit, so its session locks are gone before we go on.
 async fn cut_owner(t: &TestDb, scope: &str) {
     let n: i64 = sqlx::query_scalar(
-        "SELECT count(pg_terminate_backend(l.pid)) FROM pg_locks l
+        "SELECT count(pg_terminate_backend(l.pid, 5000)) FROM pg_locks l
          JOIN idempotency_keys k ON l.objid = k.owner::oid
          WHERE k.scope = $1 AND l.locktype = 'advisory' AND l.classid = 70110::oid
            AND l.objsubid = 2
