@@ -3,6 +3,7 @@ import json
 import secrets
 from collections.abc import Iterator, Mapping
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 import pytest
@@ -166,6 +167,33 @@ def test_pause_uses_the_checkpoint_at_the_stop_step(
         assert saved_step == stop_step
         assert report.kind == pb.EXIT_KIND_PAUSED
         assert "p1" in report.acknowledged_requests
+
+
+def test_pause_deadline_with_a_committed_periodic_save_is_not_paused(tmp_path: Path) -> None:
+    release_step = Event()
+
+    class Engine(FakeEngine):
+        def run(self, ctx: JobContext) -> Iterator[EngineEvent]:
+            yield Progress(2, total_steps=10)
+            yield CheckpointReady(2, self._write(ctx, 2, seed=0))
+            assert release_step.wait(10)
+
+    async def pause(agent: FakeAgent, _: object) -> None:
+        await agent.wait_for(lambda m: m.HasField("checkpoint_commit"), 5)
+        await agent.send(pb.AgentMessage(pause=pb.PauseRequest(request_id="p1", deadline_s=1)))
+
+    script = AgentScript(job_spec=job_spec(ALGO, {"steps": 10}), staging_dir=tmp_path)
+    try:
+        result = asyncio.run(run_in_process(Engine(), manifest(), script, control=pause))
+    finally:
+        release_step.set()
+    [(checkpoint_id, step, _)] = result.committed()
+    assert step == 2
+    report = result.exit_report
+    assert report is not None
+    assert report.last_committed_checkpoint_id == checkpoint_id
+    assert _cls(result) == "FAILURE_CLASS_INFRA_TRANSIENT/PAUSE_NOT_SAVED"
+    assert "p1" not in report.acknowledged_requests
 
 
 def test_pause_whose_commit_is_never_confirmed_is_not_paused(tmp_path: Path) -> None:
