@@ -49,7 +49,9 @@ pub async fn check(db: &Db) -> Result<Vec<String>, sqlx::Error> {
             "finished jobs that still hold resources",
             "SELECT r.id::text FROM resource_reservations r JOIN jobs j ON j.id = r.job_id
              WHERE r.state IN ('HELD','ACTIVE','RELEASING')
-               AND j.state IN ('COMPLETED','FAILED','CANCELLED','REJECTED','RETRY_WAIT','QUEUED','PAUSED')",
+               AND j.state IN ('COMPLETED','FAILED','CANCELLED','REJECTED','RETRY_WAIT','QUEUED','PAUSED')
+               AND NOT (r.state = 'RELEASING' AND EXISTS (
+                 SELECT 1 FROM job_attempts a WHERE a.id = r.attempt_id AND a.state = 'LOST'))",
         ),
         (
             "devices held by a reservation that ended",

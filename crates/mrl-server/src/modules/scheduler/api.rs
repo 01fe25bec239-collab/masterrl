@@ -1,8 +1,7 @@
 //! `GET /queue?pool=`: the jobs waiting for a pool, in the order they will be placed.
 //!
 //! Needs `compute.read` on the pool (a missing or hidden pool is 404). Each job is listed
-//! only when the caller may read it (`runs.read`); positions count every job ahead, seen or
-//! not.
+//! only when the caller may read it (`runs.read`). Totals and positions use that same scope.
 
 use super::{Core, SchedError};
 use crate::error::{ApiError, ErrorCode};
@@ -29,7 +28,7 @@ pub struct SchedulerQueueEntry {
     pub run_id: Option<String>,
     /// `prj_…`.
     pub project_id: String,
-    /// 1 = placed next.
+    /// Position among jobs the caller can read.
     pub position: u32,
     /// Higher goes first.
     pub priority: i32,
@@ -48,7 +47,7 @@ pub struct SchedulerQueueEntry {
 pub struct SchedulerQueue {
     /// `pool_…`.
     pub pool_id: String,
-    /// Jobs waiting for this pool, including ones the caller can't see.
+    /// Jobs waiting for this pool that the caller may read.
     pub total: u32,
     /// The jobs the caller may see, first in line first.
     pub jobs: Vec<SchedulerQueueEntry>,
@@ -101,6 +100,7 @@ fn field(path: &str, message: &str) -> ApiError {
 #[utoipa::path(get, path = "/queue", tag = "compute", operation_id = "get_scheduler_queue",
     params(SchedulerQueueQuery),
     responses((status = 200, description = "The pool's queue.", body = SchedulerQueue),
+              (status = 403, description = "Pool access denied.", body = crate::error::Problem),
               (status = 404, description = "No such pool.", body = crate::error::Problem),
               (status = 422, description = "Bad query.", body = crate::error::Problem)))]
 async fn get_queue(
@@ -131,39 +131,47 @@ async fn get_queue(
         ..Resource::kind("pool")
     };
     s.authorize(&ctx, "compute.read", &res).await?;
-    let rows = queued_for(&core, &info).await.map_err(unavailable)?;
-    let total = u32::try_from(rows.len()).unwrap_or(u32::MAX);
+    let mut total = 0u32;
     let mut jobs = Vec::new();
-    for (i, r) in rows.into_iter().enumerate() {
-        if jobs.len() >= limit as usize {
-            break;
-        }
-        let job = JobId::from_uuid(r.id).to_string();
-        let res = scope::resource("job", Some(job.clone()), r.org_id, r.project_id);
-        if !scope::allowed(&s, &ctx, "runs.read", &res)
+    let mut cursor = None;
+    loop {
+        let rows = queued_for(&core, &info, cursor)
             .await
-            .map_err(unavailable)?
-        {
-            continue;
+            .map_err(unavailable)?;
+        let Some(last) = rows.last() else { break };
+        cursor = Some((last.priority, last.queued_at, last.id));
+        for r in rows {
+            let job = JobId::from_uuid(r.id).to_string();
+            let res = scope::resource("job", Some(job.clone()), r.org_id, r.project_id);
+            if !scope::allowed(&s, &ctx, "runs.read", &res)
+                .await
+                .map_err(unavailable)?
+            {
+                continue;
+            }
+            total = total.saturating_add(1);
+            if jobs.len() >= limit as usize {
+                continue;
+            }
+            jobs.push(SchedulerQueueEntry {
+                job_id: job,
+                run_id: r.run_id.map(|x| RunId::from_uuid(x).to_string()),
+                project_id: ProjectId::from_uuid(r.project_id).to_string(),
+                position: total,
+                priority: r.priority,
+                queued_at: r.queued_at,
+                reason: r
+                    .reason
+                    .as_ref()
+                    .and_then(|v| v["message"].as_str())
+                    .map(str::to_owned),
+                reason_code: r
+                    .reason
+                    .as_ref()
+                    .and_then(|v| v["code"].as_str())
+                    .map(str::to_owned),
+            });
         }
-        jobs.push(SchedulerQueueEntry {
-            job_id: job,
-            run_id: r.run_id.map(|x| RunId::from_uuid(x).to_string()),
-            project_id: ProjectId::from_uuid(r.project_id).to_string(),
-            position: u32::try_from(i + 1).unwrap_or(u32::MAX),
-            priority: r.priority,
-            queued_at: r.queued_at,
-            reason: r
-                .reason
-                .as_ref()
-                .and_then(|v| v["message"].as_str())
-                .map(str::to_owned),
-            reason_code: r
-                .reason
-                .as_ref()
-                .and_then(|v| v["code"].as_str())
-                .map(str::to_owned),
-        });
     }
     Ok(Json(SchedulerQueue {
         pool_id: PoolId::from_uuid(pool).to_string(),
@@ -183,19 +191,28 @@ struct Queued {
     reason: Option<serde_json::Value>,
 }
 
-/// QUEUED jobs that may use `pool`, in placement order.
+type QueueCursor = (i32, Option<OffsetDateTime>, Uuid);
+
+/// One page of QUEUED jobs that may use `pool`, in placement order.
 async fn queued_for(
     core: &Core,
     pool: &super::pipeline::PoolInfo,
+    cursor: Option<QueueCursor>,
 ) -> Result<Vec<Queued>, SchedError> {
+    let (priority, at, id) = cursor.map_or((0, None, None), |(p, t, id)| (p, t, Some(id)));
     Ok(sqlx::query_as(
         "SELECT id, org_id, project_id, run_id, priority, queued_at, state_reason AS reason
          FROM jobs WHERE state = 'QUEUED'
            AND ($1::uuid IS NULL OR org_id = $1) AND (pool_id IS NULL OR pool_id = $2)
-         ORDER BY priority DESC, queued_at, id LIMIT 10000",
+           AND ($5::uuid IS NULL OR (-priority::bigint, COALESCE(queued_at, 'infinity'), id) >
+             (-$3::bigint, COALESCE($4::timestamptz, 'infinity'), $5))
+         ORDER BY priority DESC, queued_at, id LIMIT 500",
     )
     .bind(pool.org_id)
     .bind(pool.id)
+    .bind(priority as i64)
+    .bind(at)
+    .bind(id)
     .fetch_all(core.db.pool())
     .await?)
 }

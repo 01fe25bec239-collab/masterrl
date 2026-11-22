@@ -175,12 +175,21 @@ pub async fn hold(tx: &mut Tx, new: &NewReservation) -> Result<ReservationRow, S
 
 /// Reads and locks a reservation.
 pub async fn lock(tx: &mut Tx, id: Uuid) -> Result<Option<ReservationRow>, SchedError> {
+    lock_for(tx, id, None).await
+}
+
+pub(crate) async fn lock_for(
+    tx: &mut Tx,
+    id: Uuid,
+    org: Option<Uuid>,
+) -> Result<Option<ReservationRow>, SchedError> {
     Ok(sqlx::query_as::<_, ReservationRow>(concat!(
         "SELECT ",
         cols!(),
-        " FROM resource_reservations WHERE id = $1 FOR UPDATE"
+        " FROM resource_reservations WHERE id = $1 AND ($2::uuid IS NULL OR org_id = $2) FOR UPDATE"
     ))
     .bind(id)
+    .bind(org)
     .fetch_optional(&mut **tx)
     .await?)
 }

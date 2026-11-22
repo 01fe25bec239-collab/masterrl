@@ -162,7 +162,7 @@ pub struct SchedulerConfig {
     pub cancel_deadline_seconds: u64,
     /// Queued jobs of one project that may be placed; later ones wait.
     pub max_queued_per_project: u32,
-    /// Queued jobs looked at per tick.
+    /// Maximum jobs placed per tick. Also the queue page size.
     pub max_jobs_per_tick: u32,
 }
 
@@ -261,6 +261,77 @@ pub struct Core {
     pub(crate) wake: tokio::sync::Notify,
 }
 
+impl Core {
+    async fn audit(
+        &self,
+        tx: &mut Tx,
+        org: Uuid,
+        project: Option<Uuid>,
+        action: &str,
+        target: String,
+    ) -> Result<(), SchedError> {
+        use crate::seams::{AuditEvent, AuditOutcome, AuditSink};
+        crate::modules::audit::PgAuditSink::new(self.db.clone())
+            .record_in(
+                tx,
+                AuditEvent {
+                    at: time::OffsetDateTime::now_utc(),
+                    actor: "system:scheduler".into(),
+                    org: crate::modules::jobs::scope::org_text(org),
+                    project: project
+                        .map(|id| mrl_domain::ids::ProjectId::from_uuid(id).to_string()),
+                    action: action.to_owned(),
+                    target,
+                    outcome: AuditOutcome::Success,
+                    trace_id: Uuid::new_v4().simple().to_string(),
+                },
+            )
+            .await?;
+        Ok(())
+    }
+
+    async fn audit_job(
+        &self,
+        tx: &mut Tx,
+        job: &crate::modules::jobs::JobRow,
+        action: &str,
+    ) -> Result<(), SchedError> {
+        self.audit(
+            tx,
+            job.org_id,
+            Some(job.project_id),
+            action,
+            mrl_domain::ids::JobId::from_uuid(job.id).to_string(),
+        )
+        .await
+    }
+
+    async fn audit_reservation(
+        &self,
+        tx: &mut Tx,
+        row: &ReservationRow,
+        action: &str,
+    ) -> Result<(), SchedError> {
+        let project = if let Some(job) = row.job_id {
+            sqlx::query_scalar("SELECT project_id FROM jobs WHERE org_id = $1 AND id = $2")
+                .bind(row.org_id)
+                .bind(job)
+                .fetch_optional(&mut **tx)
+                .await?
+        } else {
+            None
+        };
+        self.audit(
+            tx,
+            row.org_id,
+            project,
+            action,
+            reservations::public_id(row.id),
+        )
+        .await
+    }
+}
+
 /// Holds and gives back resources for any owner (jobs and deployments).
 #[derive(Clone)]
 pub struct Scheduler {
@@ -270,6 +341,8 @@ pub struct Scheduler {
 /// What to hold.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ReservationRequest {
+    /// Stable id for this hold. Retry the same request with the same id.
+    pub request_id: Uuid,
     /// Job or deployment.
     pub owner: ReservationOwner,
     /// Owning org.
@@ -341,6 +414,7 @@ impl Scheduler {
         let db = &self.core.db;
         let pool = pool_info(db, req.pool_id)
             .await?
+            .filter(|pool| pool.org_id.is_none_or(|org| org == req.org_id))
             .ok_or_else(|| SchedError::Refused {
                 code: codes::NO_POOL,
                 detail: "No pool with this id exists.".into(),
@@ -362,14 +436,49 @@ impl Scheduler {
         };
         // Capacity is read before the write transaction opens (no connection held twice);
         // `place` re-checks under the machine's lock.
-        let nodes = provider.capacity(pool.id).await?;
-        let placement = match strategy.place(&req.demand, &nodes, &PlacementHints::default()) {
+        let paused = pool.flags.iter().any(|flag| flag == admission::PAUSED_FLAG);
+        let fit = if paused {
+            Fit::Busy("The pool is paused.".into())
+        } else {
+            let nodes = provider.capacity(pool.id).await?;
+            strategy.place(&req.demand, &nodes, &PlacementHints::default())
+        };
+        let mut tx = db.begin().await?;
+        // The row does not exist on the first call. Serialize replays before checking it.
+        sqlx::query(
+            "SELECT pg_advisory_xact_lock(hashtextextended('p21-reserve:' || $1::uuid::text, 0))",
+        )
+        .bind(req.request_id)
+        .execute(&mut *tx)
+        .await?;
+        let request = serde_json::to_value((
+            req.owner,
+            req.pool_id.to_string(),
+            req.epoch,
+            &req.demand,
+            req.lease,
+        ))
+        .map_err(|e| SchedError::internal(e.to_string()))?;
+        if let Some(row) = reservations::lock_for(&mut tx, req.request_id, Some(req.org_id)).await?
+        {
+            let saved: Option<serde_json::Value> = sqlx::query_scalar(
+                "SELECT reserve_request FROM resource_reservations WHERE id = $1",
+            )
+            .bind(req.request_id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if saved.as_ref() == Some(&request) {
+                return Ok(Reserved::Held(Box::new(row)));
+            }
+            return Err(SchedError::changed("reservation request"));
+        }
+        let placement = match fit {
             Fit::Placed(p) => p,
             Fit::Busy(w) => return Ok(Reserved::Busy(w)),
             Fit::Never(w) => return Ok(Reserved::Never(w)),
         };
         let new = NewReservation {
-            id: Uuid::now_v7(),
+            id: req.request_id,
             org_id: req.org_id,
             owner: req.owner,
             pool_id: pool.id,
@@ -381,32 +490,51 @@ impl Scheduler {
             epoch: req.epoch,
             lease: req.lease.unwrap_or(pool.lease_ttl),
         };
-        let mut tx = db.begin().await?;
         let held = match provider.place(&mut tx, &new).await {
             Ok(Some(r)) => r,
             Ok(None) => return Ok(Reserved::Busy("The machine was taken meanwhile.".into())),
+            Err(e) if e.is_unique_violation("resource_reservations_pkey") => {
+                return Err(SchedError::changed("reservation request"))
+            }
             Err(e) if e.is_unique_violation("one_holder_per_gpu") => {
                 return Ok(Reserved::Busy("The GPUs were taken meanwhile.".into()))
             }
             Err(e) => return Err(e),
         };
+        sqlx::query("UPDATE resource_reservations SET reserve_request = $2 WHERE id = $1")
+            .bind(held.id)
+            .bind(request)
+            .execute(&mut *tx)
+            .await?;
+        self.core
+            .audit_reservation(&mut tx, &held, "scheduler.reserve")
+            .await?;
         tx.commit().await?;
         Ok(Reserved::Held(Box::new(held)))
     }
 
     /// Extends a live hold to now + `lease`, if `epoch` is still its epoch.
-    pub async fn renew(&self, id: Uuid, epoch: i64, lease: Duration) -> Result<(), SchedError> {
+    pub async fn renew(
+        &self,
+        org: Uuid,
+        id: Uuid,
+        epoch: i64,
+        lease: Duration,
+    ) -> Result<(), SchedError> {
         let mut tx = self.core.db.begin().await?;
-        let row = fenced(&mut tx, id, epoch).await?;
+        let row = fenced(&mut tx, org, id, epoch).await?;
         if row.is_live() {
             sqlx::query(
-                "UPDATE resource_reservations SET lease_expires_at = now() + make_interval(secs => $2)
+                "UPDATE resource_reservations SET lease_expires_at = GREATEST(lease_expires_at, clock_timestamp() + make_interval(secs => $2))
                  WHERE id = $1",
             )
             .bind(id)
             .bind(lease.as_secs_f64())
             .execute(&mut *tx)
             .await?;
+            self.core
+                .audit_reservation(&mut tx, &row, "scheduler.renew")
+                .await?;
         }
         tx.commit().await?;
         Ok(())
@@ -415,22 +543,25 @@ impl Scheduler {
     /// Gives a hold back (→ RELEASED; never used → EXPIRED), if `epoch` is still its epoch.
     pub async fn release(
         &self,
+        org: Uuid,
         id: Uuid,
         epoch: i64,
         why: &str,
     ) -> Result<ReservationRow, SchedError> {
         // The pool is read before the write transaction opens (no connection held twice).
-        let pool: Option<Uuid> =
-            sqlx::query_scalar("SELECT pool_id FROM resource_reservations WHERE id = $1")
-                .bind(id)
-                .fetch_optional(self.core.db.pool())
-                .await?;
+        let pool: Option<Uuid> = sqlx::query_scalar(
+            "SELECT pool_id FROM resource_reservations WHERE id = $1 AND org_id = $2",
+        )
+        .bind(id)
+        .bind(org)
+        .fetch_optional(self.core.db.pool())
+        .await?;
         let pool = match pool {
             Some(p) => pool_info(&self.core.db, p).await?,
             None => None,
         };
         let mut tx = self.core.db.begin().await?;
-        let row = fenced(&mut tx, id, epoch).await?;
+        let row = fenced(&mut tx, org, id, epoch).await?;
         let out = match pool
             .as_ref()
             .and_then(|p| self.core.pipeline.providers.get(p.provider_kind.as_str()))
@@ -438,14 +569,24 @@ impl Scheduler {
             Some(p) => p.release(&mut tx, &row, why).await?,
             None => reservations::release(&mut tx, &row, why).await?,
         };
+        if out.state_version != row.state_version {
+            self.core
+                .audit_reservation(&mut tx, &out, "scheduler.release")
+                .await?;
+        }
         tx.commit().await?;
         Ok(out)
     }
 }
 
 /// Locks reservation `id` and checks the caller's epoch.
-async fn fenced(tx: &mut Tx, id: Uuid, epoch: i64) -> Result<ReservationRow, SchedError> {
-    let row = reservations::lock(tx, id)
+async fn fenced(
+    tx: &mut Tx,
+    org: Uuid,
+    id: Uuid,
+    epoch: i64,
+) -> Result<ReservationRow, SchedError> {
+    let row = reservations::lock_for(tx, id, Some(org))
         .await?
         .ok_or_else(|| SchedError::Refused {
             code: codes::STALE_RESERVATION,

@@ -1184,7 +1184,7 @@ class SchedulerQueue(TypedDict):
     """`pool_…`."""
 
     total: int
-    """Jobs waiting for this pool, including ones the caller can't see."""
+    """Jobs waiting for this pool that the caller may read."""
 
 
 class SchedulerQueueEntry(TypedDict):
@@ -1194,7 +1194,7 @@ class SchedulerQueueEntry(TypedDict):
     """`job_…`."""
 
     position: int
-    """1 = placed next."""
+    """Position among jobs the caller can read."""
 
     priority: int
     """Higher goes first."""

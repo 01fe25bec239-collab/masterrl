@@ -576,6 +576,27 @@ async fn every_route_answers_by_role_in_team_mode() {
     let seeded = seeded.json();
     let field = |k: &str| seeded[k].as_str().unwrap().to_owned();
     let (run, job, exp) = (field("id"), field("job_id"), field("experiment_id"));
+    // P21 routes: a foreign private pool looks missing to this org's owner.
+    let foreign_pool = mrl_server::modules::nodes::store::create_pool(
+        core.db.db(),
+        Some(OrgId::new().as_uuid()),
+        "foreign-queue",
+        "agent",
+        90,
+        &[],
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let foreign_queue = core
+        .call(
+            Method::GET,
+            &format!("/api/v1/queue?pool={}", foreign_pool.id),
+            &Auth::Bearer(seed_jwt.clone()),
+            None,
+        )
+        .await;
+    assert_eq!(foreign_queue.status, 404, "{}", foreign_queue.text());
     // Compute (P18): a pool made over the API and one machine in it (no agent connected).
     let pool = core
         .call(
@@ -784,12 +805,6 @@ async fn every_route_answers_by_role_in_team_mode() {
         ),
         (
             Method::GET,
-            format!("/api/v1/queue?pool={pool}"),
-            Action::ComputeRead,
-            None,
-        ),
-        (
-            Method::GET,
             format!("/api/v1/nodes/{node}"),
             Action::ComputeRead,
             None,
@@ -901,6 +916,13 @@ async fn every_route_answers_by_role_in_team_mode() {
             None,
         ),
     ]);
+    // P21 routes
+    routes.push((
+        Method::GET,
+        format!("/api/v1/queue?pool={pool}"),
+        Action::ComputeRead,
+        None,
+    ));
     // A run submission needs an Idempotency-Key (keys are per person).
     let key_for = |method: &Method, path: &str| -> &'static [(&'static str, &'static str)] {
         if *method == Method::POST && path.ends_with("/runs") {

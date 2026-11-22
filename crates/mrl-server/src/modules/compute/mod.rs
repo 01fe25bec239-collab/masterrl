@@ -209,10 +209,14 @@ impl ComputeProvider for LocalAgentPool {
         // The machine's row lock serializes every hold on it (scheduler and direct callers).
         let node = sqlx::query(
             "SELECT n.inventory, n.pool_id,
-                    n.status = 'ONLINE' AND (n.quarantined_until IS NULL OR n.quarantined_until < now()) AS ok
-             FROM compute_nodes n WHERE n.id = $1 FOR UPDATE",
+                    n.status = 'ONLINE' AND (n.quarantined_until IS NULL OR n.quarantined_until < now())
+                       AND (p.org_id IS NULL OR p.org_id = $2) AND NOT ($3 = ANY(p.flags)) AS ok
+             FROM compute_nodes n JOIN compute_pools p ON p.id = n.pool_id
+             WHERE n.id = $1 FOR UPDATE OF n",
         )
         .bind(new.node_id)
+        .bind(new.org_id)
+        .bind(crate::modules::scheduler::admission::PAUSED_FLAG)
         .fetch_optional(&mut **tx)
         .await?;
         let Some(node) = node else {

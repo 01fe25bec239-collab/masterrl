@@ -56,14 +56,31 @@ impl LaunchContributor for FakeEngine {
     }
     async fn contribute(
         &self,
-        _job: &JobRow,
+        job: &JobRow,
         _attempt: &mrl_server::modules::jobs::AttemptRow,
         _placement: &Placement,
         plan: &mut LaunchPlan,
     ) -> Result<(), LaunchError> {
+        if job.resource_request["stage_fixture"] == true {
+            plan.stage.push(mrl_proto::agent::v1::StageItem {
+                name: "fixture".into(),
+                ..Default::default()
+            });
+        }
         plan.launch.engine_name = "fake".into();
+        let runtime = if let Some(runtime) = job.resource_request["runtime_fixture"].as_str() {
+            plan.launch.job_spec_json = json!({
+                "run_id": "run_t", "job_kind": "TRAIN", "algorithm": "x-fake.steps",
+                "common": {"seed": 7}, "engine": {"steps": 300, "step_seconds": 0.2},
+                "switch": {}, "base_model_sha256": "0".repeat(64)
+            })
+            .to_string();
+            runtime
+        } else {
+            RUNTIME
+        };
         for r in &mut plan.launch.roles {
-            r.runtime_ref = RUNTIME.into();
+            r.runtime_ref = runtime.into();
         }
         Ok(())
     }
@@ -99,6 +116,7 @@ fn sched_config() -> SchedulerConfig {
         lease_grace_seconds: 1,
         outage_threshold_seconds: 5,
         launch_deadline_seconds: 60,
+        max_jobs_per_tick: 1,
         ..SchedulerConfig::default()
     }
 }
@@ -118,6 +136,29 @@ fn pipeline(db: &Db, pause: bool) -> Pipeline {
         vec![Arc::new(CanPause(pause))],
         vec![Arc::new(LocalAgentPool::new(db.clone()))],
     )
+}
+
+const HIDDEN_PROJECT: Uuid = Uuid::from_u128(910);
+
+struct QueueViewer;
+
+#[async_trait::async_trait]
+impl mrl_server::seams::Authorizer for QueueViewer {
+    async fn authorize(
+        &self,
+        _: &mrl_server::seams::RequestContext,
+        _: &str,
+        resource: &mrl_server::seams::Resource,
+    ) -> Result<mrl_server::seams::Decision, mrl_server::seams::SeamError> {
+        use mrl_domain::ids::ProjectId;
+        use mrl_server::seams::Decision;
+        let hidden = ProjectId::from_uuid(HIDDEN_PROJECT).to_string();
+        Ok(if resource.project.as_deref() == Some(hidden.as_str()) {
+            Decision::Hide
+        } else {
+            Decision::Allow
+        })
+    }
 }
 
 /// A server with the gateway and the scheduler on one test database.
@@ -154,7 +195,10 @@ async fn boot(
         pipeline(db.db(), pause),
     );
     let sched = module.scheduler();
-    let seams = crate::seams::build(crate::seams::solo(TEST_SECRET), Mode::Solo);
+    let seams = crate::seams::build(
+        crate::seams::solo(TEST_SECRET).authorizer(QueueViewer),
+        Mode::Solo,
+    );
     let modules: Vec<Box<dyn mrl_server::app::ServerModule>> =
         vec![Box::new(nodes), Box::new(module)];
     match TestServer::start(cfg, seams, modules).await {
@@ -828,6 +872,16 @@ async fn repeated_and_stale_reports_make_no_second_transition() {
         !w.commands(attempt, "CancelAttempt").await.is_empty()
     })
     .await;
+    w.until("the reconcile report was applied", || async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM scheduler_node_reconciles WHERE node_id = $1)",
+        )
+        .bind(m.node)
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap()
+    })
+    .await;
     let events = w.events(attempt).await;
     assert_eq!(
         events.iter().filter(|e| *e == "attempt.errored").count(),
@@ -1150,6 +1204,7 @@ async fn a_deployment_reserves_and_releases_through_the_scheduler() {
     )
     .unwrap();
     let req = ReservationRequest {
+        request_id: Uuid::now_v7(),
         owner: ReservationOwner::Deployment(mrl_domain::ids::DeploymentId::new()),
         org_id: w.org,
         pool_id: w.pool,
@@ -1165,11 +1220,21 @@ async fn a_deployment_reserves_and_releases_through_the_scheduler() {
         (held.state.as_str(), held.node_id, held.cpu_millis),
         ("HELD", m.node, 500)
     );
-    // Both GPUs are held: a job now waits, and a second deployment is busy.
-    assert!(matches!(
+    assert_eq!(
         w.sched.reserve(&req).await.unwrap(),
+        Reserved::Held(held.clone())
+    );
+    let other = ReservationRequest {
+        request_id: Uuid::now_v7(),
+        ..req.clone()
+    };
+    assert!(matches!(
+        w.sched.reserve(&other).await.unwrap(),
         Reserved::Busy(_)
     ));
+    let mut changed = req.clone();
+    changed.demand.roles[0].gpu_count = 1;
+    assert!(w.sched.reserve(&changed).await.is_err());
     let job = w.queue(1).await;
     w.until("the job waits", || async {
         w.job(job).await.state_reason.is_some()
@@ -1177,14 +1242,28 @@ async fn a_deployment_reserves_and_releases_through_the_scheduler() {
     .await;
     assert_eq!(w.job(job).await.state, "QUEUED");
     w.invariants().await;
+    assert!(w
+        .sched
+        .release(Uuid::now_v7(), held.id, 7, "wrong org")
+        .await
+        .is_err());
+    assert!(w
+        .sched
+        .renew(Uuid::now_v7(), held.id, 7, Duration::from_secs(60))
+        .await
+        .is_err());
     // An older epoch can't touch it.
-    let stale = w.sched.release(held.id, 6, "test").await.unwrap_err();
+    let stale = w
+        .sched
+        .release(w.org, held.id, 6, "test")
+        .await
+        .unwrap_err();
     assert!(stale.to_string().contains("MRL-CONFLICT-210"), "{stale}");
     w.sched
-        .renew(held.id, 7, Duration::from_secs(60))
+        .renew(w.org, held.id, 7, Duration::from_secs(60))
         .await
         .unwrap();
-    let gone = w.sched.release(held.id, 7, "done").await.unwrap();
+    let gone = w.sched.release(w.org, held.id, 7, "done").await.unwrap();
     assert_eq!(gone.state, "EXPIRED", "a hold never activated expires");
     let active: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM reservation_devices WHERE reservation_id = $1 AND active",
@@ -1196,4 +1275,361 @@ async fn a_deployment_reserves_and_releases_through_the_scheduler() {
     assert_eq!(active, 0);
     w.running(job).await;
     w.invariants().await;
+}
+
+// An impossible first page cannot hide a later fitting job. The agent's actual
+// wire decoder must keep the helper's GPU list empty.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn queue_backfills_a_mixed_cpu_gpu_job() {
+    let w = World::start(false).await;
+    let m = w.agent(1).await;
+    let first = w.queue(2).await;
+    let mixed = w.queue_with(
+        json!({"roles": [
+            {"role": "trainer", "replicas": 1, "gpu_count": 1, "cpu_millis": 100, "mem_bytes": 1024},
+            {"role": "service", "replicas": 1, "gpu_count": 0, "cpu_millis": 100, "mem_bytes": 1024}
+        ]}),
+        None,
+    ).await;
+    w.running(mixed).await;
+    assert_eq!(w.job(first).await.state, "QUEUED");
+    let launches = m.script.launches();
+    let dir = tempfile::tempdir().unwrap();
+    let spec =
+        mrl_agent::attempts::spec::AttemptSpec::from_launch(&launches[0], &[], dir.path()).unwrap();
+    assert_eq!(
+        spec.roles
+            .iter()
+            .find(|r| r.kind == "trainer")
+            .unwrap()
+            .gpus,
+        [0]
+    );
+    assert!(spec
+        .roles
+        .iter()
+        .find(|r| r.kind == "service")
+        .unwrap()
+        .gpus
+        .is_empty());
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE actor = 'system:scheduler'
+           AND target = $1 AND action IN ('scheduler.place','scheduler.attempt_status')",
+    )
+    .bind(JobId::from_uuid(mixed).to_string())
+    .fetch_one(w.db.pool())
+    .await
+    .unwrap();
+    assert!(audits >= 2);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn queue_does_not_count_hidden_jobs() {
+    let mut w = World::start(false).await;
+    let visible_project = w.project;
+    w.project = HIDDEN_PROJECT;
+    let hidden = w.queue(9).await;
+    w.project = visible_project;
+    let visible = w.queue(9).await;
+    assert_ne!(hidden, visible);
+    let q = w
+        .get(&format!(
+            "/api/v1/queue?pool={}&limit=1",
+            PoolId::from_uuid(w.pool)
+        ))
+        .await;
+    assert_eq!(q.status, 200, "{}", q.text());
+    let q = q.json();
+    assert_eq!(q["total"], 1);
+    assert_eq!(
+        q["jobs"][0]["job_id"],
+        JobId::from_uuid(visible).to_string()
+    );
+    assert_eq!(q["jobs"][0]["position"], 1);
+}
+
+struct DelayedCommand {
+    entered: tokio::sync::Notify,
+    resume: tokio::sync::Notify,
+    handler: Handler,
+}
+
+#[async_trait::async_trait]
+impl CommandHandler for DelayedCommand {
+    async fn handle(&self, command: Command) -> Result<(), Failure> {
+        self.entered.notify_one();
+        self.resume.notified().await;
+        self.handler.handle(command).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn delayed_launch_keeps_its_gpu_after_a_cancel_refusal() {
+    let w = World::start(false).await;
+    let m = w.agent(1).await;
+    let launch = Arc::new(DelayedCommand {
+        entered: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+        handler: Handler(m.script.clone()),
+    });
+    m.script.link.register("LaunchAttempt", launch.clone());
+    let job = w.queue(1).await;
+    tokio::time::timeout(WAIT, launch.entered.notified())
+        .await
+        .unwrap();
+    let attempt = w.job(job).await.current_attempt_id.unwrap();
+    w.until("the launch has reached the agent", || async {
+        w.commands(attempt, "LaunchAttempt").await[0].0 == "RECEIVED"
+    })
+    .await;
+    let mut tx = w.db.db().begin().await.unwrap();
+    let row = JobTransitions::lock(&mut tx, w.org, job)
+        .await
+        .unwrap()
+        .unwrap();
+    JobTransitions::request_cancel(&mut tx, &row, "tester")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    w.until("the first cancel was refused", || async {
+        w.commands(attempt, "CancelAttempt")
+            .await
+            .iter()
+            .any(|c| c.0 == "FAILED")
+    })
+    .await;
+    let next = w.queue(1).await;
+    w.until("the second job waits for the held GPU", || async {
+        w.job(next).await.state_reason.is_some()
+    })
+    .await;
+    assert_eq!(w.job(job).await.state, "CANCELLING");
+    assert_eq!(w.job(next).await.state, "QUEUED");
+    assert_eq!(w.reservations(job).await[0].0, "RELEASING");
+    m.script
+        .link
+        .register("LaunchAttempt", Arc::new(Handler(m.script.clone())));
+    launch.resume.notify_one();
+    w.wait_state(job, "CANCELLED").await;
+    w.running(next).await;
+    w.invariants().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn launch_waits_for_the_staging_result() {
+    let w = World::start(false).await;
+    let m = w.agent(1).await;
+    let stage = Arc::new(DelayedCommand {
+        entered: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+        handler: Handler(m.script.clone()),
+    });
+    m.script.link.register("StageArtifacts", stage.clone());
+    let job = w.queue_with(json!({
+        "stage_fixture": true,
+        "roles": [{"role": "trainer", "replicas": 1, "gpu_count": 1, "cpu_millis": 100, "mem_bytes": 1024}]
+    }), None).await;
+    tokio::time::timeout(WAIT, stage.entered.notified())
+        .await
+        .unwrap();
+    let attempt = w.job(job).await.current_attempt_id.unwrap();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(w.commands(attempt, "LaunchAttempt").await.is_empty());
+    stage.resume.notify_one();
+    w.running(job).await;
+    assert_eq!(w.commands(attempt, "LaunchAttempt").await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn reconcile_frees_a_lost_cancelling_attempt() {
+    let w = World::start(false).await;
+    let mut m = w.agent(1).await;
+    let job = w.queue(1).await;
+    let attempt = w.running(job).await;
+    m.disconnect().await;
+    let mut tx = w.db.db().begin().await.unwrap();
+    let row = JobTransitions::lock(&mut tx, w.org, job)
+        .await
+        .unwrap()
+        .unwrap();
+    JobTransitions::request_cancel(&mut tx, &row, "tester")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    w.until("the reservation begins releasing", || async {
+        w.reservations(job).await[0].0 == "RELEASING"
+    })
+    .await;
+    w.wait_attempt(attempt, "LOST").await;
+    m.script.running.lock().unwrap().clear();
+    m.script.publish();
+    m.script.report();
+    m.reconnect();
+    w.until("the reconciled reservation was released", || async {
+        w.reservations(job).await[0].0 == "RELEASED"
+    })
+    .await;
+    w.wait_state(job, "CANCELLED").await;
+    w.invariants().await;
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL and uv (just test-integration)"]
+async fn real_worker_survives_readoption_and_a_kill_retries() {
+    use mrl_agent::attempts::record::{AttemptRecord, ProcIdentity};
+    use mrl_agent::attempts::service::AttemptsService;
+    use mrl_agent::registry::AgentService;
+    use tokio_util::sync::CancellationToken;
+
+    if mrl_agent::envs::which("uv").is_none() {
+        assert!(
+            std::env::var_os("MRL_TEST_ATTEMPTS_REQUIRED").is_none(),
+            "uv is required"
+        );
+        return;
+    }
+    let w = World::start(false).await;
+    let m = w.agent(0).await;
+    let ctx = &m.agent.ctx;
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
+    let hash = mrl_storage::sha256_hex(&std::fs::read(repo.join("uv.lock")).unwrap());
+    let runtimes = ctx.state.root().join("runtimes");
+    std::fs::create_dir_all(&runtimes).unwrap();
+    std::os::unix::fs::symlink(&repo, runtimes.join(format!("uv-sha256-{hash}"))).unwrap();
+
+    let start_service = || {
+        let stop = CancellationToken::new();
+        let task = tokio::spawn({
+            let ctx = ctx.clone();
+            let stop = stop.clone();
+            async move { AttemptsService::new().run(ctx, stop).await }
+        });
+        (stop, task)
+    };
+    let reconcile_seq = || async {
+        sqlx::query_scalar::<_, i64>("SELECT seq FROM scheduler_node_reconciles WHERE node_id = $1")
+            .bind(m.node)
+            .fetch_optional(w.db.pool())
+            .await
+            .unwrap()
+            .unwrap_or(0)
+    };
+    let (stop, service) = start_service();
+    w.until("the real attempt runtime is ready", || async {
+        reconcile_seq().await > 0
+    })
+    .await;
+    let job = w.queue_with(json!({
+        "runtime_fixture": format!("uv:sha256:{hash}"),
+        "roles": [{"role": "trainer", "replicas": 1, "gpu_count": 0, "cpu_millis": 100, "mem_bytes": 1024}]
+    }), None).await;
+    let first = w.running(job).await;
+    let dir = ctx.state.job_dir(&AttemptId::from_uuid(first).to_string());
+    let worker = || {
+        AttemptRecord::load(&dir).unwrap().unwrap().workers[0]
+            .identity
+            .clone()
+    };
+    let identity = worker();
+    stop.cancel();
+    service.await.unwrap().unwrap();
+
+    let before = reconcile_seq().await;
+    let (stop, service) = start_service();
+    w.until("the restarted attempt runtime reconciled", || async {
+        reconcile_seq().await > before
+    })
+    .await;
+    assert_eq!(worker(), identity);
+    assert_eq!(w.job(job).await.current_attempt_id, Some(first));
+    assert_eq!(w.attempt_state(first).await, "RUNNING");
+    let ProcIdentity::Pid { pid, .. } = identity else {
+        panic!("expected a process worker")
+    };
+    assert!(std::process::Command::new("kill")
+        .args(["-KILL", &pid.to_string()])
+        .status()
+        .unwrap()
+        .success());
+    w.until("a fresh attempt runs after the worker kill", || async {
+        let row = w.job(job).await;
+        row.state == "RUNNING" && row.current_attempt_id != Some(first)
+    })
+    .await;
+    let row = w.job(job).await;
+    assert_eq!(row.epoch, 2);
+    assert_eq!(row.retries_used["HARNESS_ERROR"], 1);
+    assert_eq!(w.attempt_state(first).await, "EXITED_ERROR");
+
+    let mut tx = w.db.db().begin().await.unwrap();
+    let row = JobTransitions::lock(&mut tx, w.org, job)
+        .await
+        .unwrap()
+        .unwrap();
+    JobTransitions::request_cancel(&mut tx, &row, "tester")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    w.wait_state(job, "CANCELLED").await;
+    stop.cancel();
+    service.await.unwrap().unwrap();
+    w.invariants().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn the_reaper_keeps_a_hold_renewed_while_it_waits_for_the_lock() {
+    let w = World::start(false).await;
+    let _m = w.agent(1).await;
+    let req = ReservationRequest {
+        request_id: Uuid::now_v7(),
+        owner: ReservationOwner::Deployment(mrl_domain::ids::DeploymentId::new()),
+        org_id: w.org,
+        pool_id: w.pool,
+        demand: Demand::from_request(&json!({"roles": [{
+            "role": "service", "replicas": 1, "gpu_count": 1, "cpu_millis": 100, "mem_bytes": 1024
+        }]}))
+        .unwrap(),
+        epoch: 1,
+        lease: Some(Duration::from_secs(600)),
+    };
+    assert!(matches!(
+        w.sched.reserve(&req).await.unwrap(),
+        Reserved::Held(_)
+    ));
+    sqlx::query("UPDATE resource_reservations SET lease_expires_at = clock_timestamp() + interval '2 seconds' WHERE id = $1")
+        .bind(req.request_id).execute(w.db.pool()).await.unwrap();
+    let mut tx = w.db.db().begin().await.unwrap();
+    sqlx::query("SELECT id FROM resource_reservations WHERE id = $1 FOR UPDATE")
+        .bind(req.request_id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let reaper_waiting = || async {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'
+               AND query LIKE '%resource_reservations WHERE id = $1%' AND query LIKE '%FOR UPDATE%')",
+        )
+        .fetch_one(w.db.pool()).await.unwrap()
+    };
+    w.until("the reaper sees the expired hold and waits", reaper_waiting)
+        .await;
+    sqlx::query("UPDATE resource_reservations SET lease_expires_at = clock_timestamp() + interval '5 minutes' WHERE id = $1")
+        .bind(req.request_id).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    w.until("the reaper releases the row lock", || async {
+        !reaper_waiting().await
+    })
+    .await;
+    assert!(matches!(w.sched.reserve(&req).await.unwrap(), Reserved::Held(r) if r.state == "HELD"));
 }

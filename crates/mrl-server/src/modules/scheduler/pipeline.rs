@@ -21,7 +21,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 /// What one role of a job needs on its machine.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
 pub struct RoleDemand {
     /// Role name, like `trainer`.
     pub role: String,
@@ -40,11 +40,19 @@ pub struct RoleDemand {
     /// Allowed GPU models, matched without case as a substring (empty = any).
     pub models: Vec<String>,
     /// Allowed machines (empty = any).
+    #[serde(serialize_with = "serialize_node_ids")]
     pub node_ids: Vec<Uuid>,
     /// CPU, thousandths of a core.
     pub cpu_millis: u64,
     /// Memory, bytes.
     pub mem_bytes: u64,
+}
+
+fn serialize_node_ids<S: serde::Serializer>(
+    ids: &[Uuid],
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(ids.iter().map(Uuid::to_string))
 }
 
 impl RoleDemand {
@@ -62,7 +70,7 @@ impl RoleDemand {
 }
 
 /// Everything a job (or deployment) asks for.
-#[derive(Debug, Clone, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default, serde::Serialize)]
 pub struct Demand {
     /// One entry per role.
     pub roles: Vec<RoleDemand>,
