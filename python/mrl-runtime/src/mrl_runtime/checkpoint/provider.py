@@ -134,6 +134,7 @@ class CheckpointProvider:
         # The newest COMMITTED checkpoint this attempt knows: the resumed one until a new one
         # commits, so an attempt resumed at its step budget still reports its result.
         self.last_committed_id = self._parent
+        self.last_committed_step: int | None = None  # checkpoints committed in this attempt
         self.final_result: CommitResult | None = None
 
     def restore_path(self) -> Path | None:
@@ -263,8 +264,11 @@ class CheckpointProvider:
             self._pending.pop(staged.checkpoint_id, None)
             self._slots.release()
         self.results.append(result)
-        if result.committed:
+        if result.committed and (
+            self.last_committed_step is None or staged.step >= self.last_committed_step
+        ):
             self.last_committed_id = staged.checkpoint_id
+            self.last_committed_step = staged.step
         if staged.is_final:
             self.final_result = result
         return result

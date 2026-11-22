@@ -196,7 +196,6 @@ class Harness:
         self._acknowledged: list[str] = []
         # Checkpoint id -> the requests it answers; acknowledged only once it committed.
         self._requests_by_checkpoint: dict[str, list[str]] = {}
-        self._pause_checkpoint = ""  # the first checkpoint staged after a pause request
         self._hard_deadline: float | None = None
         self._lease_deadline: float | None = None
         self._harness_failure: common.Failure | None = None
@@ -294,7 +293,8 @@ class Harness:
                 final_commit=provider.final_result if provider else None,
                 cancelled=bool(self._cancel_request),
                 paused=bool(self._pause_request),
-                pause_saved=not self.manifest.pause or self._pause_checkpoint in self._committed(),
+                pause_saved=not self.manifest.pause
+                or (provider is not None and provider.last_committed_step == self._last_step),
             )
         )
         if kind == pb.EXIT_KIND_CANCELLED:
@@ -579,13 +579,12 @@ class Harness:
                 if not primary:
                     self._harness_line("[warning] a non-primary role yielded a checkpoint; ignored")
                     return
+                self._step(event.step)
                 requests, self._checkpoint_requests = self._checkpoint_requests, []
                 staged = await self.provider.stage(event, {**self._metrics, **event.metrics})
                 self.provider.submit(staged)
                 self._final_staged = self._final_staged or event.is_final
                 self._requests_by_checkpoint[staged.checkpoint_id] = requests
-                if self._pause_request and not self._pause_checkpoint:
-                    self._pause_checkpoint = staged.checkpoint_id
             case Log():
                 self._harness_line(f"[{event.level}] {event.message}")
             case EngineWarning():

@@ -123,6 +123,36 @@ def test_stage_commit_and_max_pending(tmp_path: Path) -> None:
     asyncio.run(_stage_and_commit(tmp_path))
 
 
+def test_older_ack_does_not_replace_newer_committed_checkpoint(tmp_path: Path) -> None:
+    async def run() -> None:
+        sent: asyncio.Queue[object] = asyncio.Queue()
+        provider = CheckpointProvider(sent.put_nowait, _settings(tmp_path, max_pending=2))
+        checkpoints = [
+            await provider.stage(CheckpointReady(step, _engine_dir(tmp_path, step)), {})
+            for step in (2, 3)
+        ]
+        for checkpoint in checkpoints:
+            provider.submit(checkpoint)
+            assert isinstance(await asyncio.wait_for(sent.get(), 5), pb.CheckpointStaged)
+            provider.on_grant(pb.UploadGrant(checkpoint_id=checkpoint.checkpoint_id))
+
+        for _ in checkpoints:
+            assert isinstance(await asyncio.wait_for(sent.get(), 5), pb.CheckpointCommitRequest)
+        for checkpoint in reversed(checkpoints):
+            provider.on_ack(
+                pb.CheckpointCommitAck(
+                    checkpoint_id=checkpoint.checkpoint_id, state=pb.COMMIT_STATE_COMMITTED
+                )
+            )
+            await asyncio.sleep(0)
+
+        assert await provider.wait_all(5)
+        assert provider.last_committed_step == 3
+        assert provider.last_committed_id == checkpoints[-1].checkpoint_id
+
+    asyncio.run(run())
+
+
 async def _escape(tmp_path: Path) -> None:
     provider = CheckpointProvider(lambda _m: None, _settings(tmp_path))
     staged = await provider.stage(CheckpointReady(1, _engine_dir(tmp_path, 1)), {})
