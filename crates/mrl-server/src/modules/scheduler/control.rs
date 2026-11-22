@@ -9,7 +9,7 @@
 //!
 //! An attempt ends in one of these, each in one transaction that also settles its job and
 //! reservation: it exited ([`on_status`]), its lease ran out or the machine lost it
-//! ([`lose`]), or its launch never took ([`end_unstarted`]).
+//! ([`lose`]), or it never reported starting ([`end_unstarted`]).
 
 use super::reservations;
 use super::{Core, SchedError};
@@ -25,6 +25,7 @@ use mrl_proto::agent::v1::command::Kind;
 use mrl_proto::agent::v1::{AttemptPhase, AttemptStatus, CancelAttempt, ReconcileReport};
 use mrl_proto::common::v1::AttemptRef;
 use mrl_proto::worker::v1::ExitKind;
+use prost::Message;
 use serde_json::json;
 use std::collections::HashSet;
 use std::str::FromStr;
@@ -184,6 +185,17 @@ pub(crate) async fn on_status(
     let Some(attempt) = JobTransitions::lock_attempt(&mut tx, org, id).await? else {
         return Ok(());
     };
+    let state = attempt.attempt_state()?;
+    let stale = i64::try_from(r.fencing_epoch).ok() != Some(attempt.epoch);
+    if (stale || is_ended(state)) && live {
+        // Leave the inbox entry replayable until the cancel is saved. This branch does
+        // not apply any attempt state, so it needs no status watermark.
+        tx.rollback().await?;
+        return cancel(core, node, r.clone(), "FENCED", Duration::ZERO).await;
+    }
+    if stale {
+        return Ok(());
+    }
     let fresh: Option<i32> = sqlx::query_scalar(
         "INSERT INTO scheduler_attempt_reports (attempt_id, node_id, seq) VALUES ($1, $2, $3)
          ON CONFLICT (attempt_id) DO UPDATE SET seq = EXCLUDED.seq
@@ -196,27 +208,27 @@ pub(crate) async fn on_status(
     .fetch_optional(&mut *tx)
     .await?;
     if fresh.is_none() {
-        // Already applied (a replay, or older than a status applied before).
         return Ok(());
     }
     let mut after = Vec::new();
-    let state = attempt.attempt_state()?;
-    let stale = i64::try_from(r.fencing_epoch).ok() != Some(attempt.epoch);
-    if stale || is_ended(state) {
-        if live {
-            after.push(After::Cancel {
-                node,
-                attempt: r.clone(),
-                reason: "FENCED",
-            });
-        } else if !stale {
-            // The machine confirms the old processes are gone.
-            release_for_attempt(&mut tx, id, "the machine confirmed the attempt ended").await?;
-        }
+    if is_ended(state) {
+        release_for_attempt(core, &mut tx, id, "the machine confirmed the attempt ended").await?;
         tx.commit().await?;
-        return run(core, after).await;
+        return Ok(());
     }
-    apply_live_status(&mut tx, attempt, s, &mut after).await?;
+    let previous_version = attempt.state_version;
+    let job_id = attempt.job_id;
+    apply_live_status(core, &mut tx, attempt, s, &mut after).await?;
+    let current_version: i64 =
+        sqlx::query_scalar("SELECT state_version FROM job_attempts WHERE id = $1")
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+    if current_version != previous_version {
+        let job = lock_job(&mut tx, org, job_id).await?;
+        core.audit_job(&mut tx, &job, "scheduler.attempt_status")
+            .await?;
+    }
     tx.commit().await?;
     run(core, after).await
 }
@@ -264,7 +276,7 @@ async fn acknowledge(tx: &mut Tx, a: AttemptRow) -> Result<AttemptRow, SchedErro
 
 /// Agent text as stored: PostgreSQL refuses NUL in text and jsonb, and a refused write
 /// would be retried forever, blocking the machine's CONTROL lane. At most 4 KiB is kept.
-fn clean(text: &str) -> String {
+pub(crate) fn clean(text: &str) -> String {
     let t: String = text.chars().filter(|c| *c != '\0').collect();
     match t.char_indices().nth(4096) {
         Some((i, _)) => t[..i].to_owned(),
@@ -302,6 +314,7 @@ fn failure_of(s: &AttemptStatus, fallback: FailureClass) -> (FailureCode, String
 }
 
 async fn apply_live_status(
+    core: &Core,
     tx: &mut Tx,
     attempt: AttemptRow,
     s: &AttemptStatus,
@@ -415,7 +428,7 @@ async fn apply_live_status(
                     fate(tx, org, job_id, failure, &message).await?;
                 }
             }
-            release_for_attempt(tx, a.id, "the attempt ended").await?;
+            release_for_attempt(core, tx, a.id, "the attempt ended").await?;
         }
         AttemptPhase::SelfFenced => {
             let a = acknowledge(tx, attempt).await?;
@@ -476,7 +489,8 @@ pub(crate) async fn fate(
 }
 
 /// Gives back every live reservation `attempt` uses.
-pub(crate) async fn release_for_attempt(
+async fn release_for_attempt(
+    core: &Core,
     tx: &mut Tx,
     attempt: Uuid,
     why: &str,
@@ -490,7 +504,11 @@ pub(crate) async fn release_for_attempt(
     .await?;
     for id in ids {
         if let Some(r) = reservations::lock(tx, id).await? {
-            reservations::release(tx, &r, why).await?;
+            let ended = reservations::release(tx, &r, why).await?;
+            if ended.state_version != r.state_version {
+                core.audit_reservation(tx, &ended, "scheduler.attempt_released")
+                    .await?;
+            }
         }
     }
     Ok(())
@@ -505,7 +523,23 @@ pub(crate) async fn lose(
     why: &str,
     gone: bool,
 ) -> Result<(), SchedError> {
-    let failure = FailureCode::class_only(FailureClass::NodeLost);
+    lose_with_failure(
+        tx,
+        attempt,
+        FailureCode::class_only(FailureClass::NodeLost),
+        why,
+        gone,
+    )
+    .await
+}
+
+async fn lose_with_failure(
+    tx: &mut Tx,
+    attempt: &AttemptRow,
+    failure: FailureCode,
+    why: &str,
+    gone: bool,
+) -> Result<(), SchedError> {
     let change = AttemptChange {
         failure: Some(failure),
         ..AttemptChange::default()
@@ -530,8 +564,7 @@ pub(crate) async fn lose(
     fate(tx, attempt.org_id, attempt.job_id, failure, why).await
 }
 
-/// Ends an attempt whose launch never took (still PENDING): KILLED, its GPUs released, the
-/// job retries or fails with `class`. An attempt that started meanwhile is left alone.
+/// Ends a still-PENDING attempt. A possibly delivered launch is fenced and keeps its hold.
 pub(crate) async fn end_unstarted(
     core: &Core,
     attempt: &AttemptRow,
@@ -545,14 +578,49 @@ pub(crate) async fn end_unstarted(
     if a.attempt_state()? != JobAttemptState::Pending {
         return Ok(());
     }
+    // The gateway locks each command when it claims it. Withdraw unsent commands
+    // and keep the hold if any launch may already have left the core.
+    sqlx::query(
+        "UPDATE agent_commands SET state = 'SUPERSEDED', updated_at = now()
+         WHERE attempt_id = $1 AND epoch = $2 AND state = 'PENDING'
+           AND kind IN ('LaunchAttempt','StageArtifacts','UpdateCredentials')",
+    )
+    .bind(a.id)
+    .bind(a.epoch)
+    .execute(&mut *tx)
+    .await?;
+    let may_have_started: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM agent_commands
+         WHERE attempt_id = $1 AND epoch = $2 AND kind = 'LaunchAttempt'
+           AND sent_at IS NOT NULL AND (
+             state <> 'FAILED' OR COALESCE(result->'failure'->>'sub_code', '') NOT IN
+               ('node_draining', 'unsupported_command', 'MRL-VAL-200', 'MRL-VAL-205', 'MRL-NODE-206', 'MRL-NODE-207')
+           ))",
+    )
+    .bind(a.id)
+    .bind(a.epoch)
+    .fetch_one(&mut *tx)
+    .await?;
+    if may_have_started {
+        let a = acknowledge(&mut tx, a).await?;
+        lose_with_failure(&mut tx, &a, FailureCode::class_only(class), &why, false).await?;
+        let job = lock_job(&mut tx, a.org_id, a.job_id).await?;
+        core.audit_job(&mut tx, &job, "scheduler.launch_lost")
+            .await?;
+        tx.commit().await?;
+        return Ok(());
+    }
     let failure = FailureCode::class_only(class);
     let change = AttemptChange {
         failure: Some(failure),
         ..AttemptChange::default()
     };
     JobTransitions::apply_attempt(&mut tx, &a, JobAttemptEvent::Kill, change).await?;
-    release_for_attempt(&mut tx, a.id, &why).await?;
+    release_for_attempt(core, &mut tx, a.id, &why).await?;
     fate(&mut tx, a.org_id, a.job_id, failure, &why).await?;
+    let job = lock_job(&mut tx, a.org_id, a.job_id).await?;
+    core.audit_job(&mut tx, &job, "scheduler.launch_ended")
+        .await?;
     tx.commit().await?;
     Ok(())
 }
@@ -612,15 +680,24 @@ pub(crate) async fn on_reconcile(
                     true,
                 )
                 .await?;
+                let job = lock_job(&mut tx, org, a.job_id).await?;
+                core.audit_job(&mut tx, &job, "scheduler.reconcile_lost")
+                    .await?;
             }
         }
         tx.commit().await?;
     }
-    // Quarantined GPUs whose attempt the machine no longer runs are free again.
+    // For a possibly delivered launch with no status, an empty startup report can predate
+    // the launch. Keep its hold until a terminal report or decommission proves it stopped.
     let quarantined: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
-        "SELECT id, attempt_id FROM resource_reservations WHERE node_id = $1 AND state = 'QUARANTINED'",
+        "SELECT r.id, r.attempt_id FROM resource_reservations r
+         LEFT JOIN job_attempts a ON a.id = r.attempt_id
+         LEFT JOIN scheduler_attempt_reports s ON s.attempt_id = r.attempt_id
+         WHERE r.node_id = $1 AND s.seq <= $2
+           AND (r.state = 'QUARANTINED' OR (r.state = 'RELEASING' AND a.state = 'LOST'))",
     )
     .bind(node)
+    .bind(seq)
     .fetch_all(core.db.pool())
     .await?;
     for (id, attempt) in quarantined {
@@ -629,7 +706,13 @@ pub(crate) async fn on_reconcile(
         }
         let mut tx = core.db.begin().await?;
         if let Some(r) = reservations::lock(&mut tx, id).await? {
-            reservations::release(&mut tx, &r, "the machine no longer runs the attempt").await?;
+            let ended =
+                reservations::release(&mut tx, &r, "the machine no longer runs the attempt")
+                    .await?;
+            if ended.state_version != r.state_version {
+                core.audit_reservation(&mut tx, &ended, "scheduler.reconcile_released")
+                    .await?;
+            }
         }
         tx.commit().await?;
     }
@@ -645,7 +728,7 @@ pub(crate) async fn on_reconcile(
     Ok(())
 }
 
-/// A cancel for `attempt` on `node`, once per (machine, attempt, epoch).
+/// Sends a cancel for a specific intent. Failed and expired commands can be redelivered.
 pub(crate) async fn cancel(
     core: &Core,
     node: Uuid,
@@ -657,21 +740,33 @@ pub(crate) async fn cancel(
         return Ok(());
     };
     let epoch = i64::try_from(attempt.fencing_epoch).unwrap_or(i64::MAX);
-    let sent: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM agent_commands WHERE node_id = $1 AND kind = 'CancelAttempt'
-           AND attempt_id = $2 AND epoch = $3 AND state NOT IN ('EXPIRED','SUPERSEDED'))",
+    let prior: Option<(String, Vec<u8>, f64)> = sqlx::query_as(
+        "SELECT state, payload, extract(epoch from now() - updated_at)::float8
+         FROM agent_commands WHERE node_id = $1 AND kind = 'CancelAttempt'
+           AND attempt_id = $2 AND epoch = $3 ORDER BY seq DESC LIMIT 1",
     )
     .bind(node)
     .bind(id.as_uuid())
     .bind(epoch)
-    .fetch_one(core.db.pool())
+    .fetch_optional(core.db.pool())
     .await?;
-    if sent {
+    let epoch = attempt.fencing_epoch;
+    let request_id = format!("{}-{}-{epoch}", reason.to_lowercase(), attempt.attempt_id);
+    if prior.is_some_and(|(state, payload, age)| {
+        let same_request = matches!(
+            mrl_proto::agent::v1::Command::decode(payload.as_slice()).map(|c| c.kind),
+            Ok(Some(Kind::CancelAttempt(cmd))) if cmd.request_id == request_id
+        );
+        same_request
+            && (matches!(
+                state.as_str(),
+                "PENDING" | "SENT" | "RECEIVED" | "COMPLETED"
+            ) || (state == "FAILED" && age < 5.0))
+    }) {
         return Ok(());
     }
-    let epoch = attempt.fencing_epoch;
     let k = Kind::CancelAttempt(CancelAttempt {
-        request_id: format!("{}-{}-{epoch}", reason.to_lowercase(), attempt.attempt_id),
+        request_id,
         attempt: Some(attempt),
         grace_s: u32::try_from(grace.as_secs()).unwrap_or(u32::MAX),
         reason: reason.to_owned(),
@@ -724,6 +819,8 @@ pub(crate) async fn finalize(core: &Core, org: Uuid, job: Uuid) -> Result<(), Sc
         return Ok(());
     };
     JobTransitions::verify_completion(&mut tx, &locked, verdict).await?;
+    core.audit_job(&mut tx, &locked, "scheduler.finalize")
+        .await?;
     tx.commit().await?;
     Ok(())
 }

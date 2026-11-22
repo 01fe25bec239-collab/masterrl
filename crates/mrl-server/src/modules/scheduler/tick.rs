@@ -13,8 +13,8 @@
 //! 6. FINALIZING jobs verified.
 //! 7. The queue: admission, placement, hold + launch in one transaction.
 //!
-//! Every write re-reads its rows under lock and compare-and-sets, so a zombie leader can only
-//! lose races; `one_holder_per_gpu` stops a double allocation even then (D-04-08).
+//! Placement rechecks the job and capacity under lock. The `one_holder_per_gpu` index
+//! protects allocations even if leadership changes mid-tick (D-04-08).
 
 use super::control::{self, cancel, end_unstarted, lock_job, lose, refuse_pause};
 use super::launch::{self, attempt_ref, latest_command};
@@ -28,9 +28,7 @@ use crate::modules::nodes::commands::NewCommand;
 use mrl_domain::failure::FailureClass;
 use mrl_domain::ids::{AttemptId, JobId, NodeId};
 use mrl_domain::resources::ReservationOwner;
-use mrl_domain::state::{
-    JobAttemptEvent, JobAttemptState, JobEvent, JobState, Owner, ReservationEvent,
-};
+use mrl_domain::state::{JobAttemptState, JobEvent, JobState, Owner, ReservationEvent};
 use mrl_proto::agent::v1::command::Kind;
 use mrl_proto::agent::v1::PauseAttempt;
 use serde_json::json;
@@ -100,7 +98,10 @@ fn log(pass: &str, r: Result<(), SchedError>) {
 
 /// One tick (public for tests: drive the scheduler step by step).
 pub async fn once(core: &Core, leader_for: Duration) {
-    log("gap", gap(core).await);
+    if let Err(e) = gap(core).await {
+        log("gap", Err(e));
+        return;
+    }
     log("retries", retries(core).await);
     log("leases", leases(core).await);
     log("launches", launches(core, leader_for).await);
@@ -132,7 +133,31 @@ async fn gap(core: &Core) -> Result<(), SchedError> {
         )
         .execute(&mut *tx)
         .await?;
-        if gap.is_some() {
+        if let Some(elapsed) = gap {
+            sqlx::query(
+                "UPDATE agent_commands c SET deadline_at = deadline_at + make_interval(secs => $1),
+                   state = CASE WHEN state = 'EXPIRED' THEN 'PENDING' ELSE state END
+                 WHERE kind IN ('LaunchAttempt','StageArtifacts','UpdateCredentials','CancelAttempt','PauseAttempt')
+                   AND EXISTS (SELECT 1 FROM attempt_placements p
+                     JOIN job_attempts a ON a.id = p.attempt_id JOIN jobs j ON j.id = a.job_id
+                     WHERE p.attempt_id = c.attempt_id AND p.node_id = c.node_id AND a.epoch = c.epoch
+                       AND (c.kind = 'CancelAttempt' OR
+                         (j.current_attempt_id = a.id AND j.epoch = a.epoch AND (
+                           (c.kind = 'PauseAttempt' AND j.state = 'PAUSING') OR
+                           (c.kind IN ('LaunchAttempt','StageArtifacts','UpdateCredentials')
+                               AND j.state = 'PREPARING' AND a.state = 'PENDING')
+                         )))
+                   )
+                   AND deadline_at BETWEEN now() - make_interval(secs => $1) AND now()
+                   AND (state IN ('PENDING','SENT') OR (
+                     state = 'EXPIRED' AND sent_at IS NULL
+                       AND NOT EXISTS (SELECT 1 FROM agent_commands newer
+                         WHERE newer.node_id = c.node_id AND newer.seq > c.seq AND newer.sent_at IS NOT NULL)
+                   ))",
+            )
+            .bind(elapsed)
+            .execute(&mut *tx)
+            .await?;
             tracing::warn!(
                 gap_seconds = gap,
                 extended = n,
@@ -172,6 +197,8 @@ async fn retries(core: &Core) -> Result<(), SchedError> {
                             JobChange::default(),
                         )
                         .await?;
+                        core.audit_job(&mut tx, &row, "scheduler.retry_ready")
+                            .await?;
                     }
                 }
                 tx.commit().await?;
@@ -219,16 +246,35 @@ async fn leases(core: &Core) -> Result<(), SchedError> {
         log("lease", async {
             let mut tx = core.db.begin().await?;
             if let Some(a) = JobTransitions::lock_attempt(&mut tx, org, id).await? {
-                let still: bool = sqlx::query_scalar(
-                    "SELECT lease_expires_at < now() - make_interval(secs => $2) FROM job_attempts WHERE id = $1",
+                if !matches!(a.attempt_state()?, JobAttemptState::Launching | JobAttemptState::Running) {
+                    return Ok(());
+                }
+                // A heartbeat can have renewed the command since the bulk mirror.
+                let grants: Vec<time::OffsetDateTime> = sqlx::query_scalar(
+                    "SELECT c.updated_at + p.attempt_lease_ttl FROM agent_commands c
+                     JOIN compute_nodes n ON n.id = c.node_id
+                     JOIN compute_pools p ON p.id = n.pool_id
+                     WHERE c.kind = 'LaunchAttempt' AND c.attempt_id = $1 AND c.epoch = $2
+                       AND c.state IN ('SENT','RECEIVED','COMPLETED')
+                     ORDER BY c.id FOR UPDATE OF c",
                 )
                 .bind(id)
+                .bind(a.epoch)
+                .fetch_all(&mut *tx)
+                .await?;
+                let until = grants.into_iter().chain(a.lease_expires_at).max();
+                let still: Option<bool> = sqlx::query_scalar(
+                    "SELECT $1::timestamptz < clock_timestamp() - make_interval(secs => $2)",
+                )
+                .bind(until)
                 .bind(grace)
                 .fetch_one(&mut *tx)
                 .await?;
-                if still && matches!(a.attempt_state()?, JobAttemptState::Launching | JobAttemptState::Running) {
+                if still == Some(true) {
                     tracing::warn!(attempt = %AttemptId::from_uuid(id), "attempt lease ran out; it counts as lost");
                     lose(&mut tx, &a, "Contact with the machine was lost and the attempt's lease ran out.", false).await?;
+                    let job = lock_job(&mut tx, org, a.job_id).await?;
+                    core.audit_job(&mut tx, &job, "scheduler.lease_lost").await?;
                 }
             }
             tx.commit().await?;
@@ -247,14 +293,21 @@ async fn leases(core: &Core) -> Result<(), SchedError> {
             async {
                 let mut tx = core.db.begin().await?;
                 if let Some(r) = reservations::lock(&mut tx, id).await? {
-                    if r.state == "HELD" {
-                        reservations::settle(
+                    let expired: bool =
+                        sqlx::query_scalar("SELECT $1::timestamptz < clock_timestamp()")
+                            .bind(r.lease_expires_at)
+                            .fetch_one(&mut *tx)
+                            .await?;
+                    if r.state == "HELD" && expired {
+                        let ended = reservations::settle(
                             &mut tx,
                             &r,
                             ReservationEvent::Expire,
                             "the hold was not used in time",
                         )
                         .await?;
+                        core.audit_reservation(&mut tx, &ended, "scheduler.hold_expired")
+                            .await?;
                     }
                 }
                 tx.commit().await?;
@@ -269,7 +322,7 @@ async fn leases(core: &Core) -> Result<(), SchedError> {
 async fn launches(core: &Core, leader_for: Duration) -> Result<(), SchedError> {
     let pending: Vec<(Uuid, Uuid)> = sqlx::query_as(
         "SELECT j.org_id, j.id FROM jobs j JOIN job_attempts a ON a.id = j.current_attempt_id
-         WHERE j.state = 'PREPARING' AND a.state = 'PENDING' LIMIT 500",
+         WHERE j.state = 'PREPARING' AND a.state = 'PENDING'",
     )
     .fetch_all(core.db.pool())
     .await?;
@@ -303,14 +356,14 @@ async fn node_of(core: &Core, attempt: Uuid) -> Result<Option<Uuid>, SchedError>
 }
 
 async fn controls(core: &Core) -> Result<(), SchedError> {
-    let busy: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
-        "SELECT j.org_id, j.id, j.state FROM jobs j
+    let busy: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT j.org_id, j.id FROM jobs j
          WHERE j.state IN ('CANCELLING','PAUSING') AND EXISTS (SELECT 1 FROM job_attempts a
-           WHERE a.job_id = j.id AND a.state IN ('PENDING','LAUNCHING','RUNNING')) LIMIT 500",
+           WHERE a.job_id = j.id AND a.state IN ('PENDING','LAUNCHING','RUNNING'))",
     )
     .fetch_all(core.db.pool())
     .await?;
-    for (org, id, state) in busy {
+    for (org, id) in busy {
         log(
             "control",
             async {
@@ -328,10 +381,10 @@ async fn controls(core: &Core) -> Result<(), SchedError> {
                 let Some(node) = node_of(core, attempt.id).await? else {
                     return Ok(());
                 };
-                if state == "CANCELLING" {
-                    deliver_cancel(core, &attempt, node).await
-                } else {
-                    deliver_pause(core, &job, &attempt, node).await
+                match job.job_state()? {
+                    JobState::Cancelling => deliver_cancel(core, &attempt, node).await,
+                    JobState::Pausing => deliver_pause(core, &job, &attempt, node).await,
+                    _ => Ok(()),
                 }
             }
             .await,
@@ -340,7 +393,8 @@ async fn controls(core: &Core) -> Result<(), SchedError> {
     // Quarantined attempts: the machine is told to stop them (sent when it reconnects).
     let quarantined: Vec<(Uuid, Uuid, Uuid)> = sqlx::query_as(
         "SELECT r.node_id, a.id, a.org_id FROM resource_reservations r
-         JOIN job_attempts a ON a.id = r.attempt_id WHERE r.state = 'QUARANTINED' LIMIT 500",
+         JOIN job_attempts a ON a.id = r.attempt_id WHERE r.state = 'QUARANTINED'
+            OR (r.state = 'RELEASING' AND a.state = 'LOST')",
     )
     .fetch_all(core.db.pool())
     .await?;
@@ -379,7 +433,12 @@ async fn controls(core: &Core) -> Result<(), SchedError> {
             async {
                 let mut tx = core.db.begin().await?;
                 if let Some(r) = reservations::lock(&mut tx, id).await? {
-                    reservations::release(&mut tx, &r, "the machine was removed").await?;
+                    let ended =
+                        reservations::release(&mut tx, &r, "the machine was removed").await?;
+                    if ended.state_version != r.state_version {
+                        core.audit_reservation(&mut tx, &ended, "scheduler.node_removed")
+                            .await?;
+                    }
                 }
                 tx.commit().await?;
                 Ok(())
@@ -397,51 +456,33 @@ async fn deliver_cancel(
 ) -> Result<(), SchedError> {
     if attempt.attempt_state()? == JobAttemptState::Pending {
         let launch = latest_command(&core.db, "LaunchAttempt", attempt).await?;
-        let took = launch.as_ref().is_some_and(|(s, ok, _, _)| {
-            ["PENDING", "SENT", "RECEIVED"].contains(&s.as_str()) || (s == "COMPLETED" && *ok)
-        });
-        if !took {
-            let why = "Cancelled before it started.".to_owned();
+        if launch.as_ref().is_none_or(|row| {
+            !row.sent || (!row.accepted() && (!row.in_flight() || row.past_deadline))
+        }) {
+            let why = "Cancelled before the machine confirmed it started.".to_owned();
             return end_unstarted(core, attempt, FailureClass::CancelledByUser, why).await;
         }
     }
-    match latest_command(&core.db, "CancelAttempt", attempt).await? {
-        None => {
-            let grace = Duration::from_secs(u64::from(core.cfg.cancel_grace_seconds));
-            cancel(core, node, attempt_ref(attempt), "USER", grace).await?;
-            let mut tx = core.db.begin().await?;
-            let ids: Vec<Uuid> = sqlx::query_scalar(
-                "SELECT id FROM resource_reservations WHERE attempt_id = $1 AND state = 'ACTIVE'",
-            )
-            .bind(attempt.id)
-            .fetch_all(&mut *tx)
-            .await?;
-            for id in ids {
-                if let Some(r) = reservations::lock(&mut tx, id).await? {
-                    reservations::start_release(&mut tx, &r, "cancel sent").await?;
-                }
+    let grace = Duration::from_secs(u64::from(core.cfg.cancel_grace_seconds));
+    cancel(core, node, attempt_ref(attempt), "USER", grace).await?;
+    let mut tx = core.db.begin().await?;
+    let ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM resource_reservations WHERE attempt_id = $1 AND state = 'ACTIVE'",
+    )
+    .bind(attempt.id)
+    .fetch_all(&mut *tx)
+    .await?;
+    for id in ids {
+        if let Some(r) = reservations::lock(&mut tx, id).await? {
+            let releasing = reservations::start_release(&mut tx, &r, "cancel sent").await?;
+            if releasing.state_version != r.state_version {
+                core.audit_reservation(&mut tx, &releasing, "scheduler.cancel_sent")
+                    .await?;
             }
-            tx.commit().await
         }
-        // The machine refused the cancel: it does not run this attempt.
-        Some((state, accepted, failure, _)) if state == "FAILED" || (state == "COMPLETED" && !accepted) => {
-            let mut tx = core.db.begin().await?;
-            if let Some(a) = JobTransitions::lock_attempt(&mut tx, attempt.org_id, attempt.id).await? {
-                if matches!(a.attempt_state()?, JobAttemptState::Pending | JobAttemptState::Launching | JobAttemptState::Running) {
-                    tracing::info!(attempt = %AttemptId::from_uuid(a.id), failure, "the machine does not run the cancelled attempt");
-                    let change = crate::modules::jobs::AttemptChange {
-                        failure: Some(mrl_domain::failure::FailureCode::class_only(FailureClass::CancelledByUser)),
-                        ..Default::default()
-                    };
-                    JobTransitions::apply_attempt(&mut tx, &a, JobAttemptEvent::Kill, change).await?;
-                    control::release_for_attempt(&mut tx, a.id, "cancelled").await?;
-                }
-            }
-            tx.commit().await
-        }
-        Some(_) => Ok(()),
     }
-    .map_err(SchedError::from)
+    tx.commit().await?;
+    Ok(())
 }
 
 async fn deliver_pause(
@@ -453,8 +494,10 @@ async fn deliver_pause(
     let refuse = |why: String| async move {
         let mut tx = core.db.begin().await?;
         let row = lock_job(&mut tx, job.org_id, job.id).await?;
-        if row.job_state()? == JobState::Pausing {
+        if row.job_state()? == JobState::Pausing && row.state_version == job.state_version {
             refuse_pause(&mut tx, &row, &why).await?;
+            core.audit_job(&mut tx, &row, "scheduler.pause_refused")
+                .await?;
         }
         tx.commit().await?;
         Ok::<(), SchedError>(())
@@ -466,12 +509,20 @@ async fn deliver_pause(
         )
         .await;
     }
-    match latest_command(&core.db, "PauseAttempt", attempt).await? {
+    let epoch = u64::try_from(attempt.epoch).unwrap_or(0);
+    let request_id = format!(
+        "pause-{}-{epoch}-{}",
+        AttemptId::from_uuid(attempt.id),
+        job.state_version
+    );
+    match latest_command(&core.db, "PauseAttempt", attempt)
+        .await?
+        .filter(|row| row.is_pause_request(&request_id))
+    {
         None => {
-            let epoch = u64::try_from(attempt.epoch).unwrap_or(0);
             let k = Kind::PauseAttempt(PauseAttempt {
                 attempt: Some(attempt_ref(attempt)),
-                request_id: format!("pause-{}-{epoch}", AttemptId::from_uuid(attempt.id)),
+                request_id,
                 deadline_s: core.cfg.pause_deadline_seconds,
                 reason: mrl_proto::worker::v1::PauseReason::User as i32,
             });
@@ -481,18 +532,14 @@ async fn deliver_pause(
             core.sender.send(NodeId::from_uuid(node), cmd).await?;
             Ok(())
         }
-        Some((state, accepted, failure, _))
-            if state == "FAILED" || state == "EXPIRED" || (state == "COMPLETED" && !accepted) =>
-        {
-            refuse(format!("The machine could not pause the run: {failure}")).await
-        }
+        Some(row) if !row.in_flight() && !row.accepted() => refuse(row.failure_message()).await,
         Some(_) => Ok(()),
     }
 }
 
 async fn finalize_all(core: &Core) -> Result<(), SchedError> {
     let jobs: Vec<(Uuid, Uuid)> =
-        sqlx::query_as("SELECT org_id, id FROM jobs WHERE state = 'FINALIZING' LIMIT 200")
+        sqlx::query_as("SELECT org_id, id FROM jobs WHERE state = 'FINALIZING'")
             .fetch_all(core.db.pool())
             .await?;
     for (org, id) in jobs {
@@ -509,7 +556,8 @@ async fn set_reason(
     message: &str,
 ) -> Result<(), SchedError> {
     let reason = json!({ "code": code, "message": message });
-    sqlx::query(
+    let mut tx = core.db.begin().await?;
+    let changed = sqlx::query(
         "UPDATE jobs SET state_reason = $3, version = version + 1, updated_at = now()
          WHERE id = $1 AND org_id = $2 AND state = 'QUEUED' AND state_version = $4
            AND state_reason IS DISTINCT FROM $3",
@@ -518,8 +566,13 @@ async fn set_reason(
     .bind(job.org_id)
     .bind(&reason)
     .bind(job.state_version)
-    .execute(core.db.pool())
+    .execute(&mut *tx)
     .await?;
+    if changed.rows_affected() != 0 {
+        core.audit_job(&mut tx, job, "scheduler.queue_reason")
+            .await?;
+    }
+    tx.commit().await?;
     Ok(())
 }
 
@@ -558,27 +611,47 @@ async fn queue(core: &Core, leader_for: Duration) -> Result<(), SchedError> {
                 .contains_key(p.provider_kind.as_str())
         })
         .collect();
-    let jobs: Vec<JobRow> = sqlx::query_as(concat!(
-        "SELECT ",
-        crate::modules::jobs::transitions::job_cols!(),
-        " FROM jobs WHERE state = 'QUEUED' ORDER BY priority DESC, queued_at, id LIMIT $1"
-    ))
-    .bind(i64::from(core.cfg.max_jobs_per_tick))
-    .fetch_all(core.db.pool())
-    .await?;
     let mut capacity: HashMap<Uuid, Vec<NodeCapacity>> = HashMap::new();
     let mut ahead: HashMap<Uuid, u32> = HashMap::new();
-    for job in jobs {
-        let n = ahead.entry(job.project_id).or_insert(0);
-        let queued = QueuedJob {
-            ahead_in_project: *n,
-            job,
-        };
-        *n += 1;
-        log(
-            "place",
-            place_one(core, &usable, &mut capacity, &queued, leader_for).await,
-        );
+    let limit = core.cfg.max_jobs_per_tick;
+    let mut placed = 0;
+    let (mut priority, mut queued_at, mut id) = (0i64, None, None);
+    while placed < limit {
+        let jobs: Vec<JobRow> = sqlx::query_as(concat!(
+            "SELECT ",
+            crate::modules::jobs::transitions::job_cols!(),
+            " FROM jobs WHERE state = 'QUEUED'
+               AND ($3::uuid IS NULL OR (-priority::bigint, COALESCE(queued_at, 'infinity'), id) >
+                 (-$1::bigint, COALESCE($2::timestamptz, 'infinity'), $3))
+             ORDER BY priority DESC, queued_at, id LIMIT $4"
+        ))
+        .bind(priority)
+        .bind(queued_at)
+        .bind(id)
+        .bind(i64::from(limit))
+        .fetch_all(core.db.pool())
+        .await?;
+        if jobs.is_empty() {
+            break;
+        }
+        for job in jobs {
+            (priority, queued_at, id) = (i64::from(job.priority), job.queued_at, Some(job.id));
+            let n = ahead.entry(job.project_id).or_insert(0);
+            let queued = QueuedJob {
+                ahead_in_project: *n,
+                job,
+            };
+            match place_one(core, &usable, &mut capacity, &queued, leader_for).await {
+                Ok(true) => {
+                    placed += 1;
+                    if placed == limit {
+                        break;
+                    }
+                }
+                Ok(false) => *n = n.saturating_add(1),
+                Err(e) => log("place", Err(e)),
+            }
+        }
     }
     Ok(())
 }
@@ -589,11 +662,12 @@ async fn place_one(
     capacity: &mut HashMap<Uuid, Vec<NodeCapacity>>,
     q: &QueuedJob,
     leader_for: Duration,
-) -> Result<(), SchedError> {
+) -> Result<bool, SchedError> {
     let job = &q.job;
     let Some(demand) = Demand::from_request(&job.resource_request) else {
         let msg = "The job's resource request can't be read, so it can't be placed. Submit it again with valid resources.";
-        return set_reason(core, job, &codes::NEVER_FITS.to_string(), msg).await;
+        set_reason(core, job, &codes::NEVER_FITS.to_string(), msg).await?;
+        return Ok(false);
     };
     let hints = PlacementHints {
         avoid_nodes: avoid(core, job.id).await?,
@@ -638,7 +712,11 @@ async fn place_one(
                         take(nodes, &p);
                     }
                     tracing::info!(job = %JobId::from_uuid(j.id), node = %NodeId::from_uuid(p.node_id), "job placed");
-                    return launch::ensure_launched(core, &j, &a, leader_for).await;
+                    log(
+                        "launch",
+                        launch::ensure_launched(core, &j, &a, leader_for).await,
+                    );
+                    return Ok(true);
                 }
                 None => {
                     // Taken meanwhile: read the pool again next time.
@@ -659,7 +737,8 @@ async fn place_one(
         codes::NO_POOL.to_string(),
         "No pool is set up to run jobs yet. Create a pool and add a machine to it.".into(),
     ));
-    set_reason(core, job, &code, &msg).await
+    set_reason(core, job, &code, &msg).await?;
+    Ok(false)
 }
 
 /// One transaction: QUEUED → ALLOCATING (pool set), the hold, ALLOCATING → PREPARING with a
@@ -739,6 +818,7 @@ async fn hold_and_launch(
         .execute(&mut *tx)
         .await?;
     }
+    core.audit_job(&mut tx, &job, "scheduler.place").await?;
     tx.commit().await?;
     Ok(Some((job, attempt)))
 }

@@ -1064,6 +1064,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/SchedulerQueue'
+        '403':
+          description: Pool access denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
         '404':
           description: No such pool.
           content:
@@ -4255,7 +4261,7 @@ components:
         total:
           type: integer
           format: int32
-          description: Jobs waiting for this pool, including ones the caller can't see.
+          description: Jobs waiting for this pool that the caller may read.
           minimum: 0
     SchedulerQueueEntry:
       type: object
@@ -4272,7 +4278,7 @@ components:
         position:
           type: integer
           format: int32
-          description: 1 = placed next.
+          description: Position among jobs the caller can read.
           minimum: 0
         priority:
           type: integer

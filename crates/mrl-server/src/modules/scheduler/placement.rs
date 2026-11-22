@@ -94,6 +94,29 @@ fn assign(demand: &Demand, node: &NodeCapacity, now: bool) -> Result<Placement, 
             if now { "free" } else { "in all" }
         ));
     }
+    let chosen = match preferred_gpus(demand, node, now) {
+        Ok(chosen) => chosen,
+        Err(why) => match_gpus(demand, node, now).ok_or(why)?,
+    };
+    Ok(Placement {
+        node_id: node.node_id,
+        roles: demand
+            .roles
+            .iter()
+            .zip(chosen)
+            .map(|(r, g)| (r.role.clone(), g))
+            .collect(),
+        cpu_millis: demand.cpu_millis(),
+        mem_bytes: demand.mem_bytes(),
+    })
+}
+
+// Keep NVLink preferences when they yield a complete assignment.
+fn preferred_gpus(
+    demand: &Demand,
+    node: &NodeCapacity,
+    now: bool,
+) -> Result<Vec<Vec<GpuSlot>>, String> {
     let mut order: Vec<usize> = (0..demand.roles.len()).collect();
     order.sort_by_key(|&i| std::cmp::Reverse(demand.roles[i].gpu_count));
     let mut taken: Vec<Uuid> = Vec::new();
@@ -121,17 +144,59 @@ fn assign(demand: &Demand, node: &NodeCapacity, now: bool) -> Result<Placement, 
         taken.extend(set.iter().map(|g| g.id));
         chosen[i] = set.into_iter().cloned().collect();
     }
-    Ok(Placement {
-        node_id: node.node_id,
-        roles: demand
-            .roles
-            .iter()
-            .zip(chosen)
-            .map(|(r, g)| (r.role.clone(), g))
-            .collect(),
-        cpu_millis: demand.cpu_millis(),
-        mem_bytes: demand.mem_bytes(),
-    })
+    Ok(chosen)
+}
+
+// If a flexible role picked a GPU another role needs, find an augmenting path.
+// A path visits each role at most once, even when a role needs several GPUs.
+fn match_gpus(demand: &Demand, node: &NodeCapacity, now: bool) -> Option<Vec<Vec<GpuSlot>>> {
+    fn assign_one(
+        role: usize,
+        eligible: &[Vec<usize>],
+        owner: &mut [Option<usize>],
+        seen: &mut [bool],
+    ) -> bool {
+        if std::mem::replace(&mut seen[role], true) {
+            return false;
+        }
+        for &gpu in &eligible[role] {
+            if owner[gpu].is_none_or(|other| assign_one(other, eligible, owner, seen)) {
+                owner[gpu] = Some(role);
+                return true;
+            }
+        }
+        false
+    }
+
+    let eligible: Vec<Vec<usize>> = demand
+        .roles
+        .iter()
+        .map(|role| {
+            node.gpus
+                .iter()
+                .enumerate()
+                .filter(|(_, gpu)| (!now || gpu.free) && role.accepts(gpu))
+                .map(|(index, _)| index)
+                .collect()
+        })
+        .collect();
+    let mut owner = vec![None; node.gpus.len()];
+    let mut seen = vec![false; demand.roles.len()];
+    for (index, role) in demand.roles.iter().enumerate() {
+        for _ in 0..role.gpu_count {
+            seen.fill(false);
+            if !assign_one(index, &eligible, &mut owner, &mut seen) {
+                return None;
+            }
+        }
+    }
+    let mut chosen = vec![Vec::new(); demand.roles.len()];
+    for (gpu, role) in node.gpus.iter().zip(owner) {
+        if let Some(role) = role {
+            chosen[role].push(gpu.clone());
+        }
+    }
+    Some(chosen)
 }
 
 fn constraints(r: &RoleDemand) -> String {
@@ -300,6 +365,25 @@ mod tests {
                 .map(|i| gpu(id, i, 80, i >= total - free, &[]))
                 .collect(),
         )
+    }
+
+    #[test]
+    fn flexible_role_leaves_the_only_compatible_gpu_for_the_other_role() {
+        let nvidia = gpu(1, 0, 80, true, &[]);
+        let mut amd = gpu(1, 1, 80, true, &[]);
+        amd.vendor = "amd".into();
+        let machine = node(1, vec![nvidia, amd]);
+        let mut demand = want(1);
+        demand.roles.push(RoleDemand {
+            role: "rollout".into(),
+            replicas: 1,
+            gpu_count: 1,
+            vendor: Some("nvidia".into()),
+            ..RoleDemand::default()
+        });
+        let p = placed(SingleNodePacking.place(&demand, &[machine], &PlacementHints::default()));
+        assert_eq!(p.roles[0].1[0].index, 1);
+        assert_eq!(p.roles[1].1[0].index, 0);
     }
 
     #[test]

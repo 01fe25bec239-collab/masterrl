@@ -22,6 +22,7 @@ use mrl_domain::ids::{
 use mrl_proto::agent::v1::command::Kind;
 use mrl_proto::agent::v1::{LaunchAttempt, RoleLaunch, StageArtifacts, UpdateCredentials};
 use mrl_proto::common::v1::AttemptRef;
+use prost::Message;
 use serde_json::{json, Map, Value};
 use sqlx::Row;
 use std::time::Duration;
@@ -221,6 +222,11 @@ pub(crate) async fn plan(
     let placement = placement_of(&core.db, res).await?;
     let mut all: Vec<u32> = placement.gpu_indices();
     all.dedup();
+    // Older agents use allocation.gpu_indices when a role has no list. Every GPU
+    // role already has its explicit indices; leave the fallback empty for CPU roles.
+    if placement.roles.iter().any(|(_, gpus)| gpus.is_empty()) {
+        all.clear();
+    }
     let primary = placement
         .roles
         .iter()
@@ -271,7 +277,28 @@ pub(crate) async fn plan(
     Ok(Ok(plan))
 }
 
-/// Sends stage, credentials and launch, in that order (one node, so they arrive in order).
+/// Sends a prerequisite and waits for its saved result before moving to the next command.
+async fn prerequisite(
+    core: &Core,
+    node: NodeId,
+    attempt: &AttemptRow,
+    kind: &str,
+    command: NewCommand,
+) -> Result<bool, SchedError> {
+    match latest_command(&core.db, kind, attempt).await? {
+        None => {
+            core.sender.send(node, command).await?;
+            Ok(false)
+        }
+        Some(row) if row.in_flight() && !row.past_deadline => Ok(false),
+        Some(row) if row.accepted() => Ok(true),
+        Some(row) => {
+            end_unstarted(core, attempt, row.failure_class(), row.failure_message()).await?;
+            Ok(false)
+        }
+    }
+}
+
 async fn send(
     core: &Core,
     node: Uuid,
@@ -282,52 +309,91 @@ async fn send(
     let id = AttemptId::from_uuid(attempt.id);
     let epoch = u64::try_from(attempt.epoch).unwrap_or(0);
     let deadline = Duration::from_secs(core.cfg.launch_deadline_seconds);
+    let command = |kind| NewCommand::new(kind).attempt(id, epoch).deadline(deadline);
     let r = plan.launch.attempt.clone();
     if !plan.stage.is_empty() {
         let k = Kind::StageArtifacts(StageArtifacts {
             attempt: r.clone(),
             items: plan.stage,
         });
-        core.sender
-            .send(
-                node,
-                NewCommand::new(k).attempt(id, epoch).deadline(deadline),
-            )
-            .await?;
+        if !prerequisite(core, node, attempt, "StageArtifacts", command(k)).await? {
+            return Ok(());
+        }
     }
     if !plan.credentials.is_empty() {
         let k = Kind::UpdateCredentials(UpdateCredentials {
             attempt: r,
             credentials: plan.credentials,
         });
-        core.sender
-            .send(
-                node,
-                NewCommand::new(k).attempt(id, epoch).deadline(deadline),
-            )
-            .await?;
+        if !prerequisite(core, node, attempt, "UpdateCredentials", command(k)).await? {
+            return Ok(());
+        }
     }
     let k = Kind::LaunchAttempt(plan.launch);
-    core.sender
-        .send(
-            node,
-            NewCommand::new(k)
-                .attempt(id, epoch)
-                .deadline(deadline)
-                .superseding(),
-        )
-        .await?;
+    core.sender.send(node, command(k).superseding()).await?;
     Ok(())
 }
 
-/// The newest `kind` command for the attempt's epoch: state, accepted, failure, age (s).
+#[derive(sqlx::FromRow)]
+pub(crate) struct CommandStatus {
+    pub state: String,
+    pub age: f64,
+    pub sent: bool,
+    pub past_deadline: bool,
+    result: Option<Value>,
+    payload: Vec<u8>,
+}
+
+impl CommandStatus {
+    pub fn in_flight(&self) -> bool {
+        matches!(self.state.as_str(), "PENDING" | "SENT" | "RECEIVED")
+    }
+
+    pub fn accepted(&self) -> bool {
+        self.state == "COMPLETED"
+            && self.result.as_ref().and_then(|r| r["accepted"].as_bool()) == Some(true)
+    }
+
+    pub fn failure_class(&self) -> FailureClass {
+        self.result
+            .as_ref()
+            .and_then(|r| r["failure"]["class"].as_str())
+            .and_then(|c| c.strip_prefix("FAILURE_CLASS_").unwrap_or(c).parse().ok())
+            .unwrap_or(FailureClass::InfraTransient)
+    }
+
+    pub fn failure_message(&self) -> String {
+        self.result
+            .as_ref()
+            .and_then(|r| r["failure"]["message"].as_str())
+            .map(super::control::clean)
+            .unwrap_or_else(|| {
+                format!(
+                    "The machine did not take the command ({}).",
+                    self.state.to_lowercase()
+                )
+            })
+    }
+
+    pub fn is_pause_request(&self, request_id: &str) -> bool {
+        matches!(
+            mrl_proto::agent::v1::Command::decode(self.payload.as_slice()).map(|c| c.kind),
+            Ok(Some(Kind::PauseAttempt(cmd))) if cmd.request_id == request_id
+        )
+    }
+}
+
+/// The newest command of this kind for the attempt's epoch.
 pub(crate) async fn latest_command(
     db: &Db,
     kind: &str,
     attempt: &AttemptRow,
-) -> Result<Option<(String, bool, String, f64)>, SchedError> {
-    let row: Option<(String, Option<Value>, f64)> = sqlx::query_as(
-        "SELECT state, result, extract(epoch from now() - updated_at)::float8 FROM agent_commands
+) -> Result<Option<CommandStatus>, SchedError> {
+    Ok(sqlx::query_as(
+        "SELECT state, result, extract(epoch from now() - updated_at)::float8 AS age,
+                sent_at IS NOT NULL AS sent, deadline_at <= now() AS past_deadline,
+                CASE WHEN kind = 'PauseAttempt' THEN payload ELSE ''::bytea END AS payload
+         FROM agent_commands
          WHERE kind = $1 AND attempt_id = $2 AND epoch = $3
          ORDER BY seq DESC LIMIT 1",
     )
@@ -335,21 +401,7 @@ pub(crate) async fn latest_command(
     .bind(attempt.id)
     .bind(attempt.epoch)
     .fetch_optional(db.pool())
-    .await?;
-    Ok(row.map(|(state, result, age)| {
-        let r = result.unwrap_or_default();
-        let failure = match &r["failure"] {
-            Value::String(s) => s.clone(),
-            Value::Null => String::new(),
-            other => other.to_string(),
-        };
-        (
-            state,
-            r["accepted"].as_bool().unwrap_or(false),
-            failure,
-            age,
-        )
-    }))
+    .await?)
 }
 
 /// Sends the launch of `job`'s PENDING current attempt if none exists yet, or ends the
@@ -376,6 +428,17 @@ pub(crate) async fn ensure_launched(
     match latest_command(&core.db, "LaunchAttempt", attempt).await? {
         None => match plan(core, job, attempt, &res, lease).await? {
             Ok(p) => {
+                let Some((current_job, current_attempt)) =
+                    current(core, job.org_id, job.id).await?
+                else {
+                    return Ok(());
+                };
+                if current_job.state != "PREPARING"
+                    || current_attempt.id != attempt.id
+                    || current_attempt.state != "PENDING"
+                {
+                    return Ok(());
+                }
                 if let Err(e) = send(core, res.node_id, attempt, p).await {
                     // A refused command (machine draining or removed) can't be sent again.
                     if matches!(
@@ -395,25 +458,17 @@ pub(crate) async fn ensure_launched(
             }
             Err(LaunchError::Fail(class, why)) => end_unstarted(core, attempt, class, why).await,
         },
-        Some((state, _, _, _)) if ["PENDING", "SENT", "RECEIVED"].contains(&state.as_str()) => {
-            Ok(())
-        }
-        Some((state, true, _, age)) if state == "COMPLETED" => {
+        Some(row) if row.in_flight() && !row.past_deadline => Ok(()),
+        Some(row) if row.accepted() => {
             let wait = lease + Duration::from_secs(core.cfg.lease_grace_seconds);
-            if age > wait.as_secs_f64() && leader_for > wait {
+            if row.age > wait.as_secs_f64() && leader_for > wait {
                 let why = "The machine took the launch but never reported the attempt starting.";
                 end_unstarted(core, attempt, FailureClass::NodeLost, why.into()).await
             } else {
                 Ok(())
             }
         }
-        Some((state, _, failure, _)) => {
-            let why = format!(
-                "The machine did not take the launch ({}): {failure}",
-                state.to_lowercase()
-            );
-            end_unstarted(core, attempt, FailureClass::InfraTransient, why).await
-        }
+        Some(row) => end_unstarted(core, attempt, row.failure_class(), row.failure_message()).await,
     }
 }
 
