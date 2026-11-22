@@ -39,11 +39,12 @@ use mrl_server::modules::nodes::commands::{CommandKind, CommandSender, NewComman
 use mrl_server::modules::nodes::lanes::LaneRouter;
 use mrl_server::modules::nodes::{Gateway, NodesModule};
 use mrl_server::modules::runs::RunsModule;
-use mrl_server::seams::{SeamError, SecretStore, LAUNCH_SECRET_HEADER};
+use mrl_server::seams::{AuditEvent, AuditSink, SeamError, SecretStore, LAUNCH_SECRET_HEADER};
 use mrl_storage::{sha256_hex, BackendConfig};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
@@ -68,6 +69,10 @@ enum Fault {
     Skip(&'static str),
     /// Uploads only the first byte of files whose path ends with this.
     Cut(&'static str),
+    /// Changes one byte without changing the size.
+    Flip(&'static str),
+    /// Accepts the checkpoint request without producing a save.
+    NoCheckpoint,
     /// Never answers uploads (the agent is still uploading).
     Hold,
 }
@@ -104,6 +109,16 @@ impl FakeEngine {
 
     /// Stages a checkpoint (weights + optimizer + manifest) and sends CheckpointStaged.
     fn stage(&self, step: u64, is_final: bool, metrics: &[(&str, f64)]) -> (Uuid, String) {
+        self.stage_ordered(step, is_final, metrics, false)
+    }
+
+    fn stage_ordered(
+        &self,
+        step: u64,
+        is_final: bool,
+        metrics: &[(&str, f64)],
+        commit_first: bool,
+    ) -> (Uuid, String) {
         let id = CheckpointId::new();
         let dir = format!("checkpoints/{id}");
         std::fs::create_dir_all(self.staging.join(&dir)).unwrap();
@@ -130,13 +145,21 @@ impl FakeEngine {
             });
         }
         let run = RunId::from_uuid(self.run.lock().unwrap().unwrap()).to_string();
+        let attempt = self
+            .attempt
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .attempt_id
+            .clone();
         let manifest = json!({
             "schema_version": "checkpoint-manifest/v1", "checkpoint_id": id.to_string(),
-            "run_id": run, "attempt_id": "att", "step": step, "kind": "full_resume",
+            "run_id": run, "attempt_id": attempt, "step": step, "kind": "full_resume",
             "format": "fake-v1", "engine": {"name": "fake", "adapter_version": "1.0.0"},
             "base_model_sha256": sha256_hex(b"model"), "created_at": "2026-11-22T00:00:00Z",
             "is_final": is_final,
-            "files": files.iter().map(|f| json!({"path": f.path, "size": f.size, "sha256": f.sha256, "role": f.role})).collect::<Vec<_>>(),
+            "files": files.iter().map(|f| json!({"path": f.path.strip_prefix(&format!("{dir}/")).unwrap(), "size": f.size, "sha256": f.sha256, "role": f.role})).collect::<Vec<_>>(),
         })
         .to_string()
         .into_bytes();
@@ -149,6 +172,9 @@ impl FakeEngine {
             sha256: msha.clone(),
             role: "manifest".into(),
         });
+        if commit_first {
+            self.commit(id.as_uuid(), &msha);
+        }
         self.relay(worker_message::Body::CheckpointStaged(CheckpointStaged {
             checkpoint_id: id.to_string(),
             step,
@@ -188,6 +214,7 @@ impl FakeEngine {
             match fault {
                 Fault::Skip(end) if item.local_path.ends_with(end) => continue,
                 Fault::Cut(end) if item.local_path.ends_with(end) => bytes.truncate(1),
+                Fault::Flip(end) if item.local_path.ends_with(end) => bytes[0] ^= 1,
                 _ => {}
             }
             let r = TestServer::request_to(
@@ -213,6 +240,9 @@ impl CommandHandler for FakeEngine {
         match c.kind {
             Some(command::Kind::UploadArtifacts(u)) => self.upload(&u).await,
             Some(command::Kind::CheckpointAttempt(_)) => {
+                if matches!(*self.fault.lock().unwrap(), Fault::NoCheckpoint) {
+                    return Ok(());
+                }
                 let step = {
                     let mut n = self.next_step.lock().unwrap();
                     *n += 1;
@@ -223,6 +253,29 @@ impl CommandHandler for FakeEngine {
             }
             _ => Ok(()),
         }
+    }
+}
+
+#[derive(Default)]
+struct TestAudit {
+    reject_verify: AtomicBool,
+}
+
+#[async_trait]
+impl AuditSink for TestAudit {
+    async fn record(&self, _: AuditEvent) -> Result<(), SeamError> {
+        Ok(())
+    }
+
+    async fn record_in(
+        &self,
+        _: &mut mrl_server::db::Tx,
+        event: AuditEvent,
+    ) -> Result<(), SeamError> {
+        if self.reject_verify.load(Ordering::Relaxed) && event.action == "checkpoints.verify" {
+            return Err(SeamError::new("audit", "audit unavailable for the test"));
+        }
+        Ok(())
     }
 }
 
@@ -237,6 +290,7 @@ struct Env {
     node: Uuid,
     running: Option<Running>,
     agent: TestAgent,
+    audit: Arc<TestAudit>,
     _dirs: tempfile::TempDir,
 }
 
@@ -285,8 +339,11 @@ impl Env {
         );
         let service = module.service();
         let runs = RunsModule::with_chains(db.db().clone(), chains.clone());
+        let audit = Arc::new(TestAudit::default());
         let seams = ts::build(
-            ts::solo(TEST_SECRET).secrets_arc(secrets.clone()),
+            ts::solo(TEST_SECRET)
+                .secrets_arc(secrets.clone())
+                .audit_arc(audit.clone()),
             Mode::Solo,
         );
         let server = TestServer::start(
@@ -324,6 +381,7 @@ impl Env {
             node: Uuid::nil(),
             running: None,
             agent,
+            audit,
             _dirs: dirs,
         };
         let pool = env.post("/api/v1/pools", json!({"name": "test"})).await;
@@ -535,6 +593,16 @@ impl Env {
 
     /// Ends the attempt OK and moves the job to FINALIZING.
     async fn finish(&self, job: Uuid) {
+        let step: Option<i64> =
+            sqlx::query_scalar("SELECT max(global_step) FROM checkpoints WHERE job_id = $1")
+                .bind(job)
+                .fetch_one(self.db.pool())
+                .await
+                .unwrap();
+        self.finish_at(job, step.unwrap_or(0)).await;
+    }
+
+    async fn finish_at(&self, job: Uuid, step: i64) {
         let mut tx = self.db.db().begin().await.unwrap();
         let row = self.lock(&mut tx, job).await;
         let attempt =
@@ -546,7 +614,10 @@ impl Env {
             &mut tx,
             &attempt,
             JobAttemptEvent::ExitOk,
-            AttemptChange::default(),
+            AttemptChange {
+                last_step: Some(step),
+                ..AttemptChange::default()
+            },
         )
         .await
         .unwrap();
@@ -663,7 +734,171 @@ async fn happy_path_commits_lists_verifies_and_completes_the_job() {
     assert_eq!(ckpt.kind, "weights_only");
     assert_eq!(env.service.files(last).await.unwrap().len(), 2);
     assert!(cleanup::delete_queued(&env.service).await.unwrap() >= 1);
-    env.service.rehash(last).await.unwrap();
+    let row = env.service.rehash(last).await.unwrap();
+    let manifest: Value = serde_json::from_slice(
+        &env.store
+            .org_store("local")
+            .await
+            .unwrap()
+            .get(row.manifest_key.as_deref().unwrap())
+            .await
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest["kind"], "weights_only");
+    assert_eq!(manifest["files"].as_array().unwrap().len(), 1);
+    assert_eq!(manifest["files"][0]["path"], "weights.bin");
+    env.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn reorder_replay_and_final_replacement_keep_published_bytes_immutable() {
+    let env = Env::start().await;
+    let (run, _) = env.running_run(json!({})).await;
+    let (first, _) = env.engine.stage_ordered(10, true, &[], true);
+    env.wait_state(first, "COMMITTED").await;
+    let weight = env
+        .service
+        .files(first)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|f| f.role == "weights")
+        .unwrap();
+    let store = env.store.org_store("local").await.unwrap();
+    let staged = weight.staging_key.as_deref().unwrap();
+    let published = store.get(&weight.object_key).await.unwrap();
+    assert_ne!(staged, weight.object_key);
+    let mut changed = published.to_vec();
+    changed[0] ^= 1;
+    store.put(staged, changed.into()).await.unwrap();
+    env.engine.commit(first, &"0".repeat(64));
+    let last = env.engine.checkpoint(20, true, &[]);
+    env.wait_state(last, "COMMITTED").await;
+    let first_row = env.service.find(first).await.unwrap().unwrap();
+    assert_eq!(first_row.state, "COMMITTED");
+    assert!(!first_row.is_final);
+    assert_eq!(store.get(&weight.object_key).await.unwrap(), published);
+    assert_eq!(env.latest(run).await, Some(last));
+    env.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn bad_bytes_fail_commit_and_audit_failure_rolls_back_verification() {
+    let env = Env::start().await;
+    let (run, _) = env.running_run(json!({})).await;
+    env.engine.set(Fault::Flip("weights.bin"));
+    let bad = env.engine.checkpoint(5, false, &[]);
+    env.wait_state(bad, "CORRUPT").await;
+    assert_eq!(env.latest(run).await, None);
+
+    let malformed = env.engine.checkpoint(6, false, &[("bad\0name", 1.0)]);
+    env.wait_state(malformed, "CORRUPT").await;
+
+    env.engine.set(Fault::None);
+    let good = env.engine.checkpoint(10, false, &[]);
+    env.wait_state(good, "COMMITTED").await;
+    env.audit.reject_verify.store(true, Ordering::Relaxed);
+    let verify = format!(
+        "/api/v1/checkpoints/{}:verify",
+        CheckpointId::from_uuid(good)
+    );
+    assert_eq!(env.post(&verify, json!({})).await.status, 503);
+    let row = env.service.find(good).await.unwrap().unwrap();
+    assert_eq!(row.verification_level.as_deref(), Some("manifest_head"));
+    let store = env.store.org_store("local").await.unwrap();
+    store
+        .put(&env.object(good, "weights").await, b"bad".to_vec().into())
+        .await
+        .unwrap();
+    assert_eq!(env.post(&verify, json!({})).await.status, 503);
+    assert_eq!(env.state(good).await, "COMMITTED");
+    assert_eq!(env.latest(run).await, Some(good));
+    env.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn a_pending_final_waits_and_completes_only_at_the_reported_step() {
+    let env = Env::start().await;
+    let (_, job) = env.running_run(json!({"common": {"max_steps": 20}})).await;
+    env.engine.set(Fault::Hold);
+    let id = env.engine.checkpoint(20, true, &[]);
+    env.until("commit waiting for upload", || async {
+        env.service
+            .find(id)
+            .await
+            .unwrap()
+            .is_some_and(|row| row.commit_requested_at.is_some())
+    })
+    .await;
+    env.finish_at(job, 21).await;
+    env.service.tick(&env.chains).await;
+    assert_eq!(env.job_state(job).await.0, "FINALIZING");
+    let store = env.store.org_store("local").await.unwrap();
+    for f in env.service.files(id).await.unwrap() {
+        let path = env.engine.staging.join(format!(
+            "checkpoints/{}/{}",
+            CheckpointId::from_uuid(id),
+            f.path
+        ));
+        store
+            .put(&f.object_key, std::fs::read(path).unwrap().into())
+            .await
+            .unwrap();
+    }
+    env.wait_state(id, "COMMITTED").await;
+    assert_eq!(
+        env.job_state(job).await,
+        ("FAILED".into(), Some("VERIFICATION_FAILED".into()))
+    );
+    env.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn retention_and_gc_preserve_a_checkpoint_referenced_by_an_ended_attempt() {
+    let env = Env::start().await;
+    let (_, job) = env
+        .running_run(json!({"checkpoint": {"retention": {"keep_last_n": 1}}}))
+        .await;
+    let used = env.engine.checkpoint(10, false, &[]);
+    env.wait_state(used, "COMMITTED").await;
+    let last = env.engine.checkpoint(20, true, &[]);
+    env.wait_state(last, "COMMITTED").await;
+    env.finish(job).await;
+    env.service.tick(&env.chains).await;
+    assert_eq!(env.job_state(job).await.0, "COMPLETED");
+    sqlx::query("UPDATE job_attempts SET resume_from_checkpoint_id = $1 WHERE job_id = $2")
+        .bind(used)
+        .bind(job)
+        .execute(env.db.pool())
+        .await
+        .unwrap();
+
+    cleanup::retention(&env.service).await.unwrap();
+    cleanup::strip_completed(&env.service).await.unwrap();
+    let row = env.service.find(used).await.unwrap().unwrap();
+    assert_eq!(row.state, "COMMITTED");
+    assert_eq!(row.kind, "full_resume");
+    let store = env.store.org_store("local").await.unwrap();
+    let optimizer = env.object(used, "optimizer").await;
+    assert!(store.head(&optimizer).await.is_ok());
+
+    env.service.corrupt(used, "test corruption").await.unwrap();
+    sqlx::query("UPDATE checkpoints SET verified_at = now() - interval '1 hour' WHERE id = $1")
+        .bind(used)
+        .execute(env.db.pool())
+        .await
+        .unwrap();
+    cleanup::staging_gc(&env.service).await.unwrap();
+    cleanup::delete_queued(&env.service).await.unwrap();
+    assert_eq!(env.state(used).await, "CORRUPT");
+    assert!(store.head(&optimizer).await.is_ok());
+    let path = format!("/api/v1/checkpoints/{}", CheckpointId::from_uuid(used));
+    assert_eq!(env.send(Method::DELETE, &path, None).await.status, 409);
     env.stop().await;
 }
 
@@ -761,22 +996,16 @@ async fn stale_epochs_and_cancelled_jobs_never_commit() {
     let files = env.service.files(stale).await.unwrap();
     let store = env.store.org_store("local").await.unwrap();
     for f in &files {
-        let path = env.engine.staging.join(&f.path);
+        let path = env.engine.staging.join(format!(
+            "checkpoints/{}/{}",
+            CheckpointId::from_uuid(stale),
+            f.path
+        ));
         store
             .put(&f.object_key, std::fs::read(path).unwrap().into())
             .await
             .unwrap();
     }
-    env.until("commit requested", || async {
-        env.service
-            .find(stale)
-            .await
-            .unwrap()
-            .unwrap()
-            .commit_requested_at
-            .is_some()
-    })
-    .await;
     env.wait_state(stale, "CORRUPT").await;
     let reason = env
         .service
@@ -808,7 +1037,11 @@ async fn stale_epochs_and_cancelled_jobs_never_commit() {
         .unwrap();
     tx.commit().await.unwrap();
     for f in env.service.files(late).await.unwrap() {
-        let path = env.engine.staging.join(&f.path);
+        let path = env.engine.staging.join(format!(
+            "checkpoints/{}/{}",
+            CheckpointId::from_uuid(late),
+            f.path
+        ));
         store
             .put(&f.object_key, std::fs::read(path).unwrap().into())
             .await
@@ -843,7 +1076,12 @@ async fn concurrent_commits_serialize_and_latest_is_the_highest_step() {
             .await;
         let store = env.store.org_store("local").await.unwrap();
         for f in env.service.files(*id).await.unwrap() {
-            let bytes = std::fs::read(env.engine.staging.join(&f.path)).unwrap();
+            let path = env.engine.staging.join(format!(
+                "checkpoints/{}/{}",
+                CheckpointId::from_uuid(*id),
+                f.path
+            ));
+            let bytes = std::fs::read(path).unwrap();
             store.put(&f.object_key, bytes.into()).await.unwrap();
         }
         sqlx::query("UPDATE checkpoints SET commit_requested_at = now() WHERE id = $1")
@@ -1026,6 +1264,14 @@ async fn emergency_and_time_based_checkpoints_reach_the_worker() {
         panic!("not a checkpoint request");
     };
     assert_eq!(c.reason, "time_based");
+    env.engine.set(Fault::NoCheckpoint);
+    assert_eq!(
+        env.service
+            .emergency_checkpoint(job, "guard", Duration::from_millis(450))
+            .await
+            .unwrap(),
+        EmergencyOutcome::TimedOut,
+    );
     // A job with no running attempt: refused at once.
     let mut tx = env.db.db().begin().await.unwrap();
     let row = env.lock(&mut tx, job).await;
@@ -1040,4 +1286,148 @@ async fn emergency_and_time_based_checkpoints_reach_the_worker() {
         .unwrap();
     assert!(matches!(out, EmergencyOutcome::Refused(_)), "{out:?}");
     env.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn team_checkpoint_routes_and_cursors_respect_project_and_org_scope() {
+    use crate::supabase::{
+        core::{Auth, CoreServer},
+        MockSupabase, MockUser,
+    };
+    use mrl_domain::{
+        ids::{OrgId, UserId, WorkspaceId},
+        rbac::Role,
+    };
+    use mrl_server::{
+        http::pagination::encode_cursor,
+        modules::tenancy::{bind_role, Scope},
+    };
+
+    let sb = MockSupabase::start().await;
+    let core = CoreServer::start(Mode::Team, &sb, TestDb::new().await, Arc::default()).await;
+    let (org, other) = (OrgId::new(), OrgId::new());
+    for o in [org, other] {
+        let w = WorkspaceId::new().as_uuid();
+        let o = o.as_uuid();
+        core.db
+            .seed(&format!(
+            "INSERT INTO organizations (id, slug, name, kind) VALUES ('{o}', '{o}', 'Team', 'team');
+             INSERT INTO workspaces (id, org_id, slug, name) VALUES ('{w}', '{o}', 'main', 'Main');"
+        ))
+            .await;
+    }
+    let auth_user = MockUser::new("checkpoint@example.com", "Viewer");
+    let auth = Auth::Bearer(sb.access_token(&auth_user, 600));
+    assert_eq!(
+        core.call(Method::GET, "/api/v1/auth/me", &auth, None)
+            .await
+            .status,
+        200
+    );
+    let uid: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE supabase_user_id = $1")
+        .bind(auth_user.id)
+        .fetch_one(core.db.pool())
+        .await
+        .unwrap();
+    let visible = ProjectId::new();
+    let cases = [
+        (org, visible, 1),
+        (org, ProjectId::new(), 100),
+        (other, ProjectId::new(), 100),
+    ];
+    let mut records = Vec::new();
+    for (o, project, step) in cases {
+        let (p, o) = (project.as_uuid(), o.as_uuid());
+        let (e, r, j, a, c) = (
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+        );
+        core.db.seed(&format!(
+            "INSERT INTO projects (id, org_id, workspace_id, slug, name)
+               SELECT '{p}', '{o}', id, '{p}', 'Project' FROM workspaces WHERE org_id = '{o}';
+             INSERT INTO experiments (id, org_id, project_id, name, created_by)
+               VALUES ('{e}', '{o}', '{p}', 'Experiment', 'seed');
+             INSERT INTO runs (id, org_id, project_id, experiment_id, name, kind, algorithm_id,
+                 base_model_version_id, submit_key, submit_fingerprint, created_by)
+               VALUES ('{r}', '{o}', '{p}', '{e}', 'Run', 'TRAIN', 'sft', '{a}', '{r}', '', 'seed');
+             INSERT INTO jobs (id, org_id, project_id, kind, run_id, state, resource_request, retry_policy, created_by)
+               VALUES ('{j}', '{o}', '{p}', 'TRAIN', '{r}', 'FAILED', '{{}}', '{{}}', 'seed');
+             INSERT INTO job_attempts (id, org_id, job_id, attempt_no, epoch, state)
+               VALUES ('{a}', '{o}', '{j}', 1, 1, 'EXITED_ERROR');
+             INSERT INTO checkpoints (id, org_id, storage_org, run_id, job_id, attempt_id, attempt_epoch,
+                 global_step, kind, layout, state)
+               VALUES ('{c}', '{o}', '{o}', '{r}', '{j}', '{a}', 1, {step}, 'weights_only', 'fake-v1', 'COMMITTED');"
+        )).await;
+        records.push((RunId::from_uuid(r), CheckpointId::from_uuid(c)));
+    }
+    let mut tx = core.db.db().begin().await.unwrap();
+    bind_role(
+        &mut tx,
+        org,
+        UserId::from_uuid(uid),
+        Role::Viewer,
+        Scope::Project(visible),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+
+    let (run, ckpt) = records[0];
+    let list = format!("/api/v1/runs/{run}/checkpoints");
+    let detail = format!("/api/v1/checkpoints/{ckpt}");
+    assert_eq!(
+        core.call(Method::GET, &list, &auth, None).await.json()["items"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        core.call(Method::GET, &detail, &auth, None).await.status,
+        200
+    );
+    assert_eq!(
+        core.call(Method::POST, &format!("{detail}:verify"), &auth, None)
+            .await
+            .status,
+        403
+    );
+    assert_eq!(
+        core.call(Method::DELETE, &detail, &auth, None).await.status,
+        403
+    );
+
+    for (hidden_run, hidden) in &records[1..] {
+        let path = format!("/api/v1/checkpoints/{hidden}");
+        for (method, path) in [
+            (
+                Method::GET,
+                format!("/api/v1/runs/{hidden_run}/checkpoints"),
+            ),
+            (Method::GET, path.clone()),
+            (Method::POST, format!("{path}:verify")),
+            (Method::DELETE, path),
+        ] {
+            assert_eq!(core.call(method, &path, &auth, None).await.status, 404);
+        }
+        let cursor = encode_cursor(&hidden.to_string());
+        let page = core
+            .call(Method::GET, &format!("{list}?cursor={cursor}"), &auth, None)
+            .await;
+        assert_eq!(page.json()["items"], json!([]));
+    }
+    sqlx::query("UPDATE projects SET deleted_at = now() WHERE id = $1")
+        .bind(visible.as_uuid())
+        .execute(core.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        core.call(Method::GET, &detail, &auth, None).await.status,
+        404
+    );
+    assert_eq!(core.call(Method::GET, &list, &auth, None).await.status, 404);
 }

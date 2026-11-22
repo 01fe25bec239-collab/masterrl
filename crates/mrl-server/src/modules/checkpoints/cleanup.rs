@@ -3,12 +3,11 @@
 //! Objects are never deleted in the transaction that stops referencing them: the transaction
 //! queues their keys in `checkpoint_object_deletions`, and [`delete_queued`] removes them
 //! afterwards. A crash in between leaves the queue, never a row pointing at a missing object.
-//! Checkpoint objects live under `runs/…/checkpoints/…/_staging/`, which P19's cleanup never
-//! lists, so these rows are the only references to them.
+//! Staging and published checkpoint objects have separate prefixes and cleanup records.
 
 use super::service::{
-    ckpt_cols, lock_row, lock_run, metrics, repoint, run_setting, step, CheckpointRow,
-    CheckpointService, STATE_ROLES,
+    ckpt_cols, hex, lock_row, lock_run, metrics, published_prefix, repoint, run_setting,
+    same_committed_files, step, system_audit, CheckpointRow, CheckpointService, STATE_ROLES,
 };
 use crate::db::{DbError, Tx};
 use crate::modules::jobs::JobsError;
@@ -42,6 +41,43 @@ async fn queue_all(tx: &mut Tx, row: &CheckpointRow) -> Result<(), JobsError> {
     .bind(&row.storage_org)
     .execute(&mut **tx)
     .await?;
+    // A publisher can die after writing checked bytes but before switching object_key.
+    if row.committed_at.is_none() {
+        sqlx::query(
+            "INSERT INTO checkpoint_object_deletions (storage_org, object_key, checkpoint_id)
+             SELECT $2, $3 || path, checkpoint_id FROM checkpoint_files
+             WHERE checkpoint_id = $1 AND staging_key IS NOT NULL
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(row.id)
+        .bind(&row.storage_org)
+        .bind(published_prefix(row))
+        .execute(&mut **tx)
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO checkpoint_object_deletions (storage_org, object_key, checkpoint_id)
+         VALUES ($1,$2,$3) ON CONFLICT DO NOTHING",
+    )
+    .bind(&row.storage_org)
+    .bind(stripped_manifest_key(row))
+    .bind(row.id)
+    .execute(&mut **tx)
+    .await?;
+    queue_staging(tx, row).await
+}
+
+/// Queues staging with a grace period after the last known upload ticket expires.
+pub(crate) async fn queue_staging(tx: &mut Tx, row: &CheckpointRow) -> Result<(), JobsError> {
+    sqlx::query(
+        "INSERT INTO checkpoint_object_deletions (storage_org, object_key, checkpoint_id, delete_after)
+         SELECT $2, staging_key, checkpoint_id, GREATEST(now(), $3) + interval '10 minutes'
+         FROM checkpoint_files WHERE checkpoint_id = $1 AND staging_key IS NOT NULL
+         ON CONFLICT (storage_org, object_key) DO UPDATE
+         SET delete_after = GREATEST(checkpoint_object_deletions.delete_after, EXCLUDED.delete_after)",
+    )
+    .bind(row.id).bind(&row.storage_org).bind(row.tickets_expire_at)
+    .execute(&mut **tx).await?;
     Ok(())
 }
 
@@ -63,9 +99,8 @@ pub(crate) async fn in_use(
     tx: &mut Tx,
     row: &CheckpointRow,
 ) -> Result<Option<&'static str>, JobsError> {
-    let (latest, fin, job_state): (Option<Uuid>, Option<Uuid>, Option<String>) = sqlx::query_as(
-        "SELECT r.latest_committed_checkpoint_id, r.final_checkpoint_id, j.state FROM runs r \
-         LEFT JOIN jobs j ON j.run_id = r.id WHERE r.id = $1",
+    let (latest, fin): (Option<Uuid>, Option<Uuid>) = sqlx::query_as(
+        "SELECT latest_committed_checkpoint_id, final_checkpoint_id FROM runs WHERE id = $1",
     )
     .bind(row.run_id)
     .fetch_one(&mut **tx)
@@ -73,21 +108,22 @@ pub(crate) async fn in_use(
     if fin == Some(row.id) || row.is_final {
         return Ok(Some("it is the run's final checkpoint"));
     }
-    let job_done = job_state
-        .as_deref()
-        .is_some_and(|s| matches!(s, "COMPLETED" | "FAILED" | "CANCELLED" | "REJECTED"));
-    if latest == Some(row.id) && !job_done {
+    if latest == Some(row.id) {
         return Ok(Some("the run resumes from it"));
     }
-    let used: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM runs WHERE parent_checkpoint_id = $1) \
-             OR EXISTS (SELECT 1 FROM job_attempts WHERE resume_from_checkpoint_id = $1 \
-                          AND state IN ('PENDING','LAUNCHING','RUNNING'))",
+    Ok(linked(tx, row.id)
+        .await?
+        .then_some("another run or an attempt references it"))
+}
+
+async fn linked(tx: &mut Tx, id: Uuid) -> Result<bool, JobsError> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM runs WHERE parent_checkpoint_id = $1)
+             OR EXISTS (SELECT 1 FROM job_attempts WHERE resume_from_checkpoint_id = $1)",
     )
-    .bind(row.id)
+    .bind(id)
     .fetch_one(&mut **tx)
-    .await?;
-    Ok(used.then_some("another run or a running attempt starts from it"))
+    .await?)
 }
 
 /// The policy for a run: its config's `checkpoint.retention` over the server's settings.
@@ -108,8 +144,9 @@ fn policy(service: &CheckpointService, resolved: &Value) -> Policy {
             .unwrap_or(d)
     };
     Policy {
-        last: n("keep_last_n", u64::from(c.keep_last_n)).max(1) as usize,
-        best: n("keep_best_n", u64::from(c.keep_best_n)) as usize,
+        last: usize::try_from(n("keep_last_n", u64::from(c.keep_last_n)).max(1))
+            .unwrap_or(usize::MAX),
+        best: usize::try_from(n("keep_best_n", u64::from(c.keep_best_n))).unwrap_or(usize::MAX),
         metric: r
             .and_then(|r| r.get("best_metric"))
             .and_then(Value::as_str)
@@ -154,32 +191,42 @@ fn keep(rows: &[CheckpointRow], p: &Policy) -> HashSet<Uuid> {
 /// point of an unfinished run, a run's parent or a running attempt's start).
 pub async fn retention(service: &CheckpointService) -> Result<(), JobsError> {
     let pool = service.db().pool();
-    let runs: Vec<(Uuid, Option<Value>)> = sqlx::query_as(
-        "SELECT c.run_id, rc.resolved FROM checkpoints c LEFT JOIN run_configs rc ON rc.run_id = c.run_id \
-         WHERE c.state = 'COMMITTED' GROUP BY c.run_id, rc.resolved HAVING count(*) > 1 LIMIT 200",
-    )
-    .fetch_all(pool)
-    .await?;
-    for (run, resolved) in runs {
-        let p = policy(service, &resolved.unwrap_or(Value::Null));
-        let mut tx = service.db().begin().await?;
-        lock_run(&mut tx, run).await?;
-        let rows = sqlx::query_as::<_, CheckpointRow>(concat!(
-            "SELECT ",
-            ckpt_cols!(),
-            " FROM checkpoints WHERE run_id = $1 AND state = 'COMMITTED' \
-               ORDER BY global_step DESC, committed_at DESC FOR UPDATE"
-        ))
-        .bind(run)
-        .fetch_all(&mut *tx)
+    let mut after = Uuid::nil();
+    loop {
+        let runs: Vec<(Uuid, Option<Value>)> = sqlx::query_as(
+            "SELECT c.run_id, rc.resolved FROM checkpoints c LEFT JOIN run_configs rc ON rc.run_id = c.run_id
+             WHERE c.state = 'COMMITTED' AND c.run_id > $1
+             GROUP BY c.run_id, rc.resolved HAVING count(*) > 1 ORDER BY c.run_id LIMIT 200",
+        )
+        .bind(after)
+        .fetch_all(pool)
         .await?;
-        let kept = keep(&rows, &p);
-        for row in rows.iter().filter(|r| !kept.contains(&r.id)) {
-            if in_use(&mut tx, row).await?.is_none() {
-                tombstone(&mut tx, row).await?;
+        let Some((last, _)) = runs.last() else {
+            break;
+        };
+        after = *last;
+        for (run, resolved) in runs {
+            let p = policy(service, &resolved.unwrap_or(Value::Null));
+            let mut tx = service.db().begin().await?;
+            lock_run(&mut tx, run).await?;
+            let rows = sqlx::query_as::<_, CheckpointRow>(concat!(
+                "SELECT ",
+                ckpt_cols!(),
+                " FROM checkpoints WHERE run_id = $1 AND state = 'COMMITTED'
+                   ORDER BY global_step DESC, committed_at DESC, id DESC FOR UPDATE"
+            ))
+            .bind(run)
+            .fetch_all(&mut *tx)
+            .await?;
+            let kept = keep(&rows, &p);
+            for row in rows.iter().filter(|r| !kept.contains(&r.id)) {
+                if in_use(&mut tx, row).await?.is_none() {
+                    tombstone(&mut tx, row).await?;
+                    system_audit(&mut tx, service.db(), row, "checkpoints.retain").await?;
+                }
             }
+            tx.commit().await.map_err(DbError::from)?;
         }
-        tx.commit().await.map_err(DbError::from)?;
     }
     Ok(())
 }
@@ -188,68 +235,139 @@ pub async fn retention(service: &CheckpointService) -> Result<(), JobsError> {
 /// full-resume checkpoints (they become weights- or adapter-only), unless the run config
 /// sets `checkpoint.strip_optimizer = false`.
 pub async fn strip_completed(service: &CheckpointService) -> Result<(), JobsError> {
-    let rows = sqlx::query_as::<_, CheckpointRow>(concat!(
-        "SELECT ",
-        ckpt_cols!(),
-        " FROM checkpoints c WHERE c.state = 'COMMITTED' AND c.kind = 'full_resume' \
-           AND EXISTS (SELECT 1 FROM jobs j WHERE j.run_id = c.run_id AND j.state = 'COMPLETED') \
-           AND EXISTS (SELECT 1 FROM checkpoint_files f WHERE f.checkpoint_id = c.id AND f.role = ANY($1)) \
-         LIMIT 100"
-    ))
-    .bind(&STATE_ROLES[..])
-    .fetch_all(service.db().pool())
-    .await?;
-    for row in rows {
-        let resolved: Option<Value> =
-            sqlx::query_scalar("SELECT resolved FROM run_configs WHERE run_id = $1")
-                .bind(row.run_id)
-                .fetch_optional(service.db().pool())
-                .await?;
-        let wanted = resolved
-            .as_ref()
-            .and_then(|r| run_setting(r, "strip_optimizer"))
-            .and_then(Value::as_bool)
-            .unwrap_or(service.config().strip_optimizer_after_completion);
-        if !wanted {
-            continue;
-        }
-        let mut tx = service.db().begin().await?;
-        lock_run(&mut tx, row.run_id).await?;
-        let Some(locked) = lock_row(&mut tx, row.id).await? else {
-            continue;
+    let mut after = Uuid::nil();
+    loop {
+        let rows = sqlx::query_as::<_, CheckpointRow>(concat!(
+            "SELECT ",
+            ckpt_cols!(),
+            " FROM checkpoints c WHERE c.id > $2 AND c.state = 'COMMITTED' AND c.kind = 'full_resume'
+               AND EXISTS (SELECT 1 FROM jobs j WHERE j.run_id = c.run_id AND j.state = 'COMPLETED')
+               AND EXISTS (SELECT 1 FROM checkpoint_files f WHERE f.checkpoint_id = c.id AND f.role = ANY($1))
+               AND NOT EXISTS (SELECT 1 FROM runs WHERE parent_checkpoint_id = c.id)
+               AND NOT EXISTS (SELECT 1 FROM job_attempts WHERE resume_from_checkpoint_id = c.id)
+               AND COALESCE((SELECT CASE rc.resolved #> '{checkpoint,strip_optimizer}'
+                               WHEN 'true'::jsonb THEN true WHEN 'false'::jsonb THEN false END
+                             FROM run_configs rc WHERE rc.run_id = c.run_id), $3)
+             ORDER BY c.id LIMIT 100"
+        ))
+        .bind(&STATE_ROLES[..])
+        .bind(after)
+        .bind(service.config().strip_optimizer_after_completion)
+        .fetch_all(service.db().pool())
+        .await?;
+        let Some(last) = rows.last() else {
+            break;
         };
-        if locked.state != "COMMITTED" || locked.kind != "full_resume" {
-            continue;
+        after = last.id;
+        for row in rows {
+            if let Err(e) = strip_one(service, &row).await {
+                tracing::warn!(code = e.code(), checkpoint = %row.id, "optimizer state was not stripped: {e}");
+            }
         }
-        sqlx::query(
-            "INSERT INTO checkpoint_object_deletions (storage_org, object_key, checkpoint_id) \
-             SELECT $2, object_key, checkpoint_id FROM checkpoint_files \
-             WHERE checkpoint_id = $1 AND role = ANY($3) ON CONFLICT DO NOTHING",
-        )
+    }
+    Ok(())
+}
+
+async fn strip_one(service: &CheckpointService, row: &CheckpointRow) -> Result<(), JobsError> {
+    let Some(old_key) = &row.manifest_key else {
+        return Ok(());
+    };
+    let store = service.org_store(&row.storage_org).await?;
+    let bytes = store
+        .get(old_key)
+        .await
+        .map_err(|e| storage_error(e.to_string()))?;
+    if row.manifest_sha256.as_deref().map(hex) != Some(mrl_storage::sha256_hex(&bytes)) {
+        return Err(storage_error("the manifest digest changed"));
+    }
+    let mut doc: Value =
+        serde_json::from_slice(&bytes).map_err(|e| storage_error(e.to_string()))?;
+    let Some(listed) = doc.get_mut("files").and_then(Value::as_array_mut) else {
+        return Err(storage_error("the manifest has no file list"));
+    };
+    listed.retain(|f| !f["role"].as_str().is_some_and(|r| STATE_ROLES.contains(&r)));
+    // Full checkpoints with adapter weights also need adapter metadata to be published as such.
+    let kind = if listed.iter().any(|f| f["role"] == "weights") {
+        "weights_only"
+    } else if listed.iter().any(|f| f["role"] == "adapter") && doc["adapter"].is_object() {
+        "adapter_only"
+    } else {
+        return Ok(());
+    };
+    doc["kind"] = kind.into();
+    doc["is_final"] = row.is_final.into();
+    let bytes = serde_json::to_vec(&doc).map_err(|e| storage_error(e.to_string()))?;
+    let digest = mrl_storage::sha256_hex(&bytes);
+    let key = stripped_manifest_key(row);
+
+    let mut tx = service.db().begin().await?;
+    lock_run(&mut tx, row.run_id).await?;
+    let Some(locked) = lock_row(&mut tx, row.id).await? else {
+        return Ok(());
+    };
+    if !same_committed_files(&locked, row)
+        || locked.kind != "full_resume"
+        || linked(&mut tx, row.id).await?
+    {
+        return Ok(());
+    }
+    // The replacement key is deterministic, so a retry after an interrupted write reuses it.
+    let size = bytes.len() as i64;
+    store
+        .put(&key, bytes.into())
+        .await
+        .map_err(|e| storage_error(e.to_string()))?;
+    let etag = store
+        .head(&key)
+        .await
+        .map_err(|e| storage_error(e.to_string()))?
+        .etag;
+    sqlx::query(
+        "INSERT INTO checkpoint_object_deletions (storage_org, object_key, checkpoint_id)
+         SELECT $2, object_key, checkpoint_id FROM checkpoint_files
+         WHERE checkpoint_id = $1 AND (role = 'manifest' OR role = ANY($3))
+         ON CONFLICT DO NOTHING",
+    )
+    .bind(row.id)
+    .bind(&row.storage_org)
+    .bind(&STATE_ROLES[..])
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM checkpoint_files WHERE checkpoint_id = $1 AND role = ANY($2)")
         .bind(row.id)
-        .bind(&row.storage_org)
         .bind(&STATE_ROLES[..])
         .execute(&mut *tx)
         .await?;
-        sqlx::query("DELETE FROM checkpoint_files WHERE checkpoint_id = $1 AND role = ANY($2)")
-            .bind(row.id)
-            .bind(&STATE_ROLES[..])
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(
-            "UPDATE checkpoints c SET \
-               kind = CASE WHEN EXISTS (SELECT 1 FROM checkpoint_files f WHERE f.checkpoint_id = c.id \
-                                          AND f.role = 'adapter') THEN 'adapter_only' ELSE 'weights_only' END, \
-               total_bytes = (SELECT COALESCE(sum(size_bytes), 0) FROM checkpoint_files WHERE checkpoint_id = c.id), \
-               file_count = (SELECT count(*) FROM checkpoint_files WHERE checkpoint_id = c.id) \
-             WHERE c.id = $1",
-        )
-        .bind(row.id)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await.map_err(DbError::from)?;
-    }
+    let digest = super::service::sha_bytes(&digest);
+    sqlx::query(
+        "UPDATE checkpoint_files SET object_key = $2, sha256 = $3, size_bytes = $4, storage_checksum = $5
+         WHERE checkpoint_id = $1 AND role = 'manifest'",
+    )
+    .bind(row.id).bind(&key).bind(&digest).bind(size).bind(etag)
+    .execute(&mut *tx).await?;
+    sqlx::query(
+        "UPDATE checkpoints c SET kind = $2, manifest_key = $3, manifest_sha256 = $4,
+           verification_level = 'manifest_head', verified_at = now(),
+           total_bytes = (SELECT COALESCE(sum(size_bytes), 0) FROM checkpoint_files WHERE checkpoint_id = c.id),
+           file_count = (SELECT count(*) FROM checkpoint_files WHERE checkpoint_id = c.id)
+         WHERE c.id = $1",
+    )
+    .bind(row.id).bind(kind).bind(key).bind(digest)
+    .execute(&mut *tx).await?;
+    system_audit(&mut tx, service.db(), row, "checkpoints.strip_optimizer").await?;
+    tx.commit().await.map_err(DbError::from)?;
     Ok(())
+}
+
+fn stripped_manifest_key(row: &CheckpointRow) -> String {
+    format!(
+        "{}-manifests/stripped.json",
+        published_prefix(row).trim_end_matches('/')
+    )
+}
+
+fn storage_error(message: impl Into<String>) -> JobsError {
+    JobsError::Seam(crate::seams::SeamError::new("storage", message))
 }
 
 /// Staging GC: a CORRUPT checkpoint's files go once it has been corrupt for the staging TTL
@@ -257,7 +375,11 @@ pub async fn strip_completed(service: &CheckpointService) -> Result<(), JobsErro
 pub async fn staging_gc(service: &CheckpointService) -> Result<(), JobsError> {
     let ids: Vec<(Uuid, Uuid)> = sqlx::query_as(
         "SELECT id, run_id FROM checkpoints WHERE state = 'CORRUPT' \
-           AND COALESCE(verified_at, created_at) < now() - make_interval(secs => $1) LIMIT 200",
+           AND COALESCE(verified_at, created_at) < now() - make_interval(secs => $1)
+           AND NOT is_final
+           AND NOT EXISTS (SELECT 1 FROM runs WHERE parent_checkpoint_id = checkpoints.id)
+           AND NOT EXISTS (SELECT 1 FROM job_attempts WHERE resume_from_checkpoint_id = checkpoints.id)
+           ORDER BY created_at LIMIT 200",
     )
     .bind(service.config().staging_ttl_seconds as f64)
     .fetch_all(service.db().pool())
@@ -266,8 +388,9 @@ pub async fn staging_gc(service: &CheckpointService) -> Result<(), JobsError> {
         let mut tx = service.db().begin().await?;
         lock_run(&mut tx, run).await?;
         if let Some(row) = lock_row(&mut tx, id).await? {
-            if row.state == "CORRUPT" {
+            if row.state == "CORRUPT" && in_use(&mut tx, &row).await?.is_none() {
                 tombstone(&mut tx, &row).await?;
+                system_audit(&mut tx, service.db(), &row, "checkpoints.staging_gc").await?;
             }
         }
         tx.commit().await.map_err(DbError::from)?;
@@ -277,29 +400,56 @@ pub async fn staging_gc(service: &CheckpointService) -> Result<(), JobsError> {
 
 /// Deletes queued objects (a missing object counts as deleted). Returns how many went.
 pub async fn delete_queued(service: &CheckpointService) -> Result<usize, JobsError> {
-    let rows: Vec<(String, String)> = sqlx::query_as(
-        "SELECT storage_org, object_key FROM checkpoint_object_deletions ORDER BY queued_at LIMIT 1000",
+    let rows: Vec<(String, String, Uuid)> = sqlx::query_as(
+        "SELECT storage_org, object_key, checkpoint_id FROM checkpoint_object_deletions
+         WHERE delete_after <= now() ORDER BY delete_after, queued_at LIMIT 1000",
     )
     .fetch_all(service.db().pool())
     .await?;
     let mut done = 0;
-    for (org, key) in rows {
-        let store = service.org_store(&org).await?;
-        match store.delete(&key).await {
-            Ok(()) | Err(mrl_storage::StorageError::NotFound { .. }) => {}
+    for (org, key, ckpt) in rows {
+        let deleted = async {
+            let store = service.org_store(&org).await?;
+            let mut tx = service.db().begin().await?;
+            let available: bool = sqlx::query_scalar(
+                "SELECT pg_try_advisory_xact_lock(hashtextextended($1::text, 23))",
+            )
+            .bind(ckpt.to_string()).fetch_one(&mut *tx).await?;
+            if !available {
+                return Ok(false);
+            }
+            let due: Option<bool> = sqlx::query_scalar(
+                "SELECT delete_after <= now() FROM checkpoint_object_deletions
+                 WHERE storage_org = $1 AND object_key = $2 FOR UPDATE",
+            )
+            .bind(&org).bind(&key).fetch_optional(&mut *tx).await?;
+            if due != Some(true) {
+                return Ok(false);
+            }
+            store.delete(&key).await.map_err(|e| storage_error(e.to_string()))?;
+            sqlx::query(
+                "DELETE FROM checkpoint_object_deletions WHERE storage_org = $1 AND object_key = $2",
+            )
+            .bind(&org).bind(&key).execute(&mut *tx).await?;
+            tx.commit().await.map_err(DbError::from)?;
+            Ok::<_, JobsError>(true)
+        }.await;
+        match deleted {
+            Ok(true) => done += 1,
+            Ok(false) => {}
             Err(e) => {
-                tracing::warn!(error = %e, key, "checkpoint object not deleted yet");
-                continue;
+                tracing::warn!(
+                    code = e.code(),
+                    key,
+                    "checkpoint object was not deleted: {e}"
+                );
+                sqlx::query(
+                    "UPDATE checkpoint_object_deletions SET delete_after = now() + interval '10 minutes'
+                     WHERE storage_org = $1 AND object_key = $2 AND delete_after <= now()",
+                )
+                .bind(&org).bind(&key).execute(service.db().pool()).await?;
             }
         }
-        sqlx::query(
-            "DELETE FROM checkpoint_object_deletions WHERE storage_org = $1 AND object_key = $2",
-        )
-        .bind(&org)
-        .bind(&key)
-        .execute(service.db().pool())
-        .await?;
-        done += 1;
     }
     Ok(done)
 }

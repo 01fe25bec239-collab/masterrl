@@ -1,6 +1,6 @@
 //! The FINALIZING checks (Doc 11 §11, P8) and the pass that applies them.
 
-use super::service::{ckpt_cols, metrics, CheckpointRow, CheckpointService};
+use super::service::{ckpt_cols, lock_run, metrics, CheckpointRow, CheckpointService};
 use crate::db::Db;
 use crate::modules::jobs::chains::{CompletionVerifier, Verification};
 use crate::modules::jobs::transitions::job_cols;
@@ -9,6 +9,7 @@ use crate::seams::SeamError;
 use async_trait::async_trait;
 use mrl_domain::failure::{FailureClass, FailureCode};
 use serde_json::Value;
+use uuid::Uuid;
 
 /// A TRAIN job's results are verified when:
 /// 1. the run's final checkpoint is COMMITTED with `is_final`;
@@ -37,13 +38,21 @@ fn failed(message: String) -> Verification {
 
 /// The verdict for a run's final checkpoint (`None`: there is none) and its resolved config.
 pub fn judge(last: Option<&CheckpointRow>, resolved: &Value) -> Verification {
+    let reported = last.map(metrics).unwrap_or_default();
+    judge_report(last, resolved, &reported)
+}
+
+fn judge_report(
+    last: Option<&CheckpointRow>,
+    resolved: &Value,
+    reported: &std::collections::BTreeMap<String, f64>,
+) -> Verification {
     let Some(ckpt) = last.filter(|c| c.state == "COMMITTED" && c.is_final) else {
         return failed(
             "The run finished without a committed final checkpoint, so its result can't be confirmed."
                 .into(),
         );
     };
-    let reported = metrics(ckpt);
     let missing: Vec<&str> = resolved
         .pointer("/metrics/required")
         .and_then(Value::as_array)
@@ -73,6 +82,14 @@ pub fn judge(last: Option<&CheckpointRow>, resolved: &Value) -> Verification {
     Verification::Verified
 }
 
+const FINAL_SNAPSHOT: &str =
+    "SELECT r.final_checkpoint_id, c.state_version, c.manifest_sha256 FROM runs r
+     LEFT JOIN checkpoints c ON c.id = r.final_checkpoint_id WHERE r.id = $1";
+
+const OPEN_FINAL: &str =
+    "SELECT EXISTS (SELECT 1 FROM checkpoints WHERE attempt_id = $1 AND attempt_epoch = $2
+     AND is_final AND state IN ('WRITING','UPLOADED','VERIFYING'))";
+
 #[async_trait]
 impl CompletionVerifier for FinalCheckpointVerifier {
     fn name(&self) -> &'static str {
@@ -84,15 +101,55 @@ impl CompletionVerifier for FinalCheckpointVerifier {
             return Ok(Verification::Abstain);
         };
         let db = |e: sqlx::Error| SeamError::from(crate::db::DbError::from(e));
+        let Some(attempt) = job.current_attempt_id else {
+            return Ok(failed("The run has no finished attempt to verify.".into()));
+        };
+        if sqlx::query_scalar::<_, bool>(OPEN_FINAL)
+            .bind(attempt)
+            .bind(job.epoch)
+            .fetch_one(self.db.pool())
+            .await
+            .map_err(db)?
+        {
+            // RetryLater would transition the job out of FINALIZING in P17.
+            return Err(SeamError::new(
+                "checkpoints",
+                "The final checkpoint is still being saved.",
+            ));
+        }
         let last = sqlx::query_as::<_, CheckpointRow>(concat!(
             "SELECT ",
             ckpt_cols!(),
-            " FROM checkpoints WHERE id = (SELECT final_checkpoint_id FROM runs WHERE id = $1)"
+            " FROM checkpoints WHERE id = (SELECT final_checkpoint_id FROM runs WHERE id = $1)
+               AND attempt_id = $2 AND attempt_epoch = $3"
         ))
         .bind(run)
+        .bind(attempt)
+        .bind(job.epoch)
         .fetch_optional(self.db.pool())
         .await
         .map_err(db)?;
+        let Some(checkpoint) = last.as_ref() else {
+            return Ok(judge(None, &Value::Null));
+        };
+        let exited: Option<(Option<i64>, Option<Value>)> = sqlx::query_as(
+            "SELECT last_step, exit_report FROM job_attempts WHERE id = $1 AND state = 'EXITED_OK'",
+        )
+        .bind(attempt)
+        .fetch_optional(self.db.pool())
+        .await
+        .map_err(db)?;
+        let Some((Some(step), report)) = exited else {
+            return Ok(failed(
+                "The finished attempt did not report its final step.".into(),
+            ));
+        };
+        if step != checkpoint.global_step {
+            return Ok(failed(format!(
+                "The attempt finished at step {step}, but its final checkpoint is at step {}.",
+                checkpoint.global_step,
+            )));
+        }
         let resolved: Value =
             sqlx::query_scalar("SELECT resolved FROM run_configs WHERE run_id = $1")
                 .bind(run)
@@ -100,7 +157,18 @@ impl CompletionVerifier for FinalCheckpointVerifier {
                 .await
                 .map_err(db)?
                 .unwrap_or(Value::Null);
-        Ok(judge(last.as_ref(), &resolved))
+        let reported = match report.as_ref().and_then(|r| r["final_metrics"].as_object()) {
+            Some(values) => values
+                .iter()
+                .filter_map(|(name, value)| {
+                    let value = value.as_f64()?;
+                    value.is_finite().then(|| (name.clone(), value))
+                })
+                .collect(),
+            // P21 currently persists AttemptStatus, which does not carry final metrics.
+            None => metrics(checkpoint),
+        };
+        Ok(judge_report(Some(checkpoint), &resolved, &reported))
     }
 }
 
@@ -108,24 +176,79 @@ impl CompletionVerifier for FinalCheckpointVerifier {
 /// transaction open, then `verify_completion` applies the verdict under the job lock (a job
 /// that changed meanwhile is left for the next pass).
 pub async fn finalize(service: &CheckpointService, chains: &Chains) -> Result<(), JobsError> {
-    let jobs = sqlx::query_as::<_, JobRow>(concat!(
-        "SELECT ",
-        job_cols!(),
-        " FROM jobs WHERE state = 'FINALIZING' ORDER BY updated_at LIMIT 50"
-    ))
-    .fetch_all(service.db().pool())
-    .await?;
-    for job in jobs {
-        let verdict = chains.verify(&job).await?;
-        let mut tx = service.db().begin().await?;
-        let Some(locked) = JobTransitions::lock(&mut tx, job.org_id, job.id).await? else {
-            continue;
+    let mut after = Uuid::nil();
+    loop {
+        let jobs = sqlx::query_as::<_, JobRow>(concat!(
+            "SELECT ",
+            job_cols!(),
+            " FROM jobs WHERE state = 'FINALIZING' AND id > $1 ORDER BY id LIMIT 50"
+        ))
+        .bind(after)
+        .fetch_all(service.db().pool())
+        .await?;
+        let Some(last) = jobs.last() else {
+            break;
         };
-        match JobTransitions::verify_completion(&mut tx, &locked, verdict).await {
-            Ok(_) => tx.commit().await.map_err(crate::db::DbError::from)?,
-            Err(e) if e.code() == "MRL-CONFLICT-170" || e.code() == "MRL-STATE-170" => {}
-            Err(e) => return Err(e),
+        after = last.id;
+        for job in jobs {
+            if let Err(e) = finalize_one(service, chains, &job).await {
+                tracing::warn!(code = e.code(), job = %job.id, "job completion was not decided: {e}");
+            }
         }
+    }
+
+    Ok(())
+}
+
+async fn finalize_one(
+    service: &CheckpointService,
+    chains: &Chains,
+    job: &JobRow,
+) -> Result<(), JobsError> {
+    let pool = service.db().pool();
+    type Snapshot = (Option<Uuid>, Option<i64>, Option<Vec<u8>>);
+    let snapshot: Option<Snapshot> = match job.run_id {
+        Some(run) => {
+            sqlx::query_as(FINAL_SNAPSHOT)
+                .bind(run)
+                .fetch_optional(pool)
+                .await?
+        }
+        None => None,
+    };
+    if job.kind == "TRAIN"
+        && sqlx::query_scalar::<_, bool>(OPEN_FINAL)
+            .bind(job.current_attempt_id)
+            .bind(job.epoch)
+            .fetch_one(pool)
+            .await?
+    {
+        return Ok(());
+    }
+    let verdict = chains.verify(job).await?;
+    let mut tx = service.db().begin().await?;
+    let Some(locked) = JobTransitions::lock(&mut tx, job.org_id, job.id).await? else {
+        return Ok(());
+    };
+    if let Some(run) = job.run_id {
+        lock_run(&mut tx, run).await?;
+        let current = sqlx::query_as(FINAL_SNAPSHOT)
+            .bind(run)
+            .fetch_optional(&mut *tx)
+            .await?;
+        let pending: bool = sqlx::query_scalar(OPEN_FINAL)
+            .bind(job.current_attempt_id)
+            .bind(job.epoch)
+            .fetch_one(&mut *tx)
+            .await?;
+        if current != snapshot || (job.kind == "TRAIN" && pending) {
+            return Ok(());
+        }
+    }
+    match JobTransitions::verify_completion(&mut tx, &locked, verdict).await {
+        Ok(_) => tx.commit().await.map_err(crate::db::DbError::from)?,
+        Err(e) if e.code() == "MRL-CONFLICT-170" || e.code() == "MRL-STATE-170" => {}
+        Err(e) => return Err(e),
     }
     Ok(())
 }

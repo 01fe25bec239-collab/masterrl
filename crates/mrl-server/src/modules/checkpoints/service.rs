@@ -1,25 +1,30 @@
 //! [`CheckpointService`]: staging, the commit, corruption, full verification, resume points,
 //! emergency checkpoints and the fast background tick.
 //!
-//! Lock order, everywhere: job (and attempt), then run, then checkpoint. Storage is read before
-//! a transaction opens; the transaction re-checks every guard under its locks.
+//! Job and attempt locks precede run and checkpoint row locks. The publisher uses a
+//! checkpoint advisory lock while it copies checked objects, then rechecks the row locks.
 
 use super::CheckpointsConfig;
 use crate::db::{Db, DbError, Tx};
 use crate::modules::artifacts::{ArtifactStore, LOCAL_ORG};
 use crate::modules::events::{NewEvent, OutboxWriter};
 use crate::modules::jobs::{scope, Chains, JobRow, JobTransitions, JobsError};
-use crate::modules::nodes::commands::{CommandKind, CommandSender, NewCommand};
+use crate::modules::nodes::commands::{envelope_len, CommandKind, CommandSender, NewCommand};
 use crate::modules::nodes::Gateway;
-use crate::seams::{Principal, RequestContext, RequestMeta, SeamError, Seams, SecretStore};
+use crate::seams::{
+    AuditEvent, AuditOutcome, AuditSink, Principal, RequestContext, RequestMeta, SeamError, Seams,
+    SecretStore,
+};
 use mrl_domain::ids::{AttemptId, CheckpointId, JobId, NodeId, RunId};
 use mrl_domain::state::{Checkpoint, CheckpointEvent, CheckpointState, StateMachine};
-use mrl_proto::agent::v1::{command::Kind, CheckpointAttempt, UploadArtifacts, UploadItem};
+use mrl_proto::agent::v1::{
+    command::Kind, CheckpointAttempt, Command, UploadArtifacts, UploadItem,
+};
 use mrl_proto::common::v1::AttemptRef;
 use mrl_proto::worker::v1::{CheckpointCommitRequest, CheckpointKind, CheckpointStaged};
-use mrl_storage::{StorageError, Store, TicketMethod};
+use mrl_storage::{StorageError, Store, TicketMethod, TransferOptions};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,10 +32,22 @@ use time::OffsetDateTime;
 use tokio::sync::OnceCell;
 use uuid::Uuid;
 
-/// Most files one checkpoint may list (keeps `UploadArtifacts` under the 4 MiB command limit).
+/// Most files one checkpoint may list. The upload command has a separate wire-size limit.
 pub const MAX_FILES: usize = 4096;
 /// Largest manifest the commit reads.
 const MAX_MANIFEST_BYTES: u64 = 16 << 20;
+const FILE_ROLES: &[&str] = &[
+    "weights",
+    "adapter",
+    "config",
+    "tokenizer",
+    "optimizer",
+    "scheduler",
+    "rng",
+    "trainer_state",
+    "other",
+    "manifest",
+];
 /// File roles dropped by optimizer stripping.
 pub const STATE_ROLES: [&str; 4] = ["optimizer", "scheduler", "rng", "trainer_state"];
 
@@ -132,6 +149,8 @@ pub struct FileRow {
     pub role: String,
     /// Where it is stored.
     pub object_key: String,
+    /// The upload-only key. Older checkpoints stored this in `object_key`.
+    pub staging_key: Option<String>,
     /// sha256.
     pub sha256: Vec<u8>,
     /// Size in bytes.
@@ -247,7 +266,16 @@ fn check_files(s: &CheckpointStaged) -> Result<(), String> {
     if manifests.len() != 1 || manifests[0].sha256 != s.manifest_sha256 {
         return Err("it needs exactly one manifest file with the manifest digest".into());
     }
-    let mut seen = std::collections::HashSet::new();
+    if s.files.len() < 2 || manifests[0].size > MAX_MANIFEST_BYTES {
+        return Err("it needs at least one data file and a manifest of at most 16 MiB".into());
+    }
+    if s.metrics_at_step.keys().any(|name| name.contains('\0')) {
+        return Err("a metric name contains a NUL character".into());
+    }
+    if i64::try_from(s.step).is_err() || i64::try_from(s.policy_version).is_err() {
+        return Err("its step or policy version is too large".into());
+    }
+    let mut seen = HashSet::new();
     for f in &s.files {
         if sha_bytes(&f.sha256).is_none() {
             return Err(format!("{} has no valid sha256", f.path));
@@ -255,14 +283,36 @@ fn check_files(s: &CheckpointStaged) -> Result<(), String> {
         if i64::try_from(f.size).is_err() {
             return Err(format!("{} is too large", f.path));
         }
-        if f.role.is_empty() || f.role.contains('\0') || f.path.contains('\0') {
-            return Err(format!("{} has an empty role or a NUL character", f.path));
+        if !FILE_ROLES.contains(&f.role.as_str()) || f.path.contains('\0') {
+            return Err(format!("{} has an invalid file role or path", f.path));
         }
         if !seen.insert(f.path.to_lowercase()) {
             return Err(format!("{} is listed twice", f.path));
         }
     }
+    if s.files
+        .iter()
+        .try_fold(0_i64, |sum, f| sum.checked_add(f.size as i64))
+        .is_none()
+    {
+        return Err("its total size is too large".into());
+    }
     Ok(())
+}
+
+/// Convert the P13 staging path to its checkpoint-relative name.
+fn checkpoint_path<'a>(id: &str, path: &'a str) -> Option<&'a str> {
+    let (prefix, path) = path.strip_prefix("checkpoints/")?.split_once('/')?;
+    (prefix == id).then_some(path)
+}
+
+pub(crate) fn published_prefix(row: &CheckpointRow) -> String {
+    format!(
+        "orgs/{}/runs/{}/checkpoints/{}/_committed/",
+        row.storage_org,
+        RunId::from_uuid(row.run_id),
+        CheckpointId::from_uuid(row.id)
+    )
 }
 
 impl CheckpointService {
@@ -341,7 +391,7 @@ impl CheckpointService {
     /// A checkpoint's files.
     pub async fn files(&self, id: Uuid) -> Result<Vec<FileRow>, JobsError> {
         Ok(sqlx::query_as::<_, FileRow>(
-            "SELECT path, role, object_key, sha256, size_bytes, storage_checksum \
+            "SELECT path, role, object_key, staging_key, sha256, size_bytes, storage_checksum \
              FROM checkpoint_files WHERE checkpoint_id = $1 ORDER BY path",
         )
         .bind(id)
@@ -372,6 +422,9 @@ impl CheckpointService {
             tracing::warn!(attempt = %at.attempt_id, "staged checkpoint for an unknown attempt; ignored");
             return Ok(());
         };
+        if at.job_id.parse::<JobId>().map(|id| id.as_uuid()).ok() != Some(job) {
+            return Ok(());
+        }
         let store_org = storage_org(org);
         let store = self.org_store(&store_org).await?;
         let prefix = store
@@ -383,14 +436,17 @@ impl CheckpointService {
             )
             .map_err(storage)?;
         let mut problem = check_files(s).err();
+        let id_text = CheckpointId::from_uuid(ckpt).to_string();
         let mut keys = Vec::with_capacity(s.files.len());
         for f in &s.files {
-            match store.keys().join(&prefix, &f.path) {
-                Ok(k) => keys.push(k),
-                Err(_) => {
+            match checkpoint_path(&id_text, &f.path)
+                .and_then(|path| store.keys().join(&prefix, path).ok().map(|key| (path, key)))
+            {
+                Some((path, key)) => keys.push((path, key)),
+                None => {
                     problem
                         .get_or_insert_with(|| format!("{} is not a safe relative path", f.path));
-                    keys.push(String::new());
+                    keys.push(("", String::new()));
                 }
             }
         }
@@ -437,15 +493,32 @@ impl CheckpointService {
         let metrics: serde_json::Map<String, Value> = s
             .metrics_at_step
             .iter()
-            .filter(|(_, v)| v.is_finite())
+            .filter(|(name, v)| v.is_finite() && !name.contains('\0'))
             .map(|(k, v)| (k.clone(), json!(v)))
             .collect();
-        let row = sqlx::query_as::<_, CheckpointRow>(concat!(
+        let early: Option<(Vec<u8>, OffsetDateTime)> = sqlx::query_as(
+            "DELETE FROM checkpoint_early_commits WHERE checkpoint_id = $1 AND attempt_id = $2 \
+               AND epoch = $3 AND node_id = $4 RETURNING digest, requested_at",
+        )
+        .bind(ckpt)
+        .bind(attempt)
+        .bind(epoch)
+        .bind(node)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let digest = sha_bytes(&s.manifest_sha256);
+        if early
+            .as_ref()
+            .is_some_and(|(d, _)| Some(d) != digest.as_ref())
+        {
+            problem.get_or_insert_with(|| "the manifest changed after staging".to_owned());
+        }
+        let Some(row) = sqlx::query_as::<_, CheckpointRow>(concat!(
             "INSERT INTO checkpoints (id, org_id, storage_org, run_id, job_id, attempt_id, \
                attempt_epoch, global_step, policy_version, kind, layout, is_final, state, \
-               manifest_key, manifest_sha256, total_bytes, file_count, metrics_at_save, node_id) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'WRITING',$13,$14,$15,$16,$17,$18) \
-             RETURNING ",
+               manifest_key, manifest_sha256, total_bytes, file_count, metrics_at_save, node_id, commit_requested_at) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'WRITING',$13,$14,$15,$16,$17,$18,$19) \
+             ON CONFLICT (id) DO NOTHING RETURNING ",
             ckpt_cols!()
         ))
         .bind(ckpt)
@@ -462,25 +535,28 @@ impl CheckpointService {
         .bind(s.is_final)
         .bind(
             manifest
-                .and_then(|i| keys.get(i).cloned())
+                .and_then(|i| keys.get(i).map(|(_, key)| key.clone()))
                 .filter(|k| !k.is_empty()),
         )
-        .bind(sha_bytes(&s.manifest_sha256))
+        .bind(digest)
         .bind(total)
         .bind(i32::try_from(s.files.len()).unwrap_or(i32::MAX))
         .bind(Value::Object(metrics))
         .bind(node)
-        .fetch_one(&mut *tx)
-        .await?;
+        .bind(early.map(|(_, requested)| requested))
+        .fetch_optional(&mut *tx)
+        .await? else {
+            return Ok(());
+        };
         if problem.is_none() {
-            for (f, key) in s.files.iter().zip(&keys) {
+            for (f, (path, key)) in s.files.iter().zip(&keys) {
                 sqlx::query(
                     "INSERT INTO checkpoint_files (checkpoint_id, org_id, path, role, object_key, \
-                       sha256, size_bytes) VALUES ($1,$2,$3,$4,$5,$6,$7)",
+                       staging_key, sha256, size_bytes) VALUES ($1,$2,$3,$4,$5,$5,$6,$7)",
                 )
                 .bind(ckpt)
                 .bind(org)
-                .bind(&f.path)
+                .bind(path)
                 .bind(&f.role)
                 .bind(key)
                 .bind(sha_bytes(&f.sha256).unwrap_or_default())
@@ -523,12 +599,22 @@ impl CheckpointService {
         .await?)
     }
 
-    /// Issues a PUT ticket for every file and sends them in one `UploadArtifacts` (replacing
-    /// any unsent earlier one).
+    /// Issues a PUT ticket for every staging file and sends them in one `UploadArtifacts`.
     pub(crate) async fn send_tickets(&self, row: &CheckpointRow) -> Result<(), JobsError> {
         let Some(node) = row.node_id else {
             return Ok(());
         };
+        let claimed = sqlx::query(
+            "UPDATE checkpoints SET tickets_checked_at = now() WHERE id = $1
+             AND state IN ('WRITING','UPLOADED','VERIFYING')
+             AND (tickets_checked_at IS NULL OR tickets_checked_at < now() - interval '5 seconds')",
+        )
+        .bind(row.id)
+        .execute(self.db.pool())
+        .await?;
+        if claimed.rows_affected() == 0 {
+            return Ok(());
+        }
         let files = self.files(row.id).await?;
         let seams = self.ticket_seams().await?;
         let mut principal = Principal::local_owner();
@@ -547,12 +633,26 @@ impl CheckpointService {
             let size = u64::try_from(f.size_bytes).unwrap_or(0);
             let t = self
                 .store
-                .ticket(seams, &ctx, &f.object_key, TicketMethod::Put, size)
+                .ticket(
+                    seams,
+                    &ctx,
+                    f.staging_key.as_deref().unwrap_or(&f.object_key),
+                    TicketMethod::Put,
+                    size,
+                )
                 .await
                 .map_err(|e| seam("tickets", e))?;
             expires = Some(expires.map_or(t.expires_at, |e| e.min(t.expires_at)));
             items.push(UploadItem {
-                local_path: f.path.clone(),
+                local_path: if f.staging_key.is_some() {
+                    format!(
+                        "checkpoints/{}/{path}",
+                        CheckpointId::from_uuid(row.id),
+                        path = f.path
+                    )
+                } else {
+                    f.path.clone()
+                },
                 url: t.url,
                 sha256: hex(&f.sha256),
                 size,
@@ -573,14 +673,34 @@ impl CheckpointService {
             checkpoint_id: CheckpointId::from_uuid(row.id).to_string(),
             items,
         };
+        let kind = Kind::UploadArtifacts(upload);
+        if envelope_len(&Command {
+            command_id: Uuid::nil().to_string(),
+            kind: Some(kind.clone()),
+        }) > crate::grpc::MAX_MESSAGE_BYTES
+        {
+            let mut tx = self.db.begin().await?;
+            lock_run(&mut tx, row.run_id).await?;
+            if let Some(locked) = lock_row(&mut tx, row.id).await? {
+                if locked.is_open() && locked.state_version == row.state_version {
+                    mark_corrupt(
+                        &mut tx,
+                        &locked,
+                        "its upload tickets exceed the command size limit",
+                    )
+                    .await?;
+                }
+            }
+            tx.commit().await.map_err(DbError::from)?;
+            return Ok(());
+        }
         let sent = self
             .commands
             .send(
                 NodeId::from_uuid(node),
-                NewCommand::new(Kind::UploadArtifacts(upload))
+                NewCommand::new(kind)
                     .attempt(attempt, epoch)
-                    .deadline(crate::modules::artifacts::TICKET_TTL)
-                    .superseding(),
+                    .deadline(crate::modules::artifacts::TICKET_TTL),
             )
             .await
             .map_err(|e| seam("commands", e))?;
@@ -598,44 +718,72 @@ impl CheckpointService {
 
     // ---- commit ----
 
-    /// A relayed `CheckpointCommitRequest` from `node`: notes the request and tries to commit.
+    /// Persists a relayed commit request for the publisher. The inbox can advance before I/O.
     pub async fn on_commit_request(
         &self,
         node: Uuid,
         at: &AttemptRef,
         c: &CheckpointCommitRequest,
     ) -> Result<(), JobsError> {
-        let Ok(ckpt) = c.checkpoint_id.parse::<CheckpointId>() else {
+        let (Ok(ckpt), Ok(attempt), Ok(job), Ok(epoch)) = (
+            c.checkpoint_id.parse::<CheckpointId>(),
+            at.attempt_id.parse::<AttemptId>(),
+            at.job_id.parse::<JobId>(),
+            i64::try_from(at.fencing_epoch),
+        ) else {
             return Ok(());
         };
-        let Some(row) = self.find(ckpt.as_uuid()).await? else {
-            tracing::warn!(checkpoint = %c.checkpoint_id, "commit for an unknown checkpoint; ignored");
+        let (ckpt, attempt, job) = (ckpt.as_uuid(), attempt.as_uuid(), job.as_uuid());
+        let Some((org, owner_job, run)) = self.attempt_owner(attempt).await? else {
             return Ok(());
         };
-        let same_attempt = at
-            .attempt_id
-            .parse::<AttemptId>()
-            .is_ok_and(|a| a.as_uuid() == row.attempt_id);
-        if !same_attempt || row.node_id != Some(node) {
-            tracing::warn!(checkpoint = %c.checkpoint_id, node = %node, "commit from another attempt or node; ignored");
+        if owner_job != job {
             return Ok(());
         }
-        if row.manifest_sha256.as_deref() != sha_bytes(&c.manifest_sha256).as_deref() {
-            self.corrupt(row.id, "the manifest changed after staging")
-                .await?;
+        let mut tx = self.db.begin().await?;
+        let Some(job) = JobTransitions::lock(&mut tx, org, job).await? else {
+            return Ok(());
+        };
+        if !launched_on(&mut tx, node, attempt, epoch).await? {
             return Ok(());
         }
-        sqlx::query(
-            "UPDATE checkpoints SET commit_requested_at = now() \
-             WHERE id = $1 AND commit_requested_at IS NULL",
-        )
-        .bind(row.id)
-        .execute(self.db.pool())
-        .await?;
-        // Saved: a storage problem now is retried by the tick, not by redelivery.
-        if let Err(e) = self.try_commit(row.id).await {
-            tracing::warn!(code = e.code(), error = %e, checkpoint = %c.checkpoint_id, "commit not decided yet; trying again later");
+        lock_run(&mut tx, run).await?;
+        let digest = sha_bytes(&c.manifest_sha256);
+        let Some(row) = lock_row(&mut tx, ckpt).await? else {
+            if let Some(digest) =
+                digest.filter(|_| epoch == job.epoch && !is_cancelled_or_over(&job.state))
+            {
+                sqlx::query(
+                    "INSERT INTO checkpoint_early_commits (checkpoint_id, attempt_id, epoch, node_id, digest)
+                     VALUES ($1,$2,$3,$4,$5) ON CONFLICT DO NOTHING",
+                )
+                .bind(ckpt).bind(attempt).bind(epoch).bind(node).bind(digest)
+                .execute(&mut *tx).await?;
+                tx.commit().await.map_err(DbError::from)?;
+            }
+            return Ok(());
+        };
+        if !row.is_open()
+            || row.node_id != Some(node)
+            || row.attempt_id != attempt
+            || row.attempt_epoch != epoch
+            || row.job_id != job.id
+        {
+            return Ok(());
         }
+        if let Some(why) = fence(&job, &row) {
+            mark_corrupt(&mut tx, &row, &format!("rejected: {why}")).await?;
+        } else if row.commit_requested_at.is_none() {
+            if row.manifest_sha256 != digest {
+                mark_corrupt(&mut tx, &row, "the manifest changed after staging").await?;
+            } else {
+                sqlx::query("UPDATE checkpoints SET commit_requested_at = now() WHERE id = $1")
+                    .bind(row.id)
+                    .execute(&mut *tx)
+                    .await?;
+            }
+        }
+        tx.commit().await.map_err(DbError::from)?;
         Ok(())
     }
 
@@ -650,19 +798,29 @@ impl CheckpointService {
             return Ok(Some(row.state()));
         }
         let files = self.files(id).await?;
-        let checked = match self.head_check(&row, &files).await? {
-            Head::Waiting(missing) => {
-                let age = OffsetDateTime::now_utc() - row.created_at;
-                if age.whole_seconds() >= self.config.staging_ttl_seconds as i64 {
-                    let why = format!("files never arrived in storage: {}", missing.join(", "));
-                    return self.corrupt(id, &why).await.map(Some);
-                }
-                return Ok(Some(row.state()));
-            }
-            Head::Bad(why) => return self.corrupt(id, &why).await.map(Some),
-            Head::Ok(etags) => etags,
-        };
         let mut tx = self.db.begin().await?;
+        // One publisher per checkpoint. The cleanup pass uses the same lock before deleting
+        // candidate objects from an interrupted commit.
+        let publishing: bool =
+            sqlx::query_scalar("SELECT pg_try_advisory_xact_lock(hashtextextended($1::text, 23))")
+                .bind(id.to_string())
+                .fetch_one(&mut *tx)
+                .await?;
+        if !publishing {
+            return Ok(Some(row.state()));
+        }
+        let current: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM checkpoints WHERE id = $1 AND state_version = $2
+             AND state IN ('WRITING','UPLOADED','VERIFYING'))",
+        )
+        .bind(id)
+        .bind(row.state_version)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !current {
+            return Ok(None);
+        }
+        let checked = self.head_check(&row, &files).await?;
         let Some(job) = lock_job(&mut tx, row.job_id).await? else {
             return Ok(None);
         };
@@ -678,7 +836,35 @@ impl CheckpointService {
             tx.commit().await.map_err(DbError::from)?;
             return Ok(Some(done.state()));
         }
+        let checked = match checked {
+            Head::Waiting(missing) => {
+                let age = OffsetDateTime::now_utc() - locked.created_at;
+                if age.whole_seconds() < self.config.staging_ttl_seconds as i64 {
+                    return Ok(Some(locked.state()));
+                }
+                let why = format!("files never arrived in storage: {}", missing.join(", "));
+                let done = mark_corrupt(&mut tx, &locked, &why).await?;
+                tx.commit().await.map_err(DbError::from)?;
+                return Ok(Some(done.state()));
+            }
+            Head::Bad(why) => {
+                let done = mark_corrupt(&mut tx, &locked, &why).await?;
+                tx.commit().await.map_err(DbError::from)?;
+                return Ok(Some(done.state()));
+            }
+            Head::Ok(objects) => objects,
+        };
         let mut row = locked;
+        if row.is_final {
+            sqlx::query(
+                "UPDATE checkpoints SET is_final = false
+                 WHERE run_id = $1 AND is_final AND state = 'COMMITTED' AND id <> $2",
+            )
+            .bind(row.run_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        }
         for ev in [
             CheckpointEvent::Upload,
             CheckpointEvent::RequestCommit,
@@ -688,33 +874,35 @@ impl CheckpointService {
                 row = step(&mut tx, &row, ev).await?;
             }
         }
-        for (path, etag) in &checked {
+        let mut manifest_key = None;
+        for (file, key, etag) in checked {
             sqlx::query(
-                "UPDATE checkpoint_files SET storage_checksum = $3 WHERE checkpoint_id = $1 AND path = $2",
+                "UPDATE checkpoint_files SET object_key = $3, storage_checksum = $4,
+                 staging_key = COALESCE(staging_key, $5), path = $6
+                 WHERE checkpoint_id = $1 AND path = $2",
             )
             .bind(id)
-            .bind(path)
+            .bind(&file.path)
+            .bind(&key)
             .bind(etag)
+            .bind(&file.object_key)
+            .bind(file_path(row.id, &file))
             .execute(&mut *tx)
             .await?;
+            if file.role == "manifest" {
+                manifest_key = Some(key);
+            }
         }
         sqlx::query(
-            "UPDATE checkpoints SET verification_level = 'manifest_head', committed_at = now(), \
-               verified_at = now() WHERE id = $1",
+            "UPDATE checkpoints SET verification_level = 'manifest_head', committed_at = now(),
+               verified_at = now(), manifest_key = $2 WHERE id = $1",
         )
         .bind(id)
+        .bind(manifest_key)
         .execute(&mut *tx)
         .await?;
+        super::cleanup::queue_staging(&mut tx, &row).await?;
         if row.is_final {
-            // ponytail: one final per run; a newer final (a later attempt) replaces the older.
-            sqlx::query(
-                "UPDATE checkpoints SET is_final = false \
-                 WHERE run_id = $1 AND is_final AND state = 'COMMITTED' AND id <> $2",
-            )
-            .bind(row.run_id)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
             sqlx::query("UPDATE runs SET final_checkpoint_id = $2 WHERE id = $1")
                 .bind(row.run_id)
                 .bind(id)
@@ -735,17 +923,14 @@ impl CheckpointService {
         Ok(Some(CheckpointState::Committed))
     }
 
-    /// `manifest_head`: every file is stored with its size, the manifest object hashes to the
-    /// staged digest, and the manifest lists exactly the staged files.
+    /// Checks the manifest and uploads verified copies to keys that have no PUT tickets.
     async fn head_check(&self, row: &CheckpointRow, files: &[FileRow]) -> Result<Head, JobsError> {
         let store = self.org_store(&row.storage_org).await?;
         let mut missing = Vec::new();
-        let mut etags = Vec::new();
         for f in files {
-            match store.head(&f.object_key).await {
-                Ok(info) if info.size as i64 == f.size_bytes => {
-                    etags.push((f.path.clone(), info.etag));
-                }
+            let source = f.staging_key.as_deref().unwrap_or(&f.object_key);
+            match store.head(source).await {
+                Ok(info) if info.size == f.size_bytes as u64 => {}
                 Ok(info) => {
                     return Ok(Head::Bad(format!(
                         "{} is {} bytes in storage, {} expected",
@@ -765,16 +950,66 @@ impl CheckpointService {
         if manifest.size_bytes as u64 > MAX_MANIFEST_BYTES {
             return Ok(Head::Bad("its manifest is too large".into()));
         }
-        let bytes = store.get(&manifest.object_key).await.map_err(storage)?;
+        let source = manifest
+            .staging_key
+            .as_deref()
+            .unwrap_or(&manifest.object_key);
+        let bytes = match store.get(source).await {
+            Ok(bytes) => bytes,
+            Err(StorageError::NotFound { .. }) => {
+                return Ok(Head::Waiting(vec![manifest.path.clone()]))
+            }
+            Err(e) => return Err(storage(e)),
+        };
         if Some(mrl_storage::sha256_hex(&bytes)) != row.manifest_sha256.as_deref().map(hex) {
             return Ok(Head::Bad(
                 "the stored manifest does not match its digest".into(),
             ));
         }
-        Ok(match manifest_problem(row, files, &bytes) {
-            Some(why) => Head::Bad(why),
-            None => Head::Ok(etags),
-        })
+        if let Some(why) = manifest_problem(row, files, &bytes) {
+            return Ok(Head::Bad(why));
+        }
+
+        let scratch = self.store.scratch_dir().map_err(|e| seam("storage", e))?;
+        let mut objects = Vec::with_capacity(files.len());
+        for f in files {
+            let key = published_key(&store, row, f)?;
+            if f.role == "manifest" {
+                store.put(&key, bytes.clone()).await.map_err(storage)?;
+            } else {
+                let source = f.staging_key.as_deref().unwrap_or(&f.object_key);
+                let tmp = scratch.path().join("file");
+                let expected = hex(&f.sha256);
+                let transfer = match store
+                    .download_file(source, &tmp, Some(&expected), TransferOptions::default())
+                    .await
+                {
+                    Ok(outcome) => outcome,
+                    Err(StorageError::ChecksumMismatch { .. }) => {
+                        return Ok(Head::Bad(format!(
+                            "{} does not hash to its staged sha256",
+                            f.path
+                        )));
+                    }
+                    Err(StorageError::NotFound { .. }) => {
+                        return Ok(Head::Waiting(vec![f.path.clone()]))
+                    }
+                    Err(e) => return Err(storage(e)),
+                };
+                if transfer.size != f.size_bytes as u64 {
+                    return Ok(Head::Bad(format!("{} changed size after staging", f.path)));
+                }
+                crate::modules::uploads::store_file(&store, &tmp, &key, transfer.size)
+                    .await
+                    .map_err(|e| seam("storage", e))?;
+                tokio::fs::remove_file(&tmp)
+                    .await
+                    .map_err(|e| seam("storage", e))?;
+            }
+            let etag = store.head(&key).await.map_err(storage)?.etag;
+            objects.push((f.clone(), key, etag));
+        }
+        Ok(Head::Ok(objects))
     }
 
     // ---- corruption ----
@@ -795,57 +1030,89 @@ impl CheckpointService {
         }
         mark_corrupt(&mut tx, &row, why).await?;
         tx.commit().await.map_err(DbError::from)?;
-        tracing::warn!(checkpoint = %CheckpointId::from_uuid(id), reason = why, "checkpoint is corrupt");
         Ok(CheckpointState::Corrupt)
     }
 
     // ---- full verification ----
 
-    /// `full_rehash`: re-reads every stored byte. A mismatch makes the checkpoint CORRUPT
-    /// (MRL-STORE-011); a match records the level. Only COMMITTED checkpoints (MRL-STATE-230).
-    pub async fn rehash(&self, id: Uuid) -> Result<CheckpointRow, JobsError> {
-        let row = self.committed(id).await?;
+    /// Reads and hashes every current file. The caller must recheck the snapshot before applying
+    /// the result, since stripping or deletion may have changed the file set during the read.
+    pub(crate) async fn check_hashes(
+        &self,
+        row: &CheckpointRow,
+    ) -> Result<Option<String>, JobsError> {
         let store = self.org_store(&row.storage_org).await?;
-        for f in self.files(id).await? {
+        let files = self.files(row.id).await?;
+        if files.is_empty() {
+            return Ok(Some("the checkpoint files".into()));
+        }
+        for f in files {
             let actual = match store.sha256(&f.object_key).await {
                 Ok(s) => s,
-                Err(StorageError::NotFound { .. }) => {
-                    self.corrupt(id, &format!("{} is missing from storage", f.path))
-                        .await?;
-                    return Err(mismatch(&f.path));
-                }
+                Err(StorageError::NotFound { .. }) => return Ok(Some(f.path)),
                 Err(e) => return Err(storage(e)),
             };
             if actual != hex(&f.sha256) {
-                self.corrupt(
-                    id,
-                    &format!("{} does not hash to its recorded sha256", f.path),
-                )
-                .await?;
-                return Err(mismatch(&f.path));
+                return Ok(Some(f.path));
             }
         }
-        sqlx::query(
-            "UPDATE checkpoints SET verification_level = 'full_rehash', verified_at = now() \
-             WHERE id = $1 AND state = 'COMMITTED'",
-        )
-        .bind(id)
-        .execute(self.db.pool())
-        .await?;
-        self.committed(id).await
+        Ok(None)
     }
 
-    /// Call before promoting or exporting a checkpoint: Ok once it is COMMITTED and verified
-    /// at `full_rehash` level with its objects unchanged since (re-hashes when needed).
+    /// Applies a hash check against the locked current version. The caller owns the transaction.
+    pub(crate) async fn record_verification(
+        tx: &mut Tx,
+        row: &CheckpointRow,
+        bad_file: Option<&str>,
+    ) -> Result<CheckpointRow, JobsError> {
+        let locked = lock_row(tx, row.id)
+            .await?
+            .ok_or_else(|| JobsError::not_found("checkpoint"))?;
+        if !same_committed_files(&locked, row) {
+            return Err(JobsError::changed("checkpoint"));
+        }
+        if let Some(path) = bad_file {
+            return mark_corrupt(
+                tx,
+                &locked,
+                &format!("{path} is missing or does not hash to its recorded sha256"),
+            )
+            .await;
+        }
+        Ok(sqlx::query_as::<_, CheckpointRow>(concat!(
+            "UPDATE checkpoints SET verification_level = 'full_rehash', verified_at = now() WHERE id = $1 RETURNING ",
+            ckpt_cols!(),
+        )).bind(row.id).fetch_one(&mut **tx).await?)
+    }
+
+    /// Re-reads every committed file. A mismatch marks the checkpoint CORRUPT (MRL-STORE-011).
+    pub async fn rehash(&self, id: Uuid) -> Result<CheckpointRow, JobsError> {
+        let row = self.committed(id).await?;
+        let bad = self.check_hashes(&row).await?;
+        let mut tx = self.db.begin().await?;
+        lock_run(&mut tx, row.run_id).await?;
+        let result = Self::record_verification(&mut tx, &row, bad.as_deref()).await?;
+        system_audit(&mut tx, &self.db, &row, "checkpoints.verify").await?;
+        tx.commit().await.map_err(DbError::from)?;
+        match bad {
+            Some(path) => Err(mismatch(&path)),
+            None => Ok(result),
+        }
+    }
+
+    /// Verifies the current COMMITTED checkpoint before promotion or export.
     pub async fn require_full_verification(&self, id: Uuid) -> Result<CheckpointRow, JobsError> {
         let row = self.committed(id).await?;
         if row.verification_level.as_deref() == Some("full_rehash") && self.unchanged(&row).await? {
-            return Ok(row);
+            let current = self.committed(id).await?;
+            if same_committed_files(&current, &row) {
+                return Ok(current);
+            }
         }
         self.rehash(id).await
     }
 
-    async fn committed(&self, id: Uuid) -> Result<CheckpointRow, JobsError> {
+    pub(crate) async fn committed(&self, id: Uuid) -> Result<CheckpointRow, JobsError> {
         match self.find(id).await? {
             Some(r) if r.state() == CheckpointState::Committed => Ok(r),
             Some(r) => Err(JobsError::domain(
@@ -860,11 +1127,25 @@ impl CheckpointService {
     /// True if every object still has the size and entity tag it had at commit.
     async fn unchanged(&self, row: &CheckpointRow) -> Result<bool, JobsError> {
         let store = self.org_store(&row.storage_org).await?;
-        for f in self.files(row.id).await? {
+        let files = self.files(row.id).await?;
+        if files.is_empty() {
+            return Ok(false);
+        }
+        for f in files {
             match store.head(&f.object_key).await {
-                Ok(i)
-                    if i.size as i64 == f.size_bytes
-                        && (f.storage_checksum.is_none() || i.etag == f.storage_checksum) => {}
+                Ok(i) if i.size == f.size_bytes as u64 => {
+                    if f.staging_key.as_deref() == Some(f.object_key.as_str())
+                        || f.staging_key.is_none()
+                        || f.storage_checksum.is_none()
+                        || i.etag != f.storage_checksum
+                    {
+                        match store.sha256(&f.object_key).await {
+                            Ok(hash) if hash == hex(&f.sha256) => {}
+                            Ok(_) | Err(StorageError::NotFound { .. }) => return Ok(false),
+                            Err(e) => return Err(storage(e)),
+                        }
+                    }
+                }
                 Ok(_) | Err(StorageError::NotFound { .. }) => return Ok(false),
                 Err(e) => return Err(storage(e)),
             }
@@ -880,22 +1161,47 @@ impl CheckpointService {
     pub async fn resume_point(&self, run: Uuid) -> Result<Option<Uuid>, JobsError> {
         loop {
             let latest: Option<Uuid> =
-                sqlx::query_scalar("SELECT latest_committed_checkpoint_id FROM runs WHERE id = $1")
-                    .bind(run)
-                    .fetch_optional(self.db.pool())
-                    .await?
-                    .flatten();
+                sqlx::query_scalar(
+                    "SELECT c.id FROM runs r JOIN checkpoints c ON c.id = r.latest_committed_checkpoint_id
+                     WHERE r.id = $1 AND c.state = 'COMMITTED'",
+                )
+                .bind(run)
+                .fetch_optional(self.db.pool())
+                .await?;
             let Some(id) = latest else {
                 return Ok(None);
             };
             let Some(row) = self.find(id).await? else {
                 return Ok(None);
             };
-            if self.unchanged(&row).await? {
+            if row.state() != CheckpointState::Committed {
+                continue;
+            }
+            let unchanged = self.unchanged(&row).await?;
+            let mut tx = self.db.begin().await?;
+            lock_run(&mut tx, run).await?;
+            let latest: Option<Uuid> =
+                sqlx::query_scalar("SELECT latest_committed_checkpoint_id FROM runs WHERE id = $1")
+                    .bind(run)
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let Some(current) = lock_row(&mut tx, id).await? else {
+                continue;
+            };
+            if latest != Some(id) || !same_committed_files(&current, &row) {
+                continue;
+            }
+            if unchanged {
+                tx.commit().await.map_err(DbError::from)?;
                 return Ok(Some(id));
             }
-            self.corrupt(id, "its files changed or went missing after commit")
-                .await?;
+            mark_corrupt(
+                &mut tx,
+                &current,
+                "its files changed or went missing after commit",
+            )
+            .await?;
+            tx.commit().await.map_err(DbError::from)?;
         }
     }
 
@@ -911,19 +1217,26 @@ impl CheckpointService {
         deadline: Duration,
     ) -> Result<EmergencyOutcome, JobsError> {
         let since = OffsetDateTime::now_utc();
-        let Some(sent) = self.request_checkpoint(job, reason, deadline).await? else {
+        let end = tokio::time::Instant::now() + deadline;
+        let Some((sent, attempt, epoch)) = self.request_checkpoint(job, reason, deadline).await?
+        else {
             return Ok(EmergencyOutcome::Refused(
                 "the job has no running attempt".into(),
             ));
         };
-        let end = tokio::time::Instant::now() + deadline;
         loop {
+            if tokio::time::Instant::now() >= end {
+                return Ok(EmergencyOutcome::TimedOut);
+            }
             let done: Option<Uuid> = sqlx::query_scalar(
                 "SELECT id FROM checkpoints WHERE job_id = $1 AND state = 'COMMITTED' \
-                   AND created_at >= $2 ORDER BY global_step DESC LIMIT 1",
+                   AND created_at >= $2 AND attempt_id = $3 AND attempt_epoch = $4
+                 ORDER BY global_step DESC LIMIT 1",
             )
             .bind(job)
             .bind(since)
+            .bind(attempt)
+            .bind(epoch)
             .fetch_optional(self.db.pool())
             .await?;
             if let Some(id) = done {
@@ -946,10 +1259,10 @@ impl CheckpointService {
                     return Ok(EmergencyOutcome::Refused(why));
                 }
             }
-            if tokio::time::Instant::now() >= end {
-                return Ok(EmergencyOutcome::TimedOut);
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
+            tokio::time::sleep_until(
+                end.min(tokio::time::Instant::now() + Duration::from_millis(250)),
+            )
+            .await;
         }
     }
 
@@ -960,7 +1273,7 @@ impl CheckpointService {
         job: Uuid,
         reason: &str,
         deadline: Duration,
-    ) -> Result<Option<Uuid>, JobsError> {
+    ) -> Result<Option<(Uuid, Uuid, i64)>, JobsError> {
         let target: Option<(Uuid, i64, Uuid)> = sqlx::query_as(
             "SELECT a.id, a.epoch, c.node_id FROM jobs j \
              JOIN job_attempts a ON a.id = j.current_attempt_id AND a.epoch = j.epoch \
@@ -997,7 +1310,7 @@ impl CheckpointService {
             )
             .await
             .map_err(|e| seam("commands", e))?;
-        Ok(Some(sent.id))
+        Ok(Some((sent.id, attempt.as_uuid(), epoch as i64)))
     }
 
     // ---- the fast background tick ----
@@ -1019,40 +1332,69 @@ impl CheckpointService {
     async fn pending_commits(&self) -> Result<(), JobsError> {
         let ttl = self.config.staging_ttl_seconds as f64;
         let ids: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM checkpoints WHERE state IN ('WRITING','UPLOADED','VERIFYING') \
-               AND (commit_requested_at IS NOT NULL OR created_at < now() - make_interval(secs => $1)) \
-             ORDER BY created_at LIMIT 100",
+            "SELECT id FROM checkpoints WHERE state IN ('WRITING','UPLOADED','VERIFYING')
+               AND (commit_requested_at IS NOT NULL OR created_at < now() - make_interval(secs => $1))
+             ORDER BY commit_checked_at NULLS FIRST, created_at, id LIMIT 100",
         )
         .bind(ttl)
         .fetch_all(self.db.pool())
         .await?;
         for id in ids {
-            let Some(row) = self.find(id).await? else {
-                continue;
-            };
-            if row.commit_requested_at.is_some() {
-                self.try_commit(id).await?;
-            } else {
-                self.corrupt(id, "the worker never asked to commit it")
-                    .await?;
+            sqlx::query("UPDATE checkpoints SET commit_checked_at = now() WHERE id = $1")
+                .bind(id)
+                .execute(self.db.pool())
+                .await?;
+            let result = self.try_pending(id).await;
+            if let Err(e) = result {
+                tracing::warn!(code = e.code(), checkpoint = %id, "checkpoint commit was not decided: {e}");
             }
         }
+        sqlx::query(
+            "DELETE FROM checkpoint_early_commits WHERE requested_at < now() - make_interval(secs => $1)",
+        ).bind(ttl).execute(self.db.pool()).await?;
         Ok(())
     }
 
-    /// Upload tickets live 10 minutes: open checkpoints whose tickets ended get new ones.
+    async fn try_pending(&self, id: Uuid) -> Result<(), JobsError> {
+        let Some(row) = self.find(id).await? else {
+            return Ok(());
+        };
+        if row.commit_requested_at.is_some() {
+            self.try_commit(id).await?;
+            return Ok(());
+        }
+        let mut tx = self.db.begin().await?;
+        lock_run(&mut tx, row.run_id).await?;
+        if let Some(locked) = lock_row(&mut tx, id).await? {
+            if locked.is_open() && locked.commit_requested_at.is_none() {
+                mark_corrupt(&mut tx, &locked, "the worker never asked to commit it").await?;
+            }
+        }
+        tx.commit().await.map_err(DbError::from)?;
+        Ok(())
+    }
+
+    /// Open checkpoints with a live attempt get fresh tickets when the command was lost or
+    /// the previous tickets are close to expiring.
     async fn refresh_tickets(&self) -> Result<(), JobsError> {
         let rows = sqlx::query_as::<_, CheckpointRow>(concat!(
             "SELECT ",
             ckpt_cols!(),
-            " FROM checkpoints WHERE state IN ('WRITING','UPLOADED','VERIFYING') \
-               AND (tickets_expire_at IS NULL OR tickets_expire_at < now() + interval '30 seconds') LIMIT 100"
+            " FROM checkpoints c WHERE state IN ('WRITING','UPLOADED','VERIFYING')
+               AND (tickets_checked_at IS NULL OR tickets_checked_at < now() - interval '5 seconds')
+               AND (tickets_expire_at IS NULL OR tickets_expire_at < now() + interval '30 seconds'
+                    OR EXISTS (SELECT 1 FROM agent_commands a WHERE a.id = c.upload_command_id
+                               AND a.state IN ('EXPIRED','SUPERSEDED','FAILED')))
+               AND EXISTS (SELECT 1 FROM jobs j JOIN job_attempts a ON a.id = c.attempt_id
+                           WHERE j.id = c.job_id AND j.epoch = c.attempt_epoch AND a.epoch = j.epoch
+                             AND j.state NOT IN ('CANCELLING','CANCELLED','COMPLETED','FAILED','REJECTED'))
+             ORDER BY tickets_checked_at NULLS FIRST, created_at, id LIMIT 100"
         ))
         .fetch_all(self.db.pool())
         .await?;
         for row in rows {
             if self.live_attempt(&row).await? {
-                self.send_tickets(&row).await?;
+                self.send_tickets_or_later(&row).await;
             }
         }
         Ok(())
@@ -1073,39 +1415,31 @@ impl CheckpointService {
     /// Time-based cadence (Doc 24 §5): a RUNNING attempt whose newest checkpoint (or start) is
     /// older than the run's cadence gets a `CheckpointAttempt`, at most one per period.
     async fn time_based_cadence(&self) -> Result<(), JobsError> {
-        let rows: Vec<(Uuid, Option<Value>)> = sqlx::query_as(
-            "SELECT j.id, rc.resolved #> '{checkpoint,time_based}' \
-             FROM jobs j JOIN job_attempts a ON a.id = j.current_attempt_id AND a.state = 'RUNNING' \
-             LEFT JOIN run_configs rc ON rc.run_id = j.run_id \
-             WHERE j.state = 'RUNNING' AND j.run_id IS NOT NULL LIMIT 500",
+        let due: Vec<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM (
+                 SELECT j.id, GREATEST(a.started_at, a.created_at,
+                     (SELECT max(c.created_at) FROM checkpoints c
+                      WHERE c.attempt_id = a.id AND c.state NOT IN ('CORRUPT','TOMBSTONED')),
+                     (SELECT max(x.created_at) FROM agent_commands x
+                      WHERE x.attempt_id = a.id AND x.kind = 'CheckpointAttempt')) AS since,
+                     CASE WHEN jsonb_typeof(rc.resolved #> '{checkpoint,time_based}') = 'number'
+                         AND (rc.resolved #>> '{checkpoint,time_based}') ~ '^[0-9]{1,8}$'
+                         THEN (rc.resolved #>> '{checkpoint,time_based}')::double precision
+                         ELSE $1 END AS minutes
+                 FROM jobs j JOIN job_attempts a ON a.id = j.current_attempt_id
+                   AND a.epoch = j.epoch AND a.state = 'RUNNING'
+                 LEFT JOIN run_configs rc ON rc.run_id = j.run_id
+                 WHERE j.state = 'RUNNING' AND j.run_id IS NOT NULL
+             ) active WHERE minutes > 0 AND extract(epoch FROM now() - since) >= minutes * 60
+             ORDER BY since, id LIMIT 500",
         )
+        .bind(self.config.time_based_minutes as f64)
         .fetch_all(self.db.pool())
         .await?;
-        for (job, setting) in rows {
-            let minutes = setting
-                .as_ref()
-                .and_then(Value::as_u64)
-                .unwrap_or(self.config.time_based_minutes);
-            if minutes == 0 {
-                continue;
-            }
-            let secs = (minutes.saturating_mul(60)) as f64;
-            let due: bool = sqlx::query_scalar(
-                "SELECT COALESCE(GREATEST(a.started_at, a.created_at, \
-                     (SELECT max(c.created_at) FROM checkpoints c WHERE c.attempt_id = a.id), \
-                     (SELECT max(x.created_at) FROM agent_commands x WHERE x.attempt_id = a.id \
-                        AND x.kind = 'CheckpointAttempt')) \
-                   < now() - make_interval(secs => $2), false) \
-                 FROM jobs j JOIN job_attempts a ON a.id = j.current_attempt_id WHERE j.id = $1",
-            )
-            .bind(job)
-            .bind(secs)
-            .fetch_optional(self.db.pool())
-            .await?
-            .unwrap_or(false);
-            if due {
-                let deadline = Duration::from_secs(self.config.emergency_deadline_seconds);
-                self.request_checkpoint(job, "time_based", deadline).await?;
+        for job in due {
+            let deadline = Duration::from_secs(self.config.emergency_deadline_seconds);
+            if let Err(e) = self.request_checkpoint(job, "time_based", deadline).await {
+                tracing::warn!(code = e.code(), job = %job, "scheduled checkpoint was not requested: {e}");
             }
         }
         Ok(())
@@ -1114,8 +1448,8 @@ impl CheckpointService {
 
 /// What the storage check found.
 enum Head {
-    /// Everything matches: (path, entity tag) per file.
-    Ok(Vec<(String, Option<String>)>),
+    /// Everything matches: the file, its published key and the published entity tag.
+    Ok(Vec<(FileRow, String, Option<String>)>),
     /// These files are not stored yet.
     Waiting(Vec<String>),
     /// Something is wrong; the checkpoint is corrupt.
@@ -1137,36 +1471,61 @@ fn manifest_problem(row: &CheckpointRow, files: &[FileRow], bytes: &[u8]) -> Opt
     let Ok(doc) = serde_json::from_slice::<Value>(bytes) else {
         return Some("its manifest is not JSON".into());
     };
-    if doc["schema_version"] != "checkpoint-manifest/v1" {
-        return Some("its manifest is not a checkpoint-manifest/v1 document".into());
-    }
-    if doc["checkpoint_id"] != CheckpointId::from_uuid(row.id).to_string() {
-        return Some("its manifest names another checkpoint".into());
-    }
-    if doc["step"].as_i64() != Some(row.global_step)
+    let id = CheckpointId::from_uuid(row.id).to_string();
+    if doc["schema_version"] != "checkpoint-manifest/v1"
+        || doc["checkpoint_id"] != id
+        || doc["run_id"] != RunId::from_uuid(row.run_id).to_string()
+        || doc["attempt_id"] != AttemptId::from_uuid(row.attempt_id).to_string()
+        || doc["kind"] != row.kind
+        || doc["format"] != row.layout
+        || doc["step"].as_i64() != Some(row.global_step)
         || doc["is_final"].as_bool() != Some(row.is_final)
     {
-        return Some("its manifest has another step or final flag".into());
+        return Some("its manifest disagrees with the staged checkpoint identity".into());
     }
-    let staged: HashMap<&str, &FileRow> = files
+    if doc["engine"]["name"].as_str().is_none_or(str::is_empty)
+        || doc["engine"]["adapter_version"]
+            .as_str()
+            .is_none_or(str::is_empty)
+        || doc["base_model_sha256"]
+            .as_str()
+            .and_then(sha_bytes)
+            .is_none()
+        || doc["created_at"]
+            .as_str()
+            .and_then(|t| {
+                OffsetDateTime::parse(t, &time::format_description::well_known::Rfc3339).ok()
+            })
+            .is_none()
+        || row.kind == "adapter_only" && !doc["adapter"].is_object()
+    {
+        return Some("its manifest is missing required checkpoint metadata".into());
+    }
+    let mut staged: HashMap<&str, &FileRow> = files
         .iter()
         .filter(|f| f.role != "manifest")
-        .map(|f| (f.path.as_str(), f))
+        .map(|f| (file_path(row.id, f), f))
         .collect();
-    let listed = doc["files"].as_array().cloned().unwrap_or_default();
-    if listed.len() != staged.len() {
+    let Some(listed) = doc["files"].as_array() else {
+        return Some("its manifest does not list its files".into());
+    };
+    if listed.is_empty() || listed.len() != staged.len() {
         return Some(format!(
             "its manifest lists {} files, {} were staged",
             listed.len(),
             staged.len()
         ));
     }
-    for f in &listed {
+    for f in listed {
         let path = f["path"].as_str().unwrap_or_default();
-        let Some(s) = staged.get(path) else {
-            return Some(format!("its manifest lists {path}, which was not staged"));
+        let Some(s) = staged.remove(path) else {
+            return Some(format!(
+                "its manifest lists {path} twice or it was not staged"
+            ));
         };
-        if f["size"].as_i64() != Some(s.size_bytes) || f["sha256"].as_str() != Some(&hex(&s.sha256))
+        if f["size"].as_i64() != Some(s.size_bytes)
+            || f["sha256"].as_str() != Some(&hex(&s.sha256))
+            || f["role"] != s.role
         {
             return Some(format!(
                 "{path} differs between the manifest and the staged list"
@@ -1174,6 +1533,33 @@ fn manifest_problem(row: &CheckpointRow, files: &[FileRow], bytes: &[u8]) -> Opt
         }
     }
     None
+}
+
+pub(crate) fn same_committed_files(current: &CheckpointRow, snapshot: &CheckpointRow) -> bool {
+    current.state() == CheckpointState::Committed
+        && current.state_version == snapshot.state_version
+        && current.manifest_sha256 == snapshot.manifest_sha256
+}
+
+fn file_path(id: Uuid, file: &FileRow) -> &str {
+    if file.staging_key.is_none() {
+        let ckpt = CheckpointId::from_uuid(id).to_string();
+        checkpoint_path(&ckpt, &file.path).unwrap_or(&file.path)
+    } else {
+        &file.path
+    }
+}
+
+/// Key for a checked object that was never the target of an upload ticket.
+pub(crate) fn published_key(
+    store: &Store,
+    row: &CheckpointRow,
+    file: &FileRow,
+) -> Result<String, JobsError> {
+    store
+        .keys()
+        .join(&published_prefix(row), file_path(row.id, file))
+        .map_err(storage)
 }
 
 /// Why the job no longer accepts this checkpoint (stale epoch, cancelled, finished).
@@ -1238,6 +1624,36 @@ pub(crate) async fn lock_row(tx: &mut Tx, id: Uuid) -> Result<Option<CheckpointR
     .await?)
 }
 
+/// Records an autonomous checkpoint change inside the transaction that applies it.
+pub(crate) async fn system_audit(
+    tx: &mut Tx,
+    db: &Db,
+    row: &CheckpointRow,
+    action: &str,
+) -> Result<(), JobsError> {
+    let (org, project): (Uuid, Uuid) =
+        sqlx::query_as("SELECT org_id, project_id FROM runs WHERE id = $1")
+            .bind(row.run_id)
+            .fetch_one(&mut **tx)
+            .await?;
+    crate::modules::audit::PgAuditSink::new(db.clone())
+        .record_in(
+            tx,
+            AuditEvent {
+                at: OffsetDateTime::now_utc(),
+                actor: "system:checkpoints".into(),
+                org: scope::org_text(org),
+                project: Some(mrl_domain::ids::ProjectId::from_uuid(project).to_string()),
+                action: action.into(),
+                target: CheckpointId::from_uuid(row.id).to_string(),
+                outcome: AuditOutcome::Success,
+                trace_id: String::new(),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
 async fn event(tx: &mut Tx, row: &CheckpointRow, kind: &str, seq: i64) -> Result<(), JobsError> {
     let payload = json!({
         "checkpoint_id": CheckpointId::from_uuid(row.id).to_string(),
@@ -1282,7 +1698,7 @@ pub(crate) async fn repoint(tx: &mut Tx, run: Uuid, id: Uuid) -> Result<(), Jobs
     sqlx::query(
         "UPDATE runs SET latest_committed_checkpoint_id = (SELECT c.id FROM checkpoints c \
              WHERE c.run_id = $1 AND c.state = 'COMMITTED' AND c.id <> $2 \
-             ORDER BY c.global_step DESC, c.committed_at DESC LIMIT 1) \
+             ORDER BY c.global_step DESC, c.committed_at DESC, c.id DESC LIMIT 1) \
          WHERE id = $1 AND latest_committed_checkpoint_id = $2",
     )
     .bind(run)

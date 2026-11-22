@@ -196,7 +196,7 @@ pub async fn list(
         ckpt_cols!(),
         " FROM checkpoints c WHERE run_id = $1 AND state <> 'TOMBSTONED' \
            AND ($2::uuid IS NULL OR (global_step, id) < \
-                (SELECT global_step, id FROM checkpoints WHERE id = $2)) \
+                (SELECT global_step, id FROM checkpoints WHERE id = $2 AND run_id = $1)) \
          ORDER BY global_step DESC, id DESC LIMIT $3"
     ))
     .bind(run.as_uuid())
@@ -243,13 +243,11 @@ pub async fn action(
         return Err(ApiError::new(ErrorCode::RouteNotFound, "No endpoint has this path.").into());
     };
     let (row, scope) = read(&state, &service, &ctx, ckpt, "checkpoints.write").await?;
-    match service.rehash(row.id).await {
-        Ok(_) => {}
-        // Now CORRUPT, with the reason; the answer shows it.
-        Err(e) if e.code() == super::codes::FILES_MISMATCH.to_string() => {}
-        Err(e) => return Err(e),
-    }
+    let row = service.committed(row.id).await?;
+    let bad = service.check_hashes(&row).await?;
     let mut tx = service.db().begin().await?;
+    lock_run(&mut tx, row.run_id).await?;
+    let row = CheckpointService::record_verification(&mut tx, &row, bad.as_deref()).await?;
     scope::audit(
         &mut tx,
         &state,
@@ -260,10 +258,6 @@ pub async fn action(
     )
     .await?;
     tx.commit().await.map_err(crate::db::DbError::from)?;
-    let row = service
-        .find(row.id)
-        .await?
-        .ok_or_else(|| JobsError::not_found("checkpoint"))?;
     Ok(Json(view(&row, None)).into_response())
 }
 
