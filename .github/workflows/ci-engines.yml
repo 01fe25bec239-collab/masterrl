@@ -1,0 +1,64 @@
+name: ci-engines
+
+# P24 engine registry: the embedded first-party bundles are current, the generator refuses the
+# reserved metric prefix, and the registry/probe/L0 tests pass against PostgreSQL.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-engines-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  bundles:
+    name: engines (bundles)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: "0.11.28"
+
+      - name: embedded bundles are current
+        run: tools/gen/engines.py --check
+
+      - name: a manifest using the reserved resource/ prefix is refused
+        run: |
+          set -uo pipefail
+          dir=tests/fixtures/rejections/manifests/reserved-metric
+          if tools/gen/engines.py --validate "$dir" 2> /tmp/out; then
+            echo "::error::the generator accepted a manifest with a resource/ metric"; exit 1
+          fi
+          diff -u "$dir.expected" /tmp/out
+
+  registry:
+    name: engines (postgres)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      DATABASE_URL: postgres://mrl:mrl-dev-only@127.0.0.1:55432/masterrl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+
+      - name: start PostgreSQL
+        run: docker compose -f deploy/local/compose.yaml up -d --wait postgres
+
+      - name: P24 integration tests
+        run: cargo test -p mrl-testkit --locked p24_engines -- --ignored
+
+      - name: service logs
+        if: failure()
+        run: docker compose -f deploy/local/compose.yaml logs postgres

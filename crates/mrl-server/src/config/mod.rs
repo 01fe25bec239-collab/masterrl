@@ -88,6 +88,8 @@ pub struct Config {
     // <mrl:config P22> P22 settings fields go right below this line.
     // <mrl:config P23> P23 settings fields go right below this line.
     // <mrl:config P24> P24 settings fields go right below this line.
+    /// Engine registry and probes.
+    pub engines: crate::modules::engines::EnginesConfig,
 }
 
 /// `[server]`.
@@ -499,6 +501,7 @@ impl Config {
         // <mrl:validate P22> P22 checks (push to `problems`) go right below this line.
         // <mrl:validate P23> P23 checks (push to `problems`) go right below this line.
         // <mrl:validate P24> P24 checks (push to `problems`) go right below this line.
+        problems.extend(self.engines.problems());
         if problems.is_empty() {
             Ok(())
         } else {

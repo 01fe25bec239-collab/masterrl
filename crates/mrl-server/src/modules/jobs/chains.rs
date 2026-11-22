@@ -209,6 +209,9 @@ impl Chains {
             vec![
                 Arc::new(SchemaChecks),
                 // <mrl:job-validators> Validators go right below this line.
+                Arc::new(crate::modules::engines::CapabilityValidator::new(
+                    db.clone(),
+                )),
             ],
             vec![
                 // <mrl:completion-verifiers> Verifiers go right below this line.

@@ -133,7 +133,9 @@ def load_builtin() -> tuple[str, dict[str, Any]]:
     where = str(BUILTIN.relative_to(ROOT))
     doc = json.loads(json.dumps(read_yaml(BUILTIN)))
     if doc.get("apiVersion") != "mrl.dev/builtin/v1" or doc.get("kind") != "BuiltinManifest":
-        raise ManifestError(f"{where}: expected apiVersion mrl.dev/builtin/v1, kind BuiltinManifest")
+        raise ManifestError(
+            f"{where}: expected apiVersion mrl.dev/builtin/v1, kind BuiltinManifest"
+        )
     meta = doc.get("metadata", {})
     if not meta.get("name") or not meta.get("version"):
         raise ManifestError(f"{where}: metadata.name and metadata.version are required")

@@ -76,8 +76,18 @@ impl EnginesConfig {
                 out.push(format!("engines.{name}: use {lo}–{hi} seconds (got {v})"));
             }
         };
-        range("probe_interval_seconds", self.probe_interval_seconds, 1, 3600);
-        range("probe_timeout_seconds", self.probe_timeout_seconds, 10, 86_400);
+        range(
+            "probe_interval_seconds",
+            self.probe_interval_seconds,
+            1,
+            3600,
+        );
+        range(
+            "probe_timeout_seconds",
+            self.probe_timeout_seconds,
+            10,
+            86_400,
+        );
         range("probe_retry_seconds", self.probe_retry_seconds, 10, 604_800);
         out
     }
@@ -116,6 +126,12 @@ pub enum EnginesError {
     /// Sending a command failed.
     #[error(transparent)]
     Nodes(#[from] NodesError),
+    /// A registry lookup (model or dataset records) failed.
+    #[error(transparent)]
+    Seam(SeamError),
+    /// A stored value or an event could not be made.
+    #[error("an engine record could not be read or written: {0}")]
+    Event(String),
 }
 
 impl From<sqlx::Error> for EnginesError {
@@ -131,25 +147,36 @@ impl EnginesError {
             Self::Db(e) => e.code(),
             Self::Manifest { .. } | Self::Changed { .. } => codes::MANIFEST_INVALID,
             Self::Nodes(e) => e.code(),
+            Self::Seam(_) => crate::db::codes::UNAVAILABLE,
+            Self::Event(_) => crate::db::codes::INTERNAL,
         }
     }
 }
 
 impl From<EnginesError> for SeamError {
     fn from(e: EnginesError) -> Self {
-        SeamError::new("engines", format!("{}: {e}", e.code()))
+        match e {
+            EnginesError::Seam(s) => s,
+            e => SeamError::new("engines", format!("{}: {e}", e.code())),
+        }
     }
 }
 
 /// Every embedded bundle, checked. A bundle that fails its checks is an error (the generator
 /// checked it too, so this means a hand-edited or stale file).
 pub fn embedded_bundles() -> Result<Vec<Bundle>, EnginesError> {
-    embedded::BUNDLES
-        .iter()
+    parse_all(embedded::BUNDLES.iter().copied(), "engines/first_party")
+}
+
+fn parse_all<'a>(
+    texts: impl Iterator<Item = &'a str>,
+    origin: &str,
+) -> Result<Vec<Bundle>, EnginesError> {
+    texts
         .enumerate()
         .map(|(i, text)| {
             Bundle::parse(text).map_err(|error| EnginesError::Manifest {
-                source_name: format!("#{i} in engines/first_party"),
+                source_name: format!("#{i} in {origin}"),
                 error,
             })
         })
@@ -245,20 +272,23 @@ impl EnginesModule {
         )
     }
 
-    /// A module with this gateway and lane router, plus `extra` bundles after the embedded
-    /// ones (tests and embedders).
+    /// A module with this gateway and lane router, plus `extra` bundle texts after the
+    /// embedded ones (tests and embedders). A bundle that fails its checks stops startup.
     pub fn with(
         db: Db,
         config: EnginesConfig,
         gateway: &Arc<Gateway>,
         lanes: &LaneRouter,
-        extra: Vec<Bundle>,
+        extra: Vec<String>,
         records: Records,
     ) -> Self {
         let bundles = embedded_bundles()
-            .map(|mut b| {
-                b.extend(extra);
-                b.into()
+            .and_then(|mut b| {
+                b.extend(parse_all(
+                    extra.iter().map(String::as_str),
+                    "extra bundles",
+                )?);
+                Ok(b.into())
             })
             .map_err(Arc::new);
         let prober = Arc::new(probes::Prober::new(db.clone(), config.clone(), gateway));

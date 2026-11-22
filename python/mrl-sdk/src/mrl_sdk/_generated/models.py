@@ -5,6 +5,49 @@ from __future__ import annotations
 from typing import Any, Literal, NotRequired, TypedDict
 
 
+class AlgorithmSchemaDoc(TypedDict):
+    """`GET /algorithms/{algo}/schema`."""
+
+    algorithm: str
+    """Method id."""
+
+    config_schema: NotRequired[dict[str, Any] | None]
+    """JSON Schema for `config.engine` (with `x-mrl-ui` hints), if the method has a form."""
+
+    defaults: dict[str, Any]
+    """Recommended values."""
+
+    display_name: str
+    """Shown in the app."""
+
+    engine: str
+    """Engine name."""
+
+    fidelity: str
+    """full, partial or approximation."""
+
+    fidelity_note: NotRequired[str | None]
+    """Why fidelity is not full."""
+
+    maturity: str
+    """stable, beta or experimental."""
+
+    presets: list[dict[str, Any]]
+    """Presets: `{id, title, tier, when, patch}` (JSON Merge Patch)."""
+
+    summary: str
+    """One line."""
+
+    switch: dict[str, Any]
+    """Pinned engine fields (read-only in the form)."""
+
+    ui_schema: NotRequired[dict[str, Any] | None]
+    """UI hints file, if any."""
+
+    version: str
+    """Engine version."""
+
+
 class Artifact(TypedDict):
     """A registered artifact."""
 
@@ -146,6 +189,66 @@ class CallbackRequest(TypedDict):
     """Name for that token."""
 
 
+class CapabilityItem(TypedDict):
+    """One method of one engine version."""
+
+    algorithm: str
+    """Method id."""
+
+    display_name: str
+    """Shown in the app."""
+
+    enabled_hardware: list[str]
+    """Hardware classes where the engine passed its probe."""
+
+    engine: str
+    """Engine name."""
+
+    maturity: str
+    """stable, beta or experimental."""
+
+    precision: list[str]
+    """Precisions it offers."""
+
+    problems: list[CapabilityProblem]
+    """Why it can't run."""
+
+    runnable: bool
+    """True when nothing stops it (settings are checked when you submit)."""
+
+    update_strategies: list[str]
+    """Update strategies it offers on the available hardware."""
+
+    version: str
+    """Engine version."""
+
+
+class CapabilityProblem(TypedDict):
+    """One problem (same shape as a job rejection)."""
+
+    code: str
+    """Catalog code, like `MRL-CAP-018`."""
+
+    hint: str
+    """What to do."""
+
+    message: str
+    """What is wrong."""
+
+    path: NotRequired[str | None]
+    """What it concerns, like `/resources`."""
+
+
+class CapabilityReport(TypedDict):
+    """`GET /capabilities`."""
+
+    hardware: list[str]
+    """Hardware classes of the connected machines considered."""
+
+    items: list[CapabilityItem]
+    """Every method of every live engine version."""
+
+
 class CheckResult(TypedDict):
     """One readiness check result."""
 
@@ -237,6 +340,98 @@ class Edge(TypedDict):
 
 Endpoint = dict[str, Any]
 """How the core dials one machine (stored in `compute_nodes.endpoint`)."""
+
+
+class EngineAlgorithm(TypedDict):
+    """A method of one engine version."""
+
+    display_name: str
+    """Shown in the app."""
+
+    fidelity: str
+    """full, partial or approximation."""
+
+    id: str
+    """Method id."""
+
+    maturity: str
+    """stable, beta or experimental."""
+
+    summary: str
+    """One line."""
+
+    verified_hw: list[str]
+    """Hardware classes with a passed probe."""
+
+
+class EngineList(TypedDict):
+    """`GET /engines`."""
+
+    items: list[EngineSummary]
+    """Engines by name."""
+
+
+class EngineSummary(TypedDict):
+    """One engine."""
+
+    description: NotRequired[str | None]
+    """Longer text."""
+
+    display_name: str
+    """Shown in the app."""
+
+    kind: str
+    """`engine` (training) or `builtin` (utility jobs)."""
+
+    name: str
+    """Adapter name, like `trl`."""
+
+    versions: list[EngineVersionSummary]
+    """Its versions, oldest first."""
+
+
+class EngineVersionDetail(TypedDict):
+    """`GET /engines/{eng}/versions/{ver}`."""
+
+    algorithms: list[EngineAlgorithm]
+    """Its methods."""
+
+    manifest: dict[str, Any]
+    """The merged manifest."""
+
+    manifest_sha256: str
+    """sha256 of the stored manifest."""
+
+    name: str
+    """Adapter name."""
+
+    probe_results: dict[str, Any]
+    """Probe results per hardware class."""
+
+    runtime_ref: NotRequired[str | None]
+    """Lock hash or image of the trainer environment."""
+
+    status: str
+    """Status."""
+
+    version: str
+    """Version."""
+
+
+class EngineVersionSummary(TypedDict):
+    """One version in the engine list."""
+
+    algorithms: list[str]
+    """Method ids."""
+
+    hardware: dict[str, Any]
+    """Probe outcome per hardware class (`cpu`, `nvidia`, …): ENABLED or FAILED."""
+
+    status: str
+    """PENDING_APPROVAL, PROBING, ENABLED, DISABLED or REVOKED."""
+
+    version: str
+    """Adapter version."""
 
 
 class Experiment(TypedDict):
@@ -1490,12 +1685,16 @@ class WorkspacePage(TypedDict):
 
 
 __all__ = [
+    "AlgorithmSchemaDoc",
     "Artifact",
     "Attempt",
     "AttemptPage",
     "AuditRecord",
     "AuditRecordPage",
     "CallbackRequest",
+    "CapabilityItem",
+    "CapabilityProblem",
+    "CapabilityReport",
     "CheckResult",
     "CopyInfo",
     "CreateEnrollmentToken",
@@ -1504,6 +1703,11 @@ __all__ = [
     "DownloadRequest",
     "Edge",
     "Endpoint",
+    "EngineAlgorithm",
+    "EngineList",
+    "EngineSummary",
+    "EngineVersionDetail",
+    "EngineVersionSummary",
     "Experiment",
     "ExperimentPage",
     "ExperimentPatch",
