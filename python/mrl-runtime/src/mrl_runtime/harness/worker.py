@@ -194,6 +194,9 @@ class Harness:
         self._checkpoint_requests: list[str] = []
         self._seen_checkpoint_requests: set[str] = set()
         self._acknowledged: list[str] = []
+        # Checkpoint id -> the requests it answers; acknowledged only once it committed.
+        self._requests_by_checkpoint: dict[str, list[str]] = {}
+        self._pause_checkpoint = ""  # the first checkpoint staged after a pause request
         self._hard_deadline: float | None = None
         self._lease_deadline: float | None = None
         self._harness_failure: common.Failure | None = None
@@ -291,6 +294,7 @@ class Harness:
                 final_commit=provider.final_result if provider else None,
                 cancelled=bool(self._cancel_request),
                 paused=bool(self._pause_request),
+                pause_saved=not self.manifest.pause or self._pause_checkpoint in self._committed(),
             )
         )
         if kind == pb.EXIT_KIND_CANCELLED:
@@ -579,7 +583,9 @@ class Harness:
                 staged = await self.provider.stage(event, {**self._metrics, **event.metrics})
                 self.provider.submit(staged)
                 self._final_staged = self._final_staged or event.is_final
-                self._acknowledged.extend(requests)
+                self._requests_by_checkpoint[staged.checkpoint_id] = requests
+                if self._pause_request and not self._pause_checkpoint:
+                    self._pause_checkpoint = staged.checkpoint_id
             case Log():
                 self._harness_line(f"[{event.level}] {event.message}")
             case EngineWarning():
@@ -699,6 +705,21 @@ class Harness:
                 deadline = msg.lease_deadline.deadline
                 self._lease_deadline = deadline.ToNanoseconds() / 1e9 if deadline.seconds else None
 
+    def _committed(self) -> set[str]:
+        provider = self.provider
+        return {r.checkpoint_id for r in provider.results if r.committed} if provider else set()
+
+    def _saved_requests(self) -> list[str]:
+        """Checkpoint requests whose checkpoint committed (a rejected or unconfirmed one is not
+        acknowledged, so the agent can ask again)."""
+        committed = self._committed()
+        return [
+            r
+            for cid, reqs in self._requests_by_checkpoint.items()
+            if cid in committed
+            for r in reqs
+        ]
+
     def _on_pause(self, req: pb.PauseRequest) -> None:
         if self._pause_request:
             return
@@ -761,7 +782,7 @@ class Harness:
             final_step=self._last_step,
             last_committed_checkpoint_id=self.provider.last_committed_id if self.provider else "",
             final_metrics={k: v for k, v in self._metrics.items() if math.isfinite(v)},
-            acknowledged_requests=[r for r in self._acknowledged if r],
+            acknowledged_requests=[r for r in self._acknowledged + self._saved_requests() if r],
         )
         if fail is not None:
             report.failure.CopyFrom(fail)

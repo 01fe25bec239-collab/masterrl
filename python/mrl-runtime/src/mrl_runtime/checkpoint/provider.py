@@ -131,7 +131,9 @@ class CheckpointProvider:
         self._tasks: set[asyncio.Task[CommitResult]] = set()
         self._parent = self._resume_parent()
         self.results: list[CommitResult] = []
-        self.last_committed_id = ""
+        # The newest COMMITTED checkpoint this attempt knows: the resumed one until a new one
+        # commits, so an attempt resumed at its step budget still reports its result.
+        self.last_committed_id = self._parent
         self.final_result: CommitResult | None = None
 
     def restore_path(self) -> Path | None:

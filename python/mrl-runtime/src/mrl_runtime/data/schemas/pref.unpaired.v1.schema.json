@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.masterrl.dev/datasets/pref.unpaired.v1.schema.json",
+  "title": "pref.unpaired.v1",
+  "description": "Unpaired feedback for KTO: one completion with a desirable (true) or undesirable (false) label.",
+  "type": "object",
+  "required": ["prompt", "completion", "label"],
+  "properties": {
+    "prompt": { "$ref": "common.v1.schema.json#/$defs/textOrMessages" },
+    "completion": { "$ref": "common.v1.schema.json#/$defs/textOrMessages" },
+    "label": { "type": "boolean" },
+    "meta": { "$ref": "common.v1.schema.json#/$defs/meta" }
+  },
+  "additionalProperties": false
+}
