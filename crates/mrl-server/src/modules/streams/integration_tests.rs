@@ -423,20 +423,27 @@ async fn a_cursor_behind_sealed_logs_asks_for_a_resync() {
     assert_eq!(heartbeat.event, "heartbeat");
     let last = heartbeat.id.unwrap();
     drop(c);
+    // Keep xmin behind the new chunk, as concurrent integration tests can do.
+    let mut older = w.db.db().begin().await.unwrap();
+    sqlx::query("SELECT pg_current_xact_id()")
+        .execute(&mut *older)
+        .await
+        .unwrap();
     send_log(&w, &s, 2, 0, LogStream::Stdout, 10, b"two\n").await;
     mrl_server::modules::telemetry::logs::seal(&w.tel, Duration::ZERO)
         .await
         .unwrap_or_else(|e| panic!("{e}"));
     let (_, c, _) = open(&w, Who::Solo, &topics, Some(&last)).await;
     let mut c = c.unwrap_or_else(|| panic!("stream"));
-    let e = c
-        .next(Duration::from_secs(5))
-        .await
-        .unwrap_or_else(|| panic!("event"));
-    assert_eq!(
-        (e.event.as_str(), e.data["reason"].as_str()),
-        ("resync", Some("logs_sealed"))
-    );
+    let heartbeat = c.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(heartbeat.event, "heartbeat");
+    assert_eq!(heartbeat.id.as_deref(), Some(last.as_str()));
+    older.commit().await.unwrap();
+
+    let events = c.until(|events| !events.is_empty()).await;
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].event, "resync");
+    assert_eq!(events[0].data["reason"], "logs_sealed");
     // The REST route has the line the stream can no longer show.
     let page = w
         .get(Who::Solo, &format!("/api/v1/runs/{}/logs", s.run_id()))
