@@ -19,6 +19,7 @@ use mrl_domain::capability::matcher::{
 use mrl_domain::ids::{DatasetVersionId, ModelVersionId};
 use mrl_domain::resources::{GpuVendor, ResourceRequest, WorkloadRole};
 use serde_json::Value;
+use uuid::Uuid;
 
 /// The engine capability check (P24), registered in `jobs::chains`.
 pub struct CapabilityValidator {
@@ -102,8 +103,25 @@ fn engine_choice(config: &Value) -> Option<(String, Option<String>)> {
     })
 }
 
+/// What the capability check decides for one job.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Pick {
+    /// No live engine version offers the method and the submission names no engine: the
+    /// chain decides (MRL-CAP-001 when nobody vouches).
+    NoEngine,
+    /// This engine version (`engine_versions.id`) runs the job: the first candidate, in
+    /// engine name order, that passes every check.
+    Engine(Uuid),
+    /// No candidate can run it: the problems of the one that came closest.
+    Rejected(Vec<Rejection>),
+}
+
 impl CapabilityValidator {
-    async fn check(&self, spec: &JobSpec) -> Result<Verdict, EnginesError> {
+    /// The engine version this job runs on: the same decision [`JobValidator::validate`]
+    /// makes (`Engine` is its `Accept`, `Rejected` its `Reject`, `NoEngine` its `Abstain`).
+    /// Candidates are the live versions declaring `spec.algorithm_id`, narrowed by
+    /// `config.common.engine` (`name` or `name@version`).
+    pub async fn pick(&self, spec: &JobSpec) -> Result<Pick, EnginesError> {
         let mut candidates = store::candidates(&self.db, Some(&spec.algorithm_id)).await?;
         let choice = engine_choice(&spec.resolved);
         if let Some((name, version)) = &choice {
@@ -115,10 +133,10 @@ impl CapabilityValidator {
             // rejects it with MRL-CAP-001 when nobody vouches (and adds nothing when another
             // member already rejected it).
             let Some((n, v)) = &choice else {
-                return Ok(Verdict::Abstain);
+                return Ok(Pick::NoEngine);
             };
             let named = v.as_ref().map_or_else(|| n.clone(), |v| format!("{n} {v}"));
-            return Ok(Verdict::Reject(vec![Rejection::new(
+            return Ok(Pick::Rejected(vec![Rejection::new(
                 Cap::NoEngineForMethod.code(),
                 Some("/config/common/engine"),
                 format!("Engine {named} has no method `{}` here.", spec.algorithm_id),
@@ -126,7 +144,7 @@ impl CapabilityValidator {
         }
         let hardware = match hardware_of(&spec.resources) {
             Ok(h) => h,
-            Err(p) => return Ok(Verdict::Reject(vec![rejection(p)])),
+            Err(p) => return Ok(Pick::Rejected(vec![rejection(p)])),
         };
         let org = spec.org_id;
         let model = match self
@@ -173,13 +191,13 @@ impl CapabilityValidator {
                 &req,
             );
             if problems.is_empty() {
-                return Ok(Verdict::Accept);
+                return Ok(Pick::Engine(c.id));
             }
             if best.as_ref().is_none_or(|b| problems.len() < b.len()) {
                 best = Some(problems);
             }
         }
-        Ok(Verdict::Reject(
+        Ok(Pick::Rejected(
             best.unwrap_or_default()
                 .into_iter()
                 .map(rejection)
@@ -195,7 +213,12 @@ impl JobValidator for CapabilityValidator {
     }
 
     async fn validate(&self, spec: &JobSpec) -> Result<Verdict, SeamError> {
-        self.check(spec).await.map_err(SeamError::from)
+        // `Verdict::Accept` carries no engine; callers that need the choice use `pick`.
+        Ok(match self.pick(spec).await.map_err(SeamError::from)? {
+            Pick::NoEngine => Verdict::Abstain,
+            Pick::Engine(_) => Verdict::Accept,
+            Pick::Rejected(r) => Verdict::Reject(r),
+        })
     }
 }
 

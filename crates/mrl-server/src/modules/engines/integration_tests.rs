@@ -5,7 +5,8 @@
 //! `TestServer`, `TestDb` and `TestAgent`. `#[ignore]`d; run them with
 //! `just dev && just test-integration`.
 
-use crate::agent::gateway::{fast_config, server_config, TestAgent};
+use crate::agent::gateway::{Running, TestAgent};
+use crate::engines::{start_server as start, TinyFixture};
 use crate::pg::TestDb;
 use crate::seams::InMemorySecretStore;
 use crate::server::{TestResponse, TestServer, TEST_SECRET};
@@ -20,16 +21,12 @@ use mrl_proto::agent::v1::{
     ProbeOutcome, ProbeResult,
 };
 use mrl_proto::common::v1::Failure;
-use mrl_server::app::ServerModule;
-use mrl_server::config::Mode;
 use mrl_server::modules::engines::probes::ProbeSink;
 use mrl_server::modules::engines::{
-    CapabilityValidator, EnginesConfig, EnginesModule, Records, RegistryRecords,
+    CapabilityValidator, EnginesConfig, Pick, Records, RegistryRecords,
 };
-use mrl_server::modules::jobs::{Chains, SchemaChecks};
-use mrl_server::modules::nodes::lanes::{LaneItem, LaneKind, LaneRouter, LaneSink};
-use mrl_server::modules::nodes::NodesModule;
-use mrl_server::modules::runs::RunsModule;
+use mrl_server::modules::jobs::JobSpec;
+use mrl_server::modules::nodes::lanes::{LaneItem, LaneKind, LaneSink};
 use mrl_server::seams::{SeamError, LAUNCH_SECRET_HEADER};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -104,44 +101,6 @@ fn engines_config(dev: bool) -> EnginesConfig {
     }
 }
 
-/// A solo server with the nodes, engines and runs modules on `db` (keep `secrets` across
-/// restarts: it holds the gateway CA).
-async fn start(
-    db: &TestDb,
-    secrets: &Arc<InMemorySecretStore>,
-    engines: EnginesConfig,
-    extra: Vec<String>,
-    records: Records,
-) -> Result<TestServer, String> {
-    let mut cfg = server_config(fast_config(), Mode::Solo, 0);
-    cfg.engines = engines.clone();
-    let lanes = LaneRouter::new();
-    let nodes = NodesModule::new(db.db().clone(), &cfg, secrets.clone(), lanes.clone());
-    let gw = nodes.gateway();
-    let validator = CapabilityValidator::with_records(db.db().clone(), records.clone());
-    let chains = Chains::new(
-        vec![Arc::new(SchemaChecks), Arc::new(validator)],
-        vec![],
-        vec![],
-    );
-    let modules: Vec<Box<dyn ServerModule>> = vec![
-        Box::new(nodes),
-        Box::new(EnginesModule::with(
-            db.db().clone(),
-            engines,
-            &gw,
-            &lanes,
-            extra,
-            records,
-        )),
-        Box::new(RunsModule::with_chains(db.db().clone(), chains)),
-    ];
-    let seams = crate::seams::build(crate::seams::solo(TEST_SECRET), Mode::Solo);
-    TestServer::start(cfg, seams, modules)
-        .await
-        .map_err(|e| e.explain())
-}
-
 async fn call(s: &TestServer, method: Method, path: &str, body: Option<Value>) -> TestResponse {
     let key = Uuid::new_v4().to_string();
     let mut headers = vec![
@@ -187,6 +146,52 @@ impl CommandHandler for AnswerProbes {
         }
         Ok(())
     }
+}
+
+/// A CPU machine enrolled in a new pool that answers every probe OK: its agent, its loop
+/// (keep both alive while the test needs it), node id and pool id.
+async fn join_cpu_machine(s: &TestServer) -> (TestAgent, Running, String, String) {
+    let pool = call(
+        s,
+        Method::POST,
+        "/api/v1/pools",
+        Some(json!({"name": "p24"})),
+    )
+    .await;
+    assert_eq!(pool.status, 201, "{}", pool.text());
+    let pool = pool.json()["id"].as_str().unwrap().to_owned();
+    let token = call(
+        s,
+        Method::POST,
+        &format!("/api/v1/pools/{pool}/enrollment-tokens"),
+        Some(json!({})),
+    )
+    .await;
+    assert_eq!(token.status, 201, "{}", token.text());
+    let token = token.json()["token"].as_str().unwrap().to_owned();
+    let agent = TestAgent::new(0, |_| {});
+    let link = Link::of(&agent.ctx).unwrap();
+    link.register(
+        "Probe",
+        Arc::new(AnswerProbes {
+            link: link.clone(),
+            outcome: ProbeOutcome::Ok,
+        }),
+    );
+    let grpc = s.running().grpc_addr().expect("grpc listener");
+    let node = mrl_agent::enroll::enroll_dial(
+        &agent.ctx,
+        &grpc.to_string(),
+        &token,
+        mrl_agent::transports::TransportKind::Direct,
+        false,
+    )
+    .await
+    .unwrap()
+    .link
+    .node_id;
+    let running = agent.run();
+    (agent, running, node, pool)
 }
 
 async fn wait_for(what: &str, mut ok: impl AsyncFnMut() -> bool) {
@@ -386,46 +391,7 @@ async fn a_passed_probe_enables_cpu_then_runs_are_queued_or_rejected_by_l0() {
     assert_eq!(early["state_reason"]["code"], "MRL-CAP-245", "{early}");
 
     // A CPU machine joins and answers probes.
-    let pool = call(
-        &s,
-        Method::POST,
-        "/api/v1/pools",
-        Some(json!({"name": "p24"})),
-    )
-    .await;
-    assert_eq!(pool.status, 201, "{}", pool.text());
-    let pool = pool.json()["id"].as_str().unwrap().to_owned();
-    let token = call(
-        &s,
-        Method::POST,
-        &format!("/api/v1/pools/{pool}/enrollment-tokens"),
-        Some(json!({})),
-    )
-    .await;
-    assert_eq!(token.status, 201, "{}", token.text());
-    let token = token.json()["token"].as_str().unwrap().to_owned();
-    let agent = TestAgent::new(0, |_| {});
-    let link = Link::of(&agent.ctx).unwrap();
-    link.register(
-        "Probe",
-        Arc::new(AnswerProbes {
-            link: link.clone(),
-            outcome: ProbeOutcome::Ok,
-        }),
-    );
-    let grpc = s.running().grpc_addr().expect("grpc listener");
-    let node = mrl_agent::enroll::enroll_dial(
-        &agent.ctx,
-        &grpc.to_string(),
-        &token,
-        mrl_agent::transports::TransportKind::Direct,
-        false,
-    )
-    .await
-    .unwrap()
-    .link
-    .node_id;
-    let running = agent.run();
+    let (_agent, running, node, pool) = join_cpu_machine(&s).await;
 
     // Probes reach it; every engine version with a CPU setup is enabled on `cpu`.
     wait_for("fake ENABLED", async || {
@@ -716,4 +682,67 @@ async fn algorithm_schema_and_version_routes_answer_and_refuse_bad_input() {
     assert!(codes.contains(&json!("MRL-MODEL-240")), "{codes:?}");
     assert!(codes.contains(&json!("MRL-CAP-245")), "{codes:?}");
     s.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn an_sft_run_on_the_tiny_fixtures_passes_l0_and_picks_the_fake_engine() {
+    let db = TestDb::new().await;
+    let secrets = Arc::new(InMemorySecretStore::default());
+    let tiny = TinyFixture::default();
+    let s = start(&db, &secrets, engines_config(true), vec![], tiny.records())
+        .await
+        .unwrap();
+    let (_agent, running, _, _) = join_cpu_machine(&s).await;
+    wait_for("fake ENABLED", async || {
+        scalar_text(&db, "SELECT ev.status FROM engine_versions ev JOIN training_engines te ON te.id = ev.engine_id WHERE te.name = 'fake'")
+            .await
+            .as_deref()
+            == Some("ENABLED")
+    })
+    .await;
+
+    let w = World {
+        model: tiny.model,
+        dataset: tiny.dataset,
+        records: tiny.records(),
+    };
+    let run = submit(&s, submission(&w, "x-fake.steps", json!({}), 0)).await;
+    assert_eq!(run["state"], "QUEUED", "{run}");
+
+    // The pick names the FakeEngine version, the same decision the chain accepted.
+    let org: Uuid = sqlx::query_scalar("SELECT org_id FROM runs")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let fake: Uuid = sqlx::query_scalar("SELECT ev.id FROM engine_versions ev JOIN training_engines te ON te.id = ev.engine_id WHERE te.name = 'fake'")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    let spec = JobSpec {
+        org_id: org,
+        project_id: Uuid::new_v4(),
+        kind: "TRAIN".into(),
+        algorithm_id: "x-fake.steps".into(),
+        base_model_version_id: tiny.model.as_uuid(),
+        reward_version_id: None,
+        dataset_version_ids: vec![tiny.dataset.as_uuid()],
+        resolved: json!({}),
+        resources: serde_json::from_value(json!({"roles": [{"role": "trainer", "replicas": 1,
+            "gpu_count": 0, "cpu_millis": 1000, "mem_bytes": 1073741824}]}))
+        .unwrap(),
+        max_runtime_seconds: None,
+    };
+    let v = CapabilityValidator::with_records(db.db().clone(), tiny.records());
+    assert_eq!(v.pick(&spec).await.unwrap(), Pick::Engine(fake));
+    // Another model is unknown to the fixture records.
+    let other = JobSpec {
+        base_model_version_id: Uuid::new_v4(),
+        ..spec
+    };
+    match v.pick(&other).await.unwrap() {
+        Pick::Rejected(r) => assert_eq!(r[0].code.to_string(), "MRL-MODEL-240"),
+        p => panic!("expected a rejection, got {p:?}"),
+    }
+    running.stop().await;
 }

@@ -17,7 +17,7 @@ pub mod probes;
 pub mod store;
 pub mod validator;
 
-pub use validator::CapabilityValidator;
+pub use validator::{CapabilityValidator, Pick};
 
 use crate::app::{ServerModule, Task};
 use crate::config::Role;

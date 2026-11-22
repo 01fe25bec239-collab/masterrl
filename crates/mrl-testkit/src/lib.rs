@@ -29,6 +29,8 @@ mod p19_artifacts;
 // <mrl:testkit P22> P22 `pub mod` lines go right below this line.
 // <mrl:testkit P23> P23 `pub mod` lines go right below this line.
 // <mrl:testkit P24> P24 `pub mod` lines go right below this line.
+#[path = "../../mrl-server/src/modules/engines/testkit.rs"]
+pub mod engines;
 #[cfg(test)]
 #[path = "../../mrl-server/src/modules/engines/integration_tests.rs"]
 mod p24_engines;
