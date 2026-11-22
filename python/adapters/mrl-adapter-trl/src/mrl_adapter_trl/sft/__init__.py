@@ -218,19 +218,14 @@ def _make_sampler(prompts: list[str], max_tokens: int) -> Any:
         model.eval()
         try:
             for i, prompt in enumerate(prompts):
-                inputs = tokenizer(
-                    prompt,
-                    return_tensors="pt",
-                    add_special_tokens=False,
-                    truncation=True,
-                    max_length=prompt_tokens,
-                )
+                encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+                # Keep the end: a chat prompt ends with the turn the model must answer.
+                inputs = {k: v[:, -prompt_tokens:] for k, v in encoded.items()}
                 input_ids = inputs["input_ids"][0]
                 if not len(input_ids):
                     continue
-                sample_prompt = (
-                    tokenizer.decode(input_ids) if len(input_ids) == prompt_tokens else prompt
-                )
+                cut = encoded["input_ids"].shape[1] > prompt_tokens
+                sample_prompt = tokenizer.decode(input_ids) if cut else prompt
                 inputs = {k: v.to(model.device) for k, v in inputs.items()}
                 with torch.no_grad():
                     out = model.generate(

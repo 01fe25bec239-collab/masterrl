@@ -518,3 +518,26 @@ def test_resume_at_budget_performs_no_more_steps(
     assert resumed.exit_report.last_committed_checkpoint_id == checkpoint_id
     assert not resumed.agent.of("progress")
     assert not resumed.committed()
+
+
+def test_long_chat_prompt_sample_keeps_the_assistant_turn(
+    tmp_path: Path, model_dir: Path
+) -> None:
+    # ~117 tokens: trains whole within max_length 128; the sample prompt gets 128 - 48 = 80.
+    turns = [{"role": "user", "content": "apple " * 20}, {"role": "assistant", "content": "ok"}]
+    train = tmp_path / "long.jsonl"
+    train.write_text(json.dumps({"messages": turns}) + "\n", encoding="utf-8")
+    run = attempt(
+        tmp_path,
+        "sft",
+        {**FAST, "max_steps": 1, "max_length": 128, "samples_every": 1},
+        {"model": model_dir, "train": train},
+    )
+    assert run.exit_report is not None
+    assert run.exit_report.kind == pb.EXIT_KIND_COMPLETED
+    [batch] = run.agent.of("samples")
+    [sample] = batch.samples.samples
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    full = tokenizer.apply_chat_template(turns[:1], tokenize=False, add_generation_prompt=True)
+    assert sample.prompt != full
+    assert sample.prompt.endswith(full[-24:])  # the assistant header survives truncation
