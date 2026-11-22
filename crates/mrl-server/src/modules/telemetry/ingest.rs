@@ -160,7 +160,8 @@ pub(crate) fn prepare(
             name: p.name.clone(),
             split: p.split.clone(),
             freshness,
-            declared: !p.undeclared,
+            // `resource/` is the platform's own prefix: never an undeclared engine metric.
+            declared: !p.undeclared || p.name.starts_with(RESOURCE_PREFIX),
             step,
             ts: clamp_ts(timestamp(p.time.as_ref()).or(sent_at), now),
             value: p.value,
@@ -225,11 +226,25 @@ fn system_points(v: Vec<(String, f64)>, step: u64, split: &str) -> Vec<MetricPoi
         .collect()
 }
 
-/// `resource/<signal>[/<device>]` points (Doc 07 §6.10): `(device, signal)`.
+/// Reserved metric prefix for resource samples (Doc 07 §6.10).
+pub const RESOURCE_PREFIX: &str = "resource/";
+/// Resource signals, all in bytes.
+pub const RESOURCE_SIGNALS: &[&str] = &[
+    "torch_allocated_peak",
+    "torch_reserved_peak",
+    "process_peak",
+    "host_rss_peak",
+    "scratch_peak",
+];
+
+/// `resource/<signal>[/<gpu-uuid>]` points with a known signal: `(device, signal)`; the
+/// device is empty for the whole host.
 pub(crate) fn resource_signal(name: &str) -> Option<(String, String)> {
-    let rest = name.strip_prefix("resource/")?;
+    let rest = name.strip_prefix(RESOURCE_PREFIX)?;
     let (signal, device) = rest.split_once('/').unwrap_or((rest, ""));
-    (!signal.is_empty()).then(|| (device.to_owned(), signal.to_owned()))
+    RESOURCE_SIGNALS
+        .contains(&signal)
+        .then(|| (device.to_owned(), signal.to_owned()))
 }
 
 fn log_stream(s: i32) -> &'static str {
@@ -853,9 +868,17 @@ mod tests {
             point("nan", 1, f64::NAN),
             point("big", u64::MAX, 1.0),
             point("ok", 2, 2.5),
+            MetricPoint {
+                undeclared: true,
+                ..point("resource/process_peak", 3, 1.0)
+            },
         ];
         let got = prepare(&pts, None, now);
-        assert_eq!(got.len(), 2);
+        assert_eq!(got.len(), 3);
+        assert!(
+            got[2].declared,
+            "resource/ is the platform's prefix, never undeclared"
+        );
         assert_eq!(got[0].ts, now, "a time far in the past becomes now");
         assert!(!got[0].declared);
         assert_eq!(got[0].freshness, "delayed");
@@ -892,8 +915,13 @@ mod tests {
     #[test]
     fn resource_names_split_into_signal_and_device() {
         assert_eq!(
-            resource_signal("resource/torch_allocated_peak/gpu0"),
-            Some(("gpu0".into(), "torch_allocated_peak".into()))
+            resource_signal("resource/torch_allocated_peak/GPU-1f2a"),
+            Some(("GPU-1f2a".into(), "torch_allocated_peak".into()))
+        );
+        assert_eq!(
+            resource_signal("resource/made_up_peak"),
+            None,
+            "unknown signal"
         );
         assert_eq!(
             resource_signal("resource/host_rss_peak"),

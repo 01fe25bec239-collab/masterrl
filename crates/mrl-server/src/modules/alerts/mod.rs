@@ -5,7 +5,7 @@
 //!   (`fire_count`, `last_fired_at`, details); once RESOLVED, the next fire opens a new one.
 //! - States: OPEN → ACKED → RESOLVED, OPEN → RESOLVED. Acknowledging a resolved alert is
 //!   MRL-STATE-220; acknowledging or resolving twice answers the current alert.
-//! - Access: run alerts need `metrics_logs.read` to read and the run's cancel permission
+//! - Access (refused 403, hidden 404): run alerts need `metrics_logs.read` to read and the run's cancel permission
 //!   (`runs.cancel_own` for your own run, else `runs.cancel_any`) to change; node and system
 //!   alerts need `compute.read` / `compute.manage`.
 //! - [`NodeHealthAlerts`] (event consumer) turns `node.*` events into alerts: each health signal
@@ -314,10 +314,9 @@ async fn authorize_change(
     ctx: &RequestContext,
     row: &AlertRow,
 ) -> Result<(), JobsError> {
-    // Seeing it comes first, so a hidden alert answers like a missing one.
-    if !visible(state, ctx, row).await? {
-        return Err(JobsError::not_found("alert"));
-    }
+    // Reading it comes first: hidden answers like missing (404), refused is 403.
+    let (action, res) = row.read();
+    scope::authorize(state, ctx, action, &res).await?;
     match (row.scope_kind.as_str(), &row.run_created_by) {
         ("run", Some(by)) => {
             let (_, res) = row.read();
@@ -335,6 +334,8 @@ pub struct AlertListParams {
     pub state: Option<String>,
     /// `run`, `node` or `system`.
     pub scope_kind: Option<String>,
+    /// Only this run's alerts, `run_…` (needs `metrics_logs.read` on the run).
+    pub run: Option<String>,
     /// Page size, 1–200 (default 50).
     pub limit: Option<String>,
     /// `next_cursor` from the previous page.
@@ -375,7 +376,16 @@ pub async fn list(
         &["run", "node", "system"],
     )?;
     let mut after = scope::after::<AlertId>(&page, |a| a.as_uuid())?;
-    let org = scope::tenant(&ctx)?;
+    // One run's alerts: authorized on the run itself (hidden or missing → 404, refused → 403).
+    let (org, run) = match q.run.as_deref() {
+        Some(run) => {
+            let row =
+                crate::modules::telemetry::read_run(&state, &db, &ctx, run, "metrics_logs.read")
+                    .await?;
+            (row.org_id, Some(row.id))
+        }
+        None => (scope::tenant(&ctx)?, None),
+    };
     let mut items = Vec::new();
     // ponytail: scans in pages of 200 until the page is full; filtering by the authorizer per
     // row costs more when the caller sees few alerts of a big org.
@@ -384,12 +394,14 @@ pub async fn list(
             "SELECT {ALERT_COLS} FROM alerts a LEFT JOIN runs r ON a.scope_kind = 'run' AND r.id = a.scope_id
               WHERE a.org_id = $1 AND ($2::uuid IS NULL OR a.id < $2)
                 AND ($3::text IS NULL OR a.state = $3) AND ($4::text IS NULL OR a.scope_kind = $4)
+                AND ($5::uuid IS NULL OR (a.scope_kind = 'run' AND a.scope_id = $5))
               ORDER BY a.id DESC LIMIT 200"
         )))
         .bind(org)
         .bind(after)
         .bind(st.as_deref())
         .bind(kind.as_deref())
+        .bind(run)
         .fetch_all(db.pool())
         .await?;
         let done = rows.len() < 200;

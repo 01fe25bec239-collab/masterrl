@@ -26,6 +26,12 @@ paths:
         required: false
         schema:
           type: string
+      - name: run
+        in: query
+        description: Only this run's alerts, `run_…` (needs `metrics_logs.read` on the run).
+        required: false
+        schema:
+          type: string
       - name: limit
         in: query
         description: Page size, 1–200 (default 50).

@@ -115,6 +115,33 @@ async fn an_alert_fires_once_per_key_and_is_acknowledged_then_resolved() {
             .status,
         422
     );
+
+    // One run's alerts only; an unknown run is 404.
+    let other = seed_run(&w.db, Uuid::nil(), json!({})).await;
+    fire(&w, &other, "safety.other", Severity::Info).await;
+    let one = w
+        .get(Who::Solo, &format!("/api/v1/alerts?run={}", s.run_id()))
+        .await;
+    assert_eq!(one.status, 200, "{}", one.text());
+    let body = one.json();
+    let codes: Vec<&str> = body["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["code"].as_str().unwrap_or_default())
+        .collect();
+    assert_eq!(
+        codes,
+        vec!["safety.plateau", "safety.plateau"],
+        "both of this run's alerts, not the other run's"
+    );
+    let missing = w
+        .get(
+            Who::Solo,
+            &format!("/api/v1/alerts?run={}", mrl_domain::ids::RunId::new()),
+        )
+        .await;
+    assert_eq!(missing.status, 404);
 }
 
 #[tokio::test]

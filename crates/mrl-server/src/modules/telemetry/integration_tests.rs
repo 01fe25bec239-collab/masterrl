@@ -550,9 +550,13 @@ async fn undeclared_names_are_flagged_and_resource_peaks_kept() {
     let s = seed_run(&w.db, Uuid::nil(), json!({})).await;
     let mut pts = points("custom/thing", 0..3, |s| s as f64);
     pts[1].undeclared = true;
-    pts.extend(points("resource/torch_allocated_peak/gpu0", 0..3, |s| {
+    let mut peaks = points("resource/torch_allocated_peak/GPU-1f2a", 0..3, |s| {
         [5.0, 9.0, 7.0][s as usize]
-    }));
+    });
+    // The platform's own prefix is never undeclared; an unknown signal is a plain metric.
+    peaks[0].undeclared = true;
+    pts.extend(peaks);
+    pts.extend(points("resource/made_up_peak", 0..1, |_| 1.0));
     send_metrics(&w, &s, 1, pts).await;
     let list = w
         .get(Who::Solo, &format!("/api/v1/runs/{}/metrics", s.run_id()))
@@ -566,8 +570,17 @@ async fn undeclared_names_are_flagged_and_resource_peaks_kept() {
         .cloned()
         .unwrap();
     assert_eq!(custom["declared"], false);
+    let peak = list["series"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|x| x["name"] == "resource/torch_allocated_peak/GPU-1f2a")
+        .cloned()
+        .unwrap();
+    assert_eq!(peak["declared"], true);
+    assert_eq!(list["resources"].as_array().unwrap().len(), 1);
     assert_eq!(list["resources"][0]["signal"], "torch_allocated_peak");
-    assert_eq!(list["resources"][0]["device"], "gpu0");
+    assert_eq!(list["resources"][0]["device"], "GPU-1f2a");
     assert_eq!(list["resources"][0]["phase"], "train");
     assert_eq!(list["resources"][0]["peak"], 9.0);
 }

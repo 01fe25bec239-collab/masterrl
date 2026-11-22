@@ -328,6 +328,7 @@ OPERATIONS: dict[str, Operation] = {
         (
             "state",
             "scope_kind",
+            "run",
             "limit",
             "cursor",
         ),
