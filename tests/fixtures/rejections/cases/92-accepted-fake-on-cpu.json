@@ -1,0 +1,29 @@
+{
+  "about": "The FakeEngine on a CPU machine: runs",
+  "enabled": [
+    "cpu"
+  ],
+  "engine": "fake",
+  "expect": [],
+  "request": {
+    "algorithm": "x-fake.steps",
+    "available": [
+      "cpu"
+    ],
+    "config": {},
+    "datasets": [
+      {
+        "schema": "sft.messages.v1"
+      }
+    ],
+    "hardware": {
+      "gpus": 0,
+      "nodes": 1,
+      "wanted": "cpu"
+    },
+    "model": {
+      "family": "decoder",
+      "has_chat_template": true
+    }
+  }
+}

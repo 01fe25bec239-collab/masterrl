@@ -11,9 +11,11 @@ pub mod rbac;
 pub mod resources;
 pub mod state;
 
-/// Capability checks. This crate holds only the rejection codes.
+/// Capability checks: rejection codes, engine manifests and the L0 matcher (P24).
 pub mod capability {
     pub mod codes;
+    pub mod manifest;
+    pub mod matcher;
 }
 
 /// The version of this crate, taken from its `Cargo.toml`.

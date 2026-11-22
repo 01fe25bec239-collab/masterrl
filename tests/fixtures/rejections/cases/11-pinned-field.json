@@ -1,0 +1,40 @@
+{
+  "about": "A config that overrides a field the method pins (row 11)",
+  "enabled": [
+    "nvidia"
+  ],
+  "engine": "golden",
+  "expect": [
+    {
+      "code": "MRL-CAP-012",
+      "message": "`loss_type` is fixed to \"grpo\" for GRPO; it is what makes the method what it is.",
+      "path": "/config/engine/loss_type"
+    }
+  ],
+  "request": {
+    "algorithm": "grpo",
+    "available": [
+      "nvidia"
+    ],
+    "config": {
+      "engine": {
+        "loss_type": "dapo"
+      }
+    },
+    "datasets": [
+      {
+        "schema": "rl.prompt.v1"
+      }
+    ],
+    "hardware": {
+      "gpus": 1,
+      "nodes": 1,
+      "wanted": "nvidia"
+    },
+    "model": {
+      "family": "decoder",
+      "has_chat_template": true
+    },
+    "reward_attached": true
+  }
+}

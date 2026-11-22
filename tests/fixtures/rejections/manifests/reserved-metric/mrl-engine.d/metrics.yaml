@@ -1,0 +1,5 @@
+# A fragment that maps an engine metric into the platform's reserved prefix: refused.
+spec:
+  metrics:
+    namespaces:
+      gpu_mem: resource/gpu_mem_peak

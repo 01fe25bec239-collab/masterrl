@@ -1,0 +1,38 @@
+{
+  "about": "An evaluation dataset in a schema the method can't read",
+  "enabled": [
+    "nvidia"
+  ],
+  "engine": "golden",
+  "expect": [
+    {
+      "code": "MRL-CAP-243",
+      "message": "SFT needs evaluation data in sft.messages.v1 or sft.prompt_completion.v1, but this dataset is rl.prompt.v1.",
+      "path": "/dataset_version_ids/1"
+    }
+  ],
+  "request": {
+    "algorithm": "sft",
+    "available": [
+      "nvidia"
+    ],
+    "config": {},
+    "datasets": [
+      {
+        "schema": "sft.messages.v1"
+      },
+      {
+        "schema": "rl.prompt.v1"
+      }
+    ],
+    "hardware": {
+      "gpus": 1,
+      "nodes": 1,
+      "wanted": "nvidia"
+    },
+    "model": {
+      "family": "decoder",
+      "has_chat_template": true
+    }
+  }
+}

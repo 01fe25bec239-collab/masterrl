@@ -1,0 +1,29 @@
+{
+  "about": "Any GPU asked for, NVIDIA connected and probed: runs",
+  "enabled": [
+    "nvidia"
+  ],
+  "engine": "golden",
+  "expect": [],
+  "request": {
+    "algorithm": "sft",
+    "available": [
+      "nvidia"
+    ],
+    "config": {},
+    "datasets": [
+      {
+        "schema": "sft.messages.v1"
+      }
+    ],
+    "hardware": {
+      "gpus": 1,
+      "nodes": 1,
+      "wanted": "any_gpu"
+    },
+    "model": {
+      "family": "decoder",
+      "has_chat_template": true
+    }
+  }
+}

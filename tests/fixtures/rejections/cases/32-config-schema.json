@@ -1,0 +1,45 @@
+{
+  "about": "Engine settings that break the method's config schema",
+  "enabled": [
+    "nvidia"
+  ],
+  "engine": "golden",
+  "expect": [
+    {
+      "code": "MRL-VAL-003",
+      "message": "This setting doesn't fit SFT: value is less than or equal to the minimum of 0.",
+      "path": "/config/engine/learning_rate"
+    },
+    {
+      "code": "MRL-VAL-003",
+      "message": "This setting doesn't fit SFT: Additional properties are not allowed ('warmup' was unexpected).",
+      "path": "/config/engine"
+    }
+  ],
+  "request": {
+    "algorithm": "sft",
+    "available": [
+      "nvidia"
+    ],
+    "config": {
+      "engine": {
+        "learning_rate": -1,
+        "warmup": 3
+      }
+    },
+    "datasets": [
+      {
+        "schema": "sft.messages.v1"
+      }
+    ],
+    "hardware": {
+      "gpus": 1,
+      "nodes": 1,
+      "wanted": "nvidia"
+    },
+    "model": {
+      "family": "decoder",
+      "has_chat_template": true
+    }
+  }
+}

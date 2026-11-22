@@ -1,0 +1,33 @@
+{
+  "about": "Machines connected, but the engine has not passed its probe there",
+  "enabled": [],
+  "engine": "golden",
+  "expect": [
+    {
+      "code": "MRL-CAP-241",
+      "message": "Golden hasn't passed its check on an NVIDIA GPU yet.",
+      "path": "/resources"
+    }
+  ],
+  "request": {
+    "algorithm": "sft",
+    "available": [
+      "nvidia"
+    ],
+    "config": {},
+    "datasets": [
+      {
+        "schema": "sft.messages.v1"
+      }
+    ],
+    "hardware": {
+      "gpus": 1,
+      "nodes": 1,
+      "wanted": "nvidia"
+    },
+    "model": {
+      "family": "decoder",
+      "has_chat_template": true
+    }
+  }
+}

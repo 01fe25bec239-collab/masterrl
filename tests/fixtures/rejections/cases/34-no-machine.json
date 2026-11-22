@@ -1,0 +1,35 @@
+{
+  "about": "No connected machine of the requested kind",
+  "enabled": [
+    "nvidia"
+  ],
+  "engine": "golden",
+  "expect": [
+    {
+      "code": "MRL-CAP-245",
+      "message": "No connected machine has an NVIDIA GPU for Golden to use.",
+      "path": "/resources"
+    }
+  ],
+  "request": {
+    "algorithm": "sft",
+    "available": [
+      "cpu"
+    ],
+    "config": {},
+    "datasets": [
+      {
+        "schema": "sft.messages.v1"
+      }
+    ],
+    "hardware": {
+      "gpus": 1,
+      "nodes": 1,
+      "wanted": "nvidia"
+    },
+    "model": {
+      "family": "decoder",
+      "has_chat_template": true
+    }
+  }
+}

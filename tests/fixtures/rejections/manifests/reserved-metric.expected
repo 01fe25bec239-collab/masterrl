@@ -1,0 +1,1 @@
+engines: tests/fixtures/rejections/manifests/reserved-metric: metric names starting with `resource/` belong to the platform (resource use per phase); rename resource/gpu_mem_peak

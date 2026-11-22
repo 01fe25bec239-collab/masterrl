@@ -1,0 +1,35 @@
+{
+  "about": "A machine whose accelerator matches no environment (row 17, Apple MPS)",
+  "enabled": [
+    "nvidia"
+  ],
+  "engine": "golden",
+  "expect": [
+    {
+      "code": "MRL-CAP-018",
+      "message": "Golden has no setup for an Apple silicon GPU. It runs on: the processor only (no GPU), an NVIDIA GPU.",
+      "path": "/resources"
+    }
+  ],
+  "request": {
+    "algorithm": "sft",
+    "available": [
+      "apple"
+    ],
+    "config": {},
+    "datasets": [
+      {
+        "schema": "sft.messages.v1"
+      }
+    ],
+    "hardware": {
+      "gpus": 1,
+      "nodes": 1,
+      "wanted": "apple"
+    },
+    "model": {
+      "family": "decoder",
+      "has_chat_template": true
+    }
+  }
+}

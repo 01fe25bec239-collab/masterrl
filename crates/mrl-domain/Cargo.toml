@@ -16,6 +16,9 @@ sqlx = ["dep:sqlx"]
 serde = { workspace = true }
 thiserror = { workspace = true }
 uuid = { workspace = true }
+# P24 capability matcher: manifests, config schemas and constraints[] are JSON Schema (no IO features).
+serde_json = { workspace = true }
+jsonschema = { version = "=0.58.6", default-features = false }
 sqlx = { workspace = true, optional = true }
 
 [dev-dependencies]

@@ -1,0 +1,40 @@
+{
+  "about": "An update strategy the method doesn't support",
+  "enabled": [
+    "nvidia"
+  ],
+  "engine": "golden",
+  "expect": [
+    {
+      "code": "MRL-CAP-240",
+      "message": "GRPO with Golden can't use the `qlora` update strategy. It can use: full, lora.",
+      "path": "/config/common/update_strategy"
+    }
+  ],
+  "request": {
+    "algorithm": "grpo",
+    "available": [
+      "nvidia"
+    ],
+    "config": {
+      "common": {
+        "update_strategy": "qlora"
+      }
+    },
+    "datasets": [
+      {
+        "schema": "rl.prompt.v1"
+      }
+    ],
+    "hardware": {
+      "gpus": 1,
+      "nodes": 1,
+      "wanted": "nvidia"
+    },
+    "model": {
+      "family": "decoder",
+      "has_chat_template": true
+    },
+    "reward_attached": true
+  }
+}
