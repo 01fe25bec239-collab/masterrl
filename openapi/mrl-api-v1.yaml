@@ -1033,6 +1033,49 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /api/v1/queue:
+    get:
+      tags:
+      - compute
+      operationId: get_scheduler_queue
+      parameters:
+      - name: pool
+        in: path
+        description: '`pool_…` (required).'
+        required: true
+        schema:
+          type:
+          - string
+          - 'null'
+      - name: limit
+        in: path
+        description: Most jobs to list, 1–500 (default 100).
+        required: true
+        schema:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          minimum: 0
+      responses:
+        '200':
+          description: The pool's queue.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SchedulerQueue'
+        '404':
+          description: No such pool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Bad query.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/runs/{run}:
     get:
       tags:
@@ -4193,6 +4236,72 @@ components:
           - 'null'
           description: 'Random seeds; the server picks `{"global": n}` when absent.'
       additionalProperties: false
+    SchedulerQueue:
+      type: object
+      description: The queue of a pool.
+      required:
+      - pool_id
+      - total
+      - jobs
+      properties:
+        jobs:
+          type: array
+          items:
+            $ref: '#/components/schemas/SchedulerQueueEntry'
+          description: The jobs the caller may see, first in line first.
+        pool_id:
+          type: string
+          description: '`pool_…`.'
+        total:
+          type: integer
+          format: int32
+          description: Jobs waiting for this pool, including ones the caller can't see.
+          minimum: 0
+    SchedulerQueueEntry:
+      type: object
+      description: One waiting job.
+      required:
+      - job_id
+      - project_id
+      - position
+      - priority
+      properties:
+        job_id:
+          type: string
+          description: '`job_…`.'
+        position:
+          type: integer
+          format: int32
+          description: 1 = placed next.
+          minimum: 0
+        priority:
+          type: integer
+          format: int32
+          description: Higher goes first.
+        project_id:
+          type: string
+          description: '`prj_…`.'
+        queued_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When it joined the queue.
+        reason:
+          type:
+          - string
+          - 'null'
+          description: Why it is still waiting, in plain words.
+        reason_code:
+          type:
+          - string
+          - 'null'
+          description: The reason's code, like `MRL-QUOTA-210`.
+        run_id:
+          type:
+          - string
+          - 'null'
+          description: '`run_…`, for training and evaluation jobs.'
     SecretMeta:
       type: object
       description: A secret reference. Never has the value.

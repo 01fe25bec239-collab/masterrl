@@ -1174,6 +1174,47 @@ class RunSubmission(TypedDict):
     """Random seeds; the server picks `{"global": n}` when absent."""
 
 
+class SchedulerQueue(TypedDict):
+    """The queue of a pool."""
+
+    jobs: list[SchedulerQueueEntry]
+    """The jobs the caller may see, first in line first."""
+
+    pool_id: str
+    """`pool_…`."""
+
+    total: int
+    """Jobs waiting for this pool, including ones the caller can't see."""
+
+
+class SchedulerQueueEntry(TypedDict):
+    """One waiting job."""
+
+    job_id: str
+    """`job_…`."""
+
+    position: int
+    """1 = placed next."""
+
+    priority: int
+    """Higher goes first."""
+
+    project_id: str
+    """`prj_…`."""
+
+    queued_at: NotRequired[str | None]
+    """When it joined the queue."""
+
+    reason: NotRequired[str | None]
+    """Why it is still waiting, in plain words."""
+
+    reason_code: NotRequired[str | None]
+    """The reason's code, like `MRL-QUOTA-210`."""
+
+    run_id: NotRequired[str | None]
+    """`run_…`, for training and evaluation jobs."""
+
+
 class SecretMeta(TypedDict):
     """A secret reference. Never has the value."""
 
@@ -1553,6 +1594,8 @@ __all__ = [
     "RunKind",
     "RunPage",
     "RunSubmission",
+    "SchedulerQueue",
+    "SchedulerQueueEntry",
     "SecretMeta",
     "SessionStarted",
     "SetupDone",
