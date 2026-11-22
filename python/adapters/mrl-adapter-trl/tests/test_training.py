@@ -1,0 +1,311 @@
+"""E tests on CPU with the tiny model: resume equivalence, pause/resume, cancel, LoRA,
+exports, cpt, and the failures the engine classifies."""
+
+# pyright: reportMissingImports=false
+
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+import torch
+from helpers import DATASETS, FAST, LORA, attempt, copy_model, issue_codes
+from peft import PeftModel
+from safetensors.numpy import load_file, save_file
+from transformers import AutoModelForCausalLM
+
+from mrl_runtime._generated.mrl.common.v1 import common_pb2 as common
+from mrl_runtime._generated.mrl.worker.v1 import worker_control_pb2 as pb
+from mrl_runtime.testkit.agent import FakeAgent
+from mrl_runtime.testkit.runner import AttemptResult
+
+pytestmark = pytest.mark.slow
+STEPS = 10
+
+
+def _losses(run: AttemptResult) -> dict[int, float]:
+    return dict(run.series("train/loss"))
+
+
+def _failure(run: AttemptResult) -> tuple[str, str]:
+    report = run.exit_report
+    assert report is not None
+    assert report.HasField("failure"), report
+    return common.FailureClass.Name(getattr(report.failure, "class")), report.failure.sub_code
+
+
+def _at_step(step: int, message: pb.AgentMessage) -> Any:
+    async def control(agent: FakeAgent, _proc: object) -> None:
+        await agent.wait_for(lambda m: m.HasField("progress") and m.progress.step >= step, 60)
+        await agent.send(message)
+
+    return control
+
+
+def _manifest_of(where: Path) -> dict[str, Any]:
+    return json.loads((where / "checkpoint-manifest.json").read_text(encoding="utf-8"))
+
+
+def test_pause_then_resume_continues_the_same_loss_series(
+    tmp_path: Path, model_dir: Path, train_file: Path
+) -> None:
+    staged = {"model": model_dir, "train": train_file}
+    engine = {**FAST, "max_steps": STEPS, "save_steps": 100}
+    reference = attempt(tmp_path, "sft", engine, staged)
+    assert reference.exit_report is not None
+    assert reference.exit_report.kind == pb.EXIT_KIND_COMPLETED
+    assert sorted(_losses(reference)) == list(range(1, STEPS + 1))
+
+    pause = pb.AgentMessage(pause=pb.PauseRequest(request_id="pause-1"))
+    paused = attempt(tmp_path, "sft", engine, staged, control=_at_step(4, pause))
+    assert paused.exit_report is not None
+    assert paused.exit_report.kind == pb.EXIT_KIND_PAUSED
+    assert "pause-1" in paused.exit_report.acknowledged_requests
+    [(_, step, where)] = paused.committed()
+    assert 4 <= step < STEPS
+    doc = _manifest_of(where)
+    assert doc["kind"] == "full_resume"
+    assert not doc["is_final"]
+    roles = {f["role"] for f in doc["files"]}
+    assert {"weights", "optimizer", "scheduler", "rng", "trainer_state"} <= roles
+
+    resumed = attempt(tmp_path, "sft", engine, {**staged, "resume_from": where})
+    assert resumed.exit_report is not None
+    assert resumed.exit_report.kind == pb.EXIT_KIND_COMPLETED
+    after = _losses(resumed)
+    assert sorted(after) == list(range(step + 1, STEPS + 1))
+    ref = _losses(reference)
+    assert max(abs(after[s] - ref[s]) for s in after) < 1e-4
+    assert _manifest_of(resumed.committed()[-1][2])["parent_checkpoint_id"] == doc["checkpoint_id"]
+
+
+def test_cancel_stops_at_the_next_step_without_a_final_checkpoint(
+    tmp_path: Path, model_dir: Path, train_file: Path
+) -> None:
+    cancel = pb.AgentMessage(cancel=pb.CancelRequest(request_id="c1", grace_s=5))
+    run = attempt(
+        tmp_path,
+        "sft",
+        {**FAST, "max_steps": 200, "save_steps": 100},
+        {"model": model_dir, "train": train_file},
+        control=_at_step(2, cancel),
+    )
+    assert run.exit_report is not None
+    assert run.exit_report.kind == pb.EXIT_KIND_CANCELLED
+    assert run.exit_report.final_step < 10
+    assert not run.committed()
+
+
+def test_on_demand_checkpoint_is_taken_at_the_next_step(
+    tmp_path: Path, model_dir: Path, train_file: Path
+) -> None:
+    ask = pb.AgentMessage(checkpoint_request=pb.CheckpointRequest(request_id="k1"))
+    run = attempt(
+        tmp_path,
+        "sft",
+        {**FAST, "max_steps": 8, "save_steps": 100},
+        {"model": model_dir, "train": train_file},
+        control=_at_step(2, ask),
+    )
+    steps = sorted(step for _, step, _ in run.committed())
+    assert len(steps) == 2
+    assert steps[0] < 8
+    assert steps[1] == 8
+    assert run.exit_report is not None
+    assert "k1" in run.exit_report.acknowledged_requests
+
+
+def test_lora_checkpoints_and_both_exports(
+    tmp_path: Path, model_dir: Path, train_file: Path
+) -> None:
+    staged = {"model": model_dir, "train": train_file}
+    engine = {**FAST, "learning_rate": 0.01, "max_steps": 4, "save_steps": 100, "samples_every": 2}
+    run = attempt(tmp_path, "sft", engine, staged, common=LORA)
+    assert run.exit_report is not None
+    assert run.exit_report.kind == pb.EXIT_KIND_COMPLETED
+    [(_, step, where)] = run.committed()
+    doc = _manifest_of(where)
+    assert (step, doc["kind"], doc["is_final"]) == (4, "adapter_only", True)
+    assert doc["adapter"]["method"] == "lora"
+    assert doc["adapter"]["rank"] == 4
+    assert "model.safetensors" not in {f["path"] for f in doc["files"]}
+    samples = [s for m in run.agent.of("samples") for s in m.samples.samples]
+    assert len(samples) == 4
+    assert all(s.prompt for s in samples)
+
+    adapter = attempt(
+        tmp_path, "sft", {}, {"checkpoint": where}, job_kind="EXPORT",
+        export={"format": "hf-peft-adapter"},
+    )  # fmt: skip
+    assert adapter.exit_report is not None
+    assert adapter.exit_report.kind == pb.EXIT_KIND_COMPLETED
+    out = adapter.agent.script.staging_dir / "outputs"
+    assert (out / "adapter_model.safetensors").is_file()
+    assert (out / "tokenizer.json").is_file()
+
+    merged = attempt(
+        tmp_path, "sft", {}, {"checkpoint": where, "model": model_dir}, job_kind="EXPORT",
+        export={"format": "merged-safetensors"},
+    )  # fmt: skip
+    assert merged.exit_report is not None
+    assert merged.exit_report.kind == pb.EXIT_KIND_COMPLETED
+    _same_logits(model_dir, where, merged.agent.script.staging_dir / "outputs")
+
+
+def _same_logits(base: Path, adapter: Path, merged: Path) -> None:
+    ids = torch.tensor([[1, 5, 9, 33, 70]])
+    with torch.no_grad():
+        peft = PeftModel.from_pretrained(AutoModelForCausalLM.from_pretrained(base), adapter)
+        want = peft(ids).logits
+        got = AutoModelForCausalLM.from_pretrained(merged)(ids).logits
+    assert torch.allclose(want, got, atol=1e-4)
+
+
+def test_merge_without_a_base_model_is_a_config_failure(
+    tmp_path: Path, model_dir: Path, train_file: Path
+) -> None:
+    run = attempt(
+        tmp_path, "sft", {**FAST, "max_steps": 1}, {"model": model_dir, "train": train_file},
+        common=LORA,
+    )  # fmt: skip
+    [(_, _, where)] = run.committed()
+    merged = attempt(
+        tmp_path, "sft", {}, {"checkpoint": where}, job_kind="EXPORT",
+        export={"format": "merged-safetensors"},
+    )  # fmt: skip
+    assert _failure(merged) == ("FAILURE_CLASS_USER_CONFIG", "MRL-VAL-002")
+
+
+def test_hostile_resume_manifest_is_refused(
+    tmp_path: Path, model_dir: Path, train_file: Path
+) -> None:
+    staged = {"model": model_dir, "train": train_file}
+    first = attempt(tmp_path, "sft", {**FAST, "max_steps": 1}, staged)
+    [(_, _, where)] = first.committed()
+    manifest = where / "checkpoint-manifest.json"
+    for text, code in (("[1, 2", "MRL-CAP-251"), ('{"engine": "trl"}', "MRL-CAP-020")):
+        manifest.write_text(text, encoding="utf-8")
+        run = attempt(tmp_path, "sft", FAST, {**staged, "resume_from": where}, dry_run=True)
+        assert _failure(run) == ("FAILURE_CLASS_USER_CONFIG", code)
+
+
+def test_full_checkpoint_exports_hf_safetensors(
+    tmp_path: Path, model_dir: Path, train_file: Path
+) -> None:
+    run = attempt(
+        tmp_path, "sft", {**FAST, "max_steps": 1}, {"model": model_dir, "train": train_file}
+    )
+    [(_, _, where)] = run.committed()
+    out = attempt(
+        tmp_path, "sft", {}, {"checkpoint": where}, job_kind="EXPORT",
+        export={"format": "hf-safetensors"},
+    )  # fmt: skip
+    assert out.exit_report is not None
+    assert out.exit_report.kind == pb.EXIT_KIND_COMPLETED
+    files = {p.name for p in (out.agent.script.staging_dir / "outputs").iterdir()}
+    assert {"model.safetensors", "config.json", "tokenizer.json"} <= files
+    assert "optimizer.pt" not in files
+
+
+def test_cpt_trains_on_raw_text(tmp_path: Path, model_dir: Path) -> None:
+    text = DATASETS / "pretrain.text.v1.jsonl"
+    run = attempt(tmp_path, "cpt", {**FAST, "max_steps": 2}, {"model": model_dir, "train": text})
+    assert run.exit_report is not None
+    assert run.exit_report.kind == pb.EXIT_KIND_COMPLETED
+    assert sorted(_losses(run)) == [1, 2]
+    assert run.prepared is not None
+    estimate = run.prepared.estimate
+    assert estimate.total_steps == 2
+    assert 0 < estimate.gpu_mem_gib_lo <= estimate.gpu_mem_gib_hi
+
+
+def test_prompt_completion_dataset_trains(tmp_path: Path, model_dir: Path) -> None:
+    pairs = tmp_path / "pairs.jsonl"
+    rows = [{"prompt": f"Repeat: word{i}", "completion": f" word{i}"} for i in range(16)]
+    pairs.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    run = attempt(tmp_path, "sft", {**FAST, "max_steps": 2}, {"model": model_dir, "train": pairs})
+    assert run.exit_report is not None
+    assert run.exit_report.kind == pb.EXIT_KIND_COMPLETED
+
+
+def test_mixed_text_and_conversation_records_fail_as_data(tmp_path: Path, model_dir: Path) -> None:
+    mixed = DATASETS / "sft.prompt_completion.v1.jsonl"  # record 1 text, record 2 messages
+    run = attempt(tmp_path, "sft", FAST, {"model": model_dir, "train": mixed}, dry_run=True)
+    assert _failure(run) == ("FAILURE_CLASS_DATA", "MRL-DATA-001")
+
+
+# ---- validation and failures ----
+
+
+def test_qlora_without_an_nvidia_gpu_is_refused(
+    tmp_path: Path, model_dir: Path, train_file: Path
+) -> None:
+    if torch.cuda.is_available():
+        pytest.skip("this machine has an NVIDIA GPU")
+    qlora = {"update": {"strategy": "qlora"}}
+    run = attempt(
+        tmp_path, "sft", FAST, {"model": model_dir, "train": train_file}, common=qlora, dry_run=True
+    )
+    assert "MRL-CAP-250" in issue_codes(run)
+    assert _failure(run) == ("FAILURE_CLASS_USER_CONFIG", "MRL-CAP-250")
+
+
+def test_model_without_chat_template_is_refused_for_conversations(
+    tmp_path: Path, model_dir: Path, train_file: Path
+) -> None:
+    bare = copy_model(model_dir, tmp_path / "bare", chat_template=None)
+    run = attempt(tmp_path, "sft", FAST, {"model": bare, "train": train_file}, dry_run=True)
+    assert _failure(run) == ("FAILURE_CLASS_USER_CONFIG", "MRL-CAP-016")
+
+
+def test_template_without_generation_marks_fails_as_user_config(
+    tmp_path: Path, model_dir: Path, train_file: Path
+) -> None:
+    plain = "{% for m in messages %}{{ m['role'] }}: {{ m['content'] }}\n{% endfor %}"
+    model = copy_model(model_dir, tmp_path / "plain", chat_template=plain)
+    run = attempt(tmp_path, "sft", FAST, {"model": model, "train": train_file}, dry_run=True)
+    assert _failure(run) == ("FAILURE_CLASS_USER_CONFIG", "MRL-CAP-016")
+
+
+def test_invalid_records_fail_as_data(tmp_path: Path, model_dir: Path) -> None:
+    bad = DATASETS / "sft.messages.v1-invalid.jsonl"
+    run = attempt(tmp_path, "sft", FAST, {"model": model_dir, "train": bad}, dry_run=True)
+    assert _failure(run) == ("FAILURE_CLASS_DATA", "MRL-DATA-001")
+
+
+def test_cpt_refuses_a_conversation_dataset(
+    tmp_path: Path, model_dir: Path, train_file: Path
+) -> None:
+    run = attempt(tmp_path, "cpt", FAST, {"model": model_dir, "train": train_file}, dry_run=True)
+    assert _failure(run) == ("FAILURE_CLASS_DATA", "MRL-DATA-001")
+
+
+def test_pickle_model_is_refused(tmp_path: Path, model_dir: Path, train_file: Path) -> None:
+    pickled = model_dir.parent / "tiny-llama-pickle"
+    run = attempt(tmp_path, "sft", FAST, {"model": pickled, "train": train_file}, dry_run=True)
+    assert "MRL-MODEL-001" in issue_codes(run)
+
+
+def test_incomplete_resume_checkpoint_is_refused(
+    tmp_path: Path, model_dir: Path, train_file: Path
+) -> None:
+    staged = {"model": model_dir, "train": train_file}
+    first = attempt(tmp_path, "sft", {**FAST, "max_steps": 1}, staged)
+    [(_, _, where)] = first.committed()
+    (where / "optimizer.pt").unlink()
+    run = attempt(tmp_path, "sft", {**FAST, "max_steps": 2}, {**staged, "resume_from": where})
+    assert _failure(run) == ("FAILURE_CLASS_USER_CONFIG", "MRL-CAP-251")
+
+
+def test_nan_loss_ends_as_numeric_divergence(
+    tmp_path: Path, model_dir: Path, train_file: Path
+) -> None:
+    broken = copy_model(model_dir, tmp_path / "nan")
+    weights = load_file(broken / "model.safetensors")
+    weights["model.norm.weight"][:] = float("nan")
+    save_file(weights, str(broken / "model.safetensors"), metadata={"format": "pt"})
+    run = attempt(
+        tmp_path, "sft", {**FAST, "max_steps": 20, "save_steps": 100},
+        {"model": broken, "train": train_file},
+    )  # fmt: skip
+    assert _failure(run) == ("FAILURE_CLASS_NUMERIC_DIVERGENCE", "NAN_LOSS")

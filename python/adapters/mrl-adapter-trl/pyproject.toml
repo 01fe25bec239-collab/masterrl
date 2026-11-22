@@ -1,5 +1,11 @@
 # Separate uv project with its own lock (not a workspace member).
 # May depend on mrl-runtime only; never on another adapter.
+#
+# Two locks, both by hash:
+#   uv.lock                the trainer environment the agent builds (process mode): PyPI torch,
+#                          which is CUDA 13 on Linux and CPU/MPS on macOS.
+#   runtimes/trainer.lock  the same trainer pins with CPU-only torch for Linux (CI and the CPU
+#                          worker image). Regenerate with runtimes/lock-cpu.sh.
 [project]
 name = "mrl-adapter-trl"
 version = "0.1.0"
@@ -15,7 +21,17 @@ dependencies = [
     "accelerate==1.15.0",
     "datasets==5.1.0",
     "torch==2.14.1",
+    "pydantic==2.14.3",
+    # QLoRA (4-bit) runs on NVIDIA GPUs only.
+    "bitsandbytes==0.50.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
 ]
+
+[project.entry-points."mrl_runtime.engines"]
+trl = "mrl_adapter_trl:manifest"
+trl-conformance = "mrl_adapter_trl.conformance:manifest"
+
+[project.entry-points."mrl_runtime.conformance"]
+trl = "mrl_adapter_trl.conformance:conformance_profile"
 
 [dependency-groups]
 dev = ["pytest==9.2.0", "import-linter==2.15"]
@@ -32,6 +48,8 @@ mrl-runtime = { path = "../../mrl-runtime", editable = true }
 
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"
+pythonpath = ["tests"]
+markers = ["slow: trains the tiny model (seconds each)"]
 
 [tool.importlinter]
 root_packages = ["mrl_adapter_trl"]

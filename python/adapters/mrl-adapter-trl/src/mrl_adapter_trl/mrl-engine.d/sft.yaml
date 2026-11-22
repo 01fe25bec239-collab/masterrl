@@ -1,0 +1,113 @@
+# SFT family: sft and cpt (Doc 05 §4.A-B). Both run trl.SFTTrainer; the switch is what makes
+# each id mean one thing. Presets are JSON Merge Patches over {common, engine}.
+spec:
+  algorithms:
+    - id: sft
+      displayName: Supervised fine-tuning
+      summary: Teach a model to answer like your examples, from conversations or prompt and completion pairs.
+      objective: autoregressive_likelihood
+      parent: trl.SFTTrainer
+      switch: { loss_type: nll }
+      upstreamStatus: stable
+      maturity: beta
+      fidelity: full
+      requires:
+        datasetSchemas:
+          train: [sft.messages.v1, sft.prompt_completion.v1]
+          eval: [sft.messages.v1, sft.prompt_completion.v1]
+        signals: { reward: none, reference: none, critic: none, rolloutEngine: none, teacher: none }
+        modelFamilies: [decoder, decoder-moe]
+      supports: { updateStrategies: [full, lora, qlora], parallelism: [single] }
+      config:
+        schema: config/sft.schema.json
+        presets:
+          - id: sft-lora-beginner
+            title: LoRA, quick start
+            tier: beginner
+            patch:
+              common: { update: { strategy: lora, lora: { r: 8, alpha: 16, dropout: 0.05 } } }
+              engine: { learning_rate: 0.0002, num_train_epochs: 1, per_device_train_batch_size: 4, max_length: 1024 }
+          - id: sft-lora-standard
+            title: LoRA, balanced
+            tier: beginner
+            patch:
+              common: { update: { strategy: lora, lora: { r: 16, alpha: 32, dropout: 0.05 } } }
+              engine:
+                learning_rate: 0.0001
+                num_train_epochs: 2
+                per_device_train_batch_size: 4
+                gradient_accumulation_steps: 4
+                max_length: 2048
+                gradient_checkpointing: true
+          - id: sft-full
+            title: Full fine-tune
+            tier: advanced
+            patch:
+              common: { update: { strategy: full } }
+              engine:
+                learning_rate: 0.00002
+                num_train_epochs: 2
+                per_device_train_batch_size: 2
+                gradient_accumulation_steps: 8
+                max_length: 2048
+                gradient_checkpointing: true
+                weight_decay: 0.01
+          - id: sft-qlora-24gb
+            title: QLoRA, fits a 24 GB GPU
+            tier: beginner
+            when: "hardware.accelerator == 'nvidia' && hardware.gpu_mem_gib <= 24"
+            patch:
+              common: { update: { strategy: qlora, lora: { r: 16, alpha: 32, dropout: 0.05 } } }
+              engine:
+                learning_rate: 0.0002
+                num_train_epochs: 1
+                per_device_train_batch_size: 2
+                gradient_accumulation_steps: 8
+                max_length: 2048
+                gradient_checkpointing: true
+                optim: paged_adamw_8bit
+      metrics: &metrics
+        - { name: train/loss, source: loss, kind: live, required: true }
+        - { name: train/learning_rate, source: learning_rate, kind: live, required: true }
+        - { name: train/grad_norm, source: grad_norm, kind: live, required: false }
+        - { name: train/entropy, source: entropy, kind: live, required: false }
+        - { name: train/mean_token_accuracy, source: mean_token_accuracy, kind: live, required: false }
+        - { name: train/num_tokens, source: num_tokens, unit: tokens, kind: live, required: false }
+        - { name: eval/loss, source: eval_loss, kind: sampled, required: false, when: "datasets.eval" }
+        - { name: eval/mean_token_accuracy, source: eval_mean_token_accuracy, kind: sampled, required: false, when: "datasets.eval" }
+      samples: { emitted: true, fields: [prompt, completion] }
+      resume: true
+      pause: true
+    - id: cpt
+      displayName: Continued pre-training
+      summary: Keep training a model on raw text from your field, so it learns its words and facts.
+      objective: autoregressive_likelihood
+      parent: trl.SFTTrainer
+      switch: { loss_type: nll, completion_only_loss: false, assistant_only_loss: false }
+      upstreamStatus: stable
+      maturity: beta
+      fidelity: full
+      requires:
+        datasetSchemas: { train: [pretrain.text.v1], eval: [pretrain.text.v1] }
+        signals: { reward: none, reference: none, critic: none, rolloutEngine: none, teacher: none }
+        modelFamilies: [decoder, decoder-moe]
+      supports: { updateStrategies: [full, lora, qlora], parallelism: [single] }
+      config: { schema: config/cpt.schema.json }
+      metrics: *metrics
+      samples: { emitted: true, fields: [prompt, completion] }
+      resume: true
+      pause: true
+  constraints:
+    - id: trl-qlora-nvidia
+      appliesTo: [sft, cpt]
+      schema:
+        if:
+          required: [common]
+          properties: { common: { required: [update], properties: { update: { required: [strategy], properties: { strategy: { const: qlora } } } } } }
+        then:
+          required: [hardware]
+          properties: { hardware: { required: [accelerator], properties: { accelerator: { type: string, pattern: "^nvidia" } } } }
+      error:
+        code: MRL-CAP-250
+        message: QLoRA needs an NVIDIA GPU.
+        hint: Pick LoRA instead, or run on a machine with an NVIDIA GPU.

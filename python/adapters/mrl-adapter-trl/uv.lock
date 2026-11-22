@@ -125,6 +125,19 @@ wheels = [
 ]
 
 [[package]]
+name = "bitsandbytes"
+version = "0.50.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+    { name = "packaging" },
+    { name = "torch" },
+]
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/a5/6e/e4e8b75716dbe5e50964f070266e06f4e6806ce051bfb97f52ee162b9310/bitsandbytes-0.50.2-py3-none-manylinux_2_24_x86_64.whl", hash = "sha256:55348a9a4a21bfd99cf8c7b32fe67b4030ae5c2a05738e03c1747f65fa6ec283", size = 43139553, upload-time = "2026-08-27T00:10:54.751Z" },
+]
+
+[[package]]
 name = "click"
 version = "8.5.1"
 source = { registry = "https://pypi.org/simple" }
@@ -550,9 +563,11 @@ version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "accelerate" },
+    { name = "bitsandbytes", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'" },
     { name = "datasets" },
     { name = "mrl-runtime" },
     { name = "peft" },
+    { name = "pydantic" },
     { name = "torch" },
     { name = "transformers" },
     { name = "trl" },
@@ -567,9 +582,11 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "accelerate", specifier = "==1.15.0" },
+    { name = "bitsandbytes", marker = "platform_machine == 'x86_64' and sys_platform == 'linux'", specifier = "==0.50.2" },
     { name = "datasets", specifier = "==5.1.0" },
     { name = "mrl-runtime", editable = "../../mrl-runtime" },
     { name = "peft", specifier = "==0.21.2" },
+    { name = "pydantic", specifier = "==2.14.3" },
     { name = "torch", specifier = "==2.14.1" },
     { name = "transformers", specifier = "==5.22.2" },
     { name = "trl", specifier = "==1.17.1" },

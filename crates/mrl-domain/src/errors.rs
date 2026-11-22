@@ -663,6 +663,14 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
     // <mrl:errors P23> rows for P23 go right below this line.
     // <mrl:errors P24> rows for P24 go right below this line.
     // <mrl:errors P25> rows for P25 go right below this line.
+    (
+        code(ErrorFamily::Cap, 250),
+        "This setting needs an NVIDIA GPU.",
+    ),
+    (
+        code(ErrorFamily::Cap, 251),
+        "This checkpoint can't resume training.",
+    ),
 ];
 
 /// Every code with its title: the registry plus every capability rejection.
