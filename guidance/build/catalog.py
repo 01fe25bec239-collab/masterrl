@@ -1130,6 +1130,13 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                     'any more. A delete that stopped halfway leaves it in this state.',
              'what_to_do': {'steps': ['Delete the secret again to finish.',
                                       'Then create a new secret if you still need one.']}},
+            {'code': 'MRL-CONFLICT-230',
+             'title': "This checkpoint is still in use, so it can't be deleted.",
+             'why': "It is the run's final result or its resume point, or another run starts from "
+                    'it. Deleting it would break that.',
+             'what_to_do': {'steps': ['Wait until the run has finished, or delete the run that '
+                                      'starts from it first.',
+                                      'The final checkpoint of a run stays as long as the run.']}},
             {'code': 'MRL-DATA-001',
              'title': 'Your dataset did not pass its checks.',
              'why': "Some rows are empty, are missing fields, or don't match the chosen format.",
@@ -1845,6 +1852,15 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'what_to_do': {'steps': ["Wait for the attempt's current step to finish, then try "
                                       'again.',
                                       'If the run moved to another machine, act on it there.']}},
+            {'code': 'MRL-STATE-230',
+             'title': "This checkpoint isn't committed, so it can't be used yet.",
+             'why': 'A checkpoint can be checked, promoted or deleted only once all its files are '
+                    'saved and confirmed. This one is still being saved, or it was found to be '
+                    'damaged or deleted.',
+             'what_to_do': {'steps': ["Refresh to see the checkpoint's state.",
+                                      'If it is still being saved, wait a moment and try again.',
+                                      'If it is damaged, use an earlier checkpoint of the same '
+                                      'run.']}},
             {'code': 'MRL-STORE-001',
              'title': 'The app refused a storage path.',
              'why': "The path points outside your workspace's storage area, or it has a part the "

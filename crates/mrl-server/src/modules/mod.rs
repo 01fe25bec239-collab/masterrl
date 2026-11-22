@@ -26,5 +26,6 @@ pub mod uploads;
 // <mrl:modules P21> P21 `pub mod` lines go right below this line.
 // <mrl:modules P22> P22 `pub mod` lines go right below this line.
 // <mrl:modules P23> P23 `pub mod` lines go right below this line.
+pub mod checkpoints;
 // <mrl:modules P24> P24 `pub mod` lines go right below this line.
 // </mrl:modules>

@@ -1,0 +1,44 @@
+name: ci-checkpoints
+
+# P23 checkpoint commit, verification, retention and the FINALIZING verifier, through the real
+# gateway and an agent link, against PostgreSQL (same setup as `just dev`).
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-checkpoints-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  checkpoints:
+    name: checkpoints (postgres)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      DATABASE_URL: postgres://mrl:mrl-dev-only@127.0.0.1:55432/masterrl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+
+      - name: start PostgreSQL
+        run: docker compose -f deploy/local/compose.yaml up -d --wait postgres
+
+      - name: P23 integration tests
+        run: cargo test -p mrl-testkit --locked p23_checkpoints -- --ignored
+
+      - name: role table (covers the checkpoint routes)
+        run: cargo test -p mrl-testkit --locked every_route_answers_by_role_in_team_mode -- --ignored
+
+      - name: service logs
+        if: failure()
+        run: docker compose -f deploy/local/compose.yaml logs postgres

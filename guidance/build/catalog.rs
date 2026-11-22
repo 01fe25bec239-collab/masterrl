@@ -2304,6 +2304,17 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-CONFLICT-230")),
+            ("title", Value::Str("This checkpoint is still in use, so it can't be deleted.")),
+            ("why", Value::Str("It is the run's final result or its resume point, or another run starts from it. Deleting it would break that.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Wait until the run has finished, or delete the run that starts from it first."),
+                    Value::Str("The final checkpoint of a run stays as long as the run."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-DATA-001")),
             ("title", Value::Str("Your dataset did not pass its checks.")),
             ("why", Value::Str("Some rows are empty, are missing fields, or don't match the chosen format.")),
@@ -3522,6 +3533,18 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Wait for the attempt's current step to finish, then try again."),
                     Value::Str("If the run moved to another machine, act on it there."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STATE-230")),
+            ("title", Value::Str("This checkpoint isn't committed, so it can't be used yet.")),
+            ("why", Value::Str("A checkpoint can be checked, promoted or deleted only once all its files are saved and confirmed. This one is still being saved, or it was found to be damaged or deleted.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Refresh to see the checkpoint's state."),
+                    Value::Str("If it is still being saved, wait a moment and try again."),
+                    Value::Str("If it is damaged, use an earlier checkpoint of the same run."),
                 ])),
             ])),
         ]),

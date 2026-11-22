@@ -576,6 +576,30 @@ async fn every_route_answers_by_role_in_team_mode() {
     let seeded = seeded.json();
     let field = |k: &str| seeded[k].as_str().unwrap().to_owned();
     let (run, job, exp) = (field("id"), field("job_id"), field("experiment_id"));
+    // P23 routes: one COMMITTED checkpoint of the P17 run, from an ended attempt. Its file is
+    // not in storage.
+    let ckpt = mrl_domain::ids::CheckpointId::new();
+    {
+        let (o, store_org) = (org.as_uuid(), org.to_string());
+        let r = mrl_domain::ids::RunId::from_str(&run).unwrap().as_uuid();
+        let j = mrl_domain::ids::JobId::from_str(&job).unwrap().as_uuid();
+        let (a, c) = (uuid::Uuid::new_v4(), ckpt.as_uuid());
+        core.db
+            .seed(&format!(
+                "INSERT INTO job_attempts (id, org_id, job_id, attempt_no, epoch, state)
+                 VALUES ('{a}', '{o}', '{j}', 1, 0, 'EXITED_ERROR');
+                 INSERT INTO checkpoints (id, org_id, storage_org, run_id, job_id, attempt_id,
+                   attempt_epoch, global_step, kind, layout, state)
+                 VALUES ('{c}', '{o}', '{store_org}', '{r}', '{j}', '{a}', 0, 1, 'full_resume',
+                   'fake-v1', 'COMMITTED');
+                 INSERT INTO checkpoint_files (checkpoint_id, org_id, path, role, object_key,
+                   sha256, size_bytes)
+                 VALUES ('{c}', '{o}', 'w.bin', 'weights',
+                   'orgs/{store_org}/runs/{run}/checkpoints/{ckpt}/w.bin',
+                   decode(repeat('00', 32), 'hex'), 1);"
+            ))
+            .await;
+    }
     // Compute (P18): a pool made over the API and one machine in it (no agent connected).
     let pool = core
         .call(
@@ -894,6 +918,31 @@ async fn every_route_answers_by_role_in_team_mode() {
             Action::SecretsManage,
             None,
         ),
+        // P23 routes
+        row(
+            Method::GET,
+            format!("/api/v1/runs/{run}/checkpoints"),
+            Action::CheckpointsRead,
+            None,
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/checkpoints/{ckpt}"),
+            Action::CheckpointsRead,
+            None,
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/checkpoints/{ckpt}:verify"),
+            Action::CheckpointsWrite,
+            None,
+        ),
+        row(
+            Method::DELETE,
+            format!("/api/v1/checkpoints/{ckpt}"),
+            Action::CheckpointsWrite,
+            None,
+        ),
     ]);
     // A run submission needs an Idempotency-Key (keys are per person).
     let key_for = |method: &Method, path: &str| -> &'static [(&'static str, &'static str)] {
@@ -930,6 +979,10 @@ async fn every_route_answers_by_role_in_team_mode() {
     // exist (404).
     let expected = |method: &Method, path: &str| -> &'static [u16] {
         match (method.as_str(), path) {
+            // P23 routes: the first allowed verify finds the file missing (CORRUPT, 200); later
+            // ones meet a deleted checkpoint (409). Deleting is 204, also when already deleted.
+            ("POST", p) if p.ends_with(":verify") => &[200, 409],
+            ("DELETE", p) if p.starts_with("/api/v1/checkpoints/") => &[204],
             (_, p) if p.starts_with("/api/v1/sync/") => &[409],
             ("POST", "/api/v1/auth/session") | ("POST", "/api/v1/auth/tokens") => &[201],
             ("DELETE", "/api/v1/auth/session") => &[204],

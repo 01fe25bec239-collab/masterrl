@@ -62,6 +62,10 @@ pub fn modules(db: &Db, config: &crate::Config) -> Vec<Box<dyn ServerModule>> {
         // <mrl:register P21> P21 modules go right below this line.
         // <mrl:register P22> P22 modules go right below this line.
         // <mrl:register P23> P23 modules go right below this line.
+        Box::new(crate::modules::checkpoints::CheckpointsModule::new(
+            db.clone(),
+            config,
+        )),
         // <mrl:register P24> P24 modules go right below this line.
         // </mrl:register>
     ]

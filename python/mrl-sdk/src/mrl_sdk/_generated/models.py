@@ -159,6 +159,90 @@ class CheckResult(TypedDict):
     """`ready` or `not_ready`."""
 
 
+class CheckpointFileInfo(TypedDict):
+    """One file of a checkpoint."""
+
+    path: str
+    """Path inside the checkpoint."""
+
+    role: str
+    """`weights`, `optimizer`, `manifest`, …."""
+
+    sha256: str
+    """sha256 (hex)."""
+
+    size: int
+    """Size in bytes."""
+
+
+class CheckpointInfo(TypedDict):
+    """A checkpoint as the API shows it."""
+
+    attempt_epoch: int
+    """That attempt's fencing epoch."""
+
+    attempt_id: str
+    """The attempt that wrote it."""
+
+    committed_at: NotRequired[str | None]
+    """Committed."""
+
+    corrupt_reason: NotRequired[str | None]
+    """Why it is CORRUPT."""
+
+    created_at: str
+    """Staged."""
+
+    file_count: NotRequired[int | None]
+    """Number of files."""
+
+    files: NotRequired[list[CheckpointFileInfo] | None]
+    """The files (only on `GET /checkpoints/{ckpt}`)."""
+
+    id: str
+    """`ckpt_…`."""
+
+    is_final: bool
+    """The run's final checkpoint."""
+
+    kind: str
+    """`full_resume`, `weights_only` or `adapter_only`."""
+
+    layout: str
+    """Format tag, like `hf-trainer-v1`."""
+
+    metrics: dict[str, Any]
+    """Metrics at this step."""
+
+    run_id: str
+    """`run_…`."""
+
+    state: str
+    """`WRITING`, `UPLOADED`, `VERIFYING`, `COMMITTED`, `CORRUPT` or `TOMBSTONED`."""
+
+    step: int
+    """Training step."""
+
+    total_bytes: NotRequired[int | None]
+    """Sum of file sizes."""
+
+    verification_level: NotRequired[str | None]
+    """`manifest_head` (files present with their sizes) or `full_rehash` (every byte re-read)."""
+
+    verified_at: NotRequired[str | None]
+    """Last verified."""
+
+
+class CheckpointInfoPage(TypedDict):
+    """One page of results."""
+
+    items: list[CheckpointInfo]
+    """The items on this page."""
+
+    next_cursor: NotRequired[str | None]
+    """Pass as `cursor` for the next page; `null` on the last page."""
+
+
 class CopyInfo(TypedDict):
     """A saved copy (metadata only)."""
 
@@ -1497,6 +1581,9 @@ __all__ = [
     "AuditRecordPage",
     "CallbackRequest",
     "CheckResult",
+    "CheckpointFileInfo",
+    "CheckpointInfo",
+    "CheckpointInfoPage",
     "CopyInfo",
     "CreateEnrollmentToken",
     "CreatePool",
