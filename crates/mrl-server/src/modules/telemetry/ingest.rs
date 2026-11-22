@@ -702,7 +702,7 @@ impl Ingest {
         sqlx::query(
             "INSERT INTO log_chunks (org_id, run_id, attempt_id, rank, stream, \"offset\", data)
              SELECT $1, $2, $3, $4, $5, o, d FROM unnest($6::bigint[], $7::bytea[]) AS u(o, d)
-             ON CONFLICT (attempt_id, rank, stream, \"offset\") DO NOTHING",
+             ON CONFLICT (attempt_id, rank, stream, \"offset\") WHERE stream <> 'agent' DO NOTHING",
         )
         .bind(o.org)
         .bind(o.run)

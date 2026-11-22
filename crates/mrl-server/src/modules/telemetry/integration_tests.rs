@@ -1471,7 +1471,13 @@ async fn distinct_deliveries_with_the_same_worker_seq_are_kept_and_sealed_replay
             ..Default::default()
         }),
     );
+    let second_node = Uuid::new_v4();
+    sqlx::query("INSERT INTO attempt_placements (attempt_id, node_id, org_id, node_rank, rank_lo, rank_hi, role)
+        VALUES ($1, $2, $3, 1, 1, 1, 'trainer')")
+        .bind(s.attempt).bind(second_node).bind(s.org).execute(w.db.pool()).await.unwrap();
     w.deliver(s.node, LaneKind::Logs, 1, 3, log.clone()).await;
+    w.deliver(second_node, LaneKind::Logs, 1, 3, log.clone())
+        .await;
     mrl_server::modules::telemetry::logs::seal(&w.tel, Duration::ZERO)
         .await
         .unwrap();
@@ -1482,8 +1488,8 @@ async fn distinct_deliveries_with_the_same_worker_seq_are_kept_and_sealed_replay
         .json();
     assert_eq!(
         page["items"].as_array().unwrap().len(),
-        2,
-        "the gap and chunk each appear once"
+        3,
+        "both nodes' gap markers and the chunk each appear once"
     );
 }
 

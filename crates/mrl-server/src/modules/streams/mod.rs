@@ -551,7 +551,12 @@ impl Live {
             sqlx::query_scalar("SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint")
                 .fetch_one(&mut *tx)
                 .await?;
-        if let Some(reason) = too_old(&mut tx, &self.sub, &self.cursor).await? {
+        if let Some((pruned_xid, reason)) = too_old(&mut tx, &self.sub, &self.cursor).await? {
+            // Wait until the safe tail can move past the deleted rows. Resetting to an
+            // older point would send another resync every poll while a transaction is open.
+            if pruned_xid >= xmin {
+                return Ok(());
+            }
             self.cursor = Cursor::start(xmin);
             out.push(event(
                 "resync",
@@ -840,8 +845,8 @@ async fn too_old(
     db: &mut PgConnection,
     sub: &Sub,
     c: &Cursor,
-) -> Result<Option<&'static str>, JobsError> {
-    let trimmed = sqlx::query_scalar::<_, String>(
+) -> Result<Option<(i64, &'static str)>, JobsError> {
+    let trimmed = sqlx::query_as::<_, (i64, String)>(
         "WITH scopes(source, scope, x, i) AS (
              SELECT 'l', unnest($1::uuid[]), $2::bigint, $3::bigint
              UNION ALL SELECT 'm', unnest($4::uuid[]), $5, $6
@@ -851,10 +856,10 @@ async fn too_old(
                   WHERE id = ANY($15) OR project_id = ANY($16)
              UNION ALL SELECT 'o', id, $13, $14 FROM job_attempts WHERE job_id = ANY($15)
          )
-         SELECT t.source FROM scopes s JOIN telemetry_pruned t
+         SELECT t.xid::text::bigint, t.source FROM scopes s JOIN telemetry_pruned t
               ON t.source = s.source AND t.scope_id = s.scope
             WHERE (t.xid, t.id) > (s.x::text::xid8, s.i)
-            ORDER BY (t.source = 'l') DESC LIMIT 1",
+            ORDER BY t.xid DESC, (t.source = 'l') DESC LIMIT 1",
     )
     .bind(&sub.logs)
     .bind(c.l.xid)
@@ -874,12 +879,15 @@ async fn too_old(
     .bind(&sub.projects)
     .fetch_optional(db)
     .await?;
-    Ok(trimmed.map(|source| {
-        if source == "l" {
-            "logs_sealed"
-        } else {
-            "too_old"
-        }
+    Ok(trimmed.map(|(xid, source)| {
+        (
+            xid,
+            if source == "l" {
+                "logs_sealed"
+            } else {
+                "too_old"
+            },
+        )
     }))
 }
 

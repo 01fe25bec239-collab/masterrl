@@ -521,3 +521,46 @@ async fn an_open_stream_resyncs_if_a_chunk_is_pruned_before_the_next_poll() {
     assert_eq!(events[0].event, "resync");
     assert_eq!(events[0].data["reason"], "logs_sealed");
 }
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn revisions_follow_write_order_when_a_transaction_gets_its_xid_early() {
+    let w = World::solo().await;
+    let s = seed_run(&w.db, Uuid::nil(), json!({})).await;
+    let topic = format!("alerts,run:{}:progress", s.run_id());
+    let (_, client, _) = open(&w, Who::Solo, &topic, None).await;
+    let mut client = client.unwrap();
+    let mut early = w.db.db().begin().await.unwrap();
+    sqlx::query("SELECT pg_current_xact_id()")
+        .execute(&mut *early)
+        .await
+        .unwrap();
+    let id = fire(&w, &s, "metric.test").await;
+    let p = WorkerBody::Progress(Progress {
+        step: 1,
+        ..Default::default()
+    });
+    w.deliver(s.node, LaneKind::Control, 1, 0, relay(&s, 1, p))
+        .await;
+    sqlx::query("UPDATE alerts SET fire_count = 2, xid = pg_current_xact_id() WHERE id = $1")
+        .bind(id)
+        .execute(&mut *early)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE run_progress SET step = 2, xid = pg_current_xact_id() WHERE run_id = $1")
+        .bind(s.run)
+        .execute(&mut *early)
+        .await
+        .unwrap();
+    early.commit().await.unwrap();
+    let events = client.until(|events| events.len() >= 4).await;
+    let values = |kind: &str, field: &str| {
+        events
+            .iter()
+            .filter(|e| e.event == kind)
+            .map(|e| e.data[field].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(values("alert", "fire_count"), [1, 2]);
+    assert_eq!(values("progress", "step"), [1, 2]);
+}
