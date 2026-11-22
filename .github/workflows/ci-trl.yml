@@ -26,6 +26,7 @@ jobs:
     timeout-minutes: 30
     env:
       MRL_TEST_TRL_FIXTURES_REQUIRED: "1"
+      TRL_VENV: ${{ runner.temp }}/trl-cpu
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
@@ -43,17 +44,49 @@ jobs:
       - name: CPU environment from runtimes/trainer.lock
         working-directory: python/adapters/mrl-adapter-trl
         run: |
-          uv venv .venv
-          uv pip install --python .venv/bin/python --only-binary :all: --require-hashes \
+          uv venv "$TRL_VENV"
+          uv pip install --python "$TRL_VENV/bin/python" --only-binary :all: --require-hashes \
             --torch-backend cpu -r runtimes/trainer.lock
-          uv pip install --python .venv/bin/python --no-deps -e ../../mrl-runtime -e .
-          uv pip install --python .venv/bin/python pytest==9.2.0 import-linter==2.15
+          uv pip install --python "$TRL_VENV/bin/python" --no-deps -e ../../mrl-runtime -e .
+          uv pip install --python "$TRL_VENV/bin/python" pytest==9.2.0 import-linter==2.15
       - name: import contract
         working-directory: python/adapters/mrl-adapter-trl
-        run: .venv/bin/lint-imports
+        run: '"$TRL_VENV/bin/lint-imports"'
       - name: tests and conformance
         working-directory: python/adapters/mrl-adapter-trl
-        run: .venv/bin/python -m pytest -q
+        run: '"$TRL_VENV/bin/python" -m pytest -q'
+
+      - name: worker installed outside the checkout
+        run: |
+          uv pip install --python "$TRL_VENV/bin/python" --no-deps --reinstall \
+            python/mrl-runtime python/adapters/mrl-adapter-trl
+          cd "$RUNNER_TEMP"
+          "$TRL_VENV/bin/python" -I - "$GITHUB_WORKSPACE/tests/fixtures" <<'PY'
+          import asyncio
+          import sys
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+
+          from mrl_runtime._generated.mrl.worker.v1 import worker_control_pb2 as pb
+          from mrl_runtime.testkit.agent import AgentScript
+          from mrl_runtime.testkit.runner import job_spec, run_subprocess
+
+          fixtures = Path(sys.argv[1])
+          with TemporaryDirectory() as work:
+              script = AgentScript(
+                  job_spec=job_spec("sft", {"max_steps": 1, "max_length": 128}),
+                  staging_dir=Path(work),
+                  staged_paths={
+                      "model": str(fixtures / "models/.cache/tiny-llama"),
+                      "train": str(fixtures / "datasets/sft.messages.v1.jsonl"),
+                  },
+                  dry_run=True,
+              )
+              result = asyncio.run(run_subprocess("trl", script))
+              assert result.prepared is not None and result.prepared.ok, result.prepared
+              assert result.exit_report is not None, result.exit_code
+              assert result.exit_report.kind == pb.EXIT_KIND_DRY_RUN_OK, result.exit_report
+          PY
 
   image:
     # CPU image on every PR; the GPU (CUDA 13) image only on manual runs (several GB).

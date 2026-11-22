@@ -413,9 +413,12 @@ def test_resume_at_budget_performs_no_more_steps(
     staged = {"model": model_dir, "train": train_file}
     engine = {**FAST, "max_steps": 1}
     first = attempt(tmp_path, "sft", engine, staged, common=LORA)
-    [(_, _, checkpoint)] = first.committed()
+    [(checkpoint_id, _, checkpoint)] = first.committed()
     resumed = attempt(tmp_path, "sft", engine, {**staged, "resume_from": checkpoint}, common=LORA)
     assert resumed.prepared is not None
     assert resumed.prepared.ok
+    assert resumed.exit_report is not None
+    assert resumed.exit_report.kind == pb.EXIT_KIND_COMPLETED
+    assert resumed.exit_report.last_committed_checkpoint_id == checkpoint_id
     assert not resumed.agent.of("progress")
     assert not resumed.committed()
