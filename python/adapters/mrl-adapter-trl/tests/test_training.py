@@ -520,9 +520,7 @@ def test_resume_at_budget_performs_no_more_steps(
     assert not resumed.committed()
 
 
-def test_long_chat_prompt_sample_keeps_the_assistant_turn(
-    tmp_path: Path, model_dir: Path
-) -> None:
+def test_long_chat_prompt_sample_keeps_the_assistant_turn(tmp_path: Path, model_dir: Path) -> None:
     # ~117 tokens: trains whole within max_length 128; the sample prompt gets 128 - 48 = 80.
     turns = [{"role": "user", "content": "apple " * 20}, {"role": "assistant", "content": "ok"}]
     train = tmp_path / "long.jsonl"
