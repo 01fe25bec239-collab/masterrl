@@ -776,6 +776,10 @@ async fn reorder_replay_and_final_replacement_keep_published_bytes_immutable() {
     env.engine.commit(first, &"0".repeat(64));
     let last = env.engine.checkpoint(20, true, &[]);
     env.wait_state(last, "COMMITTED").await;
+    let late = env.engine.checkpoint(15, true, &[]);
+    env.wait_state(late, "COMMITTED").await;
+    assert!(!env.service.find(late).await.unwrap().unwrap().is_final);
+    assert!(env.service.find(last).await.unwrap().unwrap().is_final);
     let first_row = env.service.find(first).await.unwrap().unwrap();
     assert_eq!(first_row.state, "COMMITTED");
     assert!(!first_row.is_final);

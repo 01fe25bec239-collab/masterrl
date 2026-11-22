@@ -290,6 +290,12 @@ fn check_files(s: &CheckpointStaged) -> Result<(), String> {
             return Err(format!("{} is listed twice", f.path));
         }
     }
+    if seen.iter().any(|path| {
+        path.match_indices('/')
+            .any(|(i, _)| seen.contains(&path[..i]))
+    }) {
+        return Err("a staged file is also used as a directory".into());
+    }
     if s.files
         .iter()
         .try_fold(0_i64, |sum, f| sum.checked_add(f.size as i64))
@@ -856,14 +862,28 @@ impl CheckpointService {
         };
         let mut row = locked;
         if row.is_final {
-            sqlx::query(
-                "UPDATE checkpoints SET is_final = false
-                 WHERE run_id = $1 AND is_final AND state = 'COMMITTED' AND id <> $2",
+            let previous: Option<(i64, i64, OffsetDateTime, Uuid)> = sqlx::query_as(
+                "SELECT attempt_epoch, global_step, created_at, id FROM checkpoints
+                 WHERE run_id = $1 AND is_final AND state = 'COMMITTED'",
             )
             .bind(row.run_id)
-            .bind(id)
-            .execute(&mut *tx)
+            .fetch_optional(&mut *tx)
             .await?;
+            if previous.is_some_and(|prior| {
+                prior > (row.attempt_epoch, row.global_step, row.created_at, row.id)
+            }) {
+                // The bytes can still be used as an intermediate checkpoint.
+                sqlx::query("UPDATE checkpoints SET is_final = false WHERE id = $1")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
+                row.is_final = false;
+            } else if let Some((_, _, _, prior)) = previous {
+                sqlx::query("UPDATE checkpoints SET is_final = false WHERE id = $1")
+                    .bind(prior)
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
         for ev in [
             CheckpointEvent::Upload,
@@ -1798,6 +1818,12 @@ mod tests {
             file("m.json", "manifest"),
             file("W", "weights"),
             file("w", "weights")
+        ]))
+        .is_err());
+        assert!(check_files(&staged(vec![
+            file("m.json", "manifest"),
+            file("w", "weights"),
+            file("W/child", "weights")
         ]))
         .is_err());
         let mut bad = file("w", "weights");

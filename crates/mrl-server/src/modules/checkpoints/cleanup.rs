@@ -45,8 +45,10 @@ async fn queue_all(tx: &mut Tx, row: &CheckpointRow) -> Result<(), JobsError> {
     if row.committed_at.is_none() {
         sqlx::query(
             "INSERT INTO checkpoint_object_deletions (storage_org, object_key, checkpoint_id)
-             SELECT $2, $3 || path, checkpoint_id FROM checkpoint_files
-             WHERE checkpoint_id = $1 AND staging_key IS NOT NULL
+             SELECT $2, $3 || CASE WHEN staging_key IS NULL
+                                  THEN regexp_replace(path, '^checkpoints/[^/]+/', '')
+                                  ELSE path END, checkpoint_id
+             FROM checkpoint_files WHERE checkpoint_id = $1
              ON CONFLICT DO NOTHING",
         )
         .bind(row.id)
