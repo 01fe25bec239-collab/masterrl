@@ -73,11 +73,15 @@ async def _stage_and_commit(tmp_path: Path) -> None:
         is_final=True,
         adapter=AdapterInfo("lora", 8, 16.0, ("q_proj",)),
     )
-    staged = await provider.stage(ready, {"train/loss": 0.5})
+    staged = await provider.stage(
+        ready, {"train/loss": 0.5, "eval/loss": float("nan"), "train/grad_norm": float("inf")}
+    )
     assert not ready.path.exists()  # moved into staging
     doc = json.loads((staged.directory / MANIFEST_FILE).read_text())
     assert schema_errors(doc, "checkpoint-manifest/v1") == []
     assert doc["kind"] == "adapter_only"
+    assert doc["metrics"] == {"train/loss": 0.5}
+    assert dict(staged.message.metrics_at_step) == doc["metrics"]
     assert {f["path"] for f in doc["files"]} == {
         "model.safetensors",
         "optimizer.pt",

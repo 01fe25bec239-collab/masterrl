@@ -9,6 +9,7 @@ for an ack at once, after which staging the next one waits for a slot.
 
 import asyncio
 import json
+import math
 import secrets
 import shutil
 import time
@@ -152,7 +153,8 @@ class CheckpointProvider:
         """Wait for a commit slot, then move, hash and describe the checkpoint."""
         await self._slots.acquire()
         try:
-            return await asyncio.to_thread(self._stage_sync, ready, dict(metrics))
+            finite = {key: value for key, value in metrics.items() if math.isfinite(value)}
+            return await asyncio.to_thread(self._stage_sync, ready, finite)
         except BaseException:
             self._slots.release()
             raise
@@ -206,7 +208,9 @@ class CheckpointProvider:
         if problems:
             raise ValueError(f"checkpoint manifest does not match its schema: {problems}")
         manifest_path = target / MANIFEST_FILE
-        manifest_path.write_text(json.dumps(doc, indent=2, sort_keys=True), encoding="utf-8")
+        manifest_path.write_text(
+            json.dumps(doc, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8"
+        )
         manifest_sha = sha256_file(manifest_path)
         self._parent = checkpoint_id
         prefix = target.relative_to(self._staging).as_posix()
