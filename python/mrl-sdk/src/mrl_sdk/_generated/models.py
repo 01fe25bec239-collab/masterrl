@@ -1491,7 +1491,7 @@ class SampleView(TypedDict):
     """`att_…`."""
 
     batch_id: int
-    """The batch it came in (the page cursor counts batches)."""
+    """The batch it came in."""
 
     completion: str
     """Generated text."""

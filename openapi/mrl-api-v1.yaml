@@ -1354,8 +1354,8 @@ paths:
       - name: series
         in: query
         description: |-
-          Comma-separated series ids or metric names (a name means each of its splits); default:
-          the first 20 series.
+          Comma-separated series IDs or names. Use `name:` before a numeric name.
+          A name selects every split. Defaults to the first 20 series.
         required: false
         schema:
           type: string
@@ -1552,6 +1552,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunCompareResult'
+        '403':
+          description: No permission to read a run's metrics or config
         '404':
           description: A run doesn't exist or is hidden
         '422':
@@ -5115,7 +5117,7 @@ components:
         batch_id:
           type: integer
           format: int64
-          description: The batch it came in (the page cursor counts batches).
+          description: The batch it came in.
         completion:
           type: string
           description: Generated text.

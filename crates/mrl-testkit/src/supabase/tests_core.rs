@@ -590,6 +590,28 @@ async fn every_route_answers_by_role_in_team_mode() {
         .await;
     assert_eq!(p22_second.status, 201, "{}", p22_second.text());
     let p22_run = p22_second.json()["id"].as_str().unwrap().to_owned();
+    let p22_pat = core.call(Method::POST, "/api/v1/auth/tokens", &Auth::Bearer(seed_jwt.clone()),
+        Some(json!({"name": "P22 metrics only", "scopes": ["metrics_logs:read"], "project_id": prj.to_string()}))).await;
+    assert_eq!(p22_pat.status, 201, "{}", p22_pat.text());
+    let p22_auth = Auth::Bearer(p22_pat.json()["token"].as_str().unwrap().to_owned());
+    let telemetry = core
+        .call(
+            Method::GET,
+            &format!("/api/v1/runs/{run}/metrics"),
+            &p22_auth,
+            None,
+        )
+        .await;
+    assert_eq!(telemetry.status, 200, "{}", telemetry.text());
+    let comparison = core
+        .call(
+            Method::POST,
+            "/api/v1/runs:compare",
+            &p22_auth,
+            Some(json!({"run_ids": [run, p22_run]})),
+        )
+        .await;
+    assert_eq!(comparison.status, 403, "{}", comparison.text());
     let p22_alert = mrl_domain::ids::AlertId::new();
     core.db
         .seed(&format!(

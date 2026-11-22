@@ -16,11 +16,10 @@
 //!
 //! Every source is tailed in `(xid, id)` order below the snapshot `xmin`, like the outbox
 //! dispatcher, so a row committed late is never skipped. Each event's `id` is the composite
-//! cursor of all sources (`o.<xid>.<id>~m.<xid>.<id>~l.<xid>.<id>~p.<xid>~a.<xid>.<uuid>`);
+//! cursor of all five sources (`v2~o.<xid>.<id>~m.…~l.…~p.…~a.…`);
 //! reconnecting with `Last-Event-ID` resumes each source exactly: no gap, no duplicate.
 //! Heartbeats carry the cursor too. A `metrics` event holds every new point of one poll
-//! (polls are at least 500 ms apart, so a series updates at most twice a second; at most the
-//! latest 500 points per series, `truncated` says when more came). `resync` asks the client to
+//! (polls are at least 500 ms apart, so a series updates at most twice a second). `resync` asks the client to
 //! re-read through the REST routes: an unusable cursor, logs sealed or events removed since
 //! the cursor, a client too slow to keep up (the stream then ends), or the server stopping.
 
@@ -42,7 +41,7 @@ use futures_util::StreamExt;
 use mrl_domain::ids::{AttemptId, JobId, ProjectId, RunId};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use sqlx::Row;
+use sqlx::{PgConnection, Row};
 use std::collections::{BTreeMap, HashMap};
 use std::convert::Infallible;
 use std::sync::{Arc, Mutex};
@@ -52,10 +51,10 @@ use uuid::Uuid;
 
 /// Rows read per source per poll.
 const BATCH: i64 = 200;
-/// Points per series in one `metrics` event.
-const POINTS_PER_SERIES: usize = 500;
-/// Polls in a row with a full batch before a client counts as too slow.
-const SLOW_POLLS: u32 = 20;
+/// Target points per poll. A single larger batch is sent whole.
+const TARGET_POINTS: i64 = 5000;
+/// Polls buffered behind the HTTP response.
+const BUFFERED_POLLS: usize = 2;
 
 /// One topic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,70 +124,68 @@ pub struct Cursor {
     o: Pos,
     m: Pos,
     l: Pos,
-    p: i64,
-    a: (i64, Uuid),
+    p: Pos,
+    a: Pos,
 }
 
 impl Cursor {
-    /// Every source at "now": rows from transactions at or after `xmin`.
+    /// Every source at now, including transactions still in flight.
     fn start(xmin: i64) -> Self {
         let p = Pos { xid: xmin, id: 0 };
         Self {
             o: p,
             m: p,
             l: p,
-            p: xmin - 1,
-            a: (xmin, Uuid::nil()),
+            p,
+            a: p,
         }
     }
 
     /// The `id:` text.
     pub fn encode(&self) -> String {
-        format!(
-            "o.{}.{}~m.{}.{}~l.{}.{}~p.{}~a.{}.{}",
-            self.o.xid,
-            self.o.id,
-            self.m.xid,
-            self.m.id,
-            self.l.xid,
-            self.l.id,
-            self.p,
-            self.a.0,
-            self.a.1
-        )
+        let mut text = String::from("v2");
+        for (key, pos) in [
+            ("o", self.o),
+            ("m", self.m),
+            ("l", self.l),
+            ("p", self.p),
+            ("a", self.a),
+        ] {
+            use std::fmt::Write as _;
+            let _ = write!(text, "~{key}.{}.{}", pos.xid, pos.id);
+        }
+        text
     }
 
-    /// Reads [`Cursor::encode`] text; anything else is `None`.
+    /// Reads a current cursor. Older formats require a fresh REST snapshot.
     pub fn parse(s: &str) -> Option<Self> {
-        let mut c = Self::start(0);
-        let mut seen = 0;
-        for part in s.split('~') {
-            let mut f = part.split('.');
-            let (key, a, b) = (f.next()?, f.next()?, f.next());
-            if f.next().is_some() {
+        let mut parts = s.split('~');
+        if parts.next()? != "v2" {
+            return None;
+        }
+        let mut pos = |key: &str| {
+            let mut f = parts.next()?.split('.');
+            if f.next()? != key {
                 return None;
             }
-            let pos = |b: Option<&str>| -> Option<Pos> {
-                Some(Pos {
-                    xid: a.parse().ok()?,
-                    id: b?.parse().ok()?,
-                })
-            };
-            match key {
-                "o" => c.o = pos(b)?,
-                "m" => c.m = pos(b)?,
-                "l" => c.l = pos(b)?,
-                "p" if b.is_none() => c.p = a.parse().ok()?,
-                "a" => c.a = (a.parse().ok()?, b?.parse().ok()?),
-                _ => return None,
-            }
-            seen += 1;
-        }
-        (seen == 5).then_some(c)
+            let xid = f.next()?.parse::<i64>().ok()?;
+            let id = f.next()?.parse::<i64>().ok()?;
+            (xid >= 0 && id >= 0 && f.next().is_none()).then_some(Pos { xid, id })
+        };
+        let cursor = Self {
+            o: pos("o")?,
+            m: pos("m")?,
+            l: pos("l")?,
+            p: pos("p")?,
+            a: pos("a")?,
+        };
+        parts.next().is_none().then_some(cursor)
     }
 
-    fn xids(&self) -> [i64; 5] {
-        [self.o.xid, self.m.xid, self.l.xid, self.p, self.a.0]
+    fn after_snapshot(&self, xmax: i64) -> bool {
+        [self.o, self.m, self.l, self.p, self.a]
+            .iter()
+            .any(|p| p.xid > xmax || (p.xid == xmax && p.id != 0))
     }
 }
 
@@ -403,23 +400,47 @@ async fn open(
     let slot = hub.take_slot(&ctx.principal.id)?;
     let resume = headers
         .get("last-event-id")
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned);
-    let live = Live::begin(hub.clone(), state, ctx, sub, slot, resume.as_deref()).await?;
+        .map(|v| v.to_str().unwrap_or(""));
+    let mut live = Live::begin(hub.clone(), state, ctx, sub, resume).await?;
     let poll = Duration::from_millis(hub.config.stream_poll_millis);
-    let events = futures_util::stream::unfold(live, move |mut live| async move {
-        if live.done {
-            return None;
+    let (tx, rx) = tokio::sync::mpsc::channel(BUFFERED_POLLS);
+    let (end_tx, end_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        loop {
+            let events = if let Some(first) = live.first.take() {
+                first
+            } else {
+                tokio::select! {
+                    () = tx.closed() => return,
+                    () = tokio::time::sleep(poll) => {}
+                }
+                tokio::select! {
+                    () = tx.closed() => return,
+                    events = live.step() => events,
+                }
+            };
+            if !events.is_empty() {
+                match tx.try_send(events) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        let _ = end_tx.send(event("resync", None, &json!({"reason": "too_slow"})));
+                        return;
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => return,
+                }
+            }
+            if live.done {
+                return;
+            }
         }
-        let events = if let Some(first) = live.first.take() {
-            first
-        } else {
-            tokio::time::sleep(poll).await;
-            live.step().await
-        };
-        Some((events, live))
-    })
-    .flat_map(|events| futures_util::stream::iter(events.into_iter().map(Ok::<_, Infallible>)));
+    });
+    let events = tokio_stream::wrappers::ReceiverStream::new(rx)
+        .flat_map(futures_util::stream::iter)
+        .chain(futures_util::stream::once(end_rx).filter_map(|e| async { e.ok() }))
+        .map(move |e| {
+            let _ = &slot; // The body owns the connection slot until it closes.
+            Ok::<_, Infallible>(e)
+        });
     Ok(Sse::new(events).into_response())
 }
 
@@ -433,9 +454,7 @@ struct Live {
     /// Events to send at once (a resync after the cursor check).
     first: Option<Vec<Event>>,
     last_sent: Instant,
-    slow: u32,
     done: bool,
-    _slot: Slot,
 }
 
 fn event(kind: &str, cursor: Option<&Cursor>, data: &Value) -> Event {
@@ -452,7 +471,6 @@ impl Live {
         state: AppState,
         ctx: RequestContext,
         sub: Sub,
-        slot: Slot,
         resume: Option<&str>,
     ) -> Result<Self, JobsError> {
         let (xmin, xmax): (i64, i64) = {
@@ -476,7 +494,7 @@ impl Live {
                 ));
                 fresh
             }
-            Some(Some(c)) if c.xids().iter().any(|x| *x >= xmax) => {
+            Some(Some(c)) if c.after_snapshot(xmax) => {
                 first.push(event(
                     "resync",
                     Some(&fresh),
@@ -484,13 +502,7 @@ impl Live {
                 ));
                 fresh
             }
-            Some(Some(c)) => match too_old(&hub.db, &sub, &c).await? {
-                Some(reason) => {
-                    first.push(event("resync", Some(&fresh), &json!({"reason": reason})));
-                    fresh
-                }
-                None => c,
-            },
+            Some(Some(c)) => c,
         };
         Ok(Self {
             hub,
@@ -500,9 +512,7 @@ impl Live {
             cursor,
             first: Some(first),
             last_sent: Instant::now(),
-            slow: 0,
             done: false,
-            _slot: slot,
         })
     }
 
@@ -517,21 +527,8 @@ impl Live {
             )];
         }
         let mut out = Vec::new();
-        match self.poll(&mut out).await {
-            Ok(full) => {
-                self.slow = if full { self.slow + 1 } else { 0 };
-                if self.slow >= SLOW_POLLS {
-                    self.done = true;
-                    out.push(event(
-                        "resync",
-                        Some(&self.cursor),
-                        &json!({"reason": "too_slow"}),
-                    ));
-                }
-            }
-            Err(e) => {
-                tracing::warn!(code = %e.code(), error = %e, "stream poll failed; trying again")
-            }
+        if let Err(e) = self.poll(&mut out).await {
+            tracing::warn!(code = %e.code(), error = %e, "stream poll failed; trying again");
         }
         if !out.is_empty() {
             self.last_sent = Instant::now();
@@ -544,19 +541,29 @@ impl Live {
         out
     }
 
-    /// Reads every source once; true if any source had more than one batch waiting.
-    async fn poll(&mut self, out: &mut Vec<Event>) -> Result<bool, JobsError> {
-        let db = self.hub.db.clone();
+    /// Read the prune markers and retained rows in the same database snapshot.
+    async fn poll(&mut self, out: &mut Vec<Event>) -> Result<(), JobsError> {
+        let mut tx = self.hub.db.begin().await?;
+        sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+            .execute(&mut *tx)
+            .await?;
         let xmin: i64 =
             sqlx::query_scalar("SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint")
-                .fetch_one(db.pool())
+                .fetch_one(&mut *tx)
                 .await?;
-        // Every row below xmin is visible now: a source read to its end may skip to it.
+        if let Some(reason) = too_old(&mut tx, &self.sub, &self.cursor).await? {
+            self.cursor = Cursor::start(xmin);
+            out.push(event(
+                "resync",
+                Some(&self.cursor),
+                &json!({"reason": reason}),
+            ));
+            return Ok(());
+        }
         let end = Pos {
             xid: xmin - 1,
             id: i64::MAX,
         };
-        let mut full = false;
         if !self.sub.state_jobs.is_empty() || !self.sub.projects.is_empty() {
             let rows = sqlx::query(
                 "SELECT o.id, o.xid::text::bigint AS x, o.type, o.aggregate_kind, o.aggregate_id,
@@ -576,7 +583,7 @@ impl Live {
             .bind(&self.sub.state_jobs)
             .bind(&self.sub.projects)
             .bind(BATCH)
-            .fetch_all(db.pool())
+            .fetch_all(&mut *tx)
             .await?;
             for r in &rows {
                 self.cursor.o = Pos {
@@ -600,103 +607,130 @@ impl Live {
                 });
                 out.push(event("state", Some(&self.cursor), &data));
             }
-            full |= i64::try_from(rows.len()).unwrap_or(0) >= BATCH;
             if i64::try_from(rows.len()).unwrap_or(0) < BATCH {
                 self.cursor.o = self.cursor.o.max(end);
             }
         }
         if !self.sub.metrics.is_empty() {
-            full |= self.metrics(&db, xmin, end, out).await?;
+            self.metrics(&mut tx, xmin, end, out).await?;
         }
         if !self.sub.logs.is_empty() {
-            full |= self.logs(&db, xmin, end, out).await?;
+            self.logs(&mut tx, xmin, end, out).await?;
         }
         if !self.sub.progress.is_empty() {
             let rows = sqlx::query(
-                "SELECT run_id, attempt_id, step, total_steps, epoch, phase, tokens_seen, eta_seconds,
-                        updated_at, xid::text::bigint AS x
-                   FROM run_progress
-                  WHERE run_id = ANY($1) AND xid > ($2::bigint)::text::xid8
-                    AND xid < ($3::bigint)::text::xid8
-                  ORDER BY xid",
+                "SELECT id, run_id, payload, xid::text::bigint AS x
+                   FROM telemetry_progress_events
+                  WHERE run_id = ANY($1) AND (xid, id) > (($2::bigint)::text::xid8, $3)
+                    AND xid < ($4::bigint)::text::xid8
+                  ORDER BY xid, id LIMIT $5",
             )
             .bind(&self.sub.progress)
-            .bind(self.cursor.p)
+            .bind(self.cursor.p.xid)
+            .bind(self.cursor.p.id)
             .bind(xmin)
-            .fetch_all(db.pool())
+            .bind(BATCH)
+            .fetch_all(&mut *tx)
             .await?;
             for r in &rows {
-                self.cursor.p = r.try_get("x")?;
-                let at: time::OffsetDateTime = r.try_get("updated_at")?;
+                let mut data: Value = r.try_get("payload")?;
+                let attempt = data["attempt_id"]
+                    .as_str()
+                    .and_then(|s| Uuid::parse_str(s).ok())
+                    .ok_or_else(|| sqlx::Error::Protocol("progress event has no attempt".into()))?;
                 let data = json!({
                     "run_id": RunId::from_uuid(r.try_get("run_id")?).to_string(),
-                    "attempt_id": AttemptId::from_uuid(r.try_get("attempt_id")?).to_string(),
-                    "step": r.try_get::<i64, _>("step")?,
-                    "total_steps": r.try_get::<i64, _>("total_steps")?,
-                    "epoch": r.try_get::<f64, _>("epoch")?,
-                    "phase": r.try_get::<String, _>("phase")?,
-                    "tokens_seen": r.try_get::<i64, _>("tokens_seen")?,
-                    "eta_seconds": r.try_get::<f64, _>("eta_seconds")?,
-                    "updated_at": at.format(&time::format_description::well_known::Rfc3339).unwrap_or_default(),
+                    "attempt_id": AttemptId::from_uuid(attempt).to_string(),
+                    "step": data["step"].take(),
+                    "total_steps": data["total_steps"].take(),
+                    "epoch": data["epoch"].take(),
+                    "phase": data["phase"].take(),
+                    "tokens_seen": data["tokens_seen"].take(),
+                    "eta_seconds": data["eta_seconds"].take(),
+                    "updated_at": data["updated_at"].take(),
                 });
+                self.cursor.p = row_pos(r)?;
                 out.push(event("progress", Some(&self.cursor), &data));
             }
-            self.cursor.p = self.cursor.p.max(end.xid);
+            if i64::try_from(rows.len()).unwrap_or(0) < BATCH {
+                self.cursor.p = self.cursor.p.max(end);
+            }
         }
         if let Some(org) = self.sub.alerts {
             let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-                "SELECT {}, a.xid::text::bigint AS x FROM alerts a
+                "SELECT {}, a.xid::text::bigint AS x, a.event_id AS tail_id FROM telemetry_alert_events a
                    LEFT JOIN runs r ON a.scope_kind = 'run' AND r.id = a.scope_id
-                  WHERE a.org_id = $1 AND (a.xid, a.id) > (($2::bigint)::text::xid8, $3)
+                  WHERE a.org_id = $1 AND (a.xid, a.event_id) > (($2::bigint)::text::xid8, $3)
                     AND a.xid < ($4::bigint)::text::xid8
-                  ORDER BY a.xid, a.id LIMIT $5",
+                  ORDER BY a.xid, a.event_id LIMIT $5",
                 crate::modules::alerts::ALERT_COLS
             )))
             .bind(org)
-            .bind(self.cursor.a.0)
-            .bind(self.cursor.a.1)
+            .bind(self.cursor.a.xid)
+            .bind(self.cursor.a.id)
             .bind(xmin)
             .bind(BATCH)
-            .fetch_all(db.pool())
+            .fetch_all(&mut *tx)
             .await?;
+            // P16 authorization uses the pool too, so release this connection first.
+            tx.commit().await?;
             for r in &rows {
                 let row = crate::modules::alerts::row_of(r)?;
-                self.cursor.a = (r.try_get("x")?, row.id);
-                if crate::modules::alerts::visible(&self.state, &self.ctx, &row).await? {
+                let visible = crate::modules::alerts::visible(&self.state, &self.ctx, &row).await?;
+                self.cursor.a = Pos {
+                    xid: r.try_get("x")?,
+                    id: r.try_get("tail_id")?,
+                };
+                if visible {
                     let data = serde_json::to_value(&row.view).unwrap_or(Value::Null);
                     out.push(event("alert", Some(&self.cursor), &data));
                 }
             }
-            full |= i64::try_from(rows.len()).unwrap_or(0) >= BATCH;
             if i64::try_from(rows.len()).unwrap_or(0) < BATCH {
-                self.cursor.a = self.cursor.a.max((end.xid, Uuid::from_u128(u128::MAX)));
+                self.cursor.a = self.cursor.a.max(end);
             }
+        } else {
+            tx.commit().await?;
         }
-        Ok(full)
+        Ok(())
     }
 
     /// New metric batches of the subscribed runs as one `metrics` event.
     async fn metrics(
         &mut self,
-        db: &Db,
+        db: &mut PgConnection,
         xmin: i64,
         end: Pos,
         out: &mut Vec<Event>,
-    ) -> Result<bool, JobsError> {
+    ) -> Result<(), JobsError> {
         let batches = sqlx::query(
-            "SELECT id, xid::text::bigint AS x FROM metric_batches
-              WHERE run_id = ANY($1) AND (xid, id) > (($2::bigint)::text::xid8, $3)
-                AND xid < ($4::bigint)::text::xid8
-              ORDER BY xid, id LIMIT $5",
+            "WITH candidates AS (
+                 SELECT id, xid, point_count FROM metric_batches
+                  WHERE run_id = ANY($1) AND (xid, id) > (($2::bigint)::text::xid8, $3)
+                    AND xid < ($4::bigint)::text::xid8
+                  ORDER BY xid, id LIMIT $5
+             ), sized AS (
+                 SELECT *, sum(point_count) OVER (ORDER BY xid, id) AS total FROM candidates
+             )
+             SELECT id, xid::text::bigint AS x, total
+               FROM sized ORDER BY xid, id",
         )
         .bind(&self.sub.metrics)
         .bind(self.cursor.m.xid)
         .bind(self.cursor.m.id)
         .bind(xmin)
         .bind(BATCH)
-        .fetch_all(db.pool())
+        .fetch_all(&mut *db)
         .await?;
-        let full = i64::try_from(batches.len()).unwrap_or(0) >= BATCH;
+        let mut included = batches.len().min(1);
+        while let Some(batch) = batches.get(included) {
+            if batch.try_get::<i64, _>("total")? > TARGET_POINTS {
+                break;
+            }
+            included += 1;
+        }
+        let full = included < batches.len() || i64::try_from(batches.len()).unwrap_or(0) >= BATCH;
+        let batches = &batches[..included];
         if let Some(last) = batches.last() {
             let ids: Vec<i64> = batches
                 .iter()
@@ -709,7 +743,7 @@ impl Live {
                   WHERE p.batch_id = ANY($1) ORDER BY p.series_id, p.batch_id, p.step",
             )
             .bind(&ids)
-            .fetch_all(db.pool())
+            .fetch_all(&mut *db)
             .await?;
             // run → series → (name, split, points)
             type Line = (String, String, Vec<(i64, f64, i64)>);
@@ -735,10 +769,8 @@ impl Live {
                 let data = json!({ "runs": runs.into_iter().map(|(run, series)| json!({
                     "run_id": RunId::from_uuid(run).to_string(),
                     "series": series.into_iter().map(|(id, (name, split, pts))| {
-                        let truncated = pts.len() > POINTS_PER_SERIES;
-                        let keep = &pts[pts.len().saturating_sub(POINTS_PER_SERIES)..];
-                        json!({"series_id": id, "name": name, "split": split, "truncated": truncated,
-                               "points": keep.iter().map(|(s, v, t)| json!([s, v, t])).collect::<Vec<_>>()})
+                        json!({"series_id": id, "name": name, "split": split, "truncated": false,
+                               "points": pts.iter().map(|(s, v, t)| json!([s, v, t])).collect::<Vec<_>>()})
                     }).collect::<Vec<_>>(),
                 })).collect::<Vec<_>>() });
                 out.push(event("metrics", Some(&self.cursor), &data));
@@ -747,17 +779,17 @@ impl Live {
         if !full {
             self.cursor.m = self.cursor.m.max(end);
         }
-        Ok(full)
+        Ok(())
     }
 
     /// New log chunks of the subscribed runs, one `log` event each.
     async fn logs(
         &mut self,
-        db: &Db,
+        db: &mut PgConnection,
         xmin: i64,
         end: Pos,
         out: &mut Vec<Event>,
-    ) -> Result<bool, JobsError> {
+    ) -> Result<(), JobsError> {
         let rows = sqlx::query(
             "SELECT id, xid::text::bigint AS x, run_id, attempt_id, rank, stream, \"offset\", data
                FROM log_chunks
@@ -770,7 +802,7 @@ impl Live {
         .bind(self.cursor.l.id)
         .bind(xmin)
         .bind(BATCH)
-        .fetch_all(db.pool())
+        .fetch_all(&mut *db)
         .await?;
         for r in &rows {
             self.cursor.l = Pos {
@@ -793,46 +825,62 @@ impl Live {
         if !full {
             self.cursor.l = self.cursor.l.max(end);
         }
-        Ok(full)
+        Ok(())
     }
 }
 
-/// Why a resumed cursor can't continue exactly, if it can't.
-async fn too_old(db: &Db, sub: &Sub, c: &Cursor) -> Result<Option<&'static str>, JobsError> {
-    if !sub.logs.is_empty() {
-        // Chunks after the cursor were sealed (moved out of the hot table).
-        let sealed: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM log_index WHERE run_id = ANY($1) AND id_hi > $2)",
-        )
-        .bind(&sub.logs)
-        .bind(c.l.id)
-        .fetch_one(db.pool())
-        .await?;
-        if sealed {
-            return Ok(Some("logs_sealed"));
+fn row_pos(row: &sqlx::postgres::PgRow) -> Result<Pos, sqlx::Error> {
+    Ok(Pos {
+        xid: row.try_get("x")?,
+        id: row.try_get("id")?,
+    })
+}
+
+async fn too_old(
+    db: &mut PgConnection,
+    sub: &Sub,
+    c: &Cursor,
+) -> Result<Option<&'static str>, JobsError> {
+    let trimmed = sqlx::query_scalar::<_, String>(
+        "WITH scopes(source, scope, x, i) AS (
+             SELECT 'l', unnest($1::uuid[]), $2::bigint, $3::bigint
+             UNION ALL SELECT 'm', unnest($4::uuid[]), $5, $6
+             UNION ALL SELECT 'p', unnest($7::uuid[]), $8, $9
+             UNION ALL SELECT 'a', $10::uuid, $11, $12
+             UNION ALL SELECT 'o', id, $13, $14 FROM jobs
+                  WHERE id = ANY($15) OR project_id = ANY($16)
+             UNION ALL SELECT 'o', id, $13, $14 FROM job_attempts WHERE job_id = ANY($15)
+         )
+         SELECT t.source FROM scopes s JOIN telemetry_pruned t
+              ON t.source = s.source AND t.scope_id = s.scope
+            WHERE (t.xid, t.id) > (s.x::text::xid8, s.i)
+            ORDER BY (t.source = 'l') DESC LIMIT 1",
+    )
+    .bind(&sub.logs)
+    .bind(c.l.xid)
+    .bind(c.l.id)
+    .bind(&sub.metrics)
+    .bind(c.m.xid)
+    .bind(c.m.id)
+    .bind(&sub.progress)
+    .bind(c.p.xid)
+    .bind(c.p.id)
+    .bind(sub.alerts)
+    .bind(c.a.xid)
+    .bind(c.a.id)
+    .bind(c.o.xid)
+    .bind(c.o.id)
+    .bind(&sub.state_jobs)
+    .bind(&sub.projects)
+    .fetch_optional(db)
+    .await?;
+    Ok(trimmed.map(|source| {
+        if source == "l" {
+            "logs_sealed"
+        } else {
+            "too_old"
         }
-    }
-    // Retention removed rows the cursor had not reached.
-    for (table, pos, used) in [
-        (
-            "outbox_events",
-            c.o,
-            !sub.state_jobs.is_empty() || !sub.projects.is_empty(),
-        ),
-        ("metric_batches", c.m, !sub.metrics.is_empty()),
-    ] {
-        if !used || pos.id == i64::MAX {
-            continue;
-        }
-        let min: Option<i64> =
-            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT min(id) FROM {table}")))
-                .fetch_one(db.pool())
-                .await?;
-        if min.is_some_and(|m| m > pos.id.saturating_add(1)) {
-            return Ok(Some("too_old"));
-        }
-    }
-    Ok(None)
+    }))
 }
 
 /// The streams module.
@@ -918,13 +966,16 @@ mod tests {
     fn cursors_round_trip_and_refuse_garbage() {
         let mut c = Cursor::start(100);
         c.m = Pos { xid: 120, id: 7 };
-        c.a = (130, Uuid::now_v7());
+        c.a = Pos { xid: 130, id: 8 };
         assert_eq!(Cursor::parse(&c.encode()), Some(c));
+        assert!(!Cursor::start(100).after_snapshot(100));
         for bad in [
             "",
             "o.1.2",
             "o.1.2~m.1.2~l.1.2~p.1~a.1.x",
-            "o.1.2~m.1.2~l.1.2~p.1.2~a.1.00000000-0000-0000-0000-000000000000",
+            "v2~o.1.2~m.1.2~m.1.2~p.1.2~a.1.2",
+            "v2~o.1.2~m.-1.2~l.1.2~p.1.2~a.1.2",
+            "v2~o.1.2~m.1.2~l.1.2~p.1.2~a.1.-1",
         ] {
             assert_eq!(Cursor::parse(bad), None, "{bad}");
         }

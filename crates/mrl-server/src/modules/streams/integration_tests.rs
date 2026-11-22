@@ -16,14 +16,14 @@ use uuid::Uuid;
 
 /// One server-sent event.
 #[derive(Debug, Clone, PartialEq)]
-struct Sse {
-    event: String,
-    id: Option<String>,
-    data: Value,
+pub(super) struct Sse {
+    pub(super) event: String,
+    pub(super) id: Option<String>,
+    pub(super) data: Value,
 }
 
 /// An open stream, read event by event.
-struct Client {
+pub(super) struct Client {
     body: axum::body::BodyDataStream,
     buf: String,
 }
@@ -35,7 +35,15 @@ async fn open(
     topics: &str,
     last: Option<&str>,
 ) -> (u16, Option<Client>, String) {
-    let addr = w.srv.api();
+    open_at(w.srv.api(), who, topics, last).await
+}
+
+pub(super) async fn open_at(
+    addr: std::net::SocketAddr,
+    who: Who,
+    topics: &str,
+    last: Option<&str>,
+) -> (u16, Option<Client>, String) {
     let tcp = tokio::net::TcpStream::connect(addr)
         .await
         .unwrap_or_else(|e| panic!("connect: {e}"));
@@ -107,7 +115,7 @@ impl Client {
     }
 
     /// Events (heartbeats left out) until `done(events)` or 15 s.
-    async fn until(&mut self, done: impl Fn(&[Sse]) -> bool) -> Vec<Sse> {
+    pub(super) async fn until(&mut self, done: impl Fn(&[Sse]) -> bool) -> Vec<Sse> {
         let mut got = Vec::new();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         while !done(&got) {
@@ -410,7 +418,10 @@ async fn a_cursor_behind_sealed_logs_asks_for_a_resync() {
     let mut c = c.unwrap_or_else(|| panic!("stream"));
     send_log(&w, &s, 1, 0, LogStream::Stdout, 0, b"one\n").await;
     let got = c.until(|e| !logs_of(e).is_empty()).await;
-    let last = got[0].id.clone().unwrap_or_default();
+    assert_eq!(logs_of(&got), ["one\n"]);
+    let heartbeat = c.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(heartbeat.event, "heartbeat");
+    let last = heartbeat.id.unwrap();
     drop(c);
     send_log(&w, &s, 2, 0, LogStream::Stdout, 10, b"two\n").await;
     mrl_server::modules::telemetry::logs::seal(&w.tel, Duration::ZERO)
@@ -438,4 +449,75 @@ async fn a_cursor_behind_sealed_logs_asks_for_a_resync() {
         .map(|i| i["text"].as_str().unwrap())
         .collect();
     assert!(texts.contains("two\n"));
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn reconnect_keeps_large_batches_and_each_progress_and_alert_revision() {
+    let w = World::solo().await;
+    let s = seed_run(&w.db, Uuid::nil(), json!({})).await;
+    let topics = format!("run:{0}:metrics,run:{0}:progress,alerts", s.run_id());
+    let (_, c, _) = open(&w, Who::Solo, &topics, None).await;
+    let mut c = c.unwrap();
+    let initial = c.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(initial.event, "heartbeat");
+    drop(c);
+    send_metrics(&w, &s, 1, points("loss", 0..501, |x| x as f64)).await;
+    for seq in 1..=2 {
+        let p = WorkerBody::Progress(Progress {
+            step: seq,
+            ..Default::default()
+        });
+        w.deliver(s.node, LaneKind::Control, seq, 0, relay(&s, seq, p))
+            .await;
+        fire(&w, &s, "metric.test").await;
+    }
+    let (_, c, _) = open(&w, Who::Solo, &topics, initial.id.as_deref()).await;
+    let mut c = c.unwrap();
+    let got = c.until(|e| e.len() >= 5).await;
+    assert_eq!(steps_of(&got), (0..501).collect::<Vec<_>>());
+    let values = |kind: &str, field: &str| {
+        got.iter()
+            .filter(|e| e.event == kind)
+            .map(|e| e.data[field].as_i64().unwrap())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(values("progress", "step"), [1, 2]);
+    assert_eq!(values("alert", "fire_count"), [1, 2]);
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn an_open_stream_resyncs_if_a_chunk_is_pruned_before_the_next_poll() {
+    let w = World::solo().await;
+    let s = seed_run(&w.db, Uuid::nil(), json!({})).await;
+    let topic = format!("run:{}:logs", s.run_id());
+    let (_, client, _) = open(&w, Who::Solo, &topic, None).await;
+    let mut client = client.unwrap();
+    assert_eq!(
+        client.next(Duration::from_secs(5)).await.unwrap().event,
+        "heartbeat"
+    );
+    let mut tx = w.db.db().begin().await.unwrap();
+    // Publish the pruning mark without ever making the chunk visible to a poll.
+    let id: i64 = sqlx::query_scalar(
+        r#"INSERT INTO log_chunks
+        (org_id, run_id, attempt_id, rank, stream, "offset", data)
+        VALUES ($1, $2, $3, 0, 'stdout', 0, 'line') RETURNING id"#,
+    )
+    .bind(s.org)
+    .bind(s.run)
+    .bind(s.attempt)
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM log_chunks WHERE id = $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let events = client.until(|e| !e.is_empty()).await;
+    assert_eq!(events[0].event, "resync");
+    assert_eq!(events[0].data["reason"], "logs_sealed");
 }

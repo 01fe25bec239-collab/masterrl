@@ -23,6 +23,7 @@ use base64::Engine;
 use mrl_domain::ids::{AttemptId, RunId};
 use serde::{Deserialize, Serialize};
 use sqlx::Row;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -235,29 +236,25 @@ async fn seal_segment(
         first.stream,
         first.id,
         last.id,
-        Uuid::now_v7().simple()
+        sha
     );
-    store
-        .put(&key, body.into())
-        .await
-        .map_err(|e| stored_file_error("log", &e))?;
+    super::remember_object(t.db.pool(), org, &key).await?;
+    let mut tx = t.db.begin().await?;
+    super::remember_object(&mut *tx, org, &key).await?;
     let ids: Vec<i64> = chunks.iter().map(|c| c.id).collect();
     let offsets = chunks.iter().map(|c| c.offset);
-    let mut tx = t.db.begin().await?;
     let deleted = sqlx::query("DELETE FROM log_chunks WHERE id = ANY($1)")
         .bind(&ids)
         .execute(&mut *tx)
         .await?
         .rows_affected();
     if deleted != u64::try_from(ids.len()).unwrap_or(0) {
-        // Another pass sealed some of them first: keep its segment, discard this one.
-        tx.rollback().await?;
-        store
-            .delete(&key)
-            .await
-            .map_err(|e| stored_file_error("log", &e))?;
         return Ok(false);
     }
+    store
+        .put(&key, body.into())
+        .await
+        .map_err(|e| stored_file_error("log", &e))?;
     sqlx::query(
         "INSERT INTO log_index (org_id, run_id, attempt_id, rank, stream, offset_lo, offset_hi,
                 id_lo, id_hi, chunk_count, object_key, sha256)
@@ -416,7 +413,12 @@ pub(crate) async fn read_page(
     all.sort_by_key(|c| c.id);
     let mut out = Vec::new();
     for c in all.iter() {
-        if f.matches(c) {
+        if f.matches(c)
+            || match &f.q {
+                Some(q) => crosses_boundary(t, run, c, q).await?,
+                None => false,
+            }
+        {
             out.push(c.clone());
             if out.len() == limit {
                 let more = all.last().is_some_and(|l| l.id > c.id) || bound != i64::MAX;
@@ -426,6 +428,101 @@ pub(crate) async fn read_page(
     }
     // Every id below `bound` was looked at.
     Ok((out, (bound != i64::MAX).then(|| bound - 1)))
+}
+
+// Start matches in this chunk, then look ahead by byte offset across the hot/sealed
+// boundary and across pages. Never join across a gap or a different stream.
+async fn crosses_boundary(t: &Telemetry, run: Uuid, c: &Chunk, q: &str) -> Result<bool, JobsError> {
+    if c.stream == "agent" || c.data.is_empty() {
+        return Ok(false);
+    }
+    let budget = q.len() * 4 + 4;
+    let tail = &c.data[c.data.len().saturating_sub(budget)..];
+    let prefix = String::from_utf8_lossy(tail).to_lowercase();
+    let incomplete = tail
+        .iter()
+        .rposition(|b| b & 0xc0 != 0x80)
+        .filter(|&i| std::str::from_utf8(&tail[i..]).is_err_and(|e| e.error_len().is_none()));
+    if incomplete.is_none()
+        && !prefix
+            .char_indices()
+            .any(|(i, _)| q.starts_with(&prefix[i..]))
+    {
+        return Ok(false);
+    }
+    let start_limit = incomplete.map_or(prefix.len(), |e| {
+        String::from_utf8_lossy(&tail[..e]).to_lowercase().len() + 1
+    });
+    let Some(start) = c
+        .offset
+        .checked_add(i64::try_from(c.data.len()).unwrap_or(i64::MAX))
+    else {
+        return Ok(false);
+    };
+    let end = start.saturating_add(i64::try_from(budget).unwrap_or(0));
+    let mut tx = t.db.begin().await?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await?;
+    let rows = sqlx::query(
+        r#"SELECT "offset", substring(data FOR $7) AS data FROM log_chunks
+          WHERE run_id = $1 AND attempt_id = $2 AND rank = $3 AND stream = $4
+            AND "offset" >= $5 AND "offset" < $6"#,
+    )
+    .bind(run)
+    .bind(c.attempt)
+    .bind(c.rank)
+    .bind(&c.stream)
+    .bind(start)
+    .bind(end)
+    .bind(i32::try_from(budget).unwrap_or(i32::MAX))
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut following = BTreeMap::<i64, Vec<u8>>::new();
+    for row in rows {
+        following.insert(row.try_get("offset")?, row.try_get("data")?);
+    }
+    let segments = sqlx::query(
+        "SELECT org_id, object_key, sha256 FROM log_index
+          WHERE run_id = $1 AND attempt_id = $2 AND rank = $3 AND stream = $4
+            AND offset_hi >= $5 AND offset_lo < $6",
+    )
+    .bind(run)
+    .bind(c.attempt)
+    .bind(c.rank)
+    .bind(&c.stream)
+    .bind(start)
+    .bind(end)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    for row in segments {
+        let (org, key, sha): (_, String, String) = (
+            row.try_get("org_id")?,
+            row.try_get("object_key")?,
+            row.try_get("sha256")?,
+        );
+        for mut chunk in load_segment(t, org, &key, &sha).await? {
+            if (start..end).contains(&chunk.offset) {
+                chunk.data.truncate(budget);
+                following.entry(chunk.offset).or_insert(chunk.data);
+            }
+        }
+    }
+    let mut offset = start;
+    let mut combined = tail.to_vec();
+    while offset < end {
+        let Some(bytes) = following.remove(&offset).filter(|bytes| !bytes.is_empty()) else {
+            break;
+        };
+        let room = usize::try_from(end - offset).unwrap_or(0);
+        combined.extend(bytes.iter().take(room));
+        offset += i64::try_from(bytes.len().min(room)).unwrap_or(0);
+    }
+    Ok(String::from_utf8_lossy(&combined)
+        .to_lowercase()
+        .match_indices(q)
+        .any(|(i, _)| i < start_limit))
 }
 
 async fn load_segment(

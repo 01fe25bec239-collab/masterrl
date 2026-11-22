@@ -238,6 +238,7 @@ impl World {
             lane,
             stream: match lane {
                 LaneKind::Control => Lane::Control,
+                LaneKind::Metrics => Lane::Telemetry,
                 _ => Lane::Bulk,
             },
             seq,
@@ -487,7 +488,7 @@ async fn metric_replays_are_dropped_and_the_latest_attempt_wins_per_step() {
     send_metrics(&w, &a1, 1, points("loss", 0..100, |_| 1.0)).await;
     // The attempt is resumed from step 50 and runs to 150.
     let a2 = next_attempt(&w.db, &a1).await;
-    send_metrics(&w, &a2, 1, points("loss", 50..150, |_| 2.0)).await;
+    send_metrics(&w, &a2, 2, points("loss", 50..150, |_| 2.0)).await;
 
     assert_eq!(
         count(
@@ -614,7 +615,16 @@ async fn a_query_over_a_million_points_returns_at_most_2000_with_an_envelope() {
         });
         w.tel
             .ingest
-            .metrics(owner, i as u64 + 1, None, &pts)
+            .metrics(
+                owner,
+                mrl_server::modules::telemetry::ingest::Delivery {
+                    node: s.node,
+                    stream: Lane::Telemetry,
+                    seq: i as u64 + 1,
+                },
+                None,
+                &pts,
+            )
             .await
             .unwrap_or_else(|e| panic!("ingest: {e}"));
     }
@@ -649,16 +659,13 @@ async fn a_query_over_a_million_points_returns_at_most_2000_with_an_envelope() {
         .sum();
     assert_eq!(tn, 1_000_000, "the time axis counts every point too");
 
-    // Roll up, then lose the raw points of the first half: the rollups answer for them.
-    while rollup::roll_up(&w.tel.db, 1000)
-        .await
-        .unwrap_or_else(|e| panic!("roll up: {e}"))
-        > 0
-    {}
-    sqlx::query("DELETE FROM metric_points WHERE step < 500000")
+    // Move the first half to the archive as retention would.
+    sqlx::query("WITH expired AS (
+        DELETE FROM metric_points WHERE step < 500000 RETURNING series_id, step, attempt_no, ts, value
+    ) INSERT INTO metric_step_archive SELECT * FROM expired")
         .execute(w.db.pool())
         .await
-        .unwrap_or_else(|e| panic!("delete: {e}"));
+        .unwrap();
     let body = w.get(Who::Solo, &path).await.json();
     let pts = body["series"][0]["points"]
         .as_array()
@@ -666,7 +673,10 @@ async fn a_query_over_a_million_points_returns_at_most_2000_with_an_envelope() {
         .unwrap_or_default();
     assert!(pts.len() <= 2000, "{} points", pts.len());
     let n: i64 = pts.iter().map(|p| p["n"].as_i64().unwrap_or(0)).sum();
-    assert_eq!(n, 1_000_000, "rollups stand in for the dropped raw points");
+    assert_eq!(
+        n, 1_000_000,
+        "the step archive stands in for dropped raw points"
+    );
     assert_eq!(
         (pts[0]["min"].clone(), pts[0]["max"].clone()),
         (json!(0.0), json!(499.0))
@@ -1014,11 +1024,8 @@ async fn samples_are_indexed_deduped_and_filtered() {
         )
         .await
         .json();
-    assert_eq!(
-        page["items"].as_array().unwrap().len(),
-        2,
-        "a page holds whole batches"
-    );
+    assert_eq!(page["items"].as_array().unwrap().len(), 1);
+    assert_eq!(page["items"][0]["sample_id"], "a");
     let next = page["next_cursor"].as_str().unwrap();
     let rest = w
         .get(
@@ -1027,7 +1034,20 @@ async fn samples_are_indexed_deduped_and_filtered() {
         )
         .await
         .json();
-    assert_eq!(rest["items"][0]["sample_id"], "c");
+    assert_eq!(rest["items"][0]["sample_id"], "b");
+    let final_cursor = rest["next_cursor"].as_str().unwrap();
+    let last = w
+        .get(
+            Who::Solo,
+            &format!(
+                "/api/v1/runs/{}/samples?limit=1&cursor={final_cursor}",
+                s.run_id()
+            ),
+        )
+        .await
+        .json();
+    assert_eq!(last["items"][0]["sample_id"], "c");
+    assert!(last["next_cursor"].is_null());
 }
 
 #[tokio::test]
@@ -1147,7 +1167,7 @@ async fn runs_compare_shows_differing_config_and_aligned_overlays() {
         .post(
             Who::Solo,
             "/api/v1/runs:compare",
-            json!({"run_ids": [a.run_id(), a.run_id()]}),
+            json!({"run_ids": [a.run_id(), a.run_id().to_ascii_lowercase()]}),
         )
         .await;
     assert_eq!(twice.status, 422);
@@ -1189,9 +1209,54 @@ async fn another_orgs_run_data_is_hidden() {
 }
 
 #[tokio::test]
-#[ignore = "needs PostgreSQL (just dev)"]
-async fn metrics_and_logs_from_a_real_agent_reach_the_history() {
+#[ignore = "needs PostgreSQL and uv (just test-integration)"]
+async fn fake_engine_telemetry_crosses_the_gateway_and_resumes_over_http() {
     use crate::agent::gateway::{fast_config, GatewayHarness, TestAgent};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use prost::Message;
+    let out = tokio::process::Command::new("uv")
+        .args([
+            "run",
+            "--locked",
+            "--package",
+            "mrl-runtime",
+            "python",
+            "-c",
+            r#"
+import asyncio
+import base64
+import tempfile
+from pathlib import Path
+from mrl_runtime.testkit.agent import AgentScript
+from mrl_runtime.testkit.fake import FakeEngine, manifest
+from mrl_runtime.testkit.runner import job_spec, run_in_process
+
+with tempfile.TemporaryDirectory() as d:
+    spec = job_spec("x-fake.steps", {"steps": 4, "samples_every": 2})
+    result = asyncio.run(run_in_process(FakeEngine(), manifest(), AgentScript(spec, Path(d))))
+    assert result.exit_code == 0
+    for msg in result.agent.received:
+        if msg.WhichOneof("body") in {"metrics", "progress", "samples"}:
+            print(base64.b64encode(msg.SerializeToString()).decode())
+"#,
+        ])
+        .current_dir(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "FakeEngine: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let messages: Vec<_> = std::str::from_utf8(&out.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| WorkerMessage::decode(STANDARD.decode(line).unwrap().as_slice()).unwrap())
+        .collect();
+    assert!(messages
+        .iter()
+        .any(|m| matches!(m.body, Some(WorkerBody::Metrics(_)))));
     let db = TestDb::new().await;
     let lanes = LaneRouter::new();
     let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
@@ -1244,50 +1309,506 @@ async fn metrics_and_logs_from_a_real_agent_reach_the_history() {
         .execute(gw.db.pool())
         .await
         .unwrap_or_else(|e| panic!("{e}"));
+    let any = "127.0.0.1:0".parse().unwrap();
+    let mut config = Config::default();
+    config.server.listeners.api = any;
+    config.server.roles = vec![Role::Api];
+    let srv = TestServer::start(
+        config,
+        ts::build(ts::solo(TEST_SECRET), Mode::Solo),
+        vec![
+            Box::new(module),
+            Box::new(mrl_server::modules::streams::StreamsModule::new(
+                gw.db.db().clone(),
+                fast_live(),
+            )),
+        ],
+    )
+    .await
+    .unwrap();
+    let topics = format!("run:{0}:logs,run:{0}:metrics,run:{0}:progress", s.run_id());
+    let (_, client, _) = streams::open_at(srv.api(), Who::Solo, &topics, None).await;
+    let mut client = client.unwrap();
     let link =
         mrl_agent::session::Link::of(&agent.ctx).unwrap_or_else(|e| panic!("{}", e.explain()));
     let to_relay = |m: AgentMessage| match m.body {
         Some(AgentBody::Worker(r)) => r,
         _ => panic!("relay"),
     };
-    link.send_metrics(to_relay(relay(
-        &s,
-        1,
-        WorkerBody::Metrics(MetricsBatch {
-            points: points("loss", 0..5, |x| x as f64),
-        }),
-    )));
     link.send_logs(to_relay(relay(
         &s,
-        2,
+        1,
         WorkerBody::Log(LogChunk {
             stream: LogStream::Stdout as i32,
             data: b"hello\n".to_vec(),
-            rank: 0,
-            offset: 0,
+            ..Default::default()
         }),
     )));
-    let mut got = (0, 0);
-    for _ in 0..100 {
-        got = (
-            count(
-                &gw.db,
-                "SELECT count(*) FROM metric_batches WHERE run_id = $1",
-                s.run,
-            )
-            .await,
-            count(
-                &gw.db,
-                "SELECT count(*) FROM log_chunks WHERE run_id = $1",
-                s.run,
-            )
-            .await,
-        );
-        if got == (1, 1) {
-            break;
+    let previous = client
+        .until(|events| events.iter().any(|e| e.event == "log"))
+        .await;
+    let last = previous.last().unwrap().id.as_deref().unwrap();
+    drop(client);
+    for msg in messages {
+        let Some(body) = msg.body.clone() else {
+            continue;
+        };
+        let mut envelope = to_relay(relay(&s, msg.seq, body.clone()));
+        envelope.message = Some(msg);
+        match body {
+            WorkerBody::Metrics(_) => link.send_metrics(envelope),
+            WorkerBody::Samples(_) => link.send_logs(envelope),
+            WorkerBody::Progress(_) => {
+                link.send_control(AgentBody::Worker(envelope)).unwrap();
+            }
+            _ => unreachable!(),
         }
-        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert_eq!(got, (1, 1), "metrics and logs arrived through the gateway");
+    let (_, client, _) = streams::open_at(srv.api(), Who::Solo, &topics, Some(last)).await;
+    let mut client = client.unwrap();
+    let events = client
+        .until(|events| {
+            events.iter().any(|e| e.event == "metrics")
+                && events
+                    .iter()
+                    .any(|e| e.event == "progress" && e.data["step"] == 4)
+        })
+        .await;
+    assert!(events.iter().any(|e| e.event == "metrics"));
+    assert!(events
+        .iter()
+        .any(|e| e.event == "progress" && e.data["step"] == 4));
+    assert!(events
+        .iter()
+        .all(|e| e.event != "log" && e.event != "resync"));
+    let path = format!("/api/v1/runs/{}", s.run_id());
+    let query = srv
+        .get_authed(&format!("{path}/metrics/query?series=train/loss"))
+        .await;
+    assert_eq!(query.status, 200, "{}", query.text());
+    assert_eq!(
+        query.json()["series"][0]["points"]
+            .as_array()
+            .unwrap()
+            .len(),
+        4
+    );
+    let sample_path = format!("{path}/samples");
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let samples = srv.get_authed(&sample_path).await.json();
+            if samples["items"].as_array().unwrap().len() == 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    drop(client);
     running.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn distinct_deliveries_with_the_same_worker_seq_are_kept_and_sealed_replays_are_dropped() {
+    let w = World::solo().await;
+    let s = seed_run(&w.db, Uuid::nil(), json!({})).await;
+    for seq in [1, 2, 1] {
+        let mut msg = relay(
+            &s,
+            1,
+            WorkerBody::Metrics(MetricsBatch {
+                points: points("loss", seq..seq + 1, |v| v as f64),
+            }),
+        );
+        if let Some(AgentBody::Worker(r)) = &mut msg.body {
+            r.role_id = format!("role-{seq}");
+        }
+        w.deliver(s.node, LaneKind::Metrics, seq, 0, msg).await;
+    }
+    assert_eq!(
+        count(
+            &w.db,
+            "SELECT count(*) FROM metric_batches WHERE run_id = $1",
+            s.run
+        )
+        .await,
+        2
+    );
+    for seq in [10, 11, 10] {
+        w.deliver(
+            s.node,
+            LaneKind::Metrics,
+            seq,
+            0,
+            relay(
+                &s,
+                1,
+                WorkerBody::Samples(SampleBatch {
+                    step: seq,
+                    ..Default::default()
+                }),
+            ),
+        )
+        .await;
+    }
+    assert_eq!(
+        count(
+            &w.db,
+            "SELECT count(*) FROM samples WHERE run_id = $1",
+            s.run
+        )
+        .await,
+        2
+    );
+    let log = relay(
+        &s,
+        1,
+        WorkerBody::Log(LogChunk {
+            stream: LogStream::Stdout as i32,
+            data: b"once".to_vec(),
+            ..Default::default()
+        }),
+    );
+    w.deliver(s.node, LaneKind::Logs, 1, 3, log.clone()).await;
+    mrl_server::modules::telemetry::logs::seal(&w.tel, Duration::ZERO)
+        .await
+        .unwrap();
+    w.deliver(s.node, LaneKind::Logs, 1, 3, log).await;
+    let page = w
+        .get(Who::Solo, &format!("/api/v1/runs/{}/logs", s.run_id()))
+        .await
+        .json();
+    assert_eq!(
+        page["items"].as_array().unwrap().len(),
+        2,
+        "the gap and chunk each appear once"
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn finite_extremes_do_not_overflow_history_or_either_rollup() {
+    let w = World::solo().await;
+    let s = seed_run(&w.db, Uuid::nil(), json!({})).await;
+    send_metrics(&w, &s, 1, points("123", 0..2, |_| f64::MAX)).await;
+    send_metrics(
+        &w,
+        &s,
+        2,
+        points(
+            "tiny",
+            0..3,
+            |s| if s == 0 { f64::from_bits(1) } else { 0.0 },
+        ),
+    )
+    .await;
+    let tiny = w
+        .get(
+            Who::Solo,
+            &format!(
+                "/api/v1/runs/{}/metrics/query?series=tiny&from_step=0&to_step=9&max_points=2",
+                s.run_id()
+            ),
+        )
+        .await;
+    assert_eq!(tiny.status, 200, "{}", tiny.text());
+    assert_eq!(tiny.json()["series"][0]["points"][0]["value"], 0.0);
+    let path = format!("/api/v1/runs/{}/metrics/query?series=name:123", s.run_id());
+    let step = w
+        .get(
+            Who::Solo,
+            &format!("{path}&from_step=0&to_step=9&max_points=2"),
+        )
+        .await;
+    assert_eq!(step.status, 200, "{}", step.text());
+    assert_eq!(
+        step.json()["series"][0]["points"][0]["value"].as_f64(),
+        Some(f64::MAX)
+    );
+    let time = w.get(Who::Solo, &format!("{path}&axis=time")).await;
+    assert_eq!(time.status, 200, "{}", time.text());
+    rollup::roll_up(&w.tel.db, 100).await.unwrap();
+    let tiers: Vec<String> =
+        sqlx::query_scalar("SELECT DISTINCT tier FROM metric_rollups ORDER BY tier")
+            .fetch_all(w.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(tiers, ["1m", "step_bucket"]);
+    for bound in [
+        "from_step=-9223372036854775808",
+        "axis=time&to_time=9223372036854775807",
+        "axis=time&from_time=-200000000000",
+    ] {
+        assert_eq!(
+            w.get(Who::Solo, &format!("{path}&{bound}")).await.status,
+            422
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn retention_preserves_partial_step_buckets_and_partial_minute_queries() {
+    let w = World::solo().await;
+    let s = seed_run(&w.db, Uuid::nil(), json!({})).await;
+    let now = time::OffsetDateTime::now_utc();
+    let old = (now.unix_timestamp() - 30 * 86400).div_euclid(60) * 60;
+    rollup::ensure_partitions(
+        &w.tel.db,
+        time::OffsetDateTime::from_unix_timestamp(old).unwrap(),
+    )
+    .await
+    .unwrap();
+    send_metrics(&w, &s, 1, points("loss", 0..2, |_| 3.0)).await;
+    sqlx::query("UPDATE metric_points SET ts = to_timestamp($1::bigint) WHERE step = 0")
+        .bind(old + 42)
+        .execute(w.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO metric_rollup_dirty SELECT id, '1m', $1 FROM metric_series")
+        .bind(old / 60)
+        .execute(w.db.pool())
+        .await
+        .unwrap();
+    rollup::roll_up(&w.tel.db, 100).await.unwrap();
+    rollup::drop_old_partitions(&w.tel.db, now - time::Duration::days(7))
+        .await
+        .unwrap();
+    let next = next_attempt(&w.db, &s).await;
+    send_metrics(&w, &next, 2, points("loss", 1..2, |_| 5.0)).await;
+    rollup::roll_up(&w.tel.db, 100).await.unwrap();
+    let path = format!("/api/v1/runs/{}/metrics/query?series=loss", s.run_id());
+    let out = w.get(Who::Solo, &path).await.json();
+    assert_eq!(line(&out["series"][0]), [(0, 3.0), (1, 5.0)]);
+    let out = w
+        .get(
+            Who::Solo,
+            &format!(
+                "{path}&axis=time&from_time={}&to_time={}",
+                old + 30,
+                old + 55
+            ),
+        )
+        .await
+        .json();
+    assert_eq!(line(&out["series"][0]), [(old + 30, 3.0)]);
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn a_concurrent_writer_keeps_rollup_dirty_and_the_series_cap_holds() {
+    let w = World::start(
+        Mode::Solo,
+        LiveConfig {
+            max_series_per_run: 1,
+            ..fast_live()
+        },
+    )
+    .await;
+    let s = seed_run(&w.db, Uuid::nil(), json!({})).await;
+    send_metrics(&w, &s, 1, points("loss", 0..1, |_| 1.0)).await;
+    // Pause ingestion just after it marks both buckets and before it commits.
+    sqlx::raw_sql(
+        "CREATE FUNCTION p22_pause_batch() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN PERFORM pg_advisory_xact_lock(22004); RETURN NEW; END $$;
+        CREATE TRIGGER p22_pause_batch BEFORE UPDATE ON metric_batches
+        FOR EACH ROW EXECUTE FUNCTION p22_pause_batch()",
+    )
+    .execute(w.db.pool())
+    .await
+    .unwrap();
+    let mut blocker = w.db.db().begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(22004)")
+        .execute(&mut *blocker)
+        .await
+        .unwrap();
+    let writer = send_metrics(&w, &s, 2, points("loss", 1..2, |_| 2.0));
+    let check = async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let blocked: bool = sqlx::query_scalar(
+                    "SELECT EXISTS (SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND objid = 22004 AND NOT granted)"
+                ).fetch_one(w.db.pool()).await.unwrap();
+                if blocked { break; }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert_eq!(rollup::roll_up(&w.tel.db, 100).await.unwrap(), 0);
+        blocker.commit().await.unwrap();
+    };
+    tokio::join!(writer, check);
+    rollup::roll_up(&w.tel.db, 100).await.unwrap();
+    let n: i32 = sqlx::query_scalar("SELECT n FROM metric_rollups WHERE tier = 'step_bucket'")
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(n, 2);
+    let empty = seed_run(&w.db, Uuid::nil(), json!({})).await;
+    tokio::join!(
+        send_metrics(&w, &empty, 3, points("a", 0..1, |_| 1.0)),
+        send_metrics(&w, &empty, 4, points("b", 0..1, |_| 1.0)),
+    );
+    assert_eq!(
+        count(
+            &w.db,
+            "SELECT count(*) FROM metric_series WHERE run_id = $1",
+            empty.run
+        )
+        .await,
+        1
+    );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn log_search_crosses_hot_and_sealed_chunks_without_crossing_a_gap() {
+    let w = World::solo().await;
+    let s = seed_run(&w.db, Uuid::nil(), json!({})).await;
+    send_log(&w, &s, 1, 0, LogStream::Stdout, 0, b"first ER").await;
+    send_log(&w, &s, 2, 1, LogStream::Stdout, 0, b"gap ER").await;
+    send_log(&w, &s, 5, 2, LogStream::Stdout, 0, &[0xf0, 0x9f]).await;
+    mrl_server::modules::telemetry::logs::seal(&w.tel, Duration::ZERO)
+        .await
+        .unwrap();
+    send_log(&w, &s, 3, 0, LogStream::Stdout, 8, b"ror last").await;
+    send_log(&w, &s, 4, 1, LogStream::Stdout, 7, b"ror after a gap").await;
+    send_log(&w, &s, 6, 2, LogStream::Stdout, 2, &[0x90, 0x88]).await;
+    let utf8 = w
+        .get(
+            Who::Solo,
+            &format!("/api/v1/runs/{}/logs?q=%F0%9F%90%88", s.run_id()),
+        )
+        .await
+        .json();
+    assert_eq!(utf8["items"][0]["rank"], 2);
+    assert_eq!(utf8["items"].as_array().unwrap().len(), 1);
+    let result = w
+        .get(
+            Who::Solo,
+            &format!("/api/v1/runs/{}/logs?q=error&limit=1", s.run_id()),
+        )
+        .await;
+    assert_eq!(result.status, 200, "{}", result.text());
+    let body = result.json();
+    assert_eq!(body["items"][0]["text"], "first ER");
+    if let Some(cursor) = body["next_cursor"].as_str() {
+        let next = w
+            .get(
+                Who::Solo,
+                &format!("/api/v1/runs/{}/logs?q=error&cursor={cursor}", s.run_id()),
+            )
+            .await
+            .json();
+        assert!(next["items"].as_array().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn retention_retries_unreferenced_object_removal() {
+    let w = World::solo().await;
+    let store = w
+        .tel
+        .store
+        .org_store(mrl_server::modules::artifacts::LOCAL_ORG)
+        .await
+        .unwrap();
+    let key = format!("{}runs/test-abandoned.json", store.keys().prefix());
+    store.put(&key, bytes_of(b"abandoned")).await.unwrap();
+    sqlx::query(
+        "INSERT INTO telemetry_objects (object_key, org_id, touched_at)
+                 VALUES ($1, $2, now() - interval '2 hours')",
+    )
+    .bind(&key)
+    .bind(Uuid::nil())
+    .execute(w.db.pool())
+    .await
+    .unwrap();
+    rollup::maintain(&w.tel, true).await.unwrap();
+    assert!(store.head(&key).await.is_err());
+    let intent: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM telemetry_objects WHERE object_key = $1)")
+            .bind(key)
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap();
+    assert!(!intent);
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn paging_cannot_skip_a_log_or_sample_waiting_to_commit() {
+    let w = World::solo().await;
+    let s = seed_run(&w.db, Uuid::nil(), json!({})).await;
+    let mut blocked = w.db.db().begin().await.unwrap();
+    sqlx::query("SELECT id FROM runs WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(s.run)
+        .execute(&mut *blocked)
+        .await
+        .unwrap();
+    let log = send_log(&w, &s, 1, 0, LogStream::Stdout, 0, b"first");
+    let samples = w.deliver(
+        s.node,
+        LaneKind::Metrics,
+        1,
+        0,
+        relay(
+            &s,
+            1,
+            WorkerBody::Samples(SampleBatch {
+                step: 1,
+                ..Default::default()
+            }),
+        ),
+    );
+    let read = async {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                // Both real writers are in the DB and have reached the serialization point.
+                let waiting: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM pg_stat_activity
+                    WHERE datname = current_database() AND wait_event_type = 'Lock'
+                    AND query = 'SELECT id FROM runs WHERE id = $1 FOR NO KEY UPDATE'",
+                )
+                .fetch_one(w.db.pool())
+                .await
+                .unwrap();
+                if waiting >= 2 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let counts: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM log_chunks), (SELECT count(*) FROM samples)",
+        )
+        .fetch_one(w.db.pool())
+        .await
+        .unwrap();
+        assert_eq!(counts, (0, 0));
+        blocked.commit().await.unwrap();
+    };
+    tokio::join!(log, samples, read);
+    assert_eq!(
+        count(
+            &w.db,
+            "SELECT count(*) FROM log_chunks WHERE run_id = $1",
+            s.run
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &w.db,
+            "SELECT count(*) FROM samples WHERE run_id = $1",
+            s.run
+        )
+        .await,
+        1
+    );
 }

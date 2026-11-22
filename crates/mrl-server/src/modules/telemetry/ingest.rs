@@ -3,9 +3,8 @@
 //! Every relayed worker message names its attempt. A message is taken only when the attempt
 //! belongs to a run, its fencing epoch matches and the sending node runs it (a placement or a
 //! `LaunchAttempt` command for that node); anything else is dropped and counted
-//! (`mrl_telemetry_dropped_total{reason}`). Delivery is at-least-once: metric batches and
-//! samples dedupe on `(attempt, WorkerMessage.seq)`, log chunks on `(attempt, rank, stream,
-//! offset)`, progress keeps the newest `(attempt_no, seq)`.
+//! (`mrl_telemetry_dropped_total{reason}`). Every delivery claims `(node, stream, seq)`
+//! in the transaction that stores its effects.
 
 use super::observer::{IngestedBatch, MetricObservers, ObservedPoint};
 use super::storage_org;
@@ -49,6 +48,55 @@ pub struct Owner {
     pub attempt: Uuid,
     /// Its number (later attempts win per step).
     pub attempt_no: i32,
+}
+
+/// The gateway stream position of one relayed message.
+#[derive(Clone, Copy)]
+pub struct Delivery {
+    /// The node that sent the envelope.
+    pub node: Uuid,
+    /// The protobuf stream that carried it.
+    pub stream: mrl_proto::agent::v1::Lane,
+    /// The gateway sequence number.
+    pub seq: u64,
+}
+
+impl From<&LaneItem> for Delivery {
+    fn from(item: &LaneItem) -> Self {
+        Self {
+            node: item.node_id,
+            stream: item.stream,
+            seq: item.seq,
+        }
+    }
+}
+
+impl Delivery {
+    async fn claim(self, tx: &mut Tx) -> Result<bool, DbError> {
+        let inserted = sqlx::query(
+            "INSERT INTO telemetry_receipts (node_id, stream, seq)
+             VALUES ($1, $2, $3::text::numeric) ON CONFLICT DO NOTHING",
+        )
+        .bind(self.node)
+        .bind(self.stream as i32)
+        .bind(self.seq.to_string())
+        .execute(&mut **tx)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            dropped("replay");
+            return Ok(false);
+        }
+        Ok(true)
+    }
+}
+
+// Take the run lock before assigning any cursor ID so a page can't cross an uncommitted ID.
+async fn lock_run(tx: &mut Tx, run: Uuid) -> Result<(), DbError> {
+    sqlx::query("SELECT id FROM runs WHERE id = $1 FOR NO KEY UPDATE")
+        .bind(run)
+        .execute(&mut **tx)
+        .await?;
+    Ok(())
 }
 
 /// Writes what the sinks receive.
@@ -319,12 +367,11 @@ impl Ingest {
         Ok(owner)
     }
 
-    /// Stores one metrics message (worker message `seq`) of `o`. Returns the new batch id, or
-    /// `None` for a replay or a batch with no usable point.
+    /// Stores one metrics delivery. Returns its batch ID, or `None` for a replay or empty batch.
     pub async fn metrics(
         &self,
         o: Owner,
-        seq: u64,
+        delivery: Delivery,
         sent_at: Option<OffsetDateTime>,
         points: &[MetricPoint],
     ) -> Result<Option<i64>, DbError> {
@@ -332,20 +379,15 @@ impl Ingest {
         if points.is_empty() {
             return Ok(None);
         }
-        let Ok(seq) = i64::try_from(seq) else {
-            dropped("invalid_point");
-            return Ok(None);
-        };
-        let first = self.write_metrics(o, seq, &points).await;
+        let first = self.write_metrics(o, delivery, &points).await;
         let written = match first {
             Err(e) if is_missing_partition(&e) => {
                 super::rollup::ensure_partitions(&self.db, OffsetDateTime::now_utc()).await?;
-                self.write_metrics(o, seq, &points).await?
+                self.write_metrics(o, delivery, &points).await?
             }
             other => other?,
         };
         let Some((batch, observed)) = written else {
-            dropped("replay");
             return Ok(None);
         };
         self.observers.publish(IngestedBatch {
@@ -360,24 +402,23 @@ impl Ingest {
     async fn write_metrics(
         &self,
         o: Owner,
-        seq: i64,
+        delivery: Delivery,
         points: &[Point],
     ) -> Result<Option<(i64, Vec<ObservedPoint>)>, DbError> {
         let mut tx = self.db.begin().await?;
-        let batch: Option<i64> = sqlx::query_scalar(
+        if !delivery.claim(&mut tx).await? {
+            return Ok(None);
+        }
+        let batch: i64 = sqlx::query_scalar(
             "INSERT INTO metric_batches (org_id, run_id, attempt_id, agent_seq, point_count)
-             VALUES ($1, $2, $3, $4, 0) ON CONFLICT (attempt_id, agent_seq) DO NOTHING RETURNING id",
+             VALUES ($1, $2, $3, $4, 0) RETURNING id",
         )
         .bind(o.org)
         .bind(o.run)
         .bind(o.attempt)
-        .bind(seq)
-        .fetch_optional(&mut *tx)
+        .bind(i64::try_from(delivery.seq).unwrap_or(i64::MAX))
+        .fetch_one(&mut *tx)
         .await?;
-        let Some(batch) = batch else {
-            tx.commit().await?;
-            return Ok(None);
-        };
         let series = self.series(&mut tx, o, points).await?;
         let mut copy = String::new();
         let mut observed = Vec::new();
@@ -433,7 +474,8 @@ impl Ingest {
         );
         sqlx::query(
             "INSERT INTO metric_rollup_dirty (series_id, tier, bucket_start)
-             SELECT * FROM unnest($1::bigint[], $2::text[], $3::bigint[]) ON CONFLICT DO NOTHING",
+             SELECT * FROM unnest($1::bigint[], $2::text[], $3::bigint[])
+             ON CONFLICT (series_id, tier, bucket_start) DO UPDATE SET bucket_start = EXCLUDED.bucket_start",
         )
         .bind(&ids)
         .bind(&tiers)
@@ -489,6 +531,8 @@ impl Ingest {
         }
         let names: Vec<&str> = keys.keys().map(|k| k.0.as_str()).collect();
         let splits: Vec<&str> = keys.keys().map(|k| k.1.as_str()).collect();
+        // Lock before reading the series set so concurrent batches share the same cap.
+        lock_run(tx, o.run).await?;
         let found = load_series(tx, o.run, &names, &splits).await?;
         let missing: Vec<_> = keys
             .iter()
@@ -533,26 +577,17 @@ impl Ingest {
         Ok(all)
     }
 
-    /// Stores one sample batch (worker message `seq`): the samples as a JSON file in object
-    /// storage, the index row here.
-    pub async fn samples(&self, o: Owner, seq: u64, b: &SampleBatch) -> Result<(), SinkError> {
+    async fn samples(
+        &self,
+        o: Owner,
+        delivery: Delivery,
+        b: &SampleBatch,
+    ) -> Result<(), SinkError> {
         let err = |e: &dyn std::fmt::Display| sink_error("telemetry.metrics", e);
-        let (Ok(seq), Ok(step)) = (i64::try_from(seq), i64::try_from(b.step)) else {
+        let Ok(step) = i64::try_from(b.step) else {
             dropped("invalid_sample");
             return Ok(());
         };
-        let seen: bool = sqlx::query_scalar(
-            "SELECT EXISTS (SELECT 1 FROM samples WHERE attempt_id = $1 AND worker_seq = $2)",
-        )
-        .bind(o.attempt)
-        .bind(seq)
-        .fetch_one(self.db.pool())
-        .await
-        .map_err(|e| err(&e))?;
-        if seen {
-            dropped("replay");
-            return Ok(());
-        }
         let rewards = b
             .samples
             .iter()
@@ -578,34 +613,51 @@ impl Ingest {
             .org_store(&storage_org(o.org))
             .await
             .map_err(|e| err(&e))?;
+        let sha = sha256_hex(&bytes);
         let key = format!(
-            "{}runs/{}/samples/{}-{seq}.json",
+            "{}runs/{}/samples/{}-{}-{}-{}.json",
             store.keys().prefix(),
             RunId::from_uuid(o.run),
-            AttemptId::from_uuid(o.attempt)
+            delivery.node,
+            delivery.stream as i32,
+            delivery.seq,
+            sha,
         );
+        super::remember_object(self.db.pool(), o.org, &key)
+            .await
+            .map_err(|e| err(&e))?;
+        let mut tx = self.db.begin().await.map_err(|e| err(&e))?;
+        if !delivery.claim(&mut tx).await.map_err(|e| err(&e))? {
+            return Ok(());
+        }
+        super::remember_object(&mut *tx, o.org, &key)
+            .await
+            .map_err(|e| err(&e))?;
+        lock_run(&mut tx, o.run).await.map_err(|e| err(&e))?;
         store.put(&key, bytes.into()).await.map_err(|e| err(&e))?;
         sqlx::query(
-            "INSERT INTO samples (org_id, run_id, attempt_id, worker_seq, step, object_key, count, reward_min, reward_max)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) ON CONFLICT (attempt_id, worker_seq) DO NOTHING",
+            "INSERT INTO samples (org_id, run_id, attempt_id, worker_seq, step, object_key, count, reward_min, reward_max, sha256)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
         )
         .bind(o.org)
         .bind(o.run)
         .bind(o.attempt)
-        .bind(seq)
+        .bind(i64::try_from(delivery.seq).unwrap_or(i64::MAX))
         .bind(step)
         .bind(&key)
         .bind(i32::try_from(b.samples.len()).unwrap_or(i32::MAX))
         .bind(lo)
         .bind(hi)
-        .execute(self.db.pool())
+        .bind(&sha)
+        .execute(&mut *tx)
         .await
         .map_err(|e| err(&e))?;
+        tx.commit().await.map_err(|e| err(&e))?;
         Ok(())
     }
 
     /// Stores one relayed log chunk (split into pieces of at most 64 KiB).
-    pub async fn log(&self, o: Owner, c: &LogChunk) -> Result<(), DbError> {
+    async fn log(&self, tx: &mut Tx, o: Owner, c: &LogChunk) -> Result<(), DbError> {
         let (Ok(rank), Ok(offset)) = (i32::try_from(c.rank), i64::try_from(c.offset)) else {
             dropped("invalid_log");
             return Ok(());
@@ -624,21 +676,20 @@ impl Ingest {
             offsets.push(at);
             pieces.push(piece.to_vec());
         }
-        self.insert_chunks(o, rank, stream, &offsets, &pieces).await
+        Self::insert_chunks(tx, o, rank, stream, &offsets, &pieces).await
     }
 
     /// Records that `count` log chunks were lost before this point (an `agent` line).
-    pub async fn log_gap(&self, o: Owner, at: u64, count: u64) -> Result<(), DbError> {
+    async fn log_gap(tx: &mut Tx, o: Owner, at: u64, count: u64) -> Result<(), DbError> {
         let text = format!(
             "[masterrl] {count} log chunk(s) were dropped here because the connection was too slow.\n"
         );
         let at = i64::try_from(at).unwrap_or(i64::MAX);
-        self.insert_chunks(o, 0, "agent", &[at], &[text.into_bytes()])
-            .await
+        Self::insert_chunks(tx, o, 0, "agent", &[at], &[text.into_bytes()]).await
     }
 
     async fn insert_chunks(
-        &self,
+        tx: &mut Tx,
         o: Owner,
         rank: i32,
         stream: &str,
@@ -660,41 +711,50 @@ impl Ingest {
         .bind(stream)
         .bind(offsets)
         .bind(pieces)
-        .execute(self.db.pool())
+        .execute(&mut **tx)
         .await?;
         Ok(())
     }
 
-    /// Keeps the newest progress of the run: a later attempt, or a later message of the same one.
-    pub async fn progress(&self, o: Owner, seq: u64, p: &Progress) -> Result<(), DbError> {
+    /// Keeps the newest progress of the run: a later attempt, or a non-regressing step of the same attempt.
+    async fn progress(&self, o: Owner, delivery: Delivery, p: &Progress) -> Result<(), DbError> {
+        let mut tx = self.db.begin().await?;
+        if !delivery.claim(&mut tx).await? {
+            return Ok(());
+        }
         let n = |v: u64| i64::try_from(v).unwrap_or(i64::MAX);
         let f = |v: f64| if v.is_finite() { v } else { 0.0 };
         sqlx::query(
             "INSERT INTO run_progress (run_id, org_id, attempt_id, attempt_no, worker_seq, step,
-                    total_steps, epoch, phase, tokens_seen, eta_seconds)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                    total_steps, epoch, phase, tokens_seen, eta_seconds, last_node_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
              ON CONFLICT (run_id) DO UPDATE SET
                attempt_id = EXCLUDED.attempt_id, attempt_no = EXCLUDED.attempt_no,
                worker_seq = EXCLUDED.worker_seq, step = EXCLUDED.step,
                total_steps = EXCLUDED.total_steps, epoch = EXCLUDED.epoch, phase = EXCLUDED.phase,
                tokens_seen = EXCLUDED.tokens_seen, eta_seconds = EXCLUDED.eta_seconds,
-               updated_at = now(), xid = pg_current_xact_id()
-             WHERE (run_progress.attempt_no, run_progress.worker_seq)
-                 < (EXCLUDED.attempt_no, EXCLUDED.worker_seq)",
+               updated_at = now(), xid = pg_current_xact_id(), last_node_id = EXCLUDED.last_node_id
+             WHERE run_progress.attempt_no < EXCLUDED.attempt_no OR
+               (run_progress.attempt_no = EXCLUDED.attempt_no AND
+                 CASE WHEN run_progress.last_node_id = EXCLUDED.last_node_id
+                      THEN run_progress.worker_seq < EXCLUDED.worker_seq AND run_progress.step <= EXCLUDED.step
+                      ELSE run_progress.step <= EXCLUDED.step END)",
         )
         .bind(o.run)
         .bind(o.org)
         .bind(o.attempt)
         .bind(o.attempt_no)
-        .bind(n(seq))
+        .bind(n(delivery.seq))
         .bind(n(p.step))
         .bind(n(p.total_steps))
         .bind(f(p.epoch))
         .bind(clean(&p.phase, 100))
         .bind(n(p.tokens_seen))
         .bind(f(p.eta_seconds))
-        .execute(self.db.pool())
+        .bind(delivery.node)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(())
     }
 }
@@ -745,21 +805,21 @@ impl LaneSink for MetricsSink {
         match body {
             WorkerBody::Metrics(b) => self
                 .0
-                .metrics(o, msg.seq, sent, &b.points)
+                .metrics(o, (&item).into(), sent, &b.points)
                 .await
                 .map_err(err)?,
             WorkerBody::RolloutBatch(r) => self
                 .0
-                .metrics(o, msg.seq, sent, &rollout_points(r))
+                .metrics(o, (&item).into(), sent, &rollout_points(r))
                 .await
                 .map_err(err)?,
             WorkerBody::RewardBatchStats(r) => self
                 .0
-                .metrics(o, msg.seq, sent, &reward_points(r))
+                .metrics(o, (&item).into(), sent, &reward_points(r))
                 .await
                 .map_err(err)?,
             WorkerBody::Samples(s) => {
-                self.0.samples(o, msg.seq, s).await?;
+                self.0.samples(o, (&item).into(), s).await?;
                 None
             }
             _ => None,
@@ -786,15 +846,20 @@ impl LaneSink for LogsSink {
         let Some(o) = self.0.owned(&item).await.map_err(err)? else {
             return Ok(());
         };
+        let mut tx = self.0.db.begin().await.map_err(err)?;
+        if !Delivery::from(&item).claim(&mut tx).await.map_err(err)? {
+            return Ok(());
+        }
+        lock_run(&mut tx, o.run).await.map_err(err)?;
         if item.dropped_before > 0 {
-            self.0
-                .log_gap(o, item.seq, item.dropped_before)
+            Ingest::log_gap(&mut tx, o, item.seq, item.dropped_before)
                 .await
                 .map_err(err)?;
         }
         if let Some((_, _, WorkerBody::Log(c))) = relayed(&item) {
-            self.0.log(o, c).await.map_err(err)?;
+            self.0.log(&mut tx, o, c).await.map_err(err)?;
         }
+        tx.commit().await.map_err(|e| err(e.into()))?;
         Ok(())
     }
 }
@@ -822,8 +887,8 @@ impl LaneSink for ProgressSink {
         let Some(o) = self.0.owned(&item).await.map_err(err)? else {
             return Ok(());
         };
-        if let Some((_, msg, WorkerBody::Progress(p))) = relayed(&item) {
-            self.0.progress(o, msg.seq, p).await.map_err(err)?;
+        if let Some((_, _, WorkerBody::Progress(p))) = relayed(&item) {
+            self.0.progress(o, (&item).into(), p).await.map_err(err)?;
         }
         Ok(())
     }

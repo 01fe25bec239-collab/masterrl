@@ -372,6 +372,24 @@ pub(crate) fn run_resource(row: &RunRow) -> crate::seams::Resource {
     )
 }
 
+// Call once before starting a write transaction, then again inside it. The committed row
+// tracks failed writes, and the transactional row lock keeps GC away until publication.
+async fn remember_object<'e>(
+    db: impl sqlx::PgExecutor<'e>,
+    org: Uuid,
+    key: &str,
+) -> Result<(), crate::db::DbError> {
+    sqlx::query(
+        "INSERT INTO telemetry_objects (org_id, object_key) VALUES ($1, $2)
+         ON CONFLICT (object_key) DO UPDATE SET touched_at = now()",
+    )
+    .bind(org)
+    .bind(key)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
 /// The object-storage org of rows stored under `org` (the nil org is the solo tenant).
 pub(crate) fn storage_org(org: Uuid) -> String {
     if org.is_nil() {

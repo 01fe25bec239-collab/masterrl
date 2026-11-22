@@ -5,7 +5,7 @@
 //! table where it still has them (per step, the latest attempt that reached it) and from the
 //! rollups for older ranges (step buckets on the step axis, minutes on the time axis).
 
-use super::{field_error, parse_num, read_run, Telemetry};
+use super::{field_error, parse_num, read_run, run_resource, Telemetry};
 use crate::app::AppState;
 use crate::db::{Db, DbError};
 use crate::modules::jobs::JobsError;
@@ -145,8 +145,8 @@ pub struct MetricQueryResult {
 #[derive(Debug, Clone, Default, Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
 pub struct MetricQueryParams {
-    /// Comma-separated series ids or metric names (a name means each of its splits); default:
-    /// the first 20 series.
+    /// Comma-separated series IDs or names. Use `name:` before a numeric name.
+    /// A name selects every split. Defaults to the first 20 series.
     pub series: Option<String>,
     /// `step` (default) or `time`.
     pub axis: Option<String>,
@@ -181,7 +181,11 @@ pub async fn series_points(
     to: Option<i64>,
     max_points: i64,
 ) -> Result<Vec<MetricPointView>, DbError> {
-    let (lo, hi, raw_lo) = extent(db, series, axis).await?;
+    let (lo, hi) = if from.is_none() || to.is_none() {
+        extent(db, series, axis).await?
+    } else {
+        (None, None)
+    };
     let (Some(from), Some(to)) = (from.or(lo), to.or(hi)) else {
         return Ok(Vec::new());
     };
@@ -191,31 +195,44 @@ pub async fn series_points(
     let width = group_width(from, to, max_points);
     let sql = match axis {
         Axis::Step => {
-            "WITH raw AS (
-               SELECT DISTINCT ON (step) step AS x, value FROM metric_points
-                WHERE series_id = $1 AND step BETWEEN $2 AND $3
-                ORDER BY step, attempt_no DESC, ts DESC),
-             parts AS (
-               SELECT x, value AS mn, value AS mx, value AS sm, 1::bigint AS n FROM raw
-               UNION ALL
-               SELECT bucket_start * $6, min, max, avg * n, n::bigint FROM metric_rollups
-                WHERE series_id = $1 AND tier = 'step_bucket'
-                  AND bucket_start * $6 BETWEEN $2 AND $3 AND (bucket_start + 1) * $6 <= $5)
+            "WITH steps AS (
+                 SELECT DISTINCT ON (step) step AS x, value FROM (
+                   SELECT step, value, attempt_no, ts, batch_id FROM metric_points
+                    WHERE series_id = $1 AND step BETWEEN $2 AND $3
+                   UNION ALL
+                   SELECT step, value, attempt_no, ts, 0 FROM metric_step_archive
+                    WHERE series_id = $1 AND step BETWEEN $2 AND $3
+                 ) all_steps ORDER BY step, attempt_no DESC, ts DESC, batch_id DESC
+             ), parts AS (
+                 SELECT x, value AS mn, value AS mx, value::text::numeric AS sm, 1::bigint AS n FROM steps
+                 UNION ALL
+                 SELECT r.bucket_start * $5, r.min, r.max, r.avg::text::numeric * r.n, r.n::bigint
+                   FROM metric_rollups r WHERE r.series_id = $1 AND r.tier = 'step_bucket'
+                    AND r.bucket_start * $5 BETWEEN $2 AND $3
+                    AND NOT EXISTS (SELECT 1 FROM metric_step_archive a WHERE a.series_id = $1
+                                     AND a.step >= r.bucket_start * $5 AND a.step < (r.bucket_start + 1) * $5)
+                    AND NOT EXISTS (SELECT 1 FROM metric_points p WHERE p.series_id = $1
+                                     AND p.step >= r.bucket_start * $5 AND p.step < (r.bucket_start + 1) * $5)
+             )
              SELECT $2 + ((x - $2) / $4) * $4 AS g, min(mn) AS mn, max(mx) AS mx,
-                    sum(sm) / sum(n) AS v, sum(n)::bigint AS n
+                    telemetry_float8(sum(sm) / sum(n)) AS v, sum(n)::bigint AS n
                FROM parts GROUP BY 1 ORDER BY 1"
         }
         Axis::Time => {
             "WITH parts AS (
-               SELECT floor(extract(epoch FROM ts))::bigint AS x, value AS mn, value AS mx, value AS sm,
-                      1::bigint AS n FROM metric_points
-                WHERE series_id = $1 AND ts >= to_timestamp($2) AND ts < to_timestamp($3 + 1)
+               SELECT floor(extract(epoch FROM ts))::bigint AS x, value AS mn, value AS mx,
+                      value::text::numeric AS sm, 1::bigint AS n FROM metric_points
+                WHERE series_id = $1 AND ts >= to_timestamp($2::bigint) AND ts < to_timestamp($3::bigint + 1)
                UNION ALL
-               SELECT bucket_start * $6, min, max, avg * n, n::bigint FROM metric_rollups
-                WHERE series_id = $1 AND tier = '1m'
-                  AND bucket_start * $6 BETWEEN $2 AND $3 AND (bucket_start + 1) * $6 <= $5)
+               SELECT greatest($2, r.bucket_start * $5), r.min, r.max, r.avg::text::numeric * r.n, r.n::bigint
+                 FROM metric_rollups r WHERE r.series_id = $1 AND r.tier = '1m'
+                  AND r.bucket_start * $5 <= $3 AND (r.bucket_start + 1) * $5 > $2
+                  AND NOT EXISTS (SELECT 1 FROM metric_points p WHERE p.series_id = $1
+                       AND p.ts >= to_timestamp(r.bucket_start * $5)
+                       AND p.ts < to_timestamp((r.bucket_start + 1) * $5))
+             )
              SELECT $2 + ((x - $2) / $4) * $4 AS g, min(mn) AS mn, max(mx) AS mx,
-                    sum(sm) / sum(n) AS v, sum(n)::bigint AS n
+                    telemetry_float8(sum(sm) / sum(n)) AS v, sum(n)::bigint AS n
                FROM parts GROUP BY 1 ORDER BY 1"
         }
     };
@@ -228,7 +245,6 @@ pub async fn series_points(
         .bind(from)
         .bind(to)
         .bind(width)
-        .bind(raw_lo.unwrap_or(i64::MAX))
         .bind(bucket)
         .fetch_all(db.pool())
         .await?;
@@ -254,21 +270,18 @@ pub fn group_width(from: i64, to: i64, max_points: i64) -> i64 {
         .max(1)
 }
 
-/// `(first, last, first raw)` x of a series: raw points and rollups together.
-async fn extent(
-    db: &Db,
-    series: i64,
-    axis: Axis,
-) -> Result<(Option<i64>, Option<i64>, Option<i64>), DbError> {
+/// The first and last retained x of a series.
+async fn extent(db: &Db, series: i64, axis: Axis) -> Result<(Option<i64>, Option<i64>), DbError> {
     let sql = match axis {
         Axis::Step => {
-            "SELECT least(r.lo, u.lo) AS lo, greatest(r.hi, u.hi) AS hi, r.lo AS raw_lo FROM
+            "SELECT least(r.lo, u.lo, a.lo) AS lo, greatest(r.hi, u.hi, a.hi) AS hi FROM
                (SELECT min(step) AS lo, max(step) AS hi FROM metric_points WHERE series_id = $1) r,
+               (SELECT min(step) AS lo, max(step) AS hi FROM metric_step_archive WHERE series_id = $1) a,
                (SELECT min(bucket_start) * 10 AS lo, max(bucket_start) * 10 + 9 AS hi
                   FROM metric_rollups WHERE series_id = $1 AND tier = 'step_bucket') u"
         }
         Axis::Time => {
-            "SELECT least(r.lo, u.lo) AS lo, greatest(r.hi, u.hi) AS hi, r.lo AS raw_lo FROM
+            "SELECT least(r.lo, u.lo) AS lo, greatest(r.hi, u.hi) AS hi FROM
                (SELECT floor(extract(epoch FROM min(ts)))::bigint AS lo,
                        floor(extract(epoch FROM max(ts)))::bigint AS hi
                   FROM metric_points WHERE series_id = $1) r,
@@ -277,7 +290,7 @@ async fn extent(
         }
     };
     let r = sqlx::query(sql).bind(series).fetch_one(db.pool()).await?;
-    Ok((r.try_get("lo")?, r.try_get("hi")?, r.try_get("raw_lo")?))
+    Ok((r.try_get("lo")?, r.try_get("hi")?))
 }
 
 fn series_view(r: &sqlx::postgres::PgRow) -> Result<MetricSeriesView, sqlx::Error> {
@@ -371,11 +384,17 @@ async fn pick_series(
     run: Uuid,
     tokens: &[String],
 ) -> Result<Vec<MetricSeriesView>, JobsError> {
-    let (ids, names): (Vec<&String>, Vec<&String>) = tokens
-        .iter()
-        .partition(|t| t.bytes().all(|b| b.is_ascii_digit()));
-    let ids: Vec<i64> = ids.iter().filter_map(|t| t.parse().ok()).collect();
-    let names: Vec<&str> = names.iter().map(|s| s.as_str()).collect();
+    let mut ids = Vec::<i64>::new();
+    let mut names = Vec::new();
+    for token in tokens {
+        if let Some(name) = token.strip_prefix("name:") {
+            names.push(name);
+        } else if let Ok(id) = token.parse() {
+            ids.push(id);
+        } else {
+            names.push(token.as_str());
+        }
+    }
     let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT {SERIES_COLS} FROM metric_series WHERE run_id = $1
             AND ($4 OR id = ANY($2) OR name = ANY($3)) ORDER BY id LIMIT $5"
@@ -400,6 +419,23 @@ fn max_points(v: Option<i64>) -> Result<i64, JobsError> {
         ));
     }
     Ok(n)
+}
+
+fn query_bound(value: &Option<String>, field: &str, axis: Axis) -> Result<Option<i64>, JobsError> {
+    let value = parse_num::<i64>(value.as_deref(), field)?;
+    if value.is_some_and(|n| match axis {
+        Axis::Step => !(0..=super::ingest::MAX_STEP).contains(&n),
+        Axis::Time => OffsetDateTime::from_unix_timestamp(n)
+            .ok()
+            .is_none_or(|ts| !(1..=9999).contains(&ts.year())),
+    }) {
+        return Err(field_error(
+            field,
+            "This bound is outside the supported range.",
+            "Use a nonnegative step up to 2^50 or an epoch second in years 0001–9999.",
+        ));
+    }
+    Ok(value)
 }
 
 /// `GET /runs/{run}/metrics/query`: at most `max_points` points per series, with a min/max
@@ -429,12 +465,12 @@ pub async fn query(
     };
     let (from, to) = match axis {
         Axis::Step => (
-            parse_num::<i64>(q.from_step.as_deref(), "from_step")?,
-            parse_num::<i64>(q.to_step.as_deref(), "to_step")?,
+            query_bound(&q.from_step, "from_step", axis)?,
+            query_bound(&q.to_step, "to_step", axis)?,
         ),
         Axis::Time => (
-            parse_num::<i64>(q.from_time.as_deref(), "from_time")?,
-            parse_num::<i64>(q.to_time.as_deref(), "to_time")?,
+            query_bound(&q.from_time, "from_time", axis)?,
+            query_bound(&q.to_time, "to_time", axis)?,
         ),
     };
     let limit = max_points(parse_num(q.max_points.as_deref(), "max_points")?)?;
@@ -584,7 +620,8 @@ pub fn config_diff(configs: &[(String, Value)]) -> Vec<RunCompareDiff> {
 /// `POST /runs:compare`: the config settings that differ, and metric overlays on one grid.
 #[utoipa::path(post, path = "/runs:compare", tag = "telemetry", operation_id = "compare_runs",
     request_body = RunCompareRequest,
-    responses((status = 200, body = RunCompareResult), (status = 404, description = "A run doesn't exist or is hidden"),
+    responses((status = 200, body = RunCompareResult), (status = 403, description = "No permission to read a run's metrics or config"),
+        (status = 404, description = "A run doesn't exist or is hidden"),
         (status = 422, description = "Fewer than 2 or more than 10 runs, or a repeated run")))]
 pub async fn compare(
     State(state): State<AppState>,
@@ -592,8 +629,7 @@ pub async fn compare(
     ctx: RequestContext,
     Json(req): Json<RunCompareRequest>,
 ) -> Result<Json<RunCompareResult>, JobsError> {
-    let distinct: BTreeSet<&String> = req.run_ids.iter().collect();
-    if !(2..=MAX_COMPARE).contains(&req.run_ids.len()) || distinct.len() != req.run_ids.len() {
+    if !(2..=MAX_COMPARE).contains(&req.run_ids.len()) {
         return Err(field_error(
             "run_ids",
             "Compare 2 to 10 different runs.",
@@ -609,16 +645,29 @@ pub async fn compare(
     }
     let limit = max_points(req.max_points)?;
     let mut rows = Vec::new();
+    let mut distinct = BTreeSet::new();
     for id in &req.run_ids {
-        rows.push(read_run(&state, &t.db, &ctx, id, "metrics_logs.read").await?);
+        let row = read_run(&state, &t.db, &ctx, id, "metrics_logs.read").await?;
+        crate::modules::jobs::scope::authorize(&state, &ctx, "runs.read", &run_resource(&row))
+            .await?;
+        if !distinct.insert(row.id) {
+            return Err(field_error(
+                "run_ids",
+                "Compare different runs.",
+                "List each run once.",
+            ));
+        }
+        rows.push(row);
     }
     let mut configs = Vec::new();
     for r in &rows {
-        let resolved: Option<Value> =
-            sqlx::query_scalar("SELECT resolved FROM run_configs WHERE run_id = $1")
-                .bind(r.id)
-                .fetch_optional(t.db.pool())
-                .await?;
+        let resolved: Option<Value> = sqlx::query_scalar(
+            "SELECT resolved FROM run_configs WHERE run_id = $1 AND org_id = $2",
+        )
+        .bind(r.id)
+        .bind(r.org_id)
+        .fetch_optional(t.db.pool())
+        .await?;
         configs.push((
             RunId::from_uuid(r.id).to_string(),
             resolved.unwrap_or(Value::Null),
@@ -650,7 +699,7 @@ pub async fn compare(
         // One grid for every run: the union of their ranges.
         let (mut lo, mut hi) = (None::<i64>, None::<i64>);
         for s in runs.values() {
-            let (a, b, _) = extent(&t.db, *s, Axis::Step).await?;
+            let (a, b) = extent(&t.db, *s, Axis::Step).await?;
             lo = [lo, a].into_iter().flatten().min();
             hi = [hi, b].into_iter().flatten().max();
         }

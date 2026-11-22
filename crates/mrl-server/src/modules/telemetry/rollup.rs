@@ -39,26 +39,33 @@ pub async fn maintain(t: &Telemetry, retention: bool) -> Result<Maintained, Jobs
     let now = OffsetDateTime::now_utc();
     let mut done = Maintained::default();
     ensure_partitions(&t.db, now).await?;
-    loop {
-        let n = roll_up(&t.db, ROLLUP_BATCH).await?;
+    let rolled = loop {
+        let n = match roll_up(&t.db, ROLLUP_BATCH).await {
+            Ok(n) => n,
+            Err(e) => break Err(e),
+        };
         done.rolled += n;
         if n < usize::try_from(ROLLUP_BATCH).unwrap_or(usize::MAX) {
-            break;
+            break Ok(());
         }
-    }
-    done.sealed = super::logs::seal(
+    };
+    let sealed = super::logs::seal(
         t,
         std::time::Duration::from_secs(t.config.log_seal_after_seconds),
     )
-    .await?;
+    .await;
     if retention {
-        done.dropped_partitions = drop_old_partitions(
-            &t.db,
-            now - Duration::days(t.config.raw_retention_days.into()),
-        )
-        .await?;
+        if rolled.is_ok() {
+            done.dropped_partitions = drop_old_partitions(
+                &t.db,
+                now - Duration::days(t.config.raw_retention_days.into()),
+            )
+            .await?;
+        }
         done.deleted = expire(t, now).await?;
     }
+    rolled?;
+    done.sealed = sealed?;
     Ok(done)
 }
 
@@ -130,12 +137,44 @@ pub async fn drop_old_partitions(db: &Db, cutoff: OffsetDateTime) -> Result<usiz
         if (from + Duration::weeks(1)).midnight().assume_utc() > cutoff {
             continue;
         }
+        let mut tx = db.begin().await?;
+        // Readers see either the raw partition or the archived step values and prune markers.
+        sqlx::query("LOCK TABLE ONLY metric_points IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *tx)
+            .await?;
+        let name = partition_name(from);
+        let exists: bool = sqlx::query_scalar("SELECT to_regclass($1) IS NOT NULL")
+            .bind(&name)
+            .fetch_one(&mut *tx)
+            .await?;
+        if !exists {
+            continue;
+        }
         sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DROP TABLE IF EXISTS {}",
-            partition_name(from)
+            "INSERT INTO metric_step_archive (series_id, step, attempt_no, ts, value)
+             SELECT DISTINCT ON (series_id, step) series_id, step, attempt_no, ts, value
+               FROM {name} ORDER BY series_id, step, attempt_no DESC, ts DESC, batch_id DESC
+             ON CONFLICT (series_id, step) DO UPDATE SET attempt_no = EXCLUDED.attempt_no,
+                 ts = EXCLUDED.ts, value = EXCLUDED.value
+             WHERE (metric_step_archive.attempt_no, metric_step_archive.ts) <=
+                   (EXCLUDED.attempt_no, EXCLUDED.ts)"
         )))
-        .execute(db.pool())
+        .execute(&mut *tx)
         .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO telemetry_pruned (source, scope_id, xid, id)
+             SELECT DISTINCT ON (b.run_id) 'm', b.run_id, b.xid, b.id
+               FROM metric_batches b JOIN (SELECT DISTINCT batch_id FROM {name}) p ON p.batch_id = b.id
+              ORDER BY b.run_id, b.xid DESC, b.id DESC
+             ON CONFLICT (source, scope_id) DO UPDATE SET xid = EXCLUDED.xid, id = EXCLUDED.id
+             WHERE (telemetry_pruned.xid, telemetry_pruned.id) < (EXCLUDED.xid, EXCLUDED.id)"
+        )))
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE {name}")))
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         dropped += 1;
     }
     Ok(dropped)
@@ -168,13 +207,17 @@ pub async fn roll_up(db: &Db, limit: i64) -> Result<usize, DbError> {
     if !step_s.is_empty() {
         sqlx::query(
             "INSERT INTO metric_rollups (series_id, tier, bucket_start, min, max, avg, last, n)
-             SELECT d.s, 'step_bucket', d.b, min(p.value), max(p.value), avg(p.value),
+             SELECT d.s, 'step_bucket', d.b, min(p.value), max(p.value), telemetry_float8(avg(p.value::text::numeric)),
                     (array_agg(p.value ORDER BY p.step DESC))[1], count(*)::int
                FROM unnest($1::bigint[], $2::bigint[]) AS d(s, b)
               CROSS JOIN LATERAL (
-                    SELECT DISTINCT ON (step) step, value FROM metric_points
-                     WHERE series_id = d.s AND step >= d.b * $3 AND step < (d.b + 1) * $3
-                     ORDER BY step, attempt_no DESC, ts DESC) p
+                    SELECT DISTINCT ON (step) step, value FROM (
+                        SELECT step, value, attempt_no, ts, batch_id FROM metric_points
+                         WHERE series_id = d.s AND step >= d.b * $3 AND step < (d.b + 1) * $3
+                        UNION ALL
+                        SELECT step, value, attempt_no, ts, 0 FROM metric_step_archive
+                         WHERE series_id = d.s AND step >= d.b * $3 AND step < (d.b + 1) * $3
+                    ) all_steps ORDER BY step, attempt_no DESC, ts DESC, batch_id DESC) p
               GROUP BY d.s, d.b
              ON CONFLICT (series_id, tier, bucket_start) DO UPDATE SET
                min = EXCLUDED.min, max = EXCLUDED.max, avg = EXCLUDED.avg,
@@ -189,7 +232,7 @@ pub async fn roll_up(db: &Db, limit: i64) -> Result<usize, DbError> {
     if !min_s.is_empty() {
         sqlx::query(
             "INSERT INTO metric_rollups (series_id, tier, bucket_start, min, max, avg, last, n)
-             SELECT d.s, '1m', d.b, min(p.value), max(p.value), avg(p.value),
+             SELECT d.s, '1m', d.b, min(p.value), max(p.value), telemetry_float8(avg(p.value::text::numeric)),
                     (array_agg(p.value ORDER BY p.ts DESC))[1], count(*)::int
                FROM unnest($1::bigint[], $2::bigint[]) AS d(s, b)
                JOIN metric_points p ON p.series_id = d.s
@@ -238,10 +281,19 @@ async fn expire(t: &Telemetry, now: OffsetDateTime) -> Result<u64, JobsError> {
         now - Duration::days(c.sample_retention_days.into()),
     )
     .await?;
+    for table in ["telemetry_progress_events", "telemetry_alert_events"] {
+        let sql = format!("DELETE FROM {table} WHERE captured_at < $1");
+        n += sqlx::query(sqlx::AssertSqlSafe(sql))
+            .bind(raw_cutoff)
+            .execute(t.db.pool())
+            .await?
+            .rows_affected();
+    }
+    collect_unused_objects(t).await?;
     Ok(n)
 }
 
-/// Deletes the objects, then the rows, of `table` older than `cutoff` (500 at a time).
+// Unpublish expired objects in SQL. Keep them for an hour for readers with an older page.
 async fn expire_objects(
     t: &Telemetry,
     table: &'static str,
@@ -250,38 +302,65 @@ async fn expire_objects(
 ) -> Result<u64, JobsError> {
     let mut n = 0;
     loop {
-        // Table and column names are constants.
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
-            "SELECT id, org_id, object_key FROM {table} WHERE {at} < $1 ORDER BY id LIMIT 500"
+            "WITH expired AS (
+                 DELETE FROM {table} WHERE id IN (
+                     SELECT id FROM {table} WHERE {at} < $1 ORDER BY id LIMIT 500
+                 ) RETURNING object_key, org_id
+             ) INSERT INTO telemetry_objects (object_key, org_id)
+               SELECT object_key, org_id FROM expired
+               ON CONFLICT (object_key) DO UPDATE SET touched_at = now()"
         )))
         .bind(cutoff)
-        .fetch_all(t.db.pool())
-        .await?;
-        if rows.is_empty() {
-            return Ok(n);
-        }
-        let mut ids = Vec::with_capacity(rows.len());
-        for r in &rows {
-            let org: Uuid = r.try_get("org_id")?;
-            let key: String = r.try_get("object_key")?;
-            let store = t
-                .store
-                .org_store(&super::storage_org(org))
-                .await
-                .map_err(|e| super::stored_file_error("file", &e))?;
-            store
-                .delete(&key)
-                .await
-                .map_err(|e| super::stored_file_error("file", &e))?;
-            ids.push(r.try_get::<i64, _>("id")?);
-        }
-        n += sqlx::query(sqlx::AssertSqlSafe(format!(
-            "DELETE FROM {table} WHERE id = ANY($1)"
-        )))
-        .bind(&ids)
         .execute(t.db.pool())
         .await?
         .rows_affected();
+        n += rows;
+        if rows < 500 {
+            return Ok(n);
+        }
+    }
+}
+
+async fn collect_unused_objects(t: &Telemetry) -> Result<(), JobsError> {
+    loop {
+        let mut tx = t.db.begin().await?;
+        let Some(row) = sqlx::query(
+            "SELECT object_key, org_id FROM telemetry_objects o
+              WHERE touched_at < now() - interval '1 hour'
+                AND NOT EXISTS (SELECT 1 FROM log_index WHERE object_key = o.object_key)
+                AND NOT EXISTS (SELECT 1 FROM samples WHERE object_key = o.object_key)
+              ORDER BY touched_at LIMIT 1 FOR UPDATE SKIP LOCKED",
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+        else {
+            return Ok(());
+        };
+        let org: Uuid = row.try_get("org_id")?;
+        let key: String = row.try_get("object_key")?;
+        // The row lock may have waited for a publisher that a previous snapshot couldn't see.
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM log_index WHERE object_key = $1
+                             UNION ALL SELECT 1 FROM samples WHERE object_key = $1)",
+        )
+        .bind(&key)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !live {
+            t.store
+                .org_store(&super::storage_org(org))
+                .await
+                .map_err(|e| super::stored_file_error("file", &e))?
+                .delete(&key)
+                .await
+                .map_err(|e| super::stored_file_error("file", &e))?;
+            sqlx::query("DELETE FROM telemetry_objects WHERE object_key = $1")
+                .bind(&key)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
     }
 }
 
