@@ -27,6 +27,9 @@ mod p19_artifacts;
 // <mrl:testkit P20> P20 `pub mod` lines go right below this line.
 // <mrl:testkit P21> P21 `pub mod` lines go right below this line.
 // <mrl:testkit P22> P22 `pub mod` lines go right below this line.
+#[cfg(test)]
+#[path = "../../mrl-server/src/modules/telemetry/integration_tests.rs"]
+mod p22_telemetry;
 // <mrl:testkit P23> P23 `pub mod` lines go right below this line.
 // <mrl:testkit P24> P24 `pub mod` lines go right below this line.
 
