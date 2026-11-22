@@ -19,6 +19,7 @@ use mrl_proto::common::v1::{AttemptRef, Failure, FailureClass};
 use mrl_proto::worker::v1::ExitKind;
 use mrl_server::config::Mode;
 use mrl_server::db::Db;
+use mrl_server::modules::artifacts::{ArtifactStore, ArtifactsModule};
 use mrl_server::modules::compute::LocalAgentPool;
 use mrl_server::modules::jobs::{
     Chains, CompletionVerifier, JobChange, JobRow, JobTransitions, NewJob, Verification,
@@ -26,9 +27,10 @@ use mrl_server::modules::jobs::{
 use mrl_server::modules::nodes::lanes::LaneRouter;
 use mrl_server::modules::nodes::{Gateway, NodesModule};
 use mrl_server::modules::scheduler::admission::{MaxQueuedPerProject, PoolFlags, PoolMembership};
-use mrl_server::modules::scheduler::launch::RunConfigSpec;
+use mrl_server::modules::scheduler::launch::{RunConfigSpec, Transfer};
 use mrl_server::modules::scheduler::pipeline::{
-    Demand, LaunchContributor, LaunchError, LaunchPlan, PauseSupport, Pipeline, Placement,
+    Demand, InputFile, LaunchContributor, LaunchError, LaunchPlan, PauseSupport, Pipeline,
+    Placement,
 };
 use mrl_server::modules::scheduler::placement::SingleNodePacking;
 use mrl_server::modules::scheduler::{
@@ -61,6 +63,18 @@ impl LaunchContributor for FakeEngine {
         _placement: &Placement,
         plan: &mut LaunchPlan,
     ) -> Result<(), LaunchError> {
+        if let Some(key) = job.resource_request["input_fixture"].as_str() {
+            plan.inputs.push(InputFile {
+                name: "model".into(),
+                key: key.into(),
+                sha256: job.resource_request["input_sha256"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .into(),
+                size: job.resource_request["input_size"].as_u64().unwrap_or(0),
+                local_path: "model/weights.bin".into(),
+            });
+        }
         if job.resource_request["stage_fixture"] == true {
             plan.stage.push(mrl_proto::agent::v1::StageItem {
                 name: "fixture".into(),
@@ -168,6 +182,8 @@ struct World {
     sched: Scheduler,
     db: TestDb,
     secrets: Arc<dyn SecretStore>,
+    objects: tempfile::TempDir,
+    store: Arc<ArtifactStore>,
     pool: Uuid,
     pause: bool,
     org: Uuid,
@@ -177,13 +193,24 @@ struct World {
 async fn boot(
     db: &TestDb,
     secrets: Arc<dyn SecretStore>,
+    objects: &std::path::Path,
     port: u16,
     pause: bool,
-) -> (TestServer, Arc<Gateway>, Scheduler) {
+) -> (TestServer, Arc<Gateway>, Scheduler, Arc<ArtifactStore>) {
     let cfg = server_config(fast_config(), Mode::Solo, port);
     // A fresh router per boot: a restarted server never delivers to the old module's sink.
     let lanes = LaneRouter::new();
-    let nodes = NodesModule::new(db.db().clone(), &cfg, secrets, lanes.clone());
+    let artifacts = ArtifactsModule::with_backend(
+        db.db().clone(),
+        mrl_storage::BackendConfig::Local {
+            root: objects.join("objects"),
+        },
+        Mode::Solo,
+        objects.join("scratch"),
+    );
+    let store = artifacts.store();
+    let transfer = Transfer::new(store.clone(), artifacts.secrets(), secrets.clone());
+    let nodes = NodesModule::new(db.db().clone(), &cfg, secrets.clone(), lanes.clone());
     let gw = nodes.gateway();
     let chains = Chains::new(vec![], vec![Arc::new(VerifyAll)], vec![]);
     let module = SchedulerModule::with_parts(
@@ -193,16 +220,19 @@ async fn boot(
         &lanes,
         chains,
         pipeline(db.db(), pause),
+        transfer,
     );
     let sched = module.scheduler();
     let seams = crate::seams::build(
-        crate::seams::solo(TEST_SECRET).authorizer(QueueViewer),
+        crate::seams::solo(TEST_SECRET)
+            .authorizer(QueueViewer)
+            .secrets_arc(secrets),
         Mode::Solo,
     );
     let modules: Vec<Box<dyn mrl_server::app::ServerModule>> =
-        vec![Box::new(nodes), Box::new(module)];
+        vec![Box::new(nodes), Box::new(artifacts), Box::new(module)];
     match TestServer::start(cfg, seams, modules).await {
-        Ok(s) => (s, gw, sched),
+        Ok(s) => (s, gw, sched, store),
         Err(e) => panic!("server did not start: {}", e.explain()),
     }
 }
@@ -211,13 +241,16 @@ impl World {
     async fn start(pause: bool) -> Self {
         let db = TestDb::new().await;
         let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
-        let (server, gw, sched) = boot(&db, secrets.clone(), 0, pause).await;
+        let objects = tempfile::tempdir().unwrap();
+        let (server, gw, sched, store) = boot(&db, secrets.clone(), objects.path(), 0, pause).await;
         let mut w = Self {
             server: Some(server),
             gw,
             sched,
             db,
             secrets,
+            objects,
+            store,
             pool: Uuid::nil(),
             pause,
             org: Uuid::now_v7(),
@@ -272,10 +305,18 @@ impl World {
                 .await
                 .unwrap_or_else(|e| panic!("shutdown: {}", e.explain()));
         }
-        let (server, gw, sched) = boot(&self.db, self.secrets.clone(), port, self.pause).await;
+        let (server, gw, sched, store) = boot(
+            &self.db,
+            self.secrets.clone(),
+            self.objects.path(),
+            port,
+            self.pause,
+        )
+        .await;
         self.server = Some(server);
         self.gw = gw;
         self.sched = sched;
+        self.store = store;
     }
 
     /// An enrolled agent with `gpus` fake GPUs and a scripted attempt runtime.
@@ -1632,4 +1673,198 @@ async fn the_reaper_keeps_a_hold_renewed_while_it_waits_for_the_lock() {
     })
     .await;
     assert!(matches!(w.sched.reserve(&req).await.unwrap(), Reserved::Held(r) if r.state == "HELD"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn launch_carries_download_tickets_and_granted_secrets() {
+    use mrl_proto::agent::v1::{StageArtifacts, UpdateCredentials};
+    use prost::Message;
+    let w = World::start(false).await;
+    let m = w.agent(1).await;
+    // A stored input in the job org's storage.
+    let org = mrl_domain::ids::OrgId::from_uuid(w.org).to_string();
+    let bytes = b"fake weights".to_vec();
+    let sha = sha256_hex(&bytes);
+    let key = format!("orgs/{org}/inputs/model.bin");
+    w.store
+        .org_store(&org)
+        .await
+        .unwrap()
+        .put(&key, bytes.clone().into())
+        .await
+        .unwrap();
+    // A run with one granted secret (value in the server's secret store).
+    let run = w.run().await;
+    let secret = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO secrets_metadata (id, org_id, name, backend, ref, kind, allowed_uses, created_by)
+         VALUES ($1, $2, 'hf_hub', 'secret_store', 'mrl.secret.test', 'hf_token', '{run}', 't')",
+    )
+    .bind(secret)
+    .bind(&org)
+    .execute(w.db.pool())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO run_secret_grants (run_id, secret_id, mount) VALUES ($1, $2, 'env')")
+        .bind(run)
+        .bind(secret)
+        .execute(w.db.pool())
+        .await
+        .unwrap();
+    w.secrets
+        .set(
+            "mrl.secret.test",
+            mrl_server::seams::Secret::new("canary-7f3a".to_owned()),
+        )
+        .await
+        .unwrap();
+
+    let job = w
+        .queue_with(
+            json!({
+                "input_fixture": key, "input_sha256": sha, "input_size": bytes.len(),
+                "roles": [{"role": "trainer", "replicas": 1, "gpu_count": 1, "cpu_millis": 100, "mem_bytes": 1024}]
+            }),
+            Some(run),
+        )
+        .await;
+    let attempt = w.running(job).await;
+
+    // The staged input carries a ticket the transfer endpoint honours.
+    let stage = m
+        .script
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .find_map(|c| match &c.kind {
+            Some(Kind::StageArtifacts(s)) => Some(s.clone()),
+            _ => None,
+        })
+        .unwrap_or_else(StageArtifacts::default);
+    let item = &stage.items[0];
+    assert_eq!(
+        (
+            item.name.as_str(),
+            item.sha256.as_str(),
+            item.size,
+            item.local_path.as_str()
+        ),
+        (
+            "model",
+            sha.as_str(),
+            bytes.len() as u64,
+            "model/weights.bin"
+        )
+    );
+    assert!(item.url.starts_with("/api/v1/transfer/"), "{}", item.url);
+    assert!(item.expires_at.is_some());
+    let got = w
+        .server()
+        .request(
+            Method::GET,
+            &item.url,
+            &[(LAUNCH_SECRET_HEADER, TEST_SECRET)],
+            Body::empty(),
+        )
+        .await;
+    assert_eq!(got.status, 200, "{}", got.text());
+    assert_eq!(got.text().as_bytes(), bytes.as_slice());
+
+    // The granted secret reached the agent, before the launch.
+    let seen = m.script.seen.lock().unwrap().clone();
+    let creds = seen
+        .iter()
+        .position(|c| matches!(c.kind, Some(Kind::UpdateCredentials(_))))
+        .unwrap();
+    let launch = seen
+        .iter()
+        .position(|c| matches!(c.kind, Some(Kind::LaunchAttempt(_))))
+        .unwrap();
+    assert!(creds < launch);
+    let Some(Kind::UpdateCredentials(UpdateCredentials { credentials, .. })) =
+        seen[creds].kind.clone()
+    else {
+        unreachable!()
+    };
+    assert_eq!(credentials.len(), 1);
+    assert_eq!(credentials[0].name, "hf_hub");
+    assert_eq!(credentials[0].value, b"canary-7f3a");
+
+    // Once delivered, the value is gone from the database.
+    w.until("the delivered credentials are scrubbed", || async {
+        w.commands(attempt, "UpdateCredentials")
+            .await
+            .iter()
+            .all(|(state, payload)| state == "COMPLETED" && payload.is_empty())
+    })
+    .await;
+    let leaked: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM agent_commands WHERE position('canary-7f3a'::bytea IN payload) > 0",
+    )
+    .fetch_one(w.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(leaked, 0);
+    assert!(mrl_proto::agent::v1::Command::decode(&[][..]).is_ok());
+
+    let audited: Vec<String> = sqlx::query_scalar(
+        "SELECT action FROM audit_events
+         WHERE action IN ('transfer.ticket_issued', 'scheduler.credentials_sent') ORDER BY action",
+    )
+    .fetch_all(w.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        audited,
+        ["scheduler.credentials_sent", "transfer.ticket_issued"]
+    );
+    w.invariants().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn a_missing_secret_value_fails_the_launch_as_user_config() {
+    let w = World::start(false).await;
+    let _m = w.agent(1).await;
+    let run = w.run().await;
+    let secret = Uuid::now_v7();
+    let org = mrl_domain::ids::OrgId::from_uuid(w.org).to_string();
+    sqlx::query(
+        "INSERT INTO secrets_metadata (id, org_id, name, backend, ref, kind, allowed_uses, created_by)
+         VALUES ($1, $2, 'hf_hub', 'secret_store', 'mrl.secret.unset', 'hf_token', '{run}', 't')",
+    )
+    .bind(secret)
+    .bind(&org)
+    .execute(w.db.pool())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO run_secret_grants (run_id, secret_id, mount) VALUES ($1, $2, 'env')")
+        .bind(run)
+        .bind(secret)
+        .execute(w.db.pool())
+        .await
+        .unwrap();
+    let job = w
+        .queue_with(
+            json!({"roles": [{"role": "trainer", "replicas": 1, "gpu_count": 1, "cpu_millis": 100, "mem_bytes": 1024}]}),
+            Some(run),
+        )
+        .await;
+    let row = w.wait_state(job, "FAILED").await;
+    assert_eq!(row.failure_class.as_deref(), Some("USER_CONFIG"));
+    let attempt = row.current_attempt_id.unwrap();
+    assert!(w.commands(attempt, "LaunchAttempt").await.is_empty());
+    assert!(w.commands(attempt, "UpdateCredentials").await.is_empty());
+    assert!(w.reservations(job).await.iter().all(|r| r.0 == "RELEASED"));
+    w.invariants().await;
+}
+
+fn sha256_hex(b: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(b)
+        .iter()
+        .map(|x| format!("{x:02x}"))
+        .collect()
 }

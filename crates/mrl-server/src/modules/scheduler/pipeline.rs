@@ -276,15 +276,50 @@ pub trait AdmissionPolicy: Send + Sync {
     async fn admit(&self, job: &QueuedJob, pool: &PoolInfo) -> Result<Admission, SchedError>;
 }
 
-/// What a launch carries; contributors fill it in order.
-#[derive(Debug, Clone, Default, PartialEq)]
+/// What a launch carries; contributors fill it in order. After the chain, launch issues a
+/// download ticket ([`crate::modules::artifacts::ArtifactStore::ticket`]) for every
+/// [`InputFile`] and adds the run's granted secrets
+/// ([`crate::modules::secrets::SecretResolver::resolve_for_run`]) to `credentials`.
+#[derive(Clone, Default, PartialEq)]
 pub struct LaunchPlan {
     /// The command (attempt ref, roles, allocation and lease are set before the chain).
     pub launch: LaunchAttempt,
-    /// Inputs to stage before the launch (`StageArtifacts`).
+    /// Stored files the attempt needs, in the job org's storage (no ticket yet).
+    pub inputs: Vec<InputFile>,
+    /// Inputs to stage before the launch (`StageArtifacts`), with their links.
     pub stage: Vec<StageItem>,
     /// Credentials to hand over before the launch (`UpdateCredentials`).
     pub credentials: Vec<Credential>,
+}
+
+/// Never prints credential values.
+impl std::fmt::Debug for LaunchPlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LaunchPlan")
+            .field("launch", &self.launch)
+            .field("inputs", &self.inputs)
+            .field("stage", &self.stage)
+            .field(
+                "credentials",
+                &self.credentials.iter().map(|c| &c.name).collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+/// A stored file to stage for the attempt.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InputFile {
+    /// Name the worker sees, like `model`, `dataset.train` or `resume_from`.
+    pub name: String,
+    /// Object key in the job org's storage area, like `orgs/{org}/blobs/sha256/…`.
+    pub key: String,
+    /// Lowercase hex sha256 of the file.
+    pub sha256: String,
+    /// Size in bytes.
+    pub size: u64,
+    /// Path relative to the attempt's staging folder.
+    pub local_path: String,
 }
 
 /// Why a launch could not be built.

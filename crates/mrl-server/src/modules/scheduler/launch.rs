@@ -11,22 +11,192 @@ use super::pipeline::{LaunchContributor, LaunchError, LaunchPlan, Placement};
 use super::reservations::ReservationRow;
 use super::{Core, SchedError};
 use crate::db::Db;
+use crate::modules::artifacts::ArtifactStore;
 use crate::modules::compute::GpuSlot;
 use crate::modules::jobs::{AttemptRow, JobRow, JobTransitions};
 use crate::modules::nodes::commands::NewCommand;
+use crate::modules::secrets::SecretResolver;
+use crate::seams::{Principal, PrincipalKind, RequestContext, Seams, SecretStore};
 use mrl_domain::failure::FailureClass;
 use mrl_domain::ids::{
     AttemptId, CheckpointId, DatasetVersionId, JobId, ModelVersionId, NodeId, RewardVersionId,
     RunId,
 };
 use mrl_proto::agent::v1::command::Kind;
-use mrl_proto::agent::v1::{LaunchAttempt, RoleLaunch, StageArtifacts, UpdateCredentials};
+use mrl_proto::agent::v1::{
+    Credential, LaunchAttempt, RoleLaunch, StageArtifacts, StageItem, UpdateCredentials,
+};
 use mrl_proto::common::v1::AttemptRef;
 use prost::Message;
 use serde_json::{json, Map, Value};
 use sqlx::Row;
+use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
+
+/// What launch uses from P19: download tickets for [`LaunchPlan::inputs`] and the run's
+/// granted secrets.
+pub struct Transfer {
+    store: Arc<ArtifactStore>,
+    resolver: SecretResolver,
+    secrets: SecretSource,
+    seams: tokio::sync::OnceCell<Seams>,
+}
+
+enum SecretSource {
+    Given(Arc<dyn SecretStore>),
+    Keychain {
+        service: String,
+        dir: Result<std::path::PathBuf, String>,
+        backend: crate::modules::keychain::KeychainBackend,
+    },
+}
+
+impl Transfer {
+    /// Storage from `[object_store]` and the keychain `main` opens for the server's seams.
+    // ponytail: a second handle on the server's keychain (P23 has one too), because modules
+    // can't reach the seams; a module hook that hands modules `AppState` would replace both.
+    pub fn from_config(db: &Db, config: &crate::Config) -> Self {
+        let artifacts = crate::modules::artifacts::ArtifactsModule::new(db.clone(), config);
+        Self {
+            store: artifacts.store(),
+            resolver: artifacts.secrets(),
+            secrets: SecretSource::Keychain {
+                service: config.auth.keychain_service.clone(),
+                dir: crate::pgbundle::data_dir(&config.pgbundle)
+                    .map(|d| d.join("secrets"))
+                    .map_err(|e| e.to_string()),
+                backend: config.keychain.backend,
+            },
+            seams: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Explicit parts (tests, other builds). `secrets` must be the store that holds the
+    /// ticket signing key of the server that serves `/transfer`.
+    pub fn new(
+        store: Arc<ArtifactStore>,
+        resolver: SecretResolver,
+        secrets: Arc<dyn SecretStore>,
+    ) -> Self {
+        Self {
+            store,
+            resolver,
+            secrets: SecretSource::Given(secrets),
+            seams: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    async fn seams(&self, db: &Db) -> Result<&Seams, LaunchError> {
+        self.seams
+            .get_or_try_init(|| async {
+                let secrets: Arc<dyn SecretStore> = match &self.secrets {
+                    SecretSource::Given(s) => s.clone(),
+                    SecretSource::Keychain {
+                        service,
+                        dir,
+                        backend,
+                    } => {
+                        let dir = dir.as_ref().map_err(|e| {
+                            LaunchError::Transient(format!("The secret store can't be opened: {e}"))
+                        })?;
+                        Arc::new(
+                            crate::modules::keychain::KeychainStore::open(service, dir, *backend)
+                                .await,
+                        )
+                    }
+                };
+                // Solo checks need no identity provider; only `secrets` and `audit` are used.
+                Seams::production(crate::config::Mode::Solo, "")
+                    .secrets_arc(secrets)
+                    .audit(crate::modules::audit::PgAuditSink::new(db.clone()))
+                    .build(crate::config::Mode::Solo)
+                    .map_err(|e| {
+                        LaunchError::Transient(format!("The secret store can't be used: {e}"))
+                    })
+            })
+            .await
+    }
+
+    /// Turns `plan.inputs` into staged items with download tickets and adds the run's
+    /// granted secrets to `plan.credentials`. `staged` / `credited`: the agent already took
+    /// them for this epoch, so nothing is issued again.
+    async fn fill(
+        &self,
+        db: &Db,
+        job: &JobRow,
+        attempt: &AttemptRow,
+        plan: &mut LaunchPlan,
+        (staged, credited): (bool, bool),
+    ) -> Result<(), LaunchError> {
+        if staged {
+            plan.inputs.clear();
+        }
+        let secrets = job.run_id.filter(|_| !credited);
+        if plan.inputs.is_empty() && secrets.is_none() {
+            return Ok(());
+        }
+        let seams = self.seams(db).await?;
+        let org = crate::modules::jobs::scope::org_text(job.org_id)
+            .unwrap_or_else(|| crate::modules::artifacts::LOCAL_ORG.to_owned());
+        let ctx = RequestContext {
+            principal: Principal {
+                id: "system:scheduler".into(),
+                kind: PrincipalKind::Service,
+                org: Some(org.clone()),
+            },
+            org: Some(org.clone()),
+            project: Some(mrl_domain::ids::ProjectId::from_uuid(job.project_id).to_string()),
+            trace_id: attempt.id.simple().to_string(),
+            request_id: Uuid::now_v7().to_string(),
+        };
+        for f in std::mem::take(&mut plan.inputs) {
+            let t = self
+                .store
+                .ticket(seams, &ctx, &f.key, mrl_storage::TicketMethod::Get, f.size)
+                .await
+                .map_err(p19)?;
+            plan.stage.push(StageItem {
+                name: f.name,
+                url: t.url,
+                sha256: f.sha256,
+                size: f.size,
+                local_path: f.local_path,
+                expires_at: Some(prost_types::Timestamp {
+                    seconds: t.expires_at.unix_timestamp(),
+                    nanos: 0,
+                }),
+            });
+        }
+        if let Some(run) = secrets {
+            let granted = self
+                .resolver
+                .resolve_for_run(seams.secrets.as_ref(), &org, RunId::from_uuid(run))
+                .await
+                .map_err(p19)?;
+            plan.credentials
+                .extend(granted.into_iter().map(|s| Credential {
+                    name: s.name,
+                    value: s.value.expose().as_bytes().to_vec(),
+                    expires_at: None,
+                }));
+        }
+        Ok(())
+    }
+}
+
+/// A storage or secret failure: the server's own trouble retries, anything else is the
+/// job's settings (a missing file, a secret with no value or not allowed for runs).
+fn p19(e: crate::modules::artifacts::Error) -> LaunchError {
+    if e.status().is_server_error() {
+        LaunchError::Transient(format!("Storage or the secret store did not answer: {e}"))
+    } else {
+        LaunchError::Fail(
+            FailureClass::UserConfig,
+            format!("An input or secret of this job can't be used: {e}"),
+        )
+    }
+}
 
 /// GPU indices per role, as stored on the reservation: `{"trainer": [0, 1]}`.
 pub fn role_gpus(p: &Placement) -> Value {
@@ -274,6 +444,22 @@ pub(crate) async fn plan(
             "No training engine or environment is chosen for this job yet, so it can't start. Submit it again once its method has an installed engine.".into(),
         )));
     }
+    let done = (
+        latest_command(&core.db, "StageArtifacts", attempt)
+            .await?
+            .is_some(),
+        latest_command(&core.db, "UpdateCredentials", attempt)
+            .await?
+            .is_some(),
+    );
+    if let Err(e) = core
+        .transfer
+        .fill(&core.db, job, attempt, &mut plan, done)
+        .await
+    {
+        tracing::info!(error = %e, "the launch inputs could not be prepared");
+        return Ok(Err(e));
+    }
     Ok(Ok(plan))
 }
 
@@ -302,6 +488,7 @@ async fn prerequisite(
 async fn send(
     core: &Core,
     node: Uuid,
+    job: &JobRow,
     attempt: &AttemptRow,
     plan: LaunchPlan,
 ) -> Result<(), SchedError> {
@@ -325,7 +512,24 @@ async fn send(
             attempt: r,
             credentials: plan.credentials,
         });
-        if !prerequisite(core, node, attempt, "UpdateCredentials", command(k)).await? {
+        let first = latest_command(&core.db, "UpdateCredentials", attempt)
+            .await?
+            .is_none();
+        let sent = prerequisite(core, node, attempt, "UpdateCredentials", command(k)).await?;
+        if first {
+            let mut tx = core.db.begin().await?;
+            let target = AttemptId::from_uuid(attempt.id).to_string();
+            core.audit(
+                &mut tx,
+                job.org_id,
+                Some(job.project_id),
+                "scheduler.credentials_sent",
+                target,
+            )
+            .await?;
+            tx.commit().await?;
+        }
+        if !sent {
             return Ok(());
         }
     }
@@ -426,38 +630,21 @@ pub(crate) async fn ensure_launched(
     let pool = super::pool_info(&core.db, res.pool_id).await?;
     let lease = pool.map_or(Duration::from_secs(90), |p| p.lease_ttl);
     match latest_command(&core.db, "LaunchAttempt", attempt).await? {
-        None => match plan(core, job, attempt, &res, lease).await? {
-            Ok(p) => {
-                let Some((current_job, current_attempt)) =
-                    current(core, job.org_id, job.id).await?
-                else {
-                    return Ok(());
-                };
-                if current_job.state != "PREPARING"
-                    || current_attempt.id != attempt.id
-                    || current_attempt.state != "PENDING"
-                {
-                    return Ok(());
-                }
-                if let Err(e) = send(core, res.node_id, attempt, p).await {
-                    // A refused command (machine draining or removed) can't be sent again.
-                    if matches!(
-                        e,
-                        SchedError::Nodes(crate::modules::nodes::NodesError::CommandRefused(_))
-                    ) {
-                        let why = format!("The machine did not take the launch: {e}");
-                        return end_unstarted(core, attempt, FailureClass::InfraTransient, why)
-                            .await;
+        None => {
+            // A prerequisite sent earlier for this epoch: wait for its result (or end the
+            // attempt when it failed), so tickets and secrets go out once.
+            for kind in ["StageArtifacts", "UpdateCredentials"] {
+                match latest_command(&core.db, kind, attempt).await? {
+                    Some(row) if row.in_flight() && !row.past_deadline => return Ok(()),
+                    Some(row) if !row.accepted() => {
+                        let (class, why) = (row.failure_class(), row.failure_message());
+                        return end_unstarted(core, attempt, class, why).await;
                     }
-                    return Err(e);
+                    _ => {}
                 }
-                Ok(())
             }
-            Err(LaunchError::Transient(why)) => {
-                end_unstarted(core, attempt, FailureClass::InfraTransient, why).await
-            }
-            Err(LaunchError::Fail(class, why)) => end_unstarted(core, attempt, class, why).await,
-        },
+            launch_new(core, job, attempt, &res, lease).await
+        }
         Some(row) if row.in_flight() && !row.past_deadline => Ok(()),
         Some(row) if row.accepted() => {
             let wait = lease + Duration::from_secs(core.cfg.lease_grace_seconds);
@@ -469,6 +656,46 @@ pub(crate) async fn ensure_launched(
             }
         }
         Some(row) => end_unstarted(core, attempt, row.failure_class(), row.failure_message()).await,
+    }
+}
+
+/// Plans and sends the launch of a PENDING attempt that has none yet.
+async fn launch_new(
+    core: &Core,
+    job: &JobRow,
+    attempt: &AttemptRow,
+    res: &ReservationRow,
+    lease: Duration,
+) -> Result<(), SchedError> {
+    match plan(core, job, attempt, res, lease).await? {
+        Ok(p) => {
+            let Some((current_job, current_attempt)) = current(core, job.org_id, job.id).await?
+            else {
+                return Ok(());
+            };
+            if current_job.state != "PREPARING"
+                || current_attempt.id != attempt.id
+                || current_attempt.state != "PENDING"
+            {
+                return Ok(());
+            }
+            if let Err(e) = send(core, res.node_id, job, attempt, p).await {
+                // A refused command (machine draining or removed) can't be sent again.
+                if matches!(
+                    e,
+                    SchedError::Nodes(crate::modules::nodes::NodesError::CommandRefused(_))
+                ) {
+                    let why = format!("The machine did not take the launch: {e}");
+                    return end_unstarted(core, attempt, FailureClass::InfraTransient, why).await;
+                }
+                return Err(e);
+            }
+            Ok(())
+        }
+        Err(LaunchError::Transient(why)) => {
+            end_unstarted(core, attempt, FailureClass::InfraTransient, why).await
+        }
+        Err(LaunchError::Fail(class, why)) => end_unstarted(core, attempt, class, why).await,
     }
 }
 

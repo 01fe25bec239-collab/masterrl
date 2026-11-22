@@ -107,7 +107,24 @@ pub async fn once(core: &Core, leader_for: Duration) {
     log("launches", launches(core, leader_for).await);
     log("controls", controls(core).await);
     log("finalize", finalize_all(core).await);
+    log("scrub", scrub(core).await);
     log("queue", queue(core, leader_for).await);
+}
+
+/// Empties the payload of every `UpdateCredentials` command that can never be sent again, so
+/// secret values don't stay in the database. An unsent EXPIRED command of a still PENDING
+/// attempt is kept: the gap pass may send it again.
+async fn scrub(core: &Core) -> Result<(), SchedError> {
+    sqlx::query(
+        "UPDATE agent_commands c SET payload = ''::bytea
+         WHERE c.kind = 'UpdateCredentials' AND octet_length(c.payload) > 0
+           AND c.state NOT IN ('PENDING','SENT','RECEIVED')
+           AND (c.state <> 'EXPIRED' OR c.sent_at IS NOT NULL OR NOT EXISTS (
+             SELECT 1 FROM job_attempts a WHERE a.id = c.attempt_id AND a.state = 'PENDING'))",
+    )
+    .execute(core.db.pool())
+    .await?;
+    Ok(())
 }
 
 async fn gap(core: &Core) -> Result<(), SchedError> {

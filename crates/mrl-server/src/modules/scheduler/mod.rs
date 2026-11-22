@@ -258,6 +258,7 @@ pub struct Core {
     pub(crate) sender: CommandSender,
     pub(crate) chains: Chains,
     pub(crate) pipeline: Pipeline,
+    pub(crate) transfer: launch::Transfer,
     pub(crate) wake: tokio::sync::Notify,
 }
 
@@ -621,6 +622,7 @@ impl SchedulerModule {
             &LaneRouter::global(),
             Chains::registered(&db),
             registry::pipeline(&db, &config.scheduler),
+            launch::Transfer::from_config(&db, config),
         )
     }
 
@@ -632,6 +634,7 @@ impl SchedulerModule {
         lanes: &Arc<LaneRouter>,
         chains: Chains,
         pipeline: Pipeline,
+        transfer: launch::Transfer,
     ) -> Self {
         let core = Arc::new(Core {
             db,
@@ -639,6 +642,7 @@ impl SchedulerModule {
             sender: CommandSender::new(gw, KINDS),
             chains,
             pipeline,
+            transfer,
             wake: tokio::sync::Notify::new(),
         });
         lanes.register(Arc::new(control::ControlSink::new(core.clone())));
