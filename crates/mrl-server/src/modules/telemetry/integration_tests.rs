@@ -11,7 +11,7 @@ use crate::server::{TestResponse, TestServer, TEST_SECRET};
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::Method;
-use mrl_domain::ids::{AttemptId, NodeId, OrgId, RunId};
+use mrl_domain::ids::{AttemptId, NodeId, OrgId, ProjectId, RunId};
 use mrl_proto::agent::v1::{agent_message::Body as AgentBody, AgentMessage, Lane, WorkerRelay};
 use mrl_proto::common::v1::AttemptRef;
 use mrl_proto::worker::v1::worker_message::Body as WorkerBody;
@@ -32,6 +32,9 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
+
+#[path = "../streams/integration_tests.rs"]
+mod streams;
 
 #[path = "../alerts/integration_tests.rs"]
 mod alerts;
@@ -154,6 +157,10 @@ impl World {
         }
         let modules: Vec<Box<dyn mrl_server::app::ServerModule>> = vec![
             Box::new(module),
+            Box::new(mrl_server::modules::streams::StreamsModule::new(
+                db.db().clone(),
+                live,
+            )),
             Box::new(mrl_server::modules::alerts::AlertsModule::new(
                 db.db().clone(),
             )),
@@ -262,6 +269,10 @@ impl Seeded {
 
     pub fn attempt_id(&self) -> String {
         AttemptId::from_uuid(self.attempt).to_string()
+    }
+
+    pub fn project_id(&self) -> String {
+        ProjectId::from_uuid(self.project).to_string()
     }
 }
 

@@ -3328,6 +3328,17 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-QUOTA-220")),
+            ("title", Value::Str("Too many live views are open.")),
+            ("why", Value::Str("Each sign-in may keep up to 10 live views (streams) open at once, each watching up to 50 things. This request would go over that.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Close live views you no longer need, like old browser tabs on run pages."),
+                    Value::Str("Watch fewer things in one view, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-RES-001")),
             ("title", Value::Str("The item you asked for could not be found.")),
             ("why", Value::Str("It may have been deleted, or the link may point to the wrong item.")),
@@ -3526,6 +3537,16 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-STATE-220")),
+            ("title", Value::Str("This alert is already resolved.")),
+            ("why", Value::Str("Someone resolved this alert, so it takes no more changes. If the problem comes back, a new alert opens.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Refresh the alert list to see its current state."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-STORE-001")),
             ("title", Value::Str("The app refused a storage path.")),
             ("why", Value::Str("The path points outside your workspace's storage area, or it has a part the app doesn't allow, like `..`.")),
@@ -3681,6 +3702,17 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Send the parts listed in Details again."),
                     Value::Str("Then finish the upload again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STORE-220")),
+            ("title", Value::Str("A saved log or sample file is missing or damaged.")),
+            ("why", Value::Str("Older logs and samples are kept as files in storage. The file for this part is missing, or its contents don't match the checksum saved when it was written.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check that the storage service is running and reachable."),
+                    Value::Str("If the file was deleted by a storage cleanup rule, this part of the log can't be shown any more."),
                 ])),
             ])),
         ]),

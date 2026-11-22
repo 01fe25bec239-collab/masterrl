@@ -1,0 +1,40 @@
+name: ci-telemetry
+
+# P22 telemetry, live streams and alerts against PostgreSQL (same setup as `just dev`).
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-telemetry-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  telemetry:
+    name: telemetry (postgres)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      DATABASE_URL: postgres://mrl:mrl-dev-only@127.0.0.1:55432/masterrl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+
+      - name: start PostgreSQL
+        run: docker compose -f deploy/local/compose.yaml up -d --wait postgres
+
+      - name: P22 integration tests (ingest, history, logs, samples, streams, alerts)
+        run: cargo test -p mrl-testkit --locked p22_ -- --ignored --test-threads=4
+
+      - name: database logs
+        if: failure()
+        run: docker compose -f deploy/local/compose.yaml logs postgres

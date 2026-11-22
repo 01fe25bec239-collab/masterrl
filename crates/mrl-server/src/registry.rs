@@ -66,6 +66,10 @@ pub fn modules(db: &Db, config: &crate::Config) -> Vec<Box<dyn ServerModule>> {
             db.clone(),
             config,
         )),
+        Box::new(crate::modules::streams::StreamsModule::new(
+            db.clone(),
+            config.live.clone(),
+        )),
         Box::new(crate::modules::alerts::AlertsModule::new(db.clone())),
         // <mrl:register P23> P23 modules go right below this line.
         // <mrl:register P24> P24 modules go right below this line.
