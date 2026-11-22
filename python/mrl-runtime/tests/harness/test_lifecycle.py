@@ -84,6 +84,55 @@ def test_pause_checkpoints_then_exits_paused(tmp_path: Path) -> None:
     assert report.final_step < 200
 
 
+async def _pause_at_step_2(agent: FakeAgent, _: object) -> None:
+    await agent.wait_for(lambda m: m.HasField("progress") and m.progress.step >= 2)
+    await agent.send(pb.AgentMessage(pause=pb.PauseRequest(request_id="p1", deadline_s=10)))
+
+
+def test_pause_whose_checkpoint_is_rejected_is_not_paused(tmp_path: Path) -> None:
+    r = _run(
+        tmp_path,
+        {"steps": 200, "checkpoint_every": 0, "step_seconds": 0.01},
+        control=_pause_at_step_2,
+        commit_state=pb.COMMIT_STATE_REJECTED,
+    )
+    assert _cls(r) == "FAILURE_CLASS_INFRA_TRANSIENT/PAUSE_NOT_SAVED"
+    report = r.exit_report
+    assert report is not None
+    assert report.failure.retryable_hint
+    assert "p1" not in report.acknowledged_requests
+    assert report.last_committed_checkpoint_id == ""
+
+
+def test_pause_whose_commit_is_never_confirmed_is_not_paused(tmp_path: Path) -> None:
+    spec = job_spec(
+        ALGO,
+        {"steps": 200, "checkpoint_every": 0, "step_seconds": 0.01},
+        harness={"commit_timeout_s": 1},
+    )
+    r = _run(tmp_path, {}, spec=spec, control=_pause_at_step_2, answer_commits=False)
+    assert _cls(r) == "FAILURE_CLASS_INFRA_TRANSIENT/PAUSE_NOT_SAVED"
+    report = r.exit_report
+    assert report is not None
+    assert "p1" not in report.acknowledged_requests
+
+
+def test_a_checkpoint_request_is_acknowledged_only_once_committed(tmp_path: Path) -> None:
+    async def ask(agent: FakeAgent, _: object) -> None:
+        await agent.wait_for(lambda m: m.HasField("progress") and m.progress.step >= 2)
+        await agent.send(pb.AgentMessage(checkpoint_request=pb.CheckpointRequest(request_id="c1")))
+
+    r = _run(
+        tmp_path,
+        {"steps": 30, "checkpoint_every": 0, "step_seconds": 0.01},
+        control=ask,
+        commit_state=pb.COMMIT_STATE_REJECTED,
+    )
+    report = r.exit_report
+    assert report is not None
+    assert "c1" not in report.acknowledged_requests
+
+
 def test_on_demand_checkpoint_keeps_training(tmp_path: Path) -> None:
     async def ask(agent: FakeAgent, _: object) -> None:
         await agent.wait_for(lambda m: m.HasField("progress") and m.progress.step >= 2)

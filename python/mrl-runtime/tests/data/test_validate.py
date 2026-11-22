@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from mrl_runtime.data import validate as validate_module
 from mrl_runtime.data.readers import Limits, read_records
 from mrl_runtime.data.validate import (
     DATASET_SCHEMAS,
@@ -211,6 +212,17 @@ def test_schema_dir_is_found_or_named(tmp_path: Path) -> None:
     assert (find_schema_dir() / "sft.messages.v1.schema.json").is_file()
     with pytest.raises(MrlError):
         find_schema_dir(tmp_path / "x.py")
+
+
+def test_schemas_ship_inside_the_package_and_match_the_source() -> None:
+    # An installed runtime (site-packages, no checkout) must still find them.
+    packaged = find_schema_dir()
+    assert packaged.parent == Path(validate_module.__file__).resolve().parent
+    source = find_schema_dir(Path(__file__))
+    names = sorted(p.name for p in source.glob("*.schema.json"))
+    assert names == sorted(p.name for p in packaged.glob("*.schema.json"))
+    for name in names:
+        assert (packaged / name).read_bytes() == (source / name).read_bytes(), name
 
 
 def test_lone_surrogate_is_a_defect_not_a_crash(tmp_path: Path) -> None:

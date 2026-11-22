@@ -155,6 +155,18 @@ def test_restore_path_and_parent(tmp_path: Path) -> None:
     assert asyncio.run(go()) == "ckpt_parent"
 
 
+def test_a_resumed_attempt_reports_the_resumed_checkpoint_until_a_new_one_commits(
+    tmp_path: Path,
+) -> None:
+    resume = tmp_path / "resume"
+    resume.mkdir()
+    (resume / MANIFEST_FILE).write_text(json.dumps({"checkpoint_id": "ckpt_parent"}))
+    provider = CheckpointProvider(lambda _m: None, _settings(tmp_path, resume_from=resume))
+    assert provider.last_committed_id == "ckpt_parent"
+    fresh = CheckpointProvider(lambda _m: None, _settings(tmp_path))
+    assert fresh.last_committed_id == ""
+
+
 @pytest.mark.parametrize("state", [pb.COMMIT_STATE_CORRUPT, pb.COMMIT_STATE_REJECTED])
 def test_final_checkpoint_not_committed_fails_the_run(
     tmp_path: Path, state: pb.CommitState

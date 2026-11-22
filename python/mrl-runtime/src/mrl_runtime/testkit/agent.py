@@ -43,6 +43,7 @@ class AgentScript:
     max_message_bytes: int = 0
     auto_start: bool = True
     commit_state: pb.CommitState = pb.COMMIT_STATE_COMMITTED
+    answer_commits: bool = True  # False: commit requests are never answered (commit timeout)
     grant_prefix: str = ""  # non-empty: the grant moves each staged file under this prefix
 
 
@@ -266,6 +267,8 @@ class FakeAgent:
             manifest = next(f.path for f in staged.files if f.role == "manifest")
             where = self.script.staging_dir / self._grants[req.checkpoint_id][manifest]
             self.commits[req.checkpoint_id] = (state, staged.step, where.parent)
+            if not self.script.answer_commits:
+                return
             ack = pb.CheckpointCommitAck(
                 checkpoint_id=req.checkpoint_id, state=state, reason=reason
             )

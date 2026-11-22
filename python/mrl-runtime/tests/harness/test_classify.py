@@ -225,6 +225,11 @@ _CORRUPT = CommitResult("ckpt_1", pb.COMMIT_STATE_CORRUPT)
         ),
         (ExitState(final_staged=True), pb.EXIT_KIND_FAILED, common.FAILURE_CLASS_INFRA_TRANSIENT),
         (ExitState(cancelled=True, paused=True), pb.EXIT_KIND_CANCELLED, None),
+        (
+            ExitState(paused=True, pause_saved=False),
+            pb.EXIT_KIND_FAILED,
+            common.FAILURE_CLASS_INFRA_TRANSIENT,
+        ),
         (ExitState(final_staged=True, cancelled=True), pb.EXIT_KIND_CANCELLED, None),
         (ExitState(paused=True), pb.EXIT_KIND_PAUSED, None),
         (ExitState(paused=True, final_staged=True, final_commit=_OK), pb.EXIT_KIND_COMPLETED, None),

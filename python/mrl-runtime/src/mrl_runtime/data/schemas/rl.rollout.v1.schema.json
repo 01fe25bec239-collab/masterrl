@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.masterrl.dev/datasets/rl.rollout.v1.schema.json",
+  "title": "rl.rollout.v1",
+  "description": "One generated sample from online RL with its rewards (the rollout archive). A failed sample is never a bare 0: status and resolution say what happened.",
+  "type": "object",
+  "required": ["sample_id", "group_id", "batch_no", "prompt", "completion", "status", "resolution", "reward_total"],
+  "oneOf": [{ "required": ["policy_version"] }, { "required": ["version_spans"] }],
+  "properties": {
+    "sample_id": { "$ref": "common.v1.schema.json#/$defs/text" },
+    "group_id": { "description": "All samples of one prompt share a group.", "$ref": "common.v1.schema.json#/$defs/text" },
+    "batch_no": { "type": "integer", "minimum": 0 },
+    "prompt": { "$ref": "common.v1.schema.json#/$defs/textOrMessages" },
+    "completion": { "type": "string" },
+    "token_count": { "type": "integer", "minimum": 0 },
+    "finish_reason": { "enum": ["stop", "length", "tool_calls", "abort"] },
+    "policy_version": { "type": "integer", "minimum": 0 },
+    "version_spans": {
+      "description": "Async runs: which policy version sampled which token range.",
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["start", "end", "policy_version"],
+        "properties": {
+          "start": { "type": "integer", "minimum": 0 },
+          "end": { "type": "integer", "minimum": 0 },
+          "policy_version": { "type": "integer", "minimum": 0 }
+        },
+        "additionalProperties": false
+      }
+    },
+    "reward_total": { "description": "null when the sample is masked.", "type": ["number", "null"] },
+    "components": {
+      "description": "Component id -> value; null when the component does not apply.",
+      "type": "object",
+      "additionalProperties": { "type": ["number", "null"] }
+    },
+    "status": { "enum": ["ok", "timeout", "error", "invalid_output", "not_applicable", "invalid_input"] },
+    "resolution": { "enum": ["scored", "masked", "fallback_applied"] },
+    "flags": { "type": "array", "items": { "type": "string" } },
+    "episode": { "$ref": "agent.multiturn.v1.schema.json" }
+  },
+  "additionalProperties": false
+}
