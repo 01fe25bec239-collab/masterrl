@@ -659,6 +659,24 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         "The agent was stopping and did not run the command.",
     ),
     // <mrl:errors P21> rows for P21 go right below this line.
+    (
+        code(ErrorFamily::Cap, 210),
+        "No machine in this pool can run this job as asked.",
+    ),
+    (code(Quota, 210), "This job is waiting for a free machine."),
+    (
+        code(Quota, 211),
+        "This pool is paused and starts no new work.",
+    ),
+    (
+        code(Quota, 212),
+        "Too many jobs of this project are ahead in the queue.",
+    ),
+    (code(Perm, 210), "No pool is open to this project."),
+    (
+        code(Conflict, 210),
+        "This reservation was changed by a newer holder.",
+    ),
     // <mrl:errors P22> rows for P22 go right below this line.
     // <mrl:errors P23> rows for P23 go right below this line.
     // <mrl:errors P24> rows for P24 go right below this line.
