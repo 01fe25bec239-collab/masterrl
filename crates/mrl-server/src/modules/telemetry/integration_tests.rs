@@ -33,6 +33,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use uuid::Uuid;
 
+#[path = "../alerts/integration_tests.rs"]
+mod alerts;
+
 /// Who sends a request.
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Who {
@@ -149,7 +152,12 @@ impl World {
         ] {
             (b.per_second, b.burst) = (100_000, 100_000);
         }
-        let modules: Vec<Box<dyn mrl_server::app::ServerModule>> = vec![Box::new(module)];
+        let modules: Vec<Box<dyn mrl_server::app::ServerModule>> = vec![
+            Box::new(module),
+            Box::new(mrl_server::modules::alerts::AlertsModule::new(
+                db.db().clone(),
+            )),
+        ];
         let srv = TestServer::start(c, seams, modules)
             .await
             .unwrap_or_else(|e| panic!("test server did not start: {}", e.explain()));
