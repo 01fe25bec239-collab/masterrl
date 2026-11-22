@@ -185,6 +185,8 @@ def make_bridge(  # noqa: PLR0913 (keyword-only settings)
                 for k, v in (logs or {}).items()
                 if k in sources and isinstance(v, int | float) and not isinstance(v, bool)
             }
+            if "eval_loss" in values and not math.isfinite(values["eval_loss"]):
+                raise FloatingPointError("Evaluation loss is not finite.")
             for split in sorted({sources[k] for k in values}):
                 part = {k: v for k, v in values.items() if sources[k] == split}
                 self.emit(Metrics(int(state.global_step), part, split=split))

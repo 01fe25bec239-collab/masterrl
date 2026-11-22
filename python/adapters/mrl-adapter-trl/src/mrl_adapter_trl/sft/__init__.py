@@ -144,19 +144,25 @@ def _rows(path: Path, schema: str, limit: int | None) -> Iterator[dict[str, Any]
                 DATASET_INVALID, f"{where}: {d.message} ({d.code} at {d.path or '/'})."
             )
         value: dict[str, Any] = record.value
-        extra = [k for k in UNSUPPORTED_FIELDS if k in value]
-        if extra:
-            raise DatasetError(
-                DATASET_INVALID,
-                f"{where} has {extra[0]}, which this engine version doesn't train on.",
-                f"Remove the {extra[0]} field from the dataset.",
-            )
+        if error := _unsupported_record(value, where):
+            raise error
         row = {k: value[k] for k in COLUMNS[schema]}
         if schema == "sft.prompt_completion.v1" and _conversational(row):
             for key, role in (("prompt", "user"), ("completion", "assistant")):
                 if isinstance(row[key], str):
                     row[key] = [{"role": role, "content": row[key]}]
         yield row
+
+
+def _unsupported_record(row: Mapping[str, Any], where: str) -> DatasetError | None:
+    for key in UNSUPPORTED_FIELDS:
+        if key in row:
+            return DatasetError(
+                DATASET_INVALID,
+                f"{where} has {key}, which this engine version doesn't train on.",
+                f"Remove the {key} field from the dataset.",
+            )
+    return None
 
 
 def _conversational(row: Mapping[str, Any]) -> bool:
@@ -197,34 +203,52 @@ def _sample_prompts(rows: Iterable[Mapping[str, Any]], schema: str, tokenizer: A
     return prompts
 
 
-def _make_sampler(prompts: list[str]) -> Any:
+def _make_sampler(prompts: list[str], max_tokens: int) -> Any:
+    # Keep room for a completion even when the training context is short.
+    new_tokens = min(SAMPLE_NEW_TOKENS, max_tokens // 2)
+    prompt_tokens = max_tokens - new_tokens
+
     def sample(model: Any, tokenizer: Any, step: int) -> Samples | None:
         import torch  # noqa: PLC0415 (lazy: probe() reports a broken ML environment)
 
-        if model is None or tokenizer is None or not prompts:
+        if model is None or tokenizer is None or not prompts or not new_tokens:
             return None
         items: list[RolloutSample] = []
         was_training = model.training
         model.eval()
         try:
             for i, prompt in enumerate(prompts):
-                inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+                inputs = tokenizer(
+                    prompt,
+                    return_tensors="pt",
+                    add_special_tokens=False,
+                    truncation=True,
+                    max_length=prompt_tokens,
+                )
+                input_ids = inputs["input_ids"][0]
+                if not len(input_ids):
+                    continue
+                sample_prompt = (
+                    tokenizer.decode(input_ids) if len(input_ids) == prompt_tokens else prompt
+                )
                 inputs = {k: v.to(model.device) for k, v in inputs.items()}
                 with torch.no_grad():
                     out = model.generate(
                         **inputs,
-                        max_new_tokens=SAMPLE_NEW_TOKENS,
+                        max_new_tokens=new_tokens,
                         do_sample=False,
                         pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
                     )
                 new = out[0][inputs["input_ids"].shape[1] :]
                 text = tokenizer.decode(new, skip_special_tokens=True)
                 items.append(
-                    RolloutSample(f"step{step}-{i}", prompt, text, completion_tokens=len(new))
+                    RolloutSample(
+                        f"step{step}-{i}", sample_prompt, text, completion_tokens=len(new)
+                    )
                 )
         finally:
             model.train(was_training)
-        return Samples(step, tuple(items))
+        return Samples(step, tuple(items)) if items else None
 
     return sample
 
@@ -402,16 +426,24 @@ def _dataset_issues(
     role: str, path: Path, algorithm: str, inspection: ModelInspection | None
 ) -> list[Issue]:
     schema, issues = _dataset_report(role, path, algorithm)
-    if issues or inspection is None or inspection.chat_template_sha256 is not None:
+    if issues:
         return issues
-    needs_template = schema == "sft.messages.v1" or (
-        schema == "sft.prompt_completion.v1"
-        and any(
-            isinstance(record.value, dict) and _conversational(record.value)
-            for record in read_records(path, limits=Limits(max_records=L1_SAMPLE_RECORDS))
-        )
-    )
-    if needs_template:
+    missing_template = inspection is not None and inspection.chat_template_sha256 is None
+    needs_template = schema == "sft.messages.v1"
+    if needs_template or (missing_template and schema == "sft.prompt_completion.v1"):
+        try:
+            for record in read_records(path, limits=Limits(max_records=L1_SAMPLE_RECORDS)):
+                if not isinstance(record.value, dict):
+                    continue
+                where = f"Record {record.number} of {path.name}"
+                if error := _unsupported_record(record.value, where):
+                    return [
+                        Issue(error.code, error.message, path=f"/inputs/{role}", hint=error.hint)
+                    ]
+                needs_template = needs_template or _conversational(record.value)
+        except ModelError as exc:
+            return [Issue(exc.code, exc.message, path=f"/inputs/{role}", hint=exc.detail)]
+    if missing_template and needs_template:
         issues.append(
             Issue(
                 NO_CHAT_TEMPLATE,
@@ -758,13 +790,15 @@ class TrlSftEngine(BaseEngine):
             if e.samples_every
             else []
         )
+        context = self._inspection.context_length if self._inspection is not None else None
+        sample_tokens = min(e.max_length, context or e.max_length)
         flags = Flags(self.pause_requested, self.cancel_requested, self.checkpoint_requested)
         bridge = make_bridge(
             flags,
             sources=_metric_sources(settings.algorithm),
             kind="full_resume" if strategy == "full" else "adapter_only",
             method=strategy,
-            sampler=_make_sampler(prompts) if prompts else None,
+            sampler=_make_sampler(prompts, sample_tokens) if prompts else None,
             samples_every=e.samples_every,
         )
         trainer = SftTrainer(

@@ -4,6 +4,7 @@ exports, cpt, and the failures the engine classifies."""
 # pyright: reportMissingImports=false
 
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,7 @@ import torch
 from helpers import DATASETS, FAST, FULL, LORA, attempt, copy_model, issue_codes
 from peft import PeftModel
 from safetensors.numpy import load_file, save_file
-from transformers import AutoModelForCausalLM
+from transformers import AutoModelForCausalLM, AutoTokenizer, GPT2Config, GPT2LMHeadModel
 
 from mrl_runtime._generated.mrl.common.v1 import common_pb2 as common
 from mrl_runtime._generated.mrl.worker.v1 import worker_control_pb2 as pb
@@ -310,6 +311,101 @@ def test_l1_checks_template_for_conversational_pairs(
     run = attempt(tmp_path, "sft", FAST, staged, dry_run=True)
     assert "MRL-CAP-016" in issue_codes(run)
     assert _failure(run) == ("FAILURE_CLASS_USER_CONFIG", "MRL-CAP-016")
+
+
+def _small_gpt2(tokenizer: Any) -> Any:
+    return GPT2LMHeadModel(
+        GPT2Config(
+            vocab_size=len(tokenizer),
+            n_positions=64,
+            n_embd=32,
+            n_layer=1,
+            n_head=2,
+            bos_token_id=tokenizer.bos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
+            tie_word_embeddings=False,
+        )
+    )
+
+
+def test_long_prompt_sample_stays_inside_context(tmp_path: Path, model_dir: Path) -> None:
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    model = tmp_path / "gpt2"
+    _small_gpt2(tokenizer).save_pretrained(model)
+    tokenizer.save_pretrained(model)
+    train = tmp_path / "train.jsonl"
+    prompt = "apple " * 120
+    train.write_text(json.dumps({"prompt": prompt, "completion": " yes"}) + "\n", encoding="utf-8")
+    run = attempt(
+        tmp_path,
+        "sft",
+        {
+            **FAST,
+            "max_steps": 1,
+            "max_length": 64,
+            "samples_every": 1,
+            "completion_only_loss": False,
+        },
+        {"model": model, "train": train},
+    )
+    assert run.exit_report is not None
+    assert run.exit_report.kind == pb.EXIT_KIND_COMPLETED
+    assert run.committed()
+    [batch] = run.agent.of("samples")
+    [sample] = batch.samples.samples
+    assert sample.prompt != prompt
+    assert sample.completion_tokens > 0
+
+
+def test_nonfinite_eval_loss_fails_before_saving(tmp_path: Path, model_dir: Path) -> None:
+    tokenizer = AutoTokenizer.from_pretrained(model_dir)
+    sentinel = "[EVAL_ONLY_SENTINEL]"
+    tokenizer.add_tokens([sentinel])
+    token_id = tokenizer.convert_tokens_to_ids(sentinel)
+    model = _small_gpt2(tokenizer)
+    with torch.no_grad():
+        model.get_input_embeddings().weight[token_id].fill_(float("nan"))
+    checkpoint = tmp_path / "gpt2"
+    model.save_pretrained(checkpoint)
+    tokenizer.save_pretrained(checkpoint)
+    train = tmp_path / "train.jsonl"
+    evaluation = tmp_path / "eval.jsonl"
+    train.write_text(json.dumps({"prompt": "apple", "completion": " yes"}) + "\n", encoding="utf-8")
+    evaluation.write_text(
+        json.dumps({"prompt": sentinel, "completion": " yes"}) + "\n", encoding="utf-8"
+    )
+    run = attempt(
+        tmp_path,
+        "sft",
+        {**FAST, "max_steps": 1, "max_length": 32, "save_steps": 1},
+        {"model": checkpoint, "train": train, "eval": evaluation},
+    )
+    assert math.isfinite(_losses(run)[1])
+    assert _failure(run) == ("FAILURE_CLASS_NUMERIC_DIVERGENCE", "NAN_LOSS")
+    assert not run.agent.of("checkpoint_staged")
+
+
+@pytest.mark.parametrize("role", ["train", "eval"])
+@pytest.mark.parametrize("field", ["tools", "images"])
+def test_l1_rejects_unsupported_dataset_fields(
+    tmp_path: Path, model_dir: Path, train_file: Path, role: str, field: str
+) -> None:
+    data = tmp_path / "unsupported.jsonl"
+    row = json.loads(train_file.read_text(encoding="utf-8").splitlines()[0])
+    row[field] = []
+    data.write_text(json.dumps(row) + "\n", encoding="utf-8")
+    run = attempt(
+        tmp_path,
+        "sft",
+        FAST,
+        {"model": model_dir, "train": train_file, role: data},
+        dry_run=True,
+    )
+    assert run.prepared is not None
+    assert not run.prepared.ok
+    [issue] = [issue for issue in run.prepared.issues if issue.code == "MRL-DATA-001"]
+    assert issue.path == f"/inputs/{role}"
+    assert field in issue.message
 
 
 # ---- validation and failures ----
