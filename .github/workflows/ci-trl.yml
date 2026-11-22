@@ -71,4 +71,9 @@ jobs:
       - name: runs as non-root and finds the engine
         run: |
           test "$(docker run --rm --entrypoint id mrl-worker-trl:${{ matrix.variant }} -u)" = 10001
-          docker run --rm --network none mrl-worker-trl:${{ matrix.variant }} --help >/dev/null
+          # The agent supplies the command and flags after the image name. A missing nonce
+          # exits with 2 after parsing. The message proves the full command parsed.
+          output=$(docker run --rm --network none mrl-worker-trl:${{ matrix.variant }} \
+            mrl-worker --engine trl --socket /tmp/worker.sock --attempt-id att_image 2>&1) && exit 1
+          test "$?" = 2
+          printf '%s\n' "$output" | grep -F 'MRL_WORKER_NONCE is not set'

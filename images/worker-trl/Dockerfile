@@ -50,4 +50,4 @@ ENV PATH=/opt/venv/bin:/usr/local/bin:/usr/bin:/bin \
     XDG_CACHE_HOME=/tmp/cache
 USER 10001:10001
 WORKDIR /tmp
-ENTRYPOINT ["/opt/venv/bin/mrl-worker", "--engine", "trl"]
+CMD ["/opt/venv/bin/mrl-worker", "--engine", "trl"]

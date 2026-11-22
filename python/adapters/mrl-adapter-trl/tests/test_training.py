@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 import torch
-from helpers import DATASETS, FAST, LORA, attempt, copy_model, issue_codes
+from helpers import DATASETS, FAST, FULL, LORA, attempt, copy_model, issue_codes
 from peft import PeftModel
 from safetensors.numpy import load_file, save_file
 from transformers import AutoModelForCausalLM
@@ -46,30 +46,44 @@ def _manifest_of(where: Path) -> dict[str, Any]:
     return json.loads((where / "checkpoint-manifest.json").read_text(encoding="utf-8"))
 
 
+@pytest.mark.parametrize("common_config", [FULL, LORA], ids=["full", "lora"])
 def test_pause_then_resume_continues_the_same_loss_series(
-    tmp_path: Path, model_dir: Path, train_file: Path
+    tmp_path: Path, model_dir: Path, train_file: Path, common_config: dict[str, Any]
 ) -> None:
     staged = {"model": model_dir, "train": train_file}
     engine = {**FAST, "max_steps": STEPS, "save_steps": 100}
-    reference = attempt(tmp_path, "sft", engine, staged)
+    reference = attempt(tmp_path, "sft", engine, staged, common=common_config)
     assert reference.exit_report is not None
     assert reference.exit_report.kind == pb.EXIT_KIND_COMPLETED
     assert sorted(_losses(reference)) == list(range(1, STEPS + 1))
 
     pause = pb.AgentMessage(pause=pb.PauseRequest(request_id="pause-1"))
-    paused = attempt(tmp_path, "sft", engine, staged, control=_at_step(4, pause))
+    paused = attempt(
+        tmp_path, "sft", engine, staged, common=common_config, control=_at_step(4, pause)
+    )
     assert paused.exit_report is not None
     assert paused.exit_report.kind == pb.EXIT_KIND_PAUSED
     assert "pause-1" in paused.exit_report.acknowledged_requests
     [(_, step, where)] = paused.committed()
     assert 4 <= step < STEPS
     doc = _manifest_of(where)
-    assert doc["kind"] == "full_resume"
+    is_lora = common_config == LORA
+    assert doc["kind"] == ("adapter_only" if is_lora else "full_resume")
+    if torch.backends.mps.is_available() and not torch.cuda.is_available():
+        assert (where / "rng_state_mps.pth").is_file()
     assert not doc["is_final"]
     roles = {f["role"] for f in doc["files"]}
-    assert {"weights", "optimizer", "scheduler", "rng", "trainer_state"} <= roles
+    assert {
+        "adapter" if is_lora else "weights",
+        "optimizer",
+        "scheduler",
+        "rng",
+        "trainer_state",
+    } <= roles
 
-    resumed = attempt(tmp_path, "sft", engine, {**staged, "resume_from": where})
+    resumed = attempt(
+        tmp_path, "sft", engine, {**staged, "resume_from": where}, common=common_config
+    )
     assert resumed.exit_report is not None
     assert resumed.exit_report.kind == pb.EXIT_KIND_COMPLETED
     after = _losses(resumed)
@@ -228,10 +242,74 @@ def test_prompt_completion_dataset_trains(tmp_path: Path, model_dir: Path) -> No
     assert run.exit_report.kind == pb.EXIT_KIND_COMPLETED
 
 
-def test_mixed_text_and_conversation_records_fail_as_data(tmp_path: Path, model_dir: Path) -> None:
-    mixed = DATASETS / "sft.prompt_completion.v1.jsonl"  # record 1 text, record 2 messages
-    run = attempt(tmp_path, "sft", FAST, {"model": model_dir, "train": mixed}, dry_run=True)
-    assert _failure(run) == ("FAILURE_CLASS_DATA", "MRL-DATA-001")
+@pytest.mark.parametrize("packing", [False, True])
+def test_mixed_text_and_conversation_records_train(
+    tmp_path: Path, model_dir: Path, packing: bool
+) -> None:
+    mixed = DATASETS / "sft.prompt_completion.v1.jsonl"
+    run = attempt(
+        tmp_path,
+        "sft",
+        {**FAST, "max_steps": 1, "packing": packing},
+        {
+            "model": model_dir,
+            "train": mixed,
+        },
+    )
+    assert run.exit_report is not None
+    assert run.exit_report.kind == pb.EXIT_KIND_COMPLETED
+    assert len(_losses(run)) == 1
+
+
+@pytest.mark.parametrize("train_on_messages", [True, False])
+def test_eval_masks_use_eval_schema(
+    tmp_path: Path,
+    model_dir: Path,
+    train_file: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    train_on_messages: bool,
+) -> None:
+    from mrl_adapter_trl.sft.trainer import SftTrainer  # noqa: PLC0415 (training test)
+
+    pairs = DATASETS / "sft.prompt_completion.v1.jsonl"
+    train, evaluation = (train_file, pairs) if train_on_messages else (pairs, train_file)
+    masks = []
+    prepare = SftTrainer._prepare_dataset
+
+    def inspect_labels(self: Any, *args: Any, **kwargs: Any) -> Any:
+        dataset = prepare(self, *args, **kwargs)
+        if args[-1] == "eval":
+            masks.extend(
+                -100 in row["labels"] and any(x != -100 for x in row["labels"]) for row in dataset
+            )
+        return dataset
+
+    monkeypatch.setattr(SftTrainer, "_prepare_dataset", inspect_labels)
+    run = attempt(
+        tmp_path,
+        "sft",
+        FAST,
+        {"model": model_dir, "train": train, "eval": evaluation},
+        dry_run=True,
+    )
+    assert run.exit_report is not None
+    assert run.exit_report.kind == pb.EXIT_KIND_DRY_RUN_OK
+    assert masks
+    assert all(masks)
+
+
+@pytest.mark.parametrize("role", ["train", "eval"])
+def test_l1_checks_template_for_conversational_pairs(
+    tmp_path: Path, model_dir: Path, role: str
+) -> None:
+    model = copy_model(model_dir, tmp_path / "plain", chat_template=None)
+    pairs = DATASETS / "sft.prompt_completion.v1.jsonl"
+    plain = tmp_path / "plain.jsonl"
+    plain.write_text(pairs.read_text(encoding="utf-8").splitlines()[0] + "\n", encoding="utf-8")
+    staged = {"model": model, "train": plain, role: pairs}
+    run = attempt(tmp_path, "sft", FAST, staged, dry_run=True)
+    assert "MRL-CAP-016" in issue_codes(run)
+    assert _failure(run) == ("FAILURE_CLASS_USER_CONFIG", "MRL-CAP-016")
 
 
 # ---- validation and failures ----
@@ -305,7 +383,39 @@ def test_nan_loss_ends_as_numeric_divergence(
     weights["model.norm.weight"][:] = float("nan")
     save_file(weights, str(broken / "model.safetensors"), metadata={"format": "pt"})
     run = attempt(
-        tmp_path, "sft", {**FAST, "max_steps": 20, "save_steps": 100},
+        tmp_path, "sft", {**FAST, "max_steps": 1, "logging_steps": 10},
         {"model": broken, "train": train_file},
     )  # fmt: skip
     assert _failure(run) == ("FAILURE_CLASS_NUMERIC_DIVERGENCE", "NAN_LOSS")
+    assert not run.committed()
+
+
+@pytest.mark.parametrize("algorithm", ["sft", "cpt"])
+def test_default_cadence_emits_required_metrics_on_a_short_run(
+    tmp_path: Path, model_dir: Path, train_file: Path, algorithm: str
+) -> None:
+    train = train_file if algorithm == "sft" else DATASETS / "pretrain.text.v1.jsonl"
+    run = attempt(
+        tmp_path,
+        algorithm,
+        {"max_steps": 1, "max_length": 128},
+        {"model": model_dir, "train": train},
+    )
+    assert run.exit_report is not None
+    assert run.exit_report.kind == pb.EXIT_KIND_COMPLETED
+    for name in ("train/loss", "train/learning_rate"):
+        assert [step for step, _ in run.series(name)] == [1]
+
+
+def test_resume_at_budget_performs_no_more_steps(
+    tmp_path: Path, model_dir: Path, train_file: Path
+) -> None:
+    staged = {"model": model_dir, "train": train_file}
+    engine = {**FAST, "max_steps": 1}
+    first = attempt(tmp_path, "sft", engine, staged, common=LORA)
+    [(_, _, checkpoint)] = first.committed()
+    resumed = attempt(tmp_path, "sft", engine, {**staged, "resume_from": checkpoint}, common=LORA)
+    assert resumed.prepared is not None
+    assert resumed.prepared.ok
+    assert not resumed.agent.of("progress")
+    assert not resumed.committed()

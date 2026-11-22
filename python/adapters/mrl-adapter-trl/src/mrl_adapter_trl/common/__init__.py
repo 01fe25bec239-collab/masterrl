@@ -167,6 +167,8 @@ def make_bridge(  # noqa: PLR0913 (keyword-only settings)
                 control.should_save = False
                 control.should_training_stop = True
                 return
+            if step >= state.max_steps or flags.pause.is_set():
+                control.should_log = True
             if step >= state.max_steps or flags.checkpoint.is_set():
                 control.should_save = True
             if flags.pause.is_set():
