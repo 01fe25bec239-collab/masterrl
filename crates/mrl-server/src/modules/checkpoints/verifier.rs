@@ -1,6 +1,8 @@
 //! The FINALIZING checks (Doc 11 §11, P8) and the pass that applies them.
 
-use super::service::{ckpt_cols, lock_run, metrics, CheckpointRow, CheckpointService};
+use super::service::{
+    ckpt_cols, lock_run, metrics, system_audit, CheckpointRow, CheckpointService,
+};
 use crate::db::Db;
 use crate::modules::jobs::chains::{CompletionVerifier, Verification};
 use crate::modules::jobs::transitions::job_cols;
@@ -8,11 +10,14 @@ use crate::modules::jobs::{Chains, JobRow, JobTransitions, JobsError, Rejection}
 use crate::seams::SeamError;
 use async_trait::async_trait;
 use mrl_domain::failure::{FailureClass, FailureCode};
+use mrl_domain::ids::CheckpointId;
 use serde_json::Value;
+use sqlx::PgConnection;
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 /// A TRAIN job's results are verified when:
-/// 1. the run's final checkpoint is COMMITTED with `is_final`;
+/// 1. the attempt committed a final checkpoint, or exited with its committed resume checkpoint at the step budget;
 /// 2. every metric the run config names in `metrics.required` was reported with it;
 /// 3. its step equals the planned steps (`common.max_steps`, when set), unless the engine
 ///    recorded an early stop (`early_stop ≥ 1` in the checkpoint's metrics).
@@ -39,15 +44,16 @@ fn failed(message: String) -> Verification {
 /// The verdict for a run's final checkpoint (`None`: there is none) and its resolved config.
 pub fn judge(last: Option<&CheckpointRow>, resolved: &Value) -> Verification {
     let reported = last.map(metrics).unwrap_or_default();
-    judge_report(last, resolved, &reported)
+    judge_report(last, resolved, &reported, false)
 }
 
 fn judge_report(
     last: Option<&CheckpointRow>,
     resolved: &Value,
-    reported: &std::collections::BTreeMap<String, f64>,
+    reported: &BTreeMap<String, f64>,
+    resumed: bool,
 ) -> Verification {
-    let Some(ckpt) = last.filter(|c| c.state == "COMMITTED" && c.is_final) else {
+    let Some(ckpt) = last.filter(|c| c.state == "COMMITTED" && (c.is_final || resumed)) else {
         return failed(
             "The run finished without a committed final checkpoint, so its result can't be confirmed."
                 .into(),
@@ -67,12 +73,10 @@ fn judge_report(
             missing.join(", ")
         ));
     }
-    let planned = resolved
-        .pointer("/common/max_steps")
-        .and_then(Value::as_i64);
+    let planned = planned_steps(resolved);
     let early = reported.get("early_stop").is_some_and(|v| *v >= 1.0);
     if let Some(planned) = planned {
-        if ckpt.global_step != planned && !early {
+        if ckpt.global_step != planned && !early && !resumed {
             return failed(format!(
                 "The run stopped at step {} of {planned} without recording an early stop.",
                 ckpt.global_step
@@ -80,6 +84,93 @@ fn judge_report(
         }
     }
     Verification::Verified
+}
+
+fn planned_steps(resolved: &Value) -> Option<i64> {
+    resolved
+        .pointer("/common/max_steps")
+        .and_then(Value::as_i64)
+}
+
+#[derive(PartialEq, sqlx::FromRow)]
+struct ExitEvidence {
+    last_step: Option<i64>,
+    exit_report: Option<Value>,
+    resume_from_checkpoint_id: Option<Uuid>,
+}
+
+#[derive(PartialEq)]
+struct FinalEvidence {
+    checkpoint: Option<CheckpointRow>,
+    exit: Option<ExitEvidence>,
+    resolved: Value,
+    resumed: bool,
+}
+
+async fn final_evidence(
+    conn: &mut PgConnection,
+    run: Uuid,
+    job: &JobRow,
+) -> Result<FinalEvidence, sqlx::Error> {
+    let exit = sqlx::query_as::<_, ExitEvidence>(
+        "SELECT last_step, exit_report, resume_from_checkpoint_id FROM job_attempts
+         WHERE id = $1 AND job_id = $2 AND epoch = $3 AND state = 'EXITED_OK'",
+    )
+    .bind(job.current_attempt_id)
+    .bind(job.id)
+    .bind(job.epoch)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let resolved = sqlx::query_scalar("SELECT resolved FROM run_configs WHERE run_id = $1")
+        .bind(run)
+        .fetch_optional(&mut *conn)
+        .await?
+        .unwrap_or(Value::Null);
+    let mut checkpoint = sqlx::query_as::<_, CheckpointRow>(concat!(
+        "SELECT ",
+        ckpt_cols!(),
+        " FROM checkpoints WHERE id = (SELECT final_checkpoint_id FROM runs WHERE id = $1)
+           AND attempt_id = $2 AND attempt_epoch = $3"
+    ))
+    .bind(run)
+    .bind(job.current_attempt_id)
+    .bind(job.epoch)
+    .fetch_optional(&mut *conn)
+    .await?;
+    let mut resumed = false;
+    if checkpoint.is_none() {
+        if let (Some(budget), Some(exit)) =
+            (planned_steps(&resolved).filter(|step| *step >= 0), &exit)
+        {
+            let reported = exit
+                .exit_report
+                .as_ref()
+                .and_then(|report| report["last_committed_checkpoint_id"].as_str())
+                .and_then(|id| id.parse::<CheckpointId>().ok())
+                .map(|id| id.as_uuid());
+            if let Some(id) = reported.filter(|id| Some(*id) == exit.resume_from_checkpoint_id) {
+                checkpoint = sqlx::query_as::<_, CheckpointRow>(concat!(
+                    "SELECT ",
+                    ckpt_cols!(),
+                    " FROM checkpoints WHERE id = $1 AND run_id = $2 AND job_id = $3
+                       AND state = 'COMMITTED' AND global_step >= $4"
+                ))
+                .bind(id)
+                .bind(run)
+                .bind(job.id)
+                .bind(budget)
+                .fetch_optional(&mut *conn)
+                .await?;
+                resumed = checkpoint.is_some();
+            }
+        }
+    }
+    Ok(FinalEvidence {
+        checkpoint,
+        exit,
+        resolved,
+        resumed,
+    })
 }
 
 const FINAL_SNAPSHOT: &str =
@@ -117,58 +208,49 @@ impl CompletionVerifier for FinalCheckpointVerifier {
                 "The final checkpoint is still being saved.",
             ));
         }
-        let last = sqlx::query_as::<_, CheckpointRow>(concat!(
-            "SELECT ",
-            ckpt_cols!(),
-            " FROM checkpoints WHERE id = (SELECT final_checkpoint_id FROM runs WHERE id = $1)
-               AND attempt_id = $2 AND attempt_epoch = $3"
-        ))
-        .bind(run)
-        .bind(attempt)
-        .bind(job.epoch)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db)?;
-        let Some(checkpoint) = last.as_ref() else {
-            return Ok(judge(None, &Value::Null));
+        let mut conn = self.db.pool().acquire().await.map_err(db)?;
+        let evidence = final_evidence(&mut conn, run, job).await.map_err(db)?;
+        let Some(checkpoint) = evidence.checkpoint.as_ref() else {
+            return Ok(judge(None, &evidence.resolved));
         };
-        let exited: Option<(Option<i64>, Option<Value>)> = sqlx::query_as(
-            "SELECT last_step, exit_report FROM job_attempts WHERE id = $1 AND state = 'EXITED_OK'",
-        )
-        .bind(attempt)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(db)?;
-        let Some((Some(step), report)) = exited else {
-            return Ok(failed(
-                "The finished attempt did not report its final step.".into(),
-            ));
+        let Some(exit) = evidence.exit else {
+            return Ok(failed("The run has no finished attempt to verify.".into()));
         };
-        if step != checkpoint.global_step {
-            return Ok(failed(format!(
-                "The attempt finished at step {step}, but its final checkpoint is at step {}.",
-                checkpoint.global_step,
-            )));
+        if !evidence.resumed {
+            let Some(step) = exit.last_step else {
+                return Ok(failed(
+                    "The finished attempt did not report its final step.".into(),
+                ));
+            };
+            if step != checkpoint.global_step {
+                return Ok(failed(format!(
+                    "The attempt finished at step {step}, but its final checkpoint is at step {}.",
+                    checkpoint.global_step,
+                )));
+            }
         }
-        let resolved: Value =
-            sqlx::query_scalar("SELECT resolved FROM run_configs WHERE run_id = $1")
-                .bind(run)
-                .fetch_optional(self.db.pool())
-                .await
-                .map_err(db)?
-                .unwrap_or(Value::Null);
-        let reported = match report.as_ref().and_then(|r| r["final_metrics"].as_object()) {
-            Some(values) => values
-                .iter()
-                .filter_map(|(name, value)| {
-                    let value = value.as_f64()?;
-                    value.is_finite().then(|| (name.clone(), value))
-                })
-                .collect(),
-            // P21 currently persists AttemptStatus, which does not carry final metrics.
-            None => metrics(checkpoint),
+        // A budget-exhausted resume emits no training metrics of its own.
+        let report = exit
+            .exit_report
+            .as_ref()
+            .and_then(|r| r["final_metrics"].as_object());
+        let mut reported = if evidence.resumed || report.is_none() {
+            metrics(checkpoint)
+        } else {
+            BTreeMap::new()
         };
-        Ok(judge_report(Some(checkpoint), &resolved, &reported))
+        if let Some(values) = report {
+            reported.extend(values.iter().filter_map(|(name, value)| {
+                let value = value.as_f64()?;
+                value.is_finite().then(|| (name.clone(), value))
+            }));
+        }
+        Ok(judge_report(
+            Some(checkpoint),
+            &evidence.resolved,
+            &reported,
+            evidence.resumed,
+        ))
     }
 }
 
@@ -225,6 +307,13 @@ async fn finalize_one(
     {
         return Ok(());
     }
+    let evidence = match job.run_id.filter(|_| job.kind == "TRAIN") {
+        Some(run) => {
+            let mut conn = pool.acquire().await?;
+            Some(final_evidence(&mut conn, run, job).await?)
+        }
+        None => None,
+    };
     let verdict = chains.verify(job).await?;
     let mut tx = service.db().begin().await?;
     let Some(locked) = JobTransitions::lock(&mut tx, job.org_id, job.id).await? else {
@@ -244,9 +333,45 @@ async fn finalize_one(
         if current != snapshot || (job.kind == "TRAIN" && pending) {
             return Ok(());
         }
+        if let Some(evidence) = evidence.as_ref() {
+            if final_evidence(&mut tx, run, &locked).await? != *evidence {
+                return Ok(());
+            }
+        }
     }
     match JobTransitions::verify_completion(&mut tx, &locked, verdict).await {
-        Ok(_) => tx.commit().await.map_err(crate::db::DbError::from)?,
+        Ok(done) => {
+            if done.state == "COMPLETED" {
+                if let Some(checkpoint) = evidence.filter(|e| e.resumed).and_then(|e| e.checkpoint)
+                {
+                    sqlx::query(
+                        "UPDATE checkpoints SET is_final = false
+                         WHERE run_id = $1 AND id <> $2 AND state = 'COMMITTED' AND is_final",
+                    )
+                    .bind(checkpoint.run_id)
+                    .bind(checkpoint.id)
+                    .execute(&mut *tx)
+                    .await?;
+                    sqlx::query("UPDATE checkpoints SET is_final = true WHERE id = $1")
+                        .bind(checkpoint.id)
+                        .execute(&mut *tx)
+                        .await?;
+                    sqlx::query("UPDATE runs SET final_checkpoint_id = $2 WHERE id = $1")
+                        .bind(checkpoint.run_id)
+                        .bind(checkpoint.id)
+                        .execute(&mut *tx)
+                        .await?;
+                    system_audit(
+                        &mut tx,
+                        service.db(),
+                        &checkpoint,
+                        "checkpoints.finalize_resume",
+                    )
+                    .await?;
+                }
+            }
+            tx.commit().await.map_err(crate::db::DbError::from)?;
+        }
         Err(e) if e.code() == "MRL-CONFLICT-170" || e.code() == "MRL-STATE-170" => {}
         Err(e) => return Err(e),
     }
