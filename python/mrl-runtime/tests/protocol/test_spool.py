@@ -42,15 +42,11 @@ def test_rewind_resends_unacked_with_same_seq(tmp_path: Path) -> None:
 
 
 def test_backpressure_drops_logs_then_samples_then_thins_metrics(tmp_path: Path) -> None:
-    probe = Spool(tmp_path / "probe")
-    for msg in (_log(0), _samples(0), _metrics(0)):
-        probe.push(msg)
-    budget = probe.bytes * 3  # room for about nine of these
-    spool = Spool(tmp_path / "s", max_bytes=budget)
-    for i in range(3):
-        spool.push(_log(i))
-        spool.push(_samples(i))
-        spool.push(_metrics(i))
+    messages = [msg for i in range(3) for msg in (_log(i), _samples(i), _metrics(i))]
+    # Protobuf timestamps vary in encoded length, so size the envelopes we enqueue.
+    spool = Spool(tmp_path / "s", max_bytes=sum(msg.ByteSize() for msg in messages))
+    for msg in messages:
+        spool.push(msg)
     assert spool.dropped == {}
     spool.push(wrap(pb.CheckpointStaged(checkpoint_id="ckpt_a" + "x" * 300)))
     assert spool.dropped["log"] >= 1
@@ -69,11 +65,10 @@ def test_backpressure_drops_logs_then_samples_then_thins_metrics(tmp_path: Path)
 
 
 def test_sent_messages_are_never_dropped(tmp_path: Path) -> None:
-    probe = Spool(tmp_path / "p")
-    probe.push(_log(0))
-    spool = Spool(tmp_path / "s", max_bytes=probe.bytes * 2)
-    spool.push(_log(0))
-    spool.push(_log(1))
+    first, second = _log(0), _log(1)
+    spool = Spool(tmp_path / "s", max_bytes=first.ByteSize() + second.ByteSize())
+    spool.push(first)
+    spool.push(second)
     sent = spool.next_to_send()
     assert sent is not None
     spool.push(_log(2))  # over budget: drops the unsent log 1, keeps the in-flight log 0

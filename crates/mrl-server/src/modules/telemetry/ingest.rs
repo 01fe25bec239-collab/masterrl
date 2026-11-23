@@ -726,17 +726,19 @@ impl Ingest {
         let f = |v: f64| if v.is_finite() { v } else { 0.0 };
         sqlx::query(
             "INSERT INTO run_progress (run_id, org_id, attempt_id, attempt_no, worker_seq, step,
-                    total_steps, epoch, phase, tokens_seen, eta_seconds, last_node_id)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                    total_steps, epoch, phase, tokens_seen, eta_seconds, last_node_id, last_stream)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
              ON CONFLICT (run_id) DO UPDATE SET
                attempt_id = EXCLUDED.attempt_id, attempt_no = EXCLUDED.attempt_no,
                worker_seq = EXCLUDED.worker_seq, step = EXCLUDED.step,
                total_steps = EXCLUDED.total_steps, epoch = EXCLUDED.epoch, phase = EXCLUDED.phase,
                tokens_seen = EXCLUDED.tokens_seen, eta_seconds = EXCLUDED.eta_seconds,
-               updated_at = now(), xid = pg_current_xact_id(), last_node_id = EXCLUDED.last_node_id
+               updated_at = now(), xid = pg_current_xact_id(), last_node_id = EXCLUDED.last_node_id,
+               last_stream = EXCLUDED.last_stream
              WHERE run_progress.attempt_no < EXCLUDED.attempt_no OR
                (run_progress.attempt_no = EXCLUDED.attempt_no AND
-                 CASE WHEN run_progress.last_node_id = EXCLUDED.last_node_id
+                 CASE WHEN (run_progress.last_node_id, run_progress.last_stream) =
+                           (EXCLUDED.last_node_id, EXCLUDED.last_stream)
                       THEN run_progress.worker_seq < EXCLUDED.worker_seq AND run_progress.step <= EXCLUDED.step
                       ELSE run_progress.step <= EXCLUDED.step END)",
         )
@@ -752,6 +754,7 @@ impl Ingest {
         .bind(n(p.tokens_seen))
         .bind(f(p.eta_seconds))
         .bind(delivery.node)
+        .bind(delivery.stream as i32)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;

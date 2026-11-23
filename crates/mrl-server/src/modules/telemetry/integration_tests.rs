@@ -1107,6 +1107,44 @@ async fn progress_keeps_the_newest_attempt_and_message() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL (just dev)"]
+async fn progress_orders_sequence_numbers_within_a_gateway_stream() {
+    let w = World::solo().await;
+    let s = seed_run(&w.db, Uuid::nil(), json!({})).await;
+    let sink = w.lanes.control_sink("worker.progress").unwrap();
+    for (stream, seq, step) in [
+        (Lane::Control, 100, 5),
+        (Lane::Bulk, 2, 6),
+        (Lane::Bulk, 1, 9),
+    ] {
+        let message = relay(
+            &s,
+            seq,
+            WorkerBody::Progress(Progress {
+                step,
+                ..Default::default()
+            }),
+        );
+        sink.deliver(LaneItem {
+            node_id: s.node,
+            session_epoch: 1,
+            lane: LaneKind::Control,
+            stream,
+            seq,
+            dropped_before: 0,
+            message,
+        })
+        .await
+        .unwrap();
+    }
+    let metrics = w
+        .get(Who::Solo, &format!("/api/v1/runs/{}/metrics", s.run_id()))
+        .await
+        .json();
+    assert_eq!(metrics["progress"]["step"], 6);
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
 async fn runs_compare_shows_differing_config_and_aligned_overlays() {
     let w = World::solo().await;
     let a = seed_run(
