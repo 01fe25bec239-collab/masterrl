@@ -275,26 +275,34 @@ impl SecretResolver {
         // The caller must be able to manage this very secret (with its project), not only
         // the run.
         allow(seams, ctx, MANAGE, &row.resource(org)).await?;
-        if row.deleting {
-            return Err(deleting(&row));
-        }
-        if !row.allowed_uses.iter().any(|u| u == RUN_USE) {
-            return Err(Error::coded(
-                codes::SECRET_USE,
-                StatusCode::FORBIDDEN,
-                format!("The secret {:?} does not allow the use \"run\".", row.name),
-            ));
-        }
-        sqlx::query(
-            "INSERT INTO run_secret_grants (run_id, secret_id, mount) VALUES ($1, $2, $3)
-             ON CONFLICT (run_id, secret_id) DO UPDATE SET mount = EXCLUDED.mount",
-        )
-        .bind(run.as_uuid())
+        write_grant(tx, run, &row, mount).await
+    }
+
+    /// Authorizes a future run grant before the caller opens its write transaction.
+    pub(crate) async fn prepare_grant(
+        &self,
+        seams: &crate::seams::Seams,
+        ctx: &RequestContext,
+        org: &str,
+        secret: SecretId,
+        mount: &str,
+    ) -> Result<AuthorizedGrant, Error> {
+        let row: Row = sqlx::query_as(concat!(
+            "SELECT ",
+            columns!(),
+            " FROM secrets_metadata WHERE org_id = $1 AND id = $2"
+        ))
+        .bind(org)
         .bind(secret.as_uuid())
-        .bind(mount)
-        .execute(&mut **tx)
-        .await?;
-        Ok(())
+        .fetch_optional(self.db.pool())
+        .await?
+        .ok_or_else(|| not_found("secret"))?;
+        allow(seams, ctx, MANAGE, &row.resource(org)).await?;
+        Ok(AuthorizedGrant {
+            org: org.to_owned(),
+            secret,
+            mount: mount.to_owned(),
+        })
     }
 
     /// The value of `secret` in `org` for `use_` (MRL-PERM-190 when the secret does not allow it).
@@ -358,6 +366,53 @@ impl SecretResolver {
         tx.commit().await?;
         Ok(out)
     }
+}
+
+/// Permission to attach one secret, checked against its immutable org and project.
+pub(crate) struct AuthorizedGrant {
+    org: String,
+    secret: SecretId,
+    mount: String,
+}
+
+impl AuthorizedGrant {
+    /// Locks and rechecks the secret inside the run transaction before recording the grant.
+    pub(crate) async fn grant(self, tx: &mut Tx, run: RunId) -> Result<(), Error> {
+        let row: Row = sqlx::query_as(concat!(
+            "SELECT ",
+            columns!(),
+            " FROM secrets_metadata WHERE org_id = $1 AND id = $2 FOR SHARE"
+        ))
+        .bind(&self.org)
+        .bind(self.secret.as_uuid())
+        .fetch_optional(&mut **tx)
+        .await?
+        .ok_or_else(|| not_found("secret"))?;
+        write_grant(tx, run, &row, &self.mount).await
+    }
+}
+
+async fn write_grant(tx: &mut Tx, run: RunId, row: &Row, mount: &str) -> Result<(), Error> {
+    if row.deleting {
+        return Err(deleting(row));
+    }
+    if !row.allowed_uses.iter().any(|u| u == RUN_USE) {
+        return Err(Error::coded(
+            codes::SECRET_USE,
+            StatusCode::FORBIDDEN,
+            format!("The secret {:?} does not allow the use \"run\".", row.name),
+        ));
+    }
+    sqlx::query(
+        "INSERT INTO run_secret_grants (run_id, secret_id, mount) VALUES ($1, $2, $3)
+         ON CONFLICT (run_id, secret_id) DO UPDATE SET mount = EXCLUDED.mount",
+    )
+    .bind(run.as_uuid())
+    .bind(row.id)
+    .bind(mount)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 #[derive(sqlx::FromRow)]

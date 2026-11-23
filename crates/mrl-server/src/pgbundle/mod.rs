@@ -48,6 +48,8 @@ pub const PASSWORD_SECRET: &str = "pgbundle.superuser_password";
 const DAILY: Duration = Duration::from_secs(24 * 3600);
 const CRASH_WINDOW: Duration = Duration::from_secs(600);
 const MAX_CRASHES: usize = 5;
+/// How long a held folder lock is retried before the folder counts as in use.
+const LOCK_WAIT: Duration = Duration::from_secs(2);
 
 /// The bundled database could not be set up or run.
 #[derive(Debug, thiserror::Error)]
@@ -149,7 +151,7 @@ impl PgBundle {
         create_private_dir(&o.data_dir).map_err(|e| {
             BundleError::Failed(format!("could not create {}: {e}", o.data_dir.display()))
         })?;
-        let lock = lock_data_dir(&o.data_dir)?;
+        let lock = lock_data_dir(&o.data_dir).await?;
         let pgdata = o.data_dir.join("pgdata");
         let version = cluster_version(&pgdata)?;
         let password = password(o.secrets.as_ref(), version.is_some()).await?;
@@ -374,7 +376,11 @@ pub fn default_data_dir() -> Option<PathBuf> {
 }
 
 /// Holds an exclusive lock on `<dir>/mrl-server.lock` for as long as the file stays open.
-fn lock_data_dir(dir: &Path) -> Result<File, BundleError> {
+///
+/// A lock that was just released can stay held for a moment: a process that another thread
+/// is starting keeps a copy of every open file until it runs its program. So a held lock is
+/// retried for [`LOCK_WAIT`] before the folder counts as in use.
+async fn lock_data_dir(dir: &Path) -> Result<File, BundleError> {
     let path = dir.join("mrl-server.lock");
     let file = File::options()
         .create(true)
@@ -382,13 +388,23 @@ fn lock_data_dir(dir: &Path) -> Result<File, BundleError> {
         .write(true)
         .open(&path)
         .map_err(|e| BundleError::Failed(format!("could not open {}: {e}", path.display())))?;
-    match file.try_lock() {
-        Ok(()) => Ok(file),
-        Err(std::fs::TryLockError::WouldBlock) => Err(BundleError::Locked(dir.to_path_buf())),
-        Err(std::fs::TryLockError::Error(e)) => Err(BundleError::Failed(format!(
-            "could not lock {}: {e}",
-            path.display()
-        ))),
+    let deadline = Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(BundleError::Locked(dir.to_path_buf()))
+            }
+            Err(std::fs::TryLockError::Error(e)) => {
+                return Err(BundleError::Failed(format!(
+                    "could not lock {}: {e}",
+                    path.display()
+                )))
+            }
+        }
     }
 }
 

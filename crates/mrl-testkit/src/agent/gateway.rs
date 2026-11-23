@@ -35,7 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
-/// Settings fast enough for tests: 1 s heartbeats, checks and revocation re-checks.
+/// Settings fast enough for tests: 1 s heartbeats, checks and revocation re-checks; no free-disk floor.
 pub fn fast_config() -> GatewayConfig {
     GatewayConfig {
         heartbeat_interval_seconds: 1,
@@ -43,6 +43,8 @@ pub fn fast_config() -> GatewayConfig {
         offline_after_seconds: 3,
         health_check_seconds: 1,
         revocation_check_seconds: 1,
+        // CI hosts often have < 5 GiB free; `disk_low` would mark every test node DEGRADED.
+        min_disk_free_bytes: 0,
         ..GatewayConfig::default()
     }
 }

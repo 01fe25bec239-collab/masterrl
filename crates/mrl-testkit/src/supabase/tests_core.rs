@@ -858,6 +858,12 @@ async fn every_route_answers_by_role_in_team_mode() {
         ),
         (
             Method::GET,
+            format!("/api/v1/queue?pool={pool}"),
+            Action::ComputeRead,
+            None,
+        ),
+        (
+            Method::GET,
             format!("/api/v1/nodes/{node}"),
             Action::ComputeRead,
             None,

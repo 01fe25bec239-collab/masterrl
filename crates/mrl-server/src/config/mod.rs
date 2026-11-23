@@ -85,6 +85,8 @@ pub struct Config {
     pub gateway: crate::modules::nodes::GatewayConfig,
     // <mrl:config P19> P19 settings fields go right below this line.
     // <mrl:config P21> P21 settings fields go right below this line.
+    /// The scheduler: ticks, leases, cancels and queue limits.
+    pub scheduler: crate::modules::scheduler::SchedulerConfig,
     // <mrl:config P22> P22 settings fields go right below this line.
     /// Live run data: metric history, logs, samples, streams and alerts.
     pub live: crate::modules::telemetry::LiveConfig,
@@ -498,6 +500,7 @@ impl Config {
             }
         }
         // <mrl:validate P21> P21 checks (push to `problems`) go right below this line.
+        problems.extend(self.scheduler.problems());
         // <mrl:validate P22> P22 checks (push to `problems`) go right below this line.
         problems.extend(self.live.problems());
         // <mrl:validate P23> P23 checks (push to `problems`) go right below this line.

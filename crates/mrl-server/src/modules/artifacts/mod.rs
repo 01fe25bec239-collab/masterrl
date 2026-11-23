@@ -826,6 +826,37 @@ impl ArtifactStore {
         }
     }
 
+    /// Finds a committed artifact file and ensures its checked blob exists.
+    /// The caller must authorize access to the artifact first.
+    pub(crate) async fn download_source(
+        &self,
+        org: &str,
+        found: &Artifact,
+        path: &str,
+    ) -> Result<(String, mrl_storage::ManifestFile), Error> {
+        let manifest =
+            ArtifactManifest::from_json(&serde_json::to_vec(&found.manifest).unwrap_or_default())?;
+        let file = manifest
+            .files
+            .iter()
+            .find(|f| f.path == path)
+            .ok_or_else(|| field("/path", "This artifact has no file at this path."))?;
+        // Committed files are read from their checked copies, never from the source prefix.
+        // Artifacts committed before copies existed (`files_checked` false) have the copy
+        // checked now: reused only when it hashes right, else made again from the prefix.
+        let st = self.org_store(org).await?;
+        let key = st.keys().blob(&file.sha256)?;
+        if !found.files_checked
+            && !crate::modules::uploads::blob_intact(&st, &key, file.size, &file.sha256).await?
+        {
+            let src = st.keys().join(&found.prefix, &file.path)?;
+            if let Some(problem) = self.snapshot_file(&st, &src, file).await? {
+                return Err(mismatch(&[problem]));
+            }
+        }
+        Ok((key, file.clone()))
+    }
+
     /// The artifact `id` in `org`, in any state.
     pub async fn get(&self, org: &str, id: Uuid) -> Result<Option<Artifact>, Error> {
         let row: Option<ArtifactRow> = sqlx::query_as(
@@ -1359,6 +1390,21 @@ struct ArtifactRow {
     files_checked: bool,
 }
 
+/// A stored file to stage for the attempt.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct InputFile {
+    /// Name the worker sees, like `model`, `dataset.train` or `resume_from`.
+    pub name: String,
+    /// Object key in the job org's storage area, like `orgs/{org}/blobs/sha256/…`.
+    pub key: String,
+    /// Lowercase hex sha256 of the file.
+    pub sha256: String,
+    /// Size in bytes.
+    pub size: u64,
+    /// Path relative to the attempt's staging folder.
+    pub local_path: String,
+}
+
 /// A registered artifact.
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct Artifact {
@@ -1594,26 +1640,7 @@ async fn action(
         .filter(|a| a.state == "COMMITTED")
         .ok_or_else(|| not_found("artifact"))?;
     s.authorize(&ctx, READ, &found.resource(&org)).await?;
-    let manifest =
-        ArtifactManifest::from_json(&serde_json::to_vec(&found.manifest).unwrap_or_default())?;
-    let file = manifest
-        .files
-        .iter()
-        .find(|f| f.path == body.path)
-        .ok_or_else(|| field("/path", "This artifact has no file at this path."))?;
-    // Committed files are read from their checked copies, never from the source prefix.
-    // Artifacts committed before copies existed (`files_checked` false) have the copy
-    // checked now: reused only when it hashes right, else made again from the prefix.
-    let st = store.org_store(&org).await?;
-    let key = st.keys().blob(&file.sha256)?;
-    if !found.files_checked
-        && !crate::modules::uploads::blob_intact(&st, &key, file.size, &file.sha256).await?
-    {
-        let src = st.keys().join(&found.prefix, &file.path)?;
-        if let Some(problem) = store.snapshot_file(&st, &src, file).await? {
-            return Err(mismatch(&[problem]));
-        }
-    }
+    let (key, file) = store.download_source(&org, &found, &body.path).await?;
     Ok(Json(
         store
             .ticket(&s.seams, &ctx, &key, TicketMethod::Get, file.size)

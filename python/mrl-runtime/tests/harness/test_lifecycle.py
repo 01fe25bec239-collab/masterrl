@@ -1,8 +1,9 @@
 import asyncio
 import json
 import secrets
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from pathlib import Path
+from threading import Event
 from typing import Any
 
 import pytest
@@ -10,6 +11,8 @@ from google.protobuf.timestamp_pb2 import Timestamp
 
 from mrl_runtime._generated.mrl.common.v1 import common_pb2 as common
 from mrl_runtime._generated.mrl.worker.v1 import worker_control_pb2 as pb
+from mrl_runtime.adapter import CheckpointReady, EngineEvent, JobContext, Progress
+from mrl_runtime.checkpoint import CheckpointProvider, StagedCheckpoint
 from mrl_runtime.harness import HarnessOptions
 from mrl_runtime.testkit.agent import AgentScript, FakeAgent
 from mrl_runtime.testkit.fake import FakeEngine, manifest
@@ -82,6 +85,144 @@ def test_pause_checkpoints_then_exits_paused(tmp_path: Path) -> None:
     assert committed
     assert report.last_committed_checkpoint_id == committed[-1][0]
     assert report.final_step < 200
+
+
+async def _pause_at_step_2(agent: FakeAgent, _: object) -> None:
+    await agent.wait_for(lambda m: m.HasField("progress") and m.progress.step >= 2)
+    await agent.send(pb.AgentMessage(pause=pb.PauseRequest(request_id="p1", deadline_s=10)))
+
+
+def test_pause_whose_checkpoint_is_rejected_is_not_paused(tmp_path: Path) -> None:
+    r = _run(
+        tmp_path,
+        {"steps": 200, "checkpoint_every": 0, "step_seconds": 0.01},
+        control=_pause_at_step_2,
+        commit_state=pb.COMMIT_STATE_REJECTED,
+    )
+    assert _cls(r) == "FAILURE_CLASS_INFRA_TRANSIENT/PAUSE_NOT_SAVED"
+    report = r.exit_report
+    assert report is not None
+    assert report.failure.retryable_hint
+    assert "p1" not in report.acknowledged_requests
+    assert report.last_committed_checkpoint_id == ""
+
+
+@pytest.mark.parametrize(
+    ("stop_step", "rejected_step"),
+    [(3, 3), (3, 2), (2, None)],
+    ids=["pause-save-rejected", "periodic-save-rejected", "same-step-save"],
+)
+def test_pause_uses_the_checkpoint_at_the_stop_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stop_step: int, rejected_step: int | None
+) -> None:
+    staging_periodic = asyncio.Event()
+    pause_received = asyncio.Event()
+    stage = CheckpointProvider.stage
+    verify = FakeAgent._verify
+
+    class Engine(FakeEngine):
+        def request_pause(self) -> None:
+            super().request_pause()
+            pause_received.set()
+
+        def run(self, ctx: JobContext) -> Iterator[EngineEvent]:
+            # The pause arrives after the save decision for step 2.
+            for step in range(2, stop_step + 1):
+                yield Progress(step, total_steps=10)
+                yield CheckpointReady(step, self._write(ctx, step, seed=0))
+
+    async def stage_checkpoint(
+        self: CheckpointProvider, ready: CheckpointReady, metrics: Mapping[str, float]
+    ) -> StagedCheckpoint:
+        if ready.step == 2:
+            staging_periodic.set()
+            await asyncio.wait_for(pause_received.wait(), 5)
+        return await stage(self, ready, metrics)
+
+    def verify_checkpoint(
+        self: FakeAgent, request: pb.CheckpointCommitRequest
+    ) -> tuple[pb.CommitState, str]:
+        if self._staged[request.checkpoint_id].step == rejected_step:
+            return pb.COMMIT_STATE_REJECTED, "forced by the test"
+        return verify(self, request)
+
+    async def pause(agent: FakeAgent, _: object) -> None:
+        await asyncio.wait_for(staging_periodic.wait(), 5)
+        await agent.send(pb.AgentMessage(pause=pb.PauseRequest(request_id="p1")))
+
+    monkeypatch.setattr(CheckpointProvider, "stage", stage_checkpoint)
+    monkeypatch.setattr(FakeAgent, "_verify", verify_checkpoint)
+    script = AgentScript(job_spec=job_spec(ALGO, {"steps": 10}), staging_dir=tmp_path)
+    result = asyncio.run(run_in_process(Engine(), manifest(), script, control=pause))
+    report = result.exit_report
+    assert report is not None
+    assert report.final_step == stop_step
+    [(checkpoint_id, saved_step, _)] = result.committed()
+    assert report.last_committed_checkpoint_id == checkpoint_id
+    if rejected_step == stop_step:
+        assert saved_step == 2
+        assert _cls(result) == "FAILURE_CLASS_INFRA_TRANSIENT/PAUSE_NOT_SAVED"
+        assert "p1" not in report.acknowledged_requests
+    else:
+        assert saved_step == stop_step
+        assert report.kind == pb.EXIT_KIND_PAUSED
+        assert "p1" in report.acknowledged_requests
+
+
+def test_pause_deadline_with_a_committed_periodic_save_is_not_paused(tmp_path: Path) -> None:
+    release_step = Event()
+
+    class Engine(FakeEngine):
+        def run(self, ctx: JobContext) -> Iterator[EngineEvent]:
+            yield Progress(2, total_steps=10)
+            yield CheckpointReady(2, self._write(ctx, 2, seed=0))
+            assert release_step.wait(10)
+
+    async def pause(agent: FakeAgent, _: object) -> None:
+        await agent.wait_for(lambda m: m.HasField("checkpoint_commit"), 5)
+        await agent.send(pb.AgentMessage(pause=pb.PauseRequest(request_id="p1", deadline_s=1)))
+
+    script = AgentScript(job_spec=job_spec(ALGO, {"steps": 10}), staging_dir=tmp_path)
+    try:
+        result = asyncio.run(run_in_process(Engine(), manifest(), script, control=pause))
+    finally:
+        release_step.set()
+    [(checkpoint_id, step, _)] = result.committed()
+    assert step == 2
+    report = result.exit_report
+    assert report is not None
+    assert report.last_committed_checkpoint_id == checkpoint_id
+    assert _cls(result) == "FAILURE_CLASS_INFRA_TRANSIENT/PAUSE_NOT_SAVED"
+    assert "p1" not in report.acknowledged_requests
+
+
+def test_pause_whose_commit_is_never_confirmed_is_not_paused(tmp_path: Path) -> None:
+    spec = job_spec(
+        ALGO,
+        {"steps": 200, "checkpoint_every": 0, "step_seconds": 0.01},
+        harness={"commit_timeout_s": 1},
+    )
+    r = _run(tmp_path, {}, spec=spec, control=_pause_at_step_2, answer_commits=False)
+    assert _cls(r) == "FAILURE_CLASS_INFRA_TRANSIENT/PAUSE_NOT_SAVED"
+    report = r.exit_report
+    assert report is not None
+    assert "p1" not in report.acknowledged_requests
+
+
+def test_a_checkpoint_request_is_acknowledged_only_once_committed(tmp_path: Path) -> None:
+    async def ask(agent: FakeAgent, _: object) -> None:
+        await agent.wait_for(lambda m: m.HasField("progress") and m.progress.step >= 2)
+        await agent.send(pb.AgentMessage(checkpoint_request=pb.CheckpointRequest(request_id="c1")))
+
+    r = _run(
+        tmp_path,
+        {"steps": 30, "checkpoint_every": 0, "step_seconds": 0.01},
+        control=ask,
+        commit_state=pb.COMMIT_STATE_REJECTED,
+    )
+    report = r.exit_report
+    assert report is not None
+    assert "c1" not in report.acknowledged_requests
 
 
 def test_on_demand_checkpoint_keeps_training(tmp_path: Path) -> None:

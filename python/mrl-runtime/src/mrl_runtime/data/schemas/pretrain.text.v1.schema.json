@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.masterrl.dev/datasets/pretrain.text.v1.schema.json",
+  "title": "pretrain.text.v1",
+  "description": "Raw text for pre-training and continued pre-training. One record per line (JSONL).",
+  "type": "object",
+  "required": ["text"],
+  "properties": {
+    "text": { "$ref": "common.v1.schema.json#/$defs/text" },
+    "meta": { "$ref": "common.v1.schema.json#/$defs/meta" }
+  },
+  "additionalProperties": false
+}

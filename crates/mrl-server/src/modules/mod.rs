@@ -24,6 +24,8 @@ pub mod lineage;
 pub mod secrets;
 pub mod uploads;
 // <mrl:modules P21> P21 `pub mod` lines go right below this line.
+pub mod compute;
+pub mod scheduler;
 // <mrl:modules P22> P22 `pub mod` lines go right below this line.
 pub mod alerts;
 pub mod streams;
