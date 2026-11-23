@@ -1783,6 +1783,62 @@ async fn retention_retries_unreferenced_object_removal() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL (just dev)"]
+async fn retention_expires_old_receipts_and_whole_archived_step_buckets() {
+    let w = World::solo().await;
+    let s = seed_run(&w.db, Uuid::nil(), json!({})).await;
+    send_metrics(&w, &s, 1, points("loss", 3003..3004, |_| 1.0)).await;
+    send_metrics(&w, &s, 2, points("loss", 3004..3005, |_| 1.0)).await;
+    sqlx::query(
+        "UPDATE telemetry_receipts SET received_at = now() - interval '100 days' WHERE seq = 1",
+    )
+    .execute(w.db.pool())
+    .await
+    .unwrap();
+    // Bucket 100: all old → goes, its rollup answers. Bucket 200: one recent step → stays.
+    // Bucket 300: old, but raw points are still in it → stays.
+    sqlx::query(
+        "INSERT INTO metric_step_archive (series_id, step, attempt_no, ts, value)
+         SELECT id, step, 1, now() - make_interval(days => age), 2.0 FROM metric_series,
+                (VALUES (1000, 100), (1005, 100), (2000, 100), (2005, 1), (3000, 100)) v(step, age)",
+    )
+    .execute(w.db.pool())
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO metric_rollups (series_id, tier, bucket_start, min, max, avg, last, n)
+         SELECT id, 'step_bucket', 100, 2.0, 2.0, 2.0, 2.0, 2 FROM metric_series",
+    )
+    .execute(w.db.pool())
+    .await
+    .unwrap();
+
+    rollup::maintain(&w.tel, true).await.unwrap();
+
+    let receipts: Vec<String> =
+        sqlx::query_scalar("SELECT seq::text FROM telemetry_receipts ORDER BY seq")
+            .fetch_all(w.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        receipts,
+        ["2"],
+        "only the receipt past every retention goes"
+    );
+    let kept: Vec<i64> = sqlx::query_scalar("SELECT step FROM metric_step_archive ORDER BY step")
+        .fetch_all(w.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(kept, [2000, 2005, 3000]);
+    let path = format!(
+        "/api/v1/runs/{}/metrics/query?series=loss&from_step=1000&to_step=1009",
+        s.run_id()
+    );
+    let out = w.get(Who::Solo, &path).await.json();
+    assert_eq!(line(&out["series"][0]), [(1000, 2.0)], "the rollup answers");
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
 async fn paging_cannot_skip_a_log_or_sample_waiting_to_commit() {
     let w = World::solo().await;
     let s = seed_run(&w.db, Uuid::nil(), json!({})).await;

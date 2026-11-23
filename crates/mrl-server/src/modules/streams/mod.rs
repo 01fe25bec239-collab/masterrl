@@ -549,6 +549,11 @@ impl Live {
             .await?;
         if !self.sub.metrics.is_empty() {
             // Partition drops can hide raw points from a snapshot that predates their prune marker.
+            // A retirement holds the table while it archives a week; give up after a short wait
+            // so the stream keeps sending heartbeats and polls again.
+            sqlx::query("SET LOCAL lock_timeout = '2s'")
+                .execute(&mut *tx)
+                .await?;
             sqlx::query("LOCK TABLE ONLY metric_points IN ACCESS SHARE MODE")
                 .execute(&mut *tx)
                 .await?;
