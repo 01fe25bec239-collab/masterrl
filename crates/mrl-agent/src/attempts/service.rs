@@ -296,9 +296,12 @@ impl crate::registry::AgentService for AttemptsService {
             async move { renew_leases(&w, grants, stop).await }
         });
         if let Some(statuses) = statuses {
+            // Read while the start gate is held: no command runs between re-adoption and here,
+            // so every command up to this seq shows in `statuses` (INT-4).
             let report = agent_message::Body::Reconcile(ReconcileReport {
                 attempts: statuses,
                 deployments: Vec::new(),
+                commands_through: link.commands_through(),
             });
             tokio::select! {
                 biased;

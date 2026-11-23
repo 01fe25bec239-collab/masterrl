@@ -571,8 +571,21 @@ pub(crate) async fn end_unstarted(
     class: FailureClass,
     why: String,
 ) -> Result<(), SchedError> {
+    end_pending(core, attempt.org_id, attempt.id, class, why, false).await
+}
+
+/// Ends a still-PENDING attempt. `never_started`: its machine proved (by a reconcile that
+/// covers the launch, INT-4) it never started it, so its hold is released, not fenced.
+async fn end_pending(
+    core: &Core,
+    org: Uuid,
+    id: Uuid,
+    class: FailureClass,
+    why: String,
+    never_started: bool,
+) -> Result<(), SchedError> {
     let mut tx = core.db.begin().await?;
-    let Some(a) = JobTransitions::lock_attempt(&mut tx, attempt.org_id, attempt.id).await? else {
+    let Some(a) = JobTransitions::lock_attempt(&mut tx, org, id).await? else {
         return Ok(());
     };
     if a.attempt_state()? != JobAttemptState::Pending {
@@ -603,7 +616,7 @@ pub(crate) async fn end_unstarted(
     .bind(a.epoch)
     .fetch_one(&mut *tx)
     .await?;
-    if may_have_started {
+    if may_have_started && !never_started {
         let a = acknowledge(&mut tx, a).await?;
         lose_with_failure(&mut tx, &a, FailureCode::class_only(class), &why, false).await?;
         let job = lock_job(&mut tx, a.org_id, a.job_id).await?;
@@ -621,8 +634,12 @@ pub(crate) async fn end_unstarted(
     release_for_attempt(core, &mut tx, a.id, &why).await?;
     fate(&mut tx, a.org_id, a.job_id, failure, &why).await?;
     let job = lock_job(&mut tx, a.org_id, a.job_id).await?;
-    core.audit_job(&mut tx, &job, "scheduler.launch_ended")
-        .await?;
+    let action = if never_started {
+        "scheduler.launch_never_started"
+    } else {
+        "scheduler.launch_ended"
+    };
+    core.audit_job(&mut tx, &job, action).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -689,17 +706,43 @@ pub(crate) async fn on_reconcile(
         }
         tx.commit().await?;
     }
+    // The machine handled every command up to `commands_through` before this report (INT-4):
+    // a PENDING attempt it took the launch of, and does not list, never started there. It
+    // ends now and its GPUs are freed; no terminal report will ever come.
+    let through = i64::try_from(report.commands_through).unwrap_or(i64::MAX);
+    if through > 0 {
+        let never: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT DISTINCT a.id, a.org_id FROM job_attempts a
+             JOIN attempt_placements p ON p.attempt_id = a.id AND p.node_id = $1
+             JOIN agent_commands c ON c.attempt_id = a.id AND c.epoch = a.epoch AND c.node_id = $1
+               AND c.kind = 'LaunchAttempt' AND c.state IN ('RECEIVED','COMPLETED')
+             WHERE a.state = 'PENDING' AND c.seq <= $2",
+        )
+        .bind(node)
+        .bind(through)
+        .fetch_all(core.db.pool())
+        .await?;
+        for (id, org) in never.into_iter().filter(|(id, _)| !listed.contains(id)) {
+            let why = "The machine handled the launch but never started the attempt.";
+            end_pending(core, org, id, FailureClass::NodeLost, why.into(), true).await?;
+        }
+    }
     // For a possibly delivered launch with no status, an empty startup report can predate
-    // the launch. Keep its hold until a terminal report or decommission proves it stopped.
+    // the launch. Keep its hold until a terminal report, a report covering its launch, or
+    // decommission proves it stopped.
     let quarantined: Vec<(Uuid, Option<Uuid>)> = sqlx::query_as(
         "SELECT r.id, r.attempt_id FROM resource_reservations r
          LEFT JOIN job_attempts a ON a.id = r.attempt_id
          LEFT JOIN scheduler_attempt_reports s ON s.attempt_id = r.attempt_id
-         WHERE r.node_id = $1 AND s.seq <= $2
+         WHERE r.node_id = $1
+           AND (s.seq <= $2 OR EXISTS (SELECT 1 FROM agent_commands c
+                 WHERE c.attempt_id = r.attempt_id AND c.node_id = $1 AND c.kind = 'LaunchAttempt'
+                   AND c.state IN ('RECEIVED','COMPLETED') AND c.seq <= $3))
            AND (r.state = 'QUARANTINED' OR (r.state = 'RELEASING' AND a.state = 'LOST'))",
     )
     .bind(node)
     .bind(seq)
+    .bind(through)
     .fetch_all(core.db.pool())
     .await?;
     for (id, attempt) in quarantined {

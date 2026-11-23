@@ -534,9 +534,11 @@ async fn deliver_pause(
         AttemptId::from_uuid(attempt.id),
         job.state_version
     );
+    // An expired pause never reached the machine (it was away): the job still asks, so it
+    // is sent again instead of refused (INT-4).
     match latest_command(&core.db, "PauseAttempt", attempt)
         .await?
-        .filter(|row| row.is_pause_request(&request_id))
+        .filter(|row| row.is_pause_request(&request_id) && row.state != "EXPIRED")
     {
         None => {
             let k = Kind::PauseAttempt(PauseAttempt {

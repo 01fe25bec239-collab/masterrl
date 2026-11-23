@@ -177,6 +177,9 @@ message AttemptLease {
 message ReconcileReport {
   repeated AttemptStatus attempts = 1;
   repeated DeploymentStatus deployments = 2;
+  // Every command with seq <= this was handled before the report was built (0 = not said):
+  // an attempt launched at or below it and not listed never started on this machine.
+  uint64 commands_through = 3;
 }
 
 message ReconcileResult {
