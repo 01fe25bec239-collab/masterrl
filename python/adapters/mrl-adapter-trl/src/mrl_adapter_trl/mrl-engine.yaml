@@ -1,0 +1,91 @@
+# TRL engine manifest (engine-manifest/v1). The base file holds what every TRL algorithm shares:
+# identity, upstream pins, environments, capabilities, topology, checkpoint and export formats.
+#
+# Fragment convention (mrl-engine.d/):
+#   - One file per algorithm family, named after it: sft.yaml (sft, cpt); later dpo.yaml,
+#     grpo.yaml, ... Each part that adds a family owns only its own fragment.
+#   - A fragment adds spec.algorithms, spec.constraints and spec.metrics.namespaces entries for
+#     its family, nothing else. The loader merges files in name order: mappings key by key, lists
+#     appended; a fragment may not change a value the base (or an earlier fragment) set.
+#   - Algorithm ids are unique across all fragments (the loader refuses a repeat).
+#   - Config schemas a fragment points at live in config/ next to this file.
+# The file lives inside the package so a non-editable install (the agent's) still finds it.
+apiVersion: mrl.dev/engine/v1
+kind: EngineManifest
+metadata:
+  name: trl
+  version: 0.1.0
+  displayName: Hugging Face TRL
+  description: Supervised fine-tuning and continued pre-training on Transformers, with full, LoRA or QLoRA updates.
+  license: Apache-2.0
+  homepage: https://huggingface.co/docs/trl
+  maintainers: [MasterRL core]
+spec:
+  adapter:
+    entrypoint: mrl_adapter_trl.sft:TrlSftEngine
+    adapterApi: ">=1.0,<2"
+    workerProtocol: ">=1.0,<2"
+  upstream:
+    - { name: trl, version: 1.17.1, license: Apache-2.0, source: "https://github.com/huggingface/trl" }
+    - { name: transformers, version: 5.22.2, license: Apache-2.0, source: "https://github.com/huggingface/transformers" }
+    - { name: peft, version: 0.21.2, license: Apache-2.0, source: "https://github.com/huggingface/peft" }
+    - { name: accelerate, version: 1.15.0, license: Apache-2.0, source: "https://github.com/huggingface/accelerate" }
+    - { name: datasets, version: 5.1.0, license: Apache-2.0, source: "https://github.com/huggingface/datasets" }
+    - { name: torch, version: 2.14.1, license: BSD-3-Clause, source: "https://github.com/pytorch/pytorch" }
+    - { name: bitsandbytes, version: 0.50.2, license: MIT, source: "https://github.com/bitsandbytes-foundation/bitsandbytes" }
+  runtime:
+    # Process mode: the agent builds each from the adapter project's uv.lock (checked by hash).
+    # PyPI torch is CUDA 13 on Linux (also runs on CPU) and CPU/MPS on macOS.
+    environments:
+      - id: cuda13-uv
+        kind: uv
+        lockfile: uv.lock
+        lockSha256: 1341ee05deec523beff0a5dc77c256a042768e77bd01146ff94506c75a80b3d9
+        python: "3.12"
+        platform: linux/amd64
+        accelerator: { vendor: nvidia, runtime: cuda13, minComputeCapability: "7.5" }
+        mrlRuntime: 0.1.0
+      - id: cpu-uv
+        kind: uv
+        lockfile: uv.lock
+        lockSha256: 1341ee05deec523beff0a5dc77c256a042768e77bd01146ff94506c75a80b3d9
+        python: "3.12"
+        platform: linux/amd64
+        accelerator: { vendor: cpu }
+        mrlRuntime: 0.1.0
+      - id: mps-uv
+        kind: uv
+        lockfile: uv.lock
+        lockSha256: 1341ee05deec523beff0a5dc77c256a042768e77bd01146ff94506c75a80b3d9
+        python: "3.12"
+        platform: darwin/arm64
+        accelerator: { vendor: apple, runtime: mps }
+        mrlRuntime: 0.1.0
+  runtimes:
+    - { role: trainer, runtime_ref: cuda13-uv }
+    - { role: trainer, runtime_ref: cpu-uv }
+    - { role: trainer, runtime_ref: mps-uv }
+  capabilities:
+    updateStrategies: [full, lora, qlora]
+    precision: [bf16, fp16, fp32]
+    quantizedTraining: [bnb-4bit]
+    parallelism: [single]
+    multiNode: false
+    execution: { modes: [offline] }
+    resume: true
+    pause: true # pause = checkpoint at the next step boundary, then exit
+    onDemandCheckpoint: true
+    gradientCheckpointing: true
+    streamingDatasets: false
+    trustRemoteCode: never
+  topology:
+    roles:
+      - { id: trainer, kind: trainer, environment: cuda13-uv, count: 1, reportsVia: worker_protocol }
+    primary: trainer
+    network: none
+    launcher: inprocess
+  algorithms: []
+  checkpoint: { format: hf-trainer-v1, resumable: true, portableWeights: true, stateFiles: keep }
+  exports: [hf-safetensors, hf-peft-adapter, merged-safetensors]
+  validate: { l1: true }
+  hardware: { os: [linux, macos], accelerators: [nvidia, apple, cpu], apple_silicon: true, wsl2: true }

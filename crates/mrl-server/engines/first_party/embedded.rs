@@ -3,4 +3,5 @@
 pub const BUNDLES: &[&str] = &[
     include_str!("fake.json"),
     include_str!("mrl-builtin.json"),
+    include_str!("trl.json"),
 ];

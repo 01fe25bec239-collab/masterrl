@@ -2286,6 +2286,28 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-CAP-250")),
+            ("title", Value::Str("This setting needs an NVIDIA GPU.")),
+            ("why", Value::Str("QLoRA, 8-bit optimizers and fp16 training use code that runs only on NVIDIA GPUs, and this machine has none. Details names the setting.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Pick LoRA instead of QLoRA, the adamw_torch optimizer and precision auto."),
+                    Value::Str("Or run this training on a machine with an NVIDIA GPU."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CAP-251")),
+            ("title", Value::Str("This checkpoint can't resume training.")),
+            ("why", Value::Str("It lacks files the engine needs to continue, like the optimizer state. Details lists the missing files.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Resume from an earlier checkpoint of the same run."),
+                    Value::Str("Or start a new run from the base model."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-CONFLICT-001")),
             ("title", Value::Str("Someone changed this item after you opened it.")),
             ("why", Value::Str("The version you edited is older than the saved one.")),

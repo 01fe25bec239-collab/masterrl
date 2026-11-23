@@ -2227,6 +2227,28 @@
       }
     },
     {
+      "code": "MRL-CAP-250",
+      "title": "This setting needs an NVIDIA GPU.",
+      "why": "QLoRA, 8-bit optimizers and fp16 training use code that runs only on NVIDIA GPUs, and this machine has none. Details names the setting.",
+      "what_to_do": {
+        "steps": [
+          "Pick LoRA instead of QLoRA, the adamw_torch optimizer and precision auto.",
+          "Or run this training on a machine with an NVIDIA GPU."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CAP-251",
+      "title": "This checkpoint can't resume training.",
+      "why": "It lacks files the engine needs to continue, like the optimizer state. Details lists the missing files.",
+      "what_to_do": {
+        "steps": [
+          "Resume from an earlier checkpoint of the same run.",
+          "Or start a new run from the base model."
+        ]
+      }
+    },
+    {
       "code": "MRL-CONFLICT-001",
       "title": "Someone changed this item after you opened it.",
       "why": "The version you edited is older than the saved one.",

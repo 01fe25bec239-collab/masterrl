@@ -1,0 +1,113 @@
+name: ci-trl
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-trl-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.11.28"
+  UV_PYTHON: "3.12"
+
+jobs:
+  cpu:
+    # The TRL engine on CPU: E tests and conformance TC1-TC7 with the tiny fixture, in the
+    # CPU variant (runtimes/trainer.lock). GPU tests never run in CI.
+    name: trl engine (cpu)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      MRL_TEST_TRL_FIXTURES_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - name: tiny-llama fixture
+        run: uv sync --locked && uv run --locked python tools/fixtures/make_fixtures.py
+      - name: locks are current
+        working-directory: python/adapters/mrl-adapter-trl
+        run: |
+          uv lock --check
+          runtimes/lock-cpu.sh
+          git diff --exit-code runtimes/trainer.lock
+      - name: CPU environment from runtimes/trainer.lock
+        working-directory: python/adapters/mrl-adapter-trl
+        run: |
+          TRL_VENV="$RUNNER_TEMP/trl-cpu"
+          printf 'TRL_VENV=%s\n' "$TRL_VENV" >> "$GITHUB_ENV"
+          uv venv "$TRL_VENV"
+          uv pip install --python "$TRL_VENV/bin/python" --only-binary :all: --require-hashes \
+            --torch-backend cpu -r runtimes/trainer.lock
+          uv pip install --python "$TRL_VENV/bin/python" --no-deps -e ../../mrl-runtime -e .
+          uv pip install --python "$TRL_VENV/bin/python" pytest==9.2.0 import-linter==2.15
+      - name: import contract
+        working-directory: python/adapters/mrl-adapter-trl
+        run: '"$TRL_VENV/bin/lint-imports"'
+      - name: tests and conformance
+        working-directory: python/adapters/mrl-adapter-trl
+        run: '"$TRL_VENV/bin/python" -m pytest -q'
+
+      - name: worker installed outside the checkout
+        run: |
+          uv pip install --python "$TRL_VENV/bin/python" --no-deps --reinstall \
+            python/mrl-runtime python/adapters/mrl-adapter-trl
+          cd "$RUNNER_TEMP"
+          "$TRL_VENV/bin/python" -I - "$GITHUB_WORKSPACE/tests/fixtures" <<'PY'
+          import asyncio
+          import sys
+          from pathlib import Path
+          from tempfile import TemporaryDirectory
+
+          from mrl_runtime._generated.mrl.worker.v1 import worker_control_pb2 as pb
+          from mrl_runtime.testkit.agent import AgentScript
+          from mrl_runtime.testkit.runner import job_spec, run_subprocess
+
+          fixtures = Path(sys.argv[1])
+          with TemporaryDirectory() as work:
+              script = AgentScript(
+                  job_spec=job_spec("sft", {"max_steps": 1, "max_length": 128}),
+                  staging_dir=Path(work),
+                  staged_paths={
+                      "model": str(fixtures / "models/.cache/tiny-llama"),
+                      "train": str(fixtures / "datasets/sft.messages.v1.jsonl"),
+                  },
+                  dry_run=True,
+              )
+              result = asyncio.run(run_subprocess("trl", script))
+              assert result.prepared is not None and result.prepared.ok, result.prepared
+              assert result.exit_report is not None, result.exit_code
+              assert result.exit_report.kind == pb.EXIT_KIND_DRY_RUN_OK, result.exit_report
+          PY
+
+  image:
+    # CPU image on every PR; the GPU (CUDA 13) image only on manual runs (several GB).
+    name: worker-trl image (${{ matrix.variant }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        variant: ${{ github.event_name == 'workflow_dispatch' && fromJSON('["cpu","gpu"]') || fromJSON('["cpu"]') }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: build
+        run: docker build -f images/worker-trl/Dockerfile --build-arg VARIANT=${{ matrix.variant }} -t mrl-worker-trl:${{ matrix.variant }} .
+      - name: runs as non-root and finds the engine
+        run: |
+          test "$(docker run --rm --entrypoint id mrl-worker-trl:${{ matrix.variant }} -u)" = 10001
+          # The agent supplies the command and flags after the image name. A missing nonce
+          # exits with 2 after parsing. The message proves the full command parsed.
+          output=$(docker run --rm --network none mrl-worker-trl:${{ matrix.variant }} \
+            mrl-worker --engine trl --socket /tmp/worker.sock --attempt-id att_image 2>&1) && exit 1
+          test "$?" = 2
+          printf '%s\n' "$output" | grep -F 'MRL_WORKER_NONCE is not set'

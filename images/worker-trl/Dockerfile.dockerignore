@@ -1,0 +1,10 @@
+# Build context is the repo root; send only what the image needs.
+*
+!python/mrl-runtime/pyproject.toml
+!python/mrl-runtime/src/
+!python/adapters/mrl-adapter-trl/pyproject.toml
+!python/adapters/mrl-adapter-trl/uv.lock
+!python/adapters/mrl-adapter-trl/runtimes/trainer.lock
+!python/adapters/mrl-adapter-trl/src/
+**/__pycache__
+**/.venv

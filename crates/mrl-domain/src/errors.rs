@@ -737,6 +737,14 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         "The app has no record of this dataset version.",
     ),
     // <mrl:errors P25> rows for P25 go right below this line.
+    (
+        code(ErrorFamily::Cap, 250),
+        "This setting needs an NVIDIA GPU.",
+    ),
+    (
+        code(ErrorFamily::Cap, 251),
+        "This checkpoint can't resume training.",
+    ),
 ];
 
 /// Every code with its title: the registry plus every capability rejection.
