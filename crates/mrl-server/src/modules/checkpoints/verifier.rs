@@ -245,6 +245,13 @@ impl CompletionVerifier for FinalCheckpointVerifier {
                 value.is_finite().then(|| (name.clone(), value))
             }));
         }
+        // Metrics the run streamed count too (P22's stored series); the report wins.
+        let stored = crate::modules::telemetry::history::final_values(&self.db, run)
+            .await
+            .map_err(SeamError::from)?;
+        for (name, value) in stored {
+            reported.entry(name).or_insert(value);
+        }
         Ok(judge_report(
             Some(checkpoint),
             &evidence.resolved,

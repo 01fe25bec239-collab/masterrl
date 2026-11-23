@@ -2160,6 +2160,18 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-CAP-210",
+      "title": "No machine in this pool can run this job as asked.",
+      "why": "The job asks for more GPUs, GPU memory, a GPU type or memory than any machine in the pool has. The reason names what is missing.",
+      "what_to_do": {
+        "steps": [
+          "Read the reason to see what the job needs that no machine has.",
+          "Ask for fewer or smaller GPUs, or add a machine that has them to the pool.",
+          "A job runs on one machine for now, so ask for 1 machine with more GPUs instead of several machines."
+        ]
+      }
+    },
+    {
       "code": "MRL-CONFLICT-001",
       "title": "Someone changed this item after you opened it.",
       "why": "The version you edited is older than the saved one.",
@@ -2252,6 +2264,17 @@ export const catalog = deepFreeze({
         "steps": [
           "Delete the secret again to finish.",
           "Then create a new secret if you still need one."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CONFLICT-210",
+      "title": "This reservation was changed by a newer holder.",
+      "why": "Each reservation carries an epoch. A change made with an older epoch comes from work that was already replaced, so it doesn't count.",
+      "what_to_do": {
+        "steps": [
+          "Read the reservation again and use its current epoch.",
+          "If your work was replaced, stop it; the newer holder owns the machine now."
         ]
       }
     },
@@ -3259,6 +3282,16 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-PERM-210",
+      "title": "No pool is open to this project.",
+      "why": "Jobs run on the pools of their organization or on shared pools. None of them can take this job, or no pool exists yet.",
+      "what_to_do": {
+        "steps": [
+          "Create a pool and add a machine to it, or ask an admin to open a pool to your organization."
+        ]
+      }
+    },
+    {
       "code": "MRL-QUOTA-001",
       "title": "Your team reached its limit on jobs or GPUs.",
       "why": "Your org limits how many jobs and GPUs a project can use at once.",
@@ -3287,6 +3320,50 @@ export const catalog = deepFreeze({
       "what_to_do": {
         "steps": [
           "Wait about 1 minute, then try again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-QUOTA-210",
+      "title": "This job is waiting for a free machine.",
+      "why": "A machine in the pool can run the job, but it is busy, offline or draining right now.",
+      "what_to_do": {
+        "steps": [
+          "Nothing to do; the job starts by itself when a machine is free.",
+          "To start sooner, raise the job's priority or add a machine to the pool."
+        ]
+      }
+    },
+    {
+      "code": "MRL-QUOTA-211",
+      "title": "This pool is paused and starts no new work.",
+      "why": "An admin paused the pool (its `paused` flag is set). Work already running there goes on.",
+      "what_to_do": {
+        "steps": [
+          "Wait until an admin resumes the pool.",
+          "Or ask an admin to open another pool to your project."
+        ]
+      }
+    },
+    {
+      "code": "MRL-QUOTA-212",
+      "title": "Too many jobs of this project are ahead in the queue.",
+      "why": "The scheduler places only a set number of each project's queued jobs at a time. That way one project can't fill every machine.",
+      "what_to_do": {
+        "steps": [
+          "Nothing to do; the job moves up as earlier ones start.",
+          "Cancel jobs you no longer need to let this one through sooner."
+        ]
+      }
+    },
+    {
+      "code": "MRL-QUOTA-220",
+      "title": "Too many live views are open.",
+      "why": "Each sign-in may keep up to 10 live views (streams) open at once, each watching up to 50 things. This request would go over that.",
+      "what_to_do": {
+        "steps": [
+          "Close live views you no longer need, like old browser tabs on run pages.",
+          "Watch fewer things in one view, then try again."
         ]
       }
     },
@@ -3489,6 +3566,27 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-STATE-210",
+      "title": "The agent lost its credentials before launch.",
+      "why": "The agent restarted before it started the run. Its saved metadata lists the required credentials, and the values were held in memory.",
+      "what_to_do": {
+        "steps": [
+          "Wait for the scheduler to place another attempt if the run has retries left.",
+          "If the run stops, check that the agent stays online and submit it again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STATE-220",
+      "title": "This alert is already resolved.",
+      "why": "Someone resolved this alert, so it takes no more changes. If the problem comes back, a new alert opens.",
+      "what_to_do": {
+        "steps": [
+          "Refresh the alert list to see its current state."
+        ]
+      }
+    },
+    {
       "code": "MRL-STATE-230",
       "title": "This checkpoint isn't committed, so it can't be used yet.",
       "why": "A checkpoint can be checked, promoted or deleted only once all its files are saved and confirmed. This one is still being saved, or it was found to be damaged or deleted.",
@@ -3656,6 +3754,17 @@ export const catalog = deepFreeze({
         "steps": [
           "Send the parts listed in Details again.",
           "Then finish the upload again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STORE-220",
+      "title": "A saved log or sample file is missing or damaged.",
+      "why": "Older logs and samples are kept as files in storage. The file for this part is missing, or its contents don't match the checksum saved when it was written.",
+      "what_to_do": {
+        "steps": [
+          "Check that the storage service is running and reachable.",
+          "If the file was deleted by a storage cleanup rule, this part of the log can't be shown any more."
         ]
       }
     },

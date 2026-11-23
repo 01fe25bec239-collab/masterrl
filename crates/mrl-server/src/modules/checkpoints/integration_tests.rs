@@ -1335,6 +1335,30 @@ async fn a_finished_job_without_a_final_checkpoint_fails_verification() {
         .await
         .unwrap();
     assert!(reason.to_string().contains("train/loss"), "{reason}");
+
+    // A required metric the run streamed (P22's stored series) counts without the report.
+    let (run, job) = env
+        .running_run(json!({"metrics": {"required": ["train/loss"]}}))
+        .await;
+    mrl_server::modules::telemetry::rollup::ensure_partitions(
+        env.db.db(),
+        time::OffsetDateTime::now_utc(),
+    )
+    .await
+    .unwrap();
+    env.db
+        .seed(&format!(
+            "WITH s AS (INSERT INTO metric_series (org_id, run_id, name, freshness, declared)
+               SELECT org_id, id, 'train/loss', 'live', true FROM runs WHERE id = '{run}' RETURNING id)
+             INSERT INTO metric_points (series_id, attempt_id, attempt_no, batch_id, step, ts, value)
+               SELECT s.id, '{run}', 1, 1, 10, now(), 0.5 FROM s"
+        ))
+        .await;
+    let last = env.engine.checkpoint(10, true, &[]);
+    env.wait_state(last, "COMMITTED").await;
+    env.finish(job).await;
+    env.service.tick(&env.chains).await;
+    assert_eq!(env.job_state(job).await, ("COMPLETED".to_owned(), None));
     env.stop().await;
 }
 
