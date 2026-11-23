@@ -87,6 +87,8 @@ class WorkerSession:
         self._spool = spool
         self._versions = tuple(versions)
         self._reconnect_max_s = reconnect_max_s
+        # Longest wait for the agent's HelloAck before connecting again.
+        self.hello_timeout_s = 10.0
         self._wake = asyncio.Event()
         self._write_lock = asyncio.Lock()  # gRPC allows one write at a time per stream
         self._acked = asyncio.Event()
@@ -175,7 +177,14 @@ class WorkerSession:
                 response_deserializer=pb.AgentMessage.FromString,
             )()
             await call.write(wrap(self._hello))
-            first = await _read(call)
+            try:
+                first = await asyncio.wait_for(_read(call), self.hello_timeout_s)
+            except TimeoutError:
+                # An agent that took the stream but never answers (one shutting down while a
+                # new one starts): connect again instead of waiting forever in silence.
+                _log.debug("no HelloAck within %ss; reconnecting", self.hello_timeout_s)
+                call.cancel()
+                return
             if first is None:
                 return
             if not first.HasField("hello_ack"):
