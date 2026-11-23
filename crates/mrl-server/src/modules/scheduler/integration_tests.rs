@@ -860,7 +860,22 @@ async fn a_killed_worker_retries_from_the_latest_checkpoint() {
         )
         .await;
     let first = w.running(job).await;
+    // A COMMITTED checkpoint of the first attempt (P23's table) is the run's latest.
     let ckpt = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO checkpoints (id, org_id, storage_org, run_id, job_id, attempt_id,
+           attempt_epoch, global_step, kind, layout, state)
+         VALUES ($1, $2, $3, $4, $5, $6, 1, 1, 'full_resume', 'fake-v1', 'COMMITTED')",
+    )
+    .bind(ckpt)
+    .bind(w.org)
+    .bind(mrl_domain::ids::OrgId::from_uuid(w.org).to_string())
+    .bind(run)
+    .bind(job)
+    .bind(first)
+    .execute(w.db.pool())
+    .await
+    .unwrap();
     sqlx::query("UPDATE runs SET latest_committed_checkpoint_id = $2 WHERE id = $1")
         .bind(run)
         .bind(ckpt)
