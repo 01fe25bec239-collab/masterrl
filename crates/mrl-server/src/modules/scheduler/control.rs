@@ -15,7 +15,7 @@ use super::reservations;
 use super::{Core, SchedError};
 use crate::db::Tx;
 use crate::modules::jobs::{AttemptChange, AttemptRow, JobChange, JobTransitions};
-use crate::modules::nodes::commands::NewCommand;
+use crate::modules::nodes::commands::{CommandKind, CommandSender, NewCommand};
 use crate::modules::nodes::lanes::{LaneItem, LaneKind, LaneSink, SinkError};
 use mrl_domain::failure::{FailureClass, FailureCode};
 use mrl_domain::ids::{AttemptId, NodeId};
@@ -580,14 +580,16 @@ pub(crate) async fn end_unstarted(
     }
     // The gateway locks each command when it claims it. Withdraw unsent commands
     // and keep the hold if any launch may already have left the core.
-    sqlx::query(
-        "UPDATE agent_commands SET state = 'SUPERSEDED', updated_at = now()
-         WHERE attempt_id = $1 AND epoch = $2 AND state = 'PENDING'
-           AND kind IN ('LaunchAttempt','StageArtifacts','UpdateCredentials')",
+    CommandSender::withdraw_in(
+        &mut tx,
+        a.id,
+        a.epoch,
+        &[
+            CommandKind::LaunchAttempt,
+            CommandKind::StageArtifacts,
+            CommandKind::UpdateCredentials,
+        ],
     )
-    .bind(a.id)
-    .bind(a.epoch)
-    .execute(&mut *tx)
     .await?;
     let may_have_started: bool = sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM agent_commands
@@ -775,8 +777,24 @@ pub(crate) async fn cancel(
     let cmd = NewCommand::new(k)
         .attempt(id, epoch)
         .deadline(Duration::from_secs(core.cfg.cancel_deadline_seconds));
-    match core.sender.send(NodeId::from_uuid(node), cmd).await {
-        Ok(_) => Ok(()),
+    // In one transaction with the attempt's row lock, so the cancel is ordered with the
+    // attempt's own changes (INT-2).
+    let mut tx = core.db.begin().await?;
+    let org: Option<Uuid> =
+        sqlx::query_scalar("SELECT org_id FROM job_attempts WHERE id = $1 FOR UPDATE")
+            .bind(id.as_uuid())
+            .fetch_optional(&mut *tx)
+            .await?;
+    match core
+        .sender
+        .send_in(&mut tx, NodeId::from_uuid(node), cmd)
+        .await
+    {
+        Ok(_) => {
+            super::failpoint("cancel.before_commit", org.unwrap_or_default())?;
+            tx.commit().await?;
+            Ok(())
+        }
         // A removed machine runs nothing any more.
         Err(crate::modules::nodes::NodesError::CommandRefused(why)) => {
             tracing::info!(node = %node, why, "cancel not sent");

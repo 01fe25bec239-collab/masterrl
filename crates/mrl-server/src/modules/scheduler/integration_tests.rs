@@ -1181,6 +1181,56 @@ async fn a_cancel_reaches_the_attempt_and_frees_the_gpu() {
     w.invariants().await;
 }
 
+/// INT-2: a core killed at a launch write boundary (after the placement commits, or inside
+/// the launch transaction) sends exactly one launch for the attempt once it runs again.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn a_core_killed_at_a_launch_write_boundary_sends_one_launch() {
+    use mrl_server::modules::scheduler::failpoints;
+    for point in ["launch.after_placement", "launch.before_commit"] {
+        let w = World::start(false).await;
+        failpoints::arm(point, w.org);
+        let m = w.agent(1).await;
+        let job = w.queue(1).await;
+        let attempt = w.running(job).await;
+        assert!(!failpoints::take(point, w.org), "{point} was reached");
+        assert_eq!(m.script.launches().len(), 1, "{point}");
+        assert_eq!(
+            w.commands(attempt, "LaunchAttempt").await.len(),
+            1,
+            "{point}"
+        );
+        assert_eq!(w.job(job).await.epoch, 1, "{point}");
+        w.invariants().await;
+    }
+}
+
+/// INT-2: a core killed before a cancel commits leaves no command; the next pass sends one.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn a_core_killed_before_a_cancel_commits_sends_it_once() {
+    use mrl_server::modules::scheduler::failpoints;
+    let w = World::start(false).await;
+    let m = w.agent(1).await;
+    let job = w.queue(1).await;
+    let attempt = w.running(job).await;
+    failpoints::arm("cancel.before_commit", w.org);
+    let mut tx = w.db.db().begin().await.unwrap();
+    let row = JobTransitions::lock(&mut tx, w.org, job)
+        .await
+        .unwrap()
+        .unwrap();
+    JobTransitions::request_cancel(&mut tx, &row, "tester")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    w.wait_state(job, "CANCELLED").await;
+    assert!(!failpoints::take("cancel.before_commit", w.org), "reached");
+    assert_eq!(m.script.cancels().len(), 1);
+    assert_eq!(w.commands(attempt, "CancelAttempt").await.len(), 1);
+    w.invariants().await;
+}
+
 /// Pause: sent only when the engine says it can pause; otherwise refused at once.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL (just test-integration)"]

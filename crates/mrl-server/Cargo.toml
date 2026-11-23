@@ -13,6 +13,10 @@ path = "src/lib.rs"
 name = "mrl-server"
 path = "src/main.rs"
 
+[features]
+# Test-only crash points in the scheduler (mrl-testkit turns it on).
+failpoints = []
+
 [dependencies]
 async-trait = "=0.1.92"
 axum = { workspace = true, features = ["http2"] }

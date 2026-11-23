@@ -548,7 +548,19 @@ async fn deliver_pause(
             let cmd = NewCommand::new(k)
                 .attempt(AttemptId::from_uuid(attempt.id), epoch)
                 .deadline(Duration::from_secs(core.cfg.cancel_deadline_seconds));
-            core.sender.send(NodeId::from_uuid(node), cmd).await?;
+            // Written only while the job still asks this attempt to pause (INT-2).
+            let mut tx = core.db.begin().await?;
+            let row = lock_job(&mut tx, job.org_id, job.id).await?;
+            if row.job_state()? == JobState::Pausing
+                && row.state_version == job.state_version
+                && row.current_attempt_id == Some(attempt.id)
+                && row.epoch == attempt.epoch
+            {
+                core.sender
+                    .send_in(&mut tx, NodeId::from_uuid(node), cmd)
+                    .await?;
+                tx.commit().await?;
+            }
             Ok(())
         }
         Some(row) if !row.in_flight() && !row.accepted() => refuse(row.failure_message()).await,
@@ -758,10 +770,11 @@ async fn place_one(
                         take(nodes, &p);
                     }
                     tracing::info!(job = %JobId::from_uuid(j.id), node = %NodeId::from_uuid(p.node_id), "job placed");
-                    log(
-                        "launch",
-                        launch::ensure_launched(core, &j, &a, leader_for).await,
-                    );
+                    let launched = async {
+                        super::failpoint("launch.after_placement", j.org_id)?;
+                        launch::ensure_launched(core, &j, &a, leader_for).await
+                    };
+                    log("launch", launched.await);
                     return Ok(true);
                 }
                 None => {
