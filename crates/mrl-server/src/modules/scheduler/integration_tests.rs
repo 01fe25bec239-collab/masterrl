@@ -62,6 +62,12 @@ impl LaunchContributor for FakeEngine {
         _placement: &Placement,
         plan: &mut LaunchPlan,
     ) -> Result<(), LaunchError> {
+        if job.resource_request["stage_without_expiry"] == true {
+            plan.stage.push(mrl_proto::agent::v1::StageItem {
+                name: "fixture".into(),
+                ..Default::default()
+            });
+        }
         if job.resource_request["stage_fixture"] == true {
             plan.stage.push(mrl_proto::agent::v1::StageItem {
                 name: "fixture".into(),
@@ -2158,4 +2164,55 @@ fn sha256_hex(b: &[u8]) -> String {
         .iter()
         .map(|x| format!("{x:02x}"))
         .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn a_high_priority_job_queued_mid_scan_does_not_wait_for_the_scan_to_wrap() {
+    let w = World::start(false).await;
+    let _m = w.agent(1).await;
+    // 30 jobs that never fit (2 GPUs on a 1-GPU machine); one job is looked at per tick.
+    let never = json!({"roles": [{"role": "trainer", "replicas": 1, "gpu_count": 2,
+        "cpu_millis": 100, "mem_bytes": 1024}]});
+    let mut low = Vec::new();
+    for _ in 0..30 {
+        low.push(w.queue_with(never.clone(), None).await);
+    }
+    w.until("the scan is past the first queued jobs", || async {
+        w.job(low[2]).await.state_reason.is_some()
+    })
+    .await;
+    let high = w.queue(1).await;
+    sqlx::query("UPDATE jobs SET priority = 10 WHERE id = $1")
+        .bind(high)
+        .execute(w.db.pool())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), w.running(high))
+        .await
+        .expect("the new high-priority job waited for the whole queue scan");
+    assert!(
+        w.job(low[29]).await.state_reason.is_none(),
+        "the scan wrapped first"
+    );
+    w.invariants().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn a_staged_item_without_an_expiry_is_not_treated_as_expired() {
+    let w = World::start(false).await;
+    let _m = w.agent(1).await;
+    // The scripted agent takes it; a real agent refuses the launch with its own reason.
+    let job = w
+        .queue_with(
+            json!({"stage_without_expiry": true, "roles": [{"role": "trainer", "replicas": 1,
+                "gpu_count": 1, "cpu_millis": 100, "mem_bytes": 1024}]}),
+            None,
+        )
+        .await;
+    let attempt = w.running(job).await;
+    assert_eq!(w.commands(attempt, "StageArtifacts").await.len(), 1);
+    assert_eq!(w.commands(attempt, "LaunchAttempt").await.len(), 1);
+    w.invariants().await;
 }

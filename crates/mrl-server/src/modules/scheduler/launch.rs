@@ -582,16 +582,16 @@ async fn send(
     Ok(())
 }
 
+/// The earliest link expiry among `items` (a second early). Items without an expiry don't
+/// count: the agent refuses them at launch with its own plain reason.
 fn earliest_ticket_expiry(items: &[StageItem]) -> Option<time::OffsetDateTime> {
     items
         .iter()
-        .map(|item| {
-            item.expires_at
-                .as_ref()
-                .and_then(|at| time::OffsetDateTime::from_unix_timestamp(at.seconds).ok())
-                .unwrap_or(time::OffsetDateTime::UNIX_EPOCH)
-                - time::Duration::SECOND
+        .filter_map(|item| {
+            let at = item.expires_at.as_ref()?;
+            time::OffsetDateTime::from_unix_timestamp(at.seconds).ok()
         })
+        .map(|at| at - time::Duration::SECOND)
         .min()
 }
 

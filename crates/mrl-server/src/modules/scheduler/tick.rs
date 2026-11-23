@@ -640,19 +640,34 @@ async fn queue(core: &Core, leader_for: Duration) -> Result<(), SchedError> {
     let mut capacity: HashMap<Uuid, Vec<NodeCapacity>> = HashMap::new();
     let limit = core.cfg.max_jobs_per_tick;
     let mut scan = core.queue_scan.lock().await;
+    // A job queued since this scan started that sorts before the cursor (higher priority,
+    // or a retry) would wait for the scan to wrap: start again from the top instead.
+    if let (Some((p, t, id)), Some(started)) = (scan.cursor, scan.started_at) {
+        let jumped: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM jobs WHERE state = 'QUEUED' AND queued_at >= $4
+               AND (-priority::bigint, queued_at, id) <
+                 (-$1::bigint, COALESCE($2::timestamptz, 'infinity'), $3))",
+        )
+        .bind(p)
+        .bind(t)
+        .bind(id)
+        .bind(started)
+        .fetch_one(core.db.pool())
+        .await?;
+        if jumped {
+            *scan = QueueScan::default();
+        }
+    }
+    if scan.started_at.is_none() {
+        scan.started_at = Some(
+            sqlx::query_scalar("SELECT clock_timestamp()")
+                .fetch_one(core.db.pool())
+                .await?,
+        );
+    }
     let (priority, queued_at, id) = scan
         .cursor
         .map_or((0, None, None), |(p, t, id)| (p, t, Some(id)));
-    let before = match scan.started_at {
-        Some(before) => before,
-        None => {
-            let before = sqlx::query_scalar("SELECT clock_timestamp()")
-                .fetch_one(core.db.pool())
-                .await?;
-            scan.started_at = Some(before);
-            before
-        }
-    };
     let jobs: Vec<JobRow> = sqlx::query_as(concat!(
         "SELECT ",
         crate::modules::jobs::transitions::job_cols!(),
@@ -665,7 +680,6 @@ async fn queue(core: &Core, leader_for: Duration) -> Result<(), SchedError> {
     .bind(queued_at)
     .bind(id)
     .bind(i64::from(limit))
-    .bind(before)
     .fetch_all(core.db.pool())
     .await?;
     let last_page = jobs.len() < limit as usize;
