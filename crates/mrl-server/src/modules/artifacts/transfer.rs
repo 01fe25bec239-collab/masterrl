@@ -10,8 +10,8 @@
 //!   response started with (a replaced object cuts the response short).
 //!
 //! The path carries the ticket, so spans, logs and problem `instance`s show
-//! `/api/v1/transfer/{ticket}` instead (`crate::http::shown_path`). It is the one solo path
-//! that needs no launch secret (`crate::http`'s solo gate), so agents never hold it.
+//! `/api/v1/transfer/{ticket}` instead (`crate::http::shown_path`). In solo mode the
+//! launch-secret header is still needed, as on every path of a solo server.
 
 use super::{ArtifactStore, Error};
 use crate::app::AppState;

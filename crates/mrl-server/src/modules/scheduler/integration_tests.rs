@@ -1867,6 +1867,8 @@ async fn launch_carries_download_tickets_and_granted_secrets() {
         ("model.bin", sha.as_str(), bytes.len() as u64, "model.bin")
     );
     let dir = tempfile::tempdir().unwrap();
+    let secret_file = dir.path().join("launch-secret");
+    std::fs::write(&secret_file, TEST_SECRET).unwrap();
     let agent_input = mrl_agent::attempts::spec::AttemptSpec::from_launch(
         &m.script.launches()[0],
         &stage.items,
@@ -1875,8 +1877,8 @@ async fn launch_carries_download_tickets_and_granted_secrets() {
     .unwrap();
     let ticket = agent_input.inputs[0].ticket().unwrap();
     let client = mrl_agent::transfer::TransferClient::new(&mrl_agent::config::TransferConfig {
-        // Solo: the ticket alone is the credential; the agent has no launch secret.
         server_url: Some(format!("http://{}", w.server().api())),
+        server_launch_secret_file: Some(secret_file),
         ..Default::default()
     })
     .unwrap();
