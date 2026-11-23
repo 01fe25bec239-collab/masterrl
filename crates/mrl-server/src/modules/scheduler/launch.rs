@@ -174,12 +174,30 @@ impl Transfer {
                 .resolve_for_run(seams.secrets.as_ref(), &org, RunId::from_uuid(run))
                 .await
                 .map_err(p19)?;
-            plan.credentials
-                .extend(granted.into_iter().map(|s| Credential {
-                    name: s.name,
-                    value: s.value.expose().as_bytes().to_vec(),
+            for secret in granted {
+                if secret.mount != "env" {
+                    return Err(LaunchError::Fail(
+                        FailureClass::UserConfig,
+                        "Run credentials must use an environment mount on this agent.".into(),
+                    ));
+                }
+                plan.credentials.push(Credential {
+                    name: secret.name,
+                    value: secret.value.expose().as_bytes().to_vec(),
                     expires_at: None,
-                }));
+                });
+            }
+        }
+        let mut names = std::collections::HashSet::new();
+        if plan
+            .credentials
+            .iter()
+            .any(|credential| !names.insert(mrl_proto::credential_env(&credential.name)))
+        {
+            return Err(LaunchError::Fail(
+                FailureClass::UserConfig,
+                "Two run credentials use the same worker environment variable.".into(),
+            ));
         }
         Ok(())
     }
@@ -255,7 +273,7 @@ impl LaunchContributor for RunConfigSpec {
         if let Some(run) = job.run_id {
             let row = sqlx::query(
                 "SELECT r.algorithm_id, r.base_model_version_id, r.reward_version_id, rc.resolved,
-                        rc.runtime_ref, rc.seeds, rc.dataset_version_ids
+                        rc.runtime_ref, rc.seeds, rc.dataset_version_ids, rc.launch_inputs
                  FROM runs r JOIN run_configs rc ON rc.run_id = r.id
                  WHERE r.id = $1 AND r.org_id = $2",
             )
@@ -276,6 +294,13 @@ impl LaunchContributor for RunConfigSpec {
             if let Value::Object(m) = get("resolved")? {
                 spec = m;
             }
+            plan.inputs.extend(
+                row.try_get::<sqlx::types::Json<Vec<super::pipeline::InputFile>>, _>(
+                    "launch_inputs",
+                )
+                .map_err(transient)?
+                .0,
+            );
             let mv: Uuid = row.try_get("base_model_version_id").map_err(transient)?;
             let rwd: Option<Uuid> = row.try_get("reward_version_id").map_err(transient)?;
             let dsv: Vec<Uuid> = row.try_get("dataset_version_ids").map_err(transient)?;
@@ -496,7 +521,26 @@ async fn send(
     let id = AttemptId::from_uuid(attempt.id);
     let epoch = u64::try_from(attempt.epoch).unwrap_or(0);
     let deadline = Duration::from_secs(core.cfg.launch_deadline_seconds);
-    let command = |kind| NewCommand::new(kind).attempt(id, epoch).deadline(deadline);
+    let expiry = latest_command(&core.db, "StageArtifacts", attempt)
+        .await?
+        .and_then(|row| row.staging_expiry())
+        .or_else(|| earliest_ticket_expiry(&plan.stage));
+    if expiry.is_some_and(|at| at <= time::OffsetDateTime::now_utc()) {
+        return end_unstarted(
+            core,
+            attempt,
+            FailureClass::InfraTransient,
+            "The input links expired before the machine could start. A retry gets fresh links."
+                .into(),
+        )
+        .await;
+    }
+    let command = |kind| {
+        NewCommand::new(kind)
+            .attempt(id, epoch)
+            .deadline(deadline)
+            .not_after(expiry)
+    };
     let r = plan.launch.attempt.clone();
     if !plan.stage.is_empty() {
         let k = Kind::StageArtifacts(StageArtifacts {
@@ -538,12 +582,26 @@ async fn send(
     Ok(())
 }
 
+fn earliest_ticket_expiry(items: &[StageItem]) -> Option<time::OffsetDateTime> {
+    items
+        .iter()
+        .map(|item| {
+            item.expires_at
+                .as_ref()
+                .and_then(|at| time::OffsetDateTime::from_unix_timestamp(at.seconds).ok())
+                .unwrap_or(time::OffsetDateTime::UNIX_EPOCH)
+                - time::Duration::SECOND
+        })
+        .min()
+}
+
 #[derive(sqlx::FromRow)]
 pub(crate) struct CommandStatus {
     pub state: String,
     pub age: f64,
     pub sent: bool,
     pub past_deadline: bool,
+    not_after: Option<time::OffsetDateTime>,
     result: Option<Value>,
     payload: Vec<u8>,
 }
@@ -579,6 +637,19 @@ impl CommandStatus {
             })
     }
 
+    fn staging_expiry(&self) -> Option<time::OffsetDateTime> {
+        self.not_after.or_else(|| {
+            // Older staged commands carry their expiry only in the command payload.
+            match mrl_proto::agent::v1::Command::decode(self.payload.as_slice())
+                .ok()?
+                .kind?
+            {
+                Kind::StageArtifacts(stage) => earliest_ticket_expiry(&stage.items),
+                _ => None,
+            }
+        })
+    }
+
     pub fn is_pause_request(&self, request_id: &str) -> bool {
         matches!(
             mrl_proto::agent::v1::Command::decode(self.payload.as_slice()).map(|c| c.kind),
@@ -595,8 +666,8 @@ pub(crate) async fn latest_command(
 ) -> Result<Option<CommandStatus>, SchedError> {
     Ok(sqlx::query_as(
         "SELECT state, result, extract(epoch from now() - updated_at)::float8 AS age,
-                sent_at IS NOT NULL AS sent, deadline_at <= now() AS past_deadline,
-                CASE WHEN kind = 'PauseAttempt' THEN payload ELSE ''::bytea END AS payload
+                sent_at IS NOT NULL AS sent, deadline_at <= now() AS past_deadline, not_after,
+                CASE WHEN kind IN ('PauseAttempt','StageArtifacts') THEN payload ELSE ''::bytea END AS payload
          FROM agent_commands
          WHERE kind = $1 AND attempt_id = $2 AND epoch = $3
          ORDER BY seq DESC LIMIT 1",

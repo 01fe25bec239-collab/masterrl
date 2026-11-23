@@ -29,8 +29,7 @@ use mrl_server::modules::nodes::{Gateway, NodesModule};
 use mrl_server::modules::scheduler::admission::{MaxQueuedPerProject, PoolFlags, PoolMembership};
 use mrl_server::modules::scheduler::launch::{RunConfigSpec, Transfer};
 use mrl_server::modules::scheduler::pipeline::{
-    Demand, InputFile, LaunchContributor, LaunchError, LaunchPlan, PauseSupport, Pipeline,
-    Placement,
+    Demand, LaunchContributor, LaunchError, LaunchPlan, PauseSupport, Pipeline, Placement,
 };
 use mrl_server::modules::scheduler::placement::SingleNodePacking;
 use mrl_server::modules::scheduler::{
@@ -63,21 +62,13 @@ impl LaunchContributor for FakeEngine {
         _placement: &Placement,
         plan: &mut LaunchPlan,
     ) -> Result<(), LaunchError> {
-        if let Some(key) = job.resource_request["input_fixture"].as_str() {
-            plan.inputs.push(InputFile {
-                name: "model".into(),
-                key: key.into(),
-                sha256: job.resource_request["input_sha256"]
-                    .as_str()
-                    .unwrap_or_default()
-                    .into(),
-                size: job.resource_request["input_size"].as_u64().unwrap_or(0),
-                local_path: "model/weights.bin".into(),
-            });
-        }
         if job.resource_request["stage_fixture"] == true {
             plan.stage.push(mrl_proto::agent::v1::StageItem {
                 name: "fixture".into(),
+                expires_at: Some(prost_types::Timestamp {
+                    seconds: time::OffsetDateTime::now_utc().unix_timestamp() + 600,
+                    nanos: 0,
+                }),
                 ..Default::default()
             });
         }
@@ -109,6 +100,20 @@ impl PauseSupport for CanPause {
     }
     async fn can_pause(&self, _job: &JobRow) -> Result<Option<bool>, SchedError> {
         Ok(Some(self.0))
+    }
+}
+
+#[async_trait::async_trait]
+impl mrl_server::modules::jobs::JobValidator for FakeEngine {
+    fn name(&self) -> &'static str {
+        "fake_engine"
+    }
+
+    async fn validate(
+        &self,
+        _: &mrl_server::modules::jobs::JobSpec,
+    ) -> Result<mrl_server::modules::jobs::Verdict, mrl_server::seams::SeamError> {
+        Ok(mrl_server::modules::jobs::Verdict::Accept)
     }
 }
 
@@ -197,7 +202,13 @@ async fn boot(
     port: u16,
     pause: bool,
 ) -> (TestServer, Arc<Gateway>, Scheduler, Arc<ArtifactStore>) {
-    let cfg = server_config(fast_config(), Mode::Solo, port);
+    let mut cfg = server_config(fast_config(), Mode::Solo, port);
+    cfg.object_store.url = Some(
+        reqwest::Url::from_directory_path(objects.join("objects"))
+            .unwrap()
+            .into(),
+    );
+
     // A fresh router per boot: a restarted server never delivers to the old module's sink.
     let lanes = LaneRouter::new();
     let artifacts = ArtifactsModule::with_backend(
@@ -212,13 +223,17 @@ async fn boot(
     let transfer = Transfer::new(store.clone(), artifacts.secrets(), secrets.clone());
     let nodes = NodesModule::new(db.db().clone(), &cfg, secrets.clone(), lanes.clone());
     let gw = nodes.gateway();
-    let chains = Chains::new(vec![], vec![Arc::new(VerifyAll)], vec![]);
+    let chains = Chains::new(
+        vec![Arc::new(FakeEngine)],
+        vec![Arc::new(VerifyAll)],
+        vec![],
+    );
     let module = SchedulerModule::with_parts(
         db.db().clone(),
         sched_config(),
         &gw,
         &lanes,
-        chains,
+        chains.clone(),
         pipeline(db.db(), pause),
         transfer,
     );
@@ -229,8 +244,15 @@ async fn boot(
             .secrets_arc(secrets),
         Mode::Solo,
     );
-    let modules: Vec<Box<dyn mrl_server::app::ServerModule>> =
-        vec![Box::new(nodes), Box::new(artifacts), Box::new(module)];
+    let modules: Vec<Box<dyn mrl_server::app::ServerModule>> = vec![
+        Box::new(nodes),
+        Box::new(artifacts),
+        Box::new(module),
+        Box::new(mrl_server::modules::runs::RunsModule::with_chains(
+            db.db().clone(),
+            chains,
+        )),
+    ];
     match TestServer::start(cfg, seams, modules).await {
         Ok(s) => (s, gw, sched, store),
         Err(e) => panic!("server did not start: {}", e.explain()),
@@ -239,6 +261,10 @@ async fn boot(
 
 impl World {
     async fn start(pause: bool) -> Self {
+        Self::start_for_org(pause, Uuid::now_v7()).await
+    }
+
+    async fn start_for_org(pause: bool, org: Uuid) -> Self {
         let db = TestDb::new().await;
         let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
         let objects = tempfile::tempdir().unwrap();
@@ -253,7 +279,7 @@ impl World {
             store,
             pool: Uuid::nil(),
             pause,
-            org: Uuid::now_v7(),
+            org,
             project: Uuid::now_v7(),
         };
         let r = w
@@ -1305,6 +1331,10 @@ async fn a_deployment_reserves_and_releases_through_the_scheduler() {
         .await
         .unwrap();
     let gone = w.sched.release(w.org, held.id, 7, "done").await.unwrap();
+    assert_eq!(
+        w.sched.reserve(&req).await.unwrap(),
+        Reserved::Ended(Box::new(gone.clone()))
+    );
     assert_eq!(gone.state, "EXPIRED", "a hold never activated expires");
     let active: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM reservation_devices WHERE reservation_id = $1 AND active",
@@ -1483,6 +1513,32 @@ async fn launch_waits_for_the_staging_result() {
     stage.resume.notify_one();
     w.running(job).await;
     assert_eq!(w.commands(attempt, "LaunchAttempt").await.len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn a_completed_stage_past_its_deadline_cannot_launch() {
+    let w = World::start(false).await;
+    let m = w.agent(1).await;
+    let stage = Arc::new(DelayedCommand {
+        entered: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+        handler: Handler(m.script.clone()),
+    });
+    m.script.link.register("StageArtifacts", stage.clone());
+    let job = w.queue_with(json!({
+        "stage_fixture": true,
+        "roles": [{"role": "trainer", "replicas": 1, "gpu_count": 1, "cpu_millis": 100, "mem_bytes": 1024}]
+    }), None).await;
+    tokio::time::timeout(WAIT, stage.entered.notified())
+        .await
+        .unwrap();
+    let attempt = w.job(job).await.current_attempt_id.unwrap();
+    sqlx::query("UPDATE agent_commands SET state = 'COMPLETED', result = jsonb_build_object('accepted', true), deadline_at = now() - interval '1 second', not_after = now() - interval '1 second' WHERE attempt_id = $1 AND kind = 'StageArtifacts'")
+        .bind(attempt).execute(w.db.pool()).await.unwrap();
+    w.wait_attempt(attempt, "KILLED").await;
+    assert!(w.commands(attempt, "LaunchAttempt").await.is_empty());
+    stage.resume.notify_one();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1680,55 +1736,93 @@ async fn the_reaper_keeps_a_hold_renewed_while_it_waits_for_the_lock() {
 async fn launch_carries_download_tickets_and_granted_secrets() {
     use mrl_proto::agent::v1::{StageArtifacts, UpdateCredentials};
     use prost::Message;
-    let w = World::start(false).await;
+    let w = World::start_for_org(false, Uuid::nil()).await;
     let m = w.agent(1).await;
-    // A stored input in the job org's storage.
-    let org = mrl_domain::ids::OrgId::from_uuid(w.org).to_string();
-    let bytes = b"fake weights".to_vec();
-    let sha = sha256_hex(&bytes);
-    let key = format!("orgs/{org}/inputs/model.bin");
-    w.store
-        .org_store(&org)
-        .await
-        .unwrap()
-        .put(&key, bytes.clone().into())
-        .await
-        .unwrap();
-    // A run with one granted secret (value in the server's secret store).
-    let run = w.run().await;
-    let secret = Uuid::now_v7();
-    sqlx::query(
-        "INSERT INTO secrets_metadata (id, org_id, name, backend, ref, kind, allowed_uses, created_by)
-         VALUES ($1, $2, 'hf_hub', 'secret_store', 'mrl.secret.test', 'hf_token', '{run}', 't')",
-    )
-    .bind(secret)
-    .bind(&org)
-    .execute(w.db.pool())
-    .await
-    .unwrap();
-    sqlx::query("INSERT INTO run_secret_grants (run_id, secret_id, mount) VALUES ($1, $2, 'env')")
-        .bind(run)
-        .bind(secret)
-        .execute(w.db.pool())
-        .await
-        .unwrap();
-    w.secrets
-        .set(
-            "mrl.secret.test",
-            mrl_server::seams::Secret::new("canary-7f3a".to_owned()),
-        )
-        .await
-        .unwrap();
-
-    let job = w
-        .queue_with(
+    let bytes = b"fake weights";
+    let sha = sha256_hex(bytes);
+    let upload = w
+        .post(
+            "/api/v1/uploads",
             json!({
-                "input_fixture": key, "input_sha256": sha, "input_size": bytes.len(),
-                "roles": [{"role": "trainer", "replicas": 1, "gpu_count": 1, "cpu_millis": 100, "mem_bytes": 1024}]
+                "filename": "weights.bin", "sha256": sha, "size": bytes.len()
             }),
-            Some(run),
         )
         .await;
+    assert_eq!(upload.status, 201, "{}", upload.text());
+    let up = upload.json()["id"].as_str().unwrap().to_owned();
+    let headers = [
+        (LAUNCH_SECRET_HEADER, TEST_SECRET),
+        ("content-type", "application/json"),
+    ];
+    let part = w
+        .server()
+        .request(
+            Method::PUT,
+            &format!("/api/v1/uploads/{up}/parts/0"),
+            &headers,
+            Body::from(bytes.as_slice()),
+        )
+        .await;
+    assert_eq!(part.status, 200, "{}", part.text());
+    let complete = w
+        .post(&format!("/api/v1/uploads/{up}:complete"), json!({}))
+        .await;
+    assert_eq!(complete.status, 200, "{}", complete.text());
+    let artifact = w.post("/api/v1/artifacts", json!({
+        "name": "launch-model",
+        "manifest": {"schema_version": "artifact-manifest/v1", "kind": "model",
+            "created_at": "2026-11-16T00:00:00Z",
+            "files": [{"path": "weights.bin", "size": bytes.len(), "sha256": sha, "role": "weights"}]},
+        "uploads": {"weights.bin": up},
+    })).await;
+    assert_eq!(artifact.status, 201, "{}", artifact.text());
+    let artifact = artifact.json()["id"].as_str().unwrap().to_owned();
+    let secret = w
+        .post(
+            "/api/v1/secrets",
+            json!({
+                "name": "hf_hub", "kind": "hf_token", "allowed_uses": ["run"]
+            }),
+        )
+        .await;
+    assert_eq!(secret.status, 201, "{}", secret.text());
+    let secret = secret.json()["id"].as_str().unwrap().to_owned();
+    let value = w
+        .server()
+        .request(
+            Method::PUT,
+            &format!("/api/v1/secrets/{secret}/value"),
+            &headers,
+            Body::from(r#"{"value":"canary-7f3a"}"#),
+        )
+        .await;
+    assert!(matches!(value.status, 200 | 204), "{}", value.text());
+    let project = mrl_domain::ids::ProjectId::from_uuid(w.project);
+    let body = json!({
+        "name": "with-inputs", "algorithm_id": "sft",
+        "base_model_version_id": mrl_domain::ids::ModelVersionId::new().to_string(),
+        "artifact_inputs": [{"artifact_id": artifact, "path": "weights.bin", "name": "model.bin"}],
+        "secret_ids": [secret],
+        "resources": {"roles": [{"role": "trainer", "replicas": 1, "gpu_count": 1,
+            "cpu_millis": 100, "mem_bytes": 1024}]},
+    });
+    let run = w
+        .server()
+        .request(
+            Method::POST,
+            &format!("/api/v1/projects/{project}/runs"),
+            &[
+                (LAUNCH_SECRET_HEADER, TEST_SECRET),
+                ("content-type", "application/json"),
+                ("idempotency-key", "submitted-with-artifact-and-grant"),
+            ],
+            Body::from(body.to_string()),
+        )
+        .await;
+    assert_eq!(run.status, 201, "{}", run.text());
+    let job = JobId::from_str(run.json()["job_id"].as_str().unwrap())
+        .unwrap()
+        .as_uuid();
     let attempt = w.running(job).await;
 
     // The staged input carries a ticket the transfer endpoint honours.
@@ -1751,26 +1845,27 @@ async fn launch_carries_download_tickets_and_granted_secrets() {
             item.size,
             item.local_path.as_str()
         ),
-        (
-            "model",
-            sha.as_str(),
-            bytes.len() as u64,
-            "model/weights.bin"
-        )
+        ("model.bin", sha.as_str(), bytes.len() as u64, "model.bin")
     );
-    assert!(item.url.starts_with("/api/v1/transfer/"), "{}", item.url);
-    assert!(item.expires_at.is_some());
-    let got = w
-        .server()
-        .request(
-            Method::GET,
-            &item.url,
-            &[(LAUNCH_SECRET_HEADER, TEST_SECRET)],
-            Body::empty(),
-        )
-        .await;
-    assert_eq!(got.status, 200, "{}", got.text());
-    assert_eq!(got.text().as_bytes(), bytes.as_slice());
+    let dir = tempfile::tempdir().unwrap();
+    let secret_file = dir.path().join("launch-secret");
+    std::fs::write(&secret_file, TEST_SECRET).unwrap();
+    let agent_input = mrl_agent::attempts::spec::AttemptSpec::from_launch(
+        &m.script.launches()[0],
+        &stage.items,
+        dir.path(),
+    )
+    .unwrap();
+    let ticket = agent_input.inputs[0].ticket().unwrap();
+    let client = mrl_agent::transfer::TransferClient::new(&mrl_agent::config::TransferConfig {
+        server_url: Some(format!("http://{}", w.server().api())),
+        server_launch_secret_file: Some(secret_file),
+        ..Default::default()
+    })
+    .unwrap();
+    let dest = dir.path().join("downloaded-model.bin");
+    client.download(&ticket, &dest, Some(&sha)).await.unwrap();
+    assert_eq!(std::fs::read(dest).unwrap(), bytes);
 
     // The granted secret reached the agent, before the launch.
     let seen = m.script.seen.lock().unwrap().clone();
@@ -1859,6 +1954,189 @@ async fn a_missing_secret_value_fails_the_launch_as_user_config() {
     assert!(w.commands(attempt, "UpdateCredentials").await.is_empty());
     assert!(w.reservations(job).await.iter().all(|r| r.0 == "RELEASED"));
     w.invariants().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn queue_hides_a_foreign_pool() {
+    use crate::supabase::core::{Auth, CoreServer};
+    use crate::supabase::{MockSupabase, MockUser};
+    use mrl_domain::ids::{OrgId, UserId};
+    use mrl_domain::rbac::Role;
+    use mrl_server::modules::tenancy::{self, Scope};
+
+    let sb = MockSupabase::start().await;
+    let core = CoreServer::start(Mode::Team, &sb, TestDb::new().await, Arc::default()).await;
+    let org = OrgId::new();
+    sqlx::query(
+        "INSERT INTO organizations (id, slug, name, kind) VALUES ($1, 'home', 'Home', 'team')",
+    )
+    .bind(org.as_uuid())
+    .execute(core.db.pool())
+    .await
+    .unwrap();
+    let user = MockUser::new("queue@example.com", "Queue");
+    let auth = Auth::Bearer(sb.access_token(&user, 600));
+    let me = core.call(Method::GET, "/api/v1/auth/me", &auth, None).await;
+    assert_eq!(me.status, 200, "{}", me.text());
+    let user_id: Uuid = sqlx::query_scalar("SELECT id FROM users WHERE supabase_user_id = $1")
+        .bind(user.id)
+        .fetch_one(core.db.pool())
+        .await
+        .unwrap();
+    let mut tx = core.db.db().begin().await.unwrap();
+    tenancy::bind_role(
+        &mut tx,
+        org,
+        UserId::from_uuid(user_id),
+        Role::Owner,
+        Scope::Org,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let pool = mrl_server::modules::nodes::store::create_pool(
+        core.db.db(),
+        Some(OrgId::new().as_uuid()),
+        "foreign-queue",
+        "agent",
+        90,
+        &[],
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let response = core
+        .call(
+            Method::GET,
+            &format!("/api/v1/queue?pool={}", pool.id),
+            &auth,
+            None,
+        )
+        .await;
+    assert_eq!(response.status, 404, "{}", response.text());
+    core.stop().await;
+}
+
+async fn seed_grant(w: &World, run: Uuid, name: &str, mount: &str) {
+    let org = mrl_domain::ids::OrgId::from_uuid(w.org).to_string();
+    let secret = Uuid::now_v7();
+    let reference = format!("mrl.secret.{secret}");
+    sqlx::query(
+        "INSERT INTO secrets_metadata (id, org_id, name, backend, ref, kind, allowed_uses, created_by)
+         VALUES ($1, $2, $3, 'secret_store', $4, 'hf_token', '{run}', 't')",
+    )
+    .bind(secret).bind(&org).bind(name).bind(&reference)
+    .execute(w.db.pool()).await.unwrap();
+    sqlx::query("INSERT INTO run_secret_grants (run_id, secret_id, mount) VALUES ($1, $2, $3)")
+        .bind(run)
+        .bind(secret)
+        .bind(mount)
+        .execute(w.db.pool())
+        .await
+        .unwrap();
+    w.secrets
+        .set(
+            &reference,
+            mrl_server::seams::Secret::new("canary-value".to_owned()),
+        )
+        .await
+        .unwrap();
+}
+
+async fn queue_granted_run(w: &World, run: Uuid) -> Uuid {
+    w.queue_with(
+        json!({"roles": [{
+            "role": "trainer", "replicas": 1, "gpu_count": 1, "cpu_millis": 100, "mem_bytes": 1024
+        }]}),
+        Some(run),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn received_credentials_are_scrubbed_without_a_result() {
+    let w = World::start(false).await;
+    let m = w.agent(1).await;
+    let delayed = Arc::new(DelayedCommand {
+        entered: tokio::sync::Notify::new(),
+        resume: tokio::sync::Notify::new(),
+        handler: Handler(m.script.clone()),
+    });
+    m.script.link.register("UpdateCredentials", delayed.clone());
+    let run = w.run().await;
+    seed_grant(&w, run, "hf_hub", "env").await;
+    let job = queue_granted_run(&w, run).await;
+    tokio::time::timeout(WAIT, delayed.entered.notified())
+        .await
+        .unwrap();
+    let attempt = w.job(job).await.current_attempt_id.unwrap();
+    w.until("the received credential payload is scrubbed", || async {
+        w.commands(attempt, "UpdateCredentials").await == vec![("RECEIVED".to_owned(), Vec::new())]
+    })
+    .await;
+    assert!(w.commands(attempt, "LaunchAttempt").await.is_empty());
+    delayed.resume.notify_one();
+}
+
+struct LoseCredentialsOnce(Handler, std::sync::atomic::AtomicBool);
+
+#[async_trait::async_trait]
+impl CommandHandler for LoseCredentialsOnce {
+    async fn handle(&self, command: Command) -> Result<(), Failure> {
+        if !self.1.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return Err(mrl_agent::attempts::AttemptError::CredentialsLost.to_failure());
+        }
+        self.0.handle(command).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn lost_credentials_retry_without_quarantining_the_gpu() {
+    let w = World::start(false).await;
+    let m = w.agent(1).await;
+    m.script.link.register(
+        "LaunchAttempt",
+        Arc::new(LoseCredentialsOnce(
+            Handler(m.script.clone()),
+            std::sync::atomic::AtomicBool::new(false),
+        )),
+    );
+    let run = w.run().await;
+    seed_grant(&w, run, "hf_hub", "env").await;
+    let job = queue_granted_run(&w, run).await;
+    let next = w.running(job).await;
+    assert_eq!(w.job(job).await.epoch, 2);
+    assert_eq!(w.commands(next, "LaunchAttempt").await.len(), 1);
+    assert_eq!(w.commands(next, "UpdateCredentials").await.len(), 1);
+    let reservations = w.reservations(job).await;
+    assert_eq!(reservations.len(), 2);
+    assert!(reservations.iter().any(|row| row.0 == "RELEASED"));
+    w.invariants().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn unsupported_and_aliased_credentials_never_reach_the_agent() {
+    for grants in [
+        vec![("file-token", "file")],
+        vec![("hf-token", "env"), ("hf_token", "env")],
+    ] {
+        let w = World::start(false).await;
+        let _m = w.agent(1).await;
+        let run = w.run().await;
+        for (name, mount) in grants {
+            seed_grant(&w, run, name, mount).await;
+        }
+        let job = queue_granted_run(&w, run).await;
+        let row = w.wait_state(job, "FAILED").await;
+        assert_eq!(row.failure_class.as_deref(), Some("USER_CONFIG"));
+        let attempt = row.current_attempt_id.unwrap();
+        assert!(w.commands(attempt, "UpdateCredentials").await.is_empty());
+        assert!(w.commands(attempt, "LaunchAttempt").await.is_empty());
+    }
 }
 
 fn sha256_hex(b: &[u8]) -> String {

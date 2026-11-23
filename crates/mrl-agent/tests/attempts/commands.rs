@@ -175,7 +175,7 @@ async fn inputs_are_read_only_and_ended_attempts_are_reconciled() {
 #[tokio::test(flavor = "multi_thread")]
 async fn credentials_sent_before_launch_reach_the_worker_environment() {
     let dir = tempfile::tempdir().unwrap();
-    let (_ctx, attempts, _rx) = manager(dir.path());
+    let (ctx, attempts, _rx) = manager(dir.path());
     let cmd = Command {
         command_id: "cred".into(),
         kind: Some(Kind::UpdateCredentials(
@@ -206,6 +206,20 @@ async fn credentials_sent_before_launch_reach_the_worker_environment() {
         mrl_storage::sha256_hex(b"tok-123")
     );
     assert!(!format!("{env:?}").contains("tok-123"), "never printed");
+    drop(attempts);
+    let (tx, _rx) = mrl_agent::attempts::attempt_events(16);
+    let restarted = Attempts::new(ctx.clone(), tx, None).unwrap();
+    let err = restarted.launch(spec).unwrap_err();
+    assert_eq!(err.code(), "MRL-STATE-210");
+    assert_eq!(
+        err.failure_class(),
+        mrl_proto::common::v1::FailureClass::InfraTransient
+    );
+    assert!(
+        mrl_agent::attempts::record::AttemptRecord::load(&ctx.state.job_dir("att_c"))
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// Two managers on one state folder (two `attempt run`s, or an agent and an `attempt run`):

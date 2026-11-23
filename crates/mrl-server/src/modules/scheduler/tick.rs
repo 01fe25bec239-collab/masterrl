@@ -45,6 +45,7 @@ pub async fn run(core: Arc<Core>, cancel: CancellationToken) {
         .run(cancel, |lead| {
             let core = core.clone();
             async move {
+                *core.queue_scan.lock().await = QueueScan::default();
                 let since = Instant::now();
                 let every = Duration::from_secs(core.cfg.tick_seconds);
                 loop {
@@ -118,7 +119,7 @@ async fn scrub(core: &Core) -> Result<(), SchedError> {
     sqlx::query(
         "UPDATE agent_commands c SET payload = ''::bytea
          WHERE c.kind = 'UpdateCredentials' AND octet_length(c.payload) > 0
-           AND c.state NOT IN ('PENDING','SENT','RECEIVED')
+           AND c.state NOT IN ('PENDING','SENT')
            AND (c.state <> 'EXPIRED' OR c.sent_at IS NOT NULL OR NOT EXISTS (
              SELECT 1 FROM job_attempts a WHERE a.id = c.attempt_id AND a.state = 'PENDING'))",
     )
@@ -152,9 +153,10 @@ async fn gap(core: &Core) -> Result<(), SchedError> {
         .await?;
         if let Some(elapsed) = gap {
             sqlx::query(
-                "UPDATE agent_commands c SET deadline_at = deadline_at + make_interval(secs => $1),
+                "UPDATE agent_commands c SET deadline_at = LEAST(deadline_at + make_interval(secs => $1), not_after),
                    state = CASE WHEN state = 'EXPIRED' THEN 'PENDING' ELSE state END
                  WHERE kind IN ('LaunchAttempt','StageArtifacts','UpdateCredentials','CancelAttempt','PauseAttempt')
+                   AND (not_after IS NULL OR not_after > now())
                    AND EXISTS (SELECT 1 FROM attempt_placements p
                      JOIN job_attempts a ON a.id = p.attempt_id JOIN jobs j ON j.id = a.job_id
                      WHERE p.attempt_id = c.attempt_id AND p.node_id = c.node_id AND a.epoch = c.epoch
@@ -618,6 +620,13 @@ fn take(nodes: &mut [NodeCapacity], p: &Placement) {
     }
 }
 
+#[derive(Default)]
+pub(crate) struct QueueScan {
+    cursor: Option<(i64, Option<time::OffsetDateTime>, Uuid)>,
+    started_at: Option<time::OffsetDateTime>,
+    ahead: HashMap<Uuid, u32>,
+}
+
 async fn queue(core: &Core, leader_for: Duration) -> Result<(), SchedError> {
     let all = pools(&core.db, None).await?;
     let usable: Vec<PoolInfo> = all
@@ -629,46 +638,52 @@ async fn queue(core: &Core, leader_for: Duration) -> Result<(), SchedError> {
         })
         .collect();
     let mut capacity: HashMap<Uuid, Vec<NodeCapacity>> = HashMap::new();
-    let mut ahead: HashMap<Uuid, u32> = HashMap::new();
     let limit = core.cfg.max_jobs_per_tick;
-    let mut placed = 0;
-    let (mut priority, mut queued_at, mut id) = (0i64, None, None);
-    while placed < limit {
-        let jobs: Vec<JobRow> = sqlx::query_as(concat!(
-            "SELECT ",
-            crate::modules::jobs::transitions::job_cols!(),
-            " FROM jobs WHERE state = 'QUEUED'
-               AND ($3::uuid IS NULL OR (-priority::bigint, COALESCE(queued_at, 'infinity'), id) >
-                 (-$1::bigint, COALESCE($2::timestamptz, 'infinity'), $3))
-             ORDER BY priority DESC, queued_at, id LIMIT $4"
-        ))
-        .bind(priority)
-        .bind(queued_at)
-        .bind(id)
-        .bind(i64::from(limit))
-        .fetch_all(core.db.pool())
-        .await?;
-        if jobs.is_empty() {
-            break;
+    let mut scan = core.queue_scan.lock().await;
+    let (priority, queued_at, id) = scan
+        .cursor
+        .map_or((0, None, None), |(p, t, id)| (p, t, Some(id)));
+    let before = match scan.started_at {
+        Some(before) => before,
+        None => {
+            let before = sqlx::query_scalar("SELECT clock_timestamp()")
+                .fetch_one(core.db.pool())
+                .await?;
+            scan.started_at = Some(before);
+            before
         }
-        for job in jobs {
-            (priority, queued_at, id) = (i64::from(job.priority), job.queued_at, Some(job.id));
-            let n = ahead.entry(job.project_id).or_insert(0);
-            let queued = QueuedJob {
-                ahead_in_project: *n,
-                job,
-            };
-            match place_one(core, &usable, &mut capacity, &queued, leader_for).await {
-                Ok(true) => {
-                    placed += 1;
-                    if placed == limit {
-                        break;
-                    }
-                }
-                Ok(false) => *n = n.saturating_add(1),
-                Err(e) => log("place", Err(e)),
-            }
+    };
+    let jobs: Vec<JobRow> = sqlx::query_as(concat!(
+        "SELECT ",
+        crate::modules::jobs::transitions::job_cols!(),
+        " FROM jobs WHERE state = 'QUEUED'
+           AND ($3::uuid IS NULL OR (-priority::bigint, COALESCE(queued_at, 'infinity'), id) >
+             (-$1::bigint, COALESCE($2::timestamptz, 'infinity'), $3))
+         ORDER BY priority DESC, queued_at, id LIMIT $4"
+    ))
+    .bind(priority)
+    .bind(queued_at)
+    .bind(id)
+    .bind(i64::from(limit))
+    .bind(before)
+    .fetch_all(core.db.pool())
+    .await?;
+    let last_page = jobs.len() < limit as usize;
+    for job in jobs {
+        scan.cursor = Some((i64::from(job.priority), job.queued_at, job.id));
+        let n = scan.ahead.entry(job.project_id).or_insert(0);
+        let queued = QueuedJob {
+            ahead_in_project: *n,
+            job,
+        };
+        match place_one(core, &usable, &mut capacity, &queued, leader_for).await {
+            Ok(true) => {}
+            Ok(false) => *n = n.saturating_add(1),
+            Err(e) => log("place", Err(e)),
         }
+    }
+    if last_page {
+        *scan = QueueScan::default();
     }
     Ok(())
 }

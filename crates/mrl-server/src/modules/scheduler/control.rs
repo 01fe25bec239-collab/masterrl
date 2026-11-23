@@ -594,7 +594,7 @@ pub(crate) async fn end_unstarted(
          WHERE attempt_id = $1 AND epoch = $2 AND kind = 'LaunchAttempt'
            AND sent_at IS NOT NULL AND (
              state <> 'FAILED' OR COALESCE(result->'failure'->>'sub_code', '') NOT IN
-               ('node_draining', 'unsupported_command', 'MRL-VAL-200', 'MRL-VAL-205', 'MRL-NODE-206', 'MRL-NODE-207')
+               ('node_draining', 'unsupported_command', 'MRL-VAL-200', 'MRL-VAL-205', 'MRL-NODE-206', 'MRL-NODE-207', 'MRL-STATE-210')
            ))",
     )
     .bind(a.id)

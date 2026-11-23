@@ -63,6 +63,7 @@ impl Throttle {
 pub struct TransferClient {
     http: reqwest::Client,
     server_url: Option<String>,
+    launch_secret: Option<reqwest::header::HeaderValue>,
     retries: u32,
     throttle: Option<Arc<Throttle>>,
 }
@@ -83,17 +84,59 @@ fn retryable(status: u16) -> bool {
 impl TransferClient {
     /// A client with these settings.
     pub fn new(config: &TransferConfig) -> Result<Self> {
-        let http = reqwest::Client::builder()
+        let launch_secret = config
+            .server_launch_secret_file
+            .as_ref()
+            .map(|path| {
+                let invalid = |reason: &str| AgentError::Config {
+                    path: path.clone(),
+                    reason: reason.to_owned(),
+                };
+                let value = std::fs::read_to_string(path)
+                    .map_err(|_| invalid("the Solo launch secret file could not be read"))?;
+                let mut value =
+                    reqwest::header::HeaderValue::from_str(value.trim_end_matches(['\r', '\n']))
+                        .map_err(|_| {
+                            invalid("the Solo launch secret is not a valid header value")
+                        })?;
+                if value.is_empty() {
+                    return Err(invalid("the Solo launch secret file is empty"));
+                }
+                value.set_sensitive(true);
+                let server = config
+                    .server_url
+                    .as_deref()
+                    .and_then(|url| reqwest::Url::parse(url).ok())
+                    .ok_or_else(|| {
+                        invalid("configure transfer.server_url for the Solo launch secret")
+                    })?;
+                if !matches!(server.scheme(), "http" | "https")
+                    || server.host_str().is_none()
+                    || server.query().is_some()
+                    || server.fragment().is_some()
+                    || !server.username().is_empty()
+                    || server.password().is_some()
+                {
+                    return Err(invalid("configure an HTTP or HTTPS Solo transfer base URL"));
+                }
+                Ok(value)
+            })
+            .transpose()?;
+        let mut builder = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(config.connect_timeout_secs.max(1)))
-            .read_timeout(Duration::from_secs(60))
-            .build()
-            .map_err(|e| AgentError::Config {
-                path: PathBuf::from("<transfer settings>"),
-                reason: format!("the HTTP client could not start ({e})"),
-            })?;
+            .read_timeout(Duration::from_secs(60));
+        if launch_secret.is_some() {
+            // The private header must never follow redirects to another handler or host.
+            builder = builder.redirect(reqwest::redirect::Policy::none());
+        }
+        let http = builder.build().map_err(|e| AgentError::Config {
+            path: PathBuf::from("<transfer settings>"),
+            reason: format!("the HTTP client could not start ({e})"),
+        })?;
         Ok(Self {
             http,
             server_url: config.server_url.clone(),
+            launch_secret,
             retries: config.retries,
             throttle: config.bandwidth_bytes_per_sec.map(|rate| {
                 Arc::new(Throttle {
@@ -142,6 +185,15 @@ impl TransferClient {
         let mut req = self.http.request(method, url);
         for (k, v) in &t.headers {
             req = req.header(k, v);
+        }
+        let proxied = t.url.strip_prefix("/api/v1/transfer/").filter(|token| {
+            !token.is_empty()
+                && token
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        });
+        if let (Some(secret), Some(_)) = (&self.launch_secret, proxied) {
+            req = req.header("x-mrl-launch-secret", secret.clone());
         }
         req
     }

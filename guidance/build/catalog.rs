@@ -3592,6 +3592,17 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-STATE-210")),
+            ("title", Value::Str("The agent lost its credentials before launch.")),
+            ("why", Value::Str("The agent restarted before it started the run. Its saved metadata lists the required credentials, and the values were held in memory.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Wait for the scheduler to place another attempt if the run has retries left."),
+                    Value::Str("If the run stops, check that the agent stays online and submit it again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-STORE-001")),
             ("title", Value::Str("The app refused a storage path.")),
             ("why", Value::Str("The path points outside your workspace's storage area, or it has a part the app doesn't allow, like `..`.")),

@@ -64,6 +64,9 @@ pub enum AttemptError {
     /// The machine is draining and takes no new attempts.
     #[error("this machine is not taking new attempts: {0}")]
     Draining(String),
+    /// The agent restarted and lost credentials before the attempt could launch.
+    #[error("the agent lost its credentials before launch")]
+    CredentialsLost,
     /// The agent is stopping and takes no more commands.
     #[error("the agent is stopping and did not run the command; try again once the machine is back online")]
     Stopping,
@@ -126,6 +129,7 @@ impl AttemptError {
             Self::State { .. } => "MRL-STATE-204",
             Self::Draining(_) => "MRL-NODE-206",
             Self::Stopping => "MRL-NODE-207",
+            Self::CredentialsLost => "MRL-STATE-210",
             Self::Agent(e) => e.code(),
         }
     }
@@ -145,7 +149,7 @@ impl AttemptError {
             | Self::EnvInstall { .. }
             | Self::UvMissing(_)
             | Self::DockerMissing(_) => FailureClass::DependencyEnv,
-            Self::Agent(AgentError::CacheFull { .. }) | Self::Stopping => {
+            Self::Agent(AgentError::CacheFull { .. }) | Self::Stopping | Self::CredentialsLost => {
                 FailureClass::InfraTransient
             }
             Self::Agent(AgentError::SandboxUnavailable(_)) => FailureClass::DependencyEnv,

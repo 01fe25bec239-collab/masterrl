@@ -287,3 +287,54 @@ async fn a_download_into_the_cache_resumes_after_a_restart() {
     let path = cache.insert_file(&dest, &sha).await.unwrap();
     assert_eq!(std::fs::read(path).unwrap(), data());
 }
+
+#[tokio::test]
+async fn solo_launch_secret_stays_on_the_configured_proxy_request() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = Router::new()
+        .route(
+            "/api/v1/transfer/v1.fixture",
+            get(|| async { axum::response::Redirect::temporary("/other") }),
+        )
+        .route(
+            "/other",
+            get(|headers: HeaderMap| async move {
+                assert!(headers.get("x-mrl-launch-secret").is_none());
+                StatusCode::OK
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("launch-secret");
+    std::fs::write(&file, "fixture-secret\n").unwrap();
+    let client = TransferClient::new(&TransferConfig {
+        server_url: Some(base.clone()),
+        server_launch_secret_file: Some(file),
+        ..Default::default()
+    })
+    .unwrap();
+    assert!(!format!("{client:?}").contains("fixture-secret"));
+    let proxy = ticket("/api/v1/transfer/v1.fixture", TicketMethod::Get, 10);
+    let proxied_url = client.url(&proxy).unwrap();
+    let request = client.request(reqwest::Method::GET, &proxied_url, &proxy);
+    assert!(
+        request.try_clone().unwrap().build().unwrap().headers()["x-mrl-launch-secret"]
+            .is_sensitive()
+    );
+    assert_eq!(
+        request.send().await.unwrap().status(),
+        StatusCode::TEMPORARY_REDIRECT
+    );
+    let url = format!("{base}/other");
+    let absolute = ticket(&url, TicketMethod::Get, 10);
+    assert_eq!(
+        client
+            .request(reqwest::Method::GET, &url, &absolute)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+}

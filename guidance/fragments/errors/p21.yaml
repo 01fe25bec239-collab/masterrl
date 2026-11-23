@@ -49,3 +49,11 @@ errors:
       steps:
         - Read the reservation again and use its current epoch.
         - If your work was replaced, stop it; the newer holder owns the machine now.
+
+  - code: MRL-STATE-210
+    title: The agent lost its credentials before launch.
+    why: The agent restarted before it started the run. Its saved metadata lists the required credentials, and the values were held in memory.
+    what_to_do:
+      steps:
+        - Wait for the scheduler to place another attempt if the run has retries left.
+        - If the run stops, check that the agent stays online and submit it again.

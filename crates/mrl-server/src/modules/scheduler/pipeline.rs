@@ -307,20 +307,7 @@ impl std::fmt::Debug for LaunchPlan {
     }
 }
 
-/// A stored file to stage for the attempt.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct InputFile {
-    /// Name the worker sees, like `model`, `dataset.train` or `resume_from`.
-    pub name: String,
-    /// Object key in the job org's storage area, like `orgs/{org}/blobs/sha256/…`.
-    pub key: String,
-    /// Lowercase hex sha256 of the file.
-    pub sha256: String,
-    /// Size in bytes.
-    pub size: u64,
-    /// Path relative to the attempt's staging folder.
-    pub local_path: String,
-}
+pub use crate::modules::artifacts::InputFile;
 
 /// Why a launch could not be built.
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]

@@ -677,6 +677,10 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         code(Conflict, 210),
         "This reservation was changed by a newer holder.",
     ),
+    (
+        code(ErrorFamily::State, 210),
+        "The agent lost its credentials before launch.",
+    ),
     // <mrl:errors P22> rows for P22 go right below this line.
     // <mrl:errors P23> rows for P23 go right below this line.
     // <mrl:errors P24> rows for P24 go right below this line.
