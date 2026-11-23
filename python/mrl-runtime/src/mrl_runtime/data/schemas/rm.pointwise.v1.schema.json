@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.masterrl.dev/datasets/rm.pointwise.v1.schema.json",
+  "title": "rm.pointwise.v1",
+  "description": "One completion with a numeric score, for regression-style reward models.",
+  "type": "object",
+  "required": ["prompt", "completion", "score"],
+  "properties": {
+    "prompt": { "$ref": "common.v1.schema.json#/$defs/textOrMessages" },
+    "completion": { "$ref": "common.v1.schema.json#/$defs/textOrMessages" },
+    "score": { "type": "number" },
+    "meta": { "$ref": "common.v1.schema.json#/$defs/meta" }
+  },
+  "additionalProperties": false
+}

@@ -47,6 +47,21 @@ package!(
     "EnvService: multi-turn environments and tools."
 );
 
+/// `MRL_CREDENTIAL_<NAME>` for a credential name.
+pub fn credential_env(name: &str) -> String {
+    let up: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("MRL_CREDENTIAL_{up}")
+}
+
 #[cfg(test)]
 mod golden;
 

@@ -659,7 +659,41 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         "The agent was stopping and did not run the command.",
     ),
     // <mrl:errors P21> rows for P21 go right below this line.
+    (
+        code(ErrorFamily::Cap, 210),
+        "No machine in this pool can run this job as asked.",
+    ),
+    (code(Quota, 210), "This job is waiting for a free machine."),
+    (
+        code(Quota, 211),
+        "This pool is paused and starts no new work.",
+    ),
+    (
+        code(Quota, 212),
+        "Too many jobs of this project are ahead in the queue.",
+    ),
+    (code(Perm, 210), "No pool is open to this project."),
+    (
+        code(Conflict, 210),
+        "This reservation was changed by a newer holder.",
+    ),
+    (
+        code(ErrorFamily::State, 210),
+        "The agent lost its credentials before launch.",
+    ),
     // <mrl:errors P22> rows for P22 go right below this line.
+    (
+        code(ErrorFamily::Quota, 220),
+        "Too many live views are open.",
+    ),
+    (
+        code(ErrorFamily::State, 220),
+        "This alert is already resolved.",
+    ),
+    (
+        code(Store, 220),
+        "A saved log or sample file is missing or damaged.",
+    ),
     // <mrl:errors P23> rows for P23 go right below this line.
     (
         code(ErrorFamily::State, 230),

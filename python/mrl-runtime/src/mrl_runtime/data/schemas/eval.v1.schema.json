@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.masterrl.dev/datasets/eval.v1.schema.json",
+  "title": "eval.v1",
+  "description": "Evaluation and benchmark items: input, optional reference answer, metadata.",
+  "type": "object",
+  "required": ["input"],
+  "properties": {
+    "input": { "$ref": "common.v1.schema.json#/$defs/textOrMessages" },
+    "reference": { "type": "string" },
+    "meta": { "$ref": "common.v1.schema.json#/$defs/meta" }
+  },
+  "additionalProperties": false
+}

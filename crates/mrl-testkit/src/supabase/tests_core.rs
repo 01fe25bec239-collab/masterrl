@@ -576,6 +576,80 @@ async fn every_route_answers_by_role_in_team_mode() {
     let seeded = seeded.json();
     let field = |k: &str| seeded[k].as_str().unwrap().to_owned();
     let (run, job, exp) = (field("id"), field("job_id"), field("experiment_id"));
+    // P22 routes: a second run (for POST /runs:compare) and one OPEN alert on the P17 run.
+    // GET /streams never ends, so the loops below can't call it: it is checked here by status
+    // only (owner 200, annotator 403) and left out of the coverage check (A1, 2026-11-22).
+    let p22_second = core
+        .call_with(
+            Method::POST,
+            &format!("/api/v1/projects/{prj}/runs"),
+            &Auth::Bearer(seed_jwt.clone()),
+            Some(submission.clone()),
+            &[("idempotency-key", "rbac-seed-p22")],
+        )
+        .await;
+    assert_eq!(p22_second.status, 201, "{}", p22_second.text());
+    let p22_run = p22_second.json()["id"].as_str().unwrap().to_owned();
+    let p22_pat = core.call(Method::POST, "/api/v1/auth/tokens", &Auth::Bearer(seed_jwt.clone()),
+        Some(json!({"name": "P22 metrics only", "scopes": ["metrics_logs:read"], "project_id": prj.to_string()}))).await;
+    assert_eq!(p22_pat.status, 201, "{}", p22_pat.text());
+    let p22_auth = Auth::Bearer(p22_pat.json()["token"].as_str().unwrap().to_owned());
+    let telemetry = core
+        .call(
+            Method::GET,
+            &format!("/api/v1/runs/{run}/metrics"),
+            &p22_auth,
+            None,
+        )
+        .await;
+    assert_eq!(telemetry.status, 200, "{}", telemetry.text());
+    let comparison = core
+        .call(
+            Method::POST,
+            "/api/v1/runs:compare",
+            &p22_auth,
+            Some(json!({"run_ids": [run, p22_run]})),
+        )
+        .await;
+    assert_eq!(comparison.status, 403, "{}", comparison.text());
+    let p22_alert = mrl_domain::ids::AlertId::new();
+    core.db
+        .seed(&format!(
+            "INSERT INTO alerts (id, org_id, project_id, scope_kind, scope_id, source, code,
+                    severity, title, dedup_key, state)
+             VALUES ('{a}', '{o}', '{p}', 'run', '{r}', 'safety', 'safety.rbac', 'warning',
+                    'Role table check.', 'rbac', 'OPEN');",
+            a = p22_alert.as_uuid(),
+            o = org.as_uuid(),
+            p = prj.as_uuid(),
+            r = mrl_domain::ids::RunId::from_str(&run).unwrap().as_uuid()
+        ))
+        .await;
+    let p22_stream_status = |jwt: String| {
+        let addr = core.server.api();
+        let path = format!("/api/v1/streams?topics=run:{run}:state");
+        async move {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (mut send, conn) =
+                hyper::client::conn::http1::handshake(hyper_util::rt::TokioIo::new(tcp))
+                    .await
+                    .unwrap();
+            tokio::spawn(conn);
+            let req = axum::http::Request::builder()
+                .uri(path)
+                .header("host", addr.to_string())
+                .header("authorization", format!("Bearer {jwt}"))
+                .body(axum::body::Body::empty())
+                .unwrap();
+            // The status only; the response and its endless body are dropped here.
+            send.send_request(req).await.unwrap().status().as_u16()
+        }
+    };
+    assert_eq!(p22_stream_status(seed_jwt.clone()).await, 200);
+    let (p22_annotator_jwt, p22_annotator) = member(&core, &sb, "p22-annotator").await;
+    grant(&core, org, p22_annotator, Role::Annotator, Scope::Org).await;
+    assert_eq!(p22_stream_status(p22_annotator_jwt).await, 403);
+    let public: Vec<&str> = public.iter().copied().chain(["/api/v1/streams"]).collect();
     // P23 routes: one COMMITTED checkpoint of the P17 run, from an ended attempt. Its file is
     // not in storage.
     let ckpt = mrl_domain::ids::CheckpointId::new();
@@ -808,6 +882,12 @@ async fn every_route_answers_by_role_in_team_mode() {
         ),
         (
             Method::GET,
+            format!("/api/v1/queue?pool={pool}"),
+            Action::ComputeRead,
+            None,
+        ),
+        (
+            Method::GET,
             format!("/api/v1/nodes/{node}"),
             Action::ComputeRead,
             None,
@@ -918,6 +998,61 @@ async fn every_route_answers_by_role_in_team_mode() {
             Action::SecretsManage,
             None,
         ),
+        // P22 routes
+        row(
+            Method::GET,
+            format!("/api/v1/runs/{run}/metrics"),
+            Action::MetricsLogsRead,
+            None,
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/runs/{run}/metrics/query"),
+            Action::MetricsLogsRead,
+            None,
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/runs/{run}/logs"),
+            Action::MetricsLogsRead,
+            None,
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/runs/{run}/logs:download"),
+            Action::MetricsLogsDownload,
+            None,
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/runs/{run}/samples"),
+            Action::MetricsLogsRead,
+            None,
+        ),
+        row(
+            Method::POST,
+            "/api/v1/runs:compare".into(),
+            Action::MetricsLogsRead,
+            Some(json!({"run_ids": [run, p22_run]})),
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/alerts?run={run}"),
+            Action::MetricsLogsRead,
+            None,
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/alerts/{p22_alert}:ack"),
+            Action::RunsCancelAny,
+            None,
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/alerts/{p22_alert}:resolve"),
+            Action::RunsCancelAny,
+            None,
+        ),
         // P23 routes
         row(
             Method::GET,
@@ -979,6 +1114,11 @@ async fn every_route_answers_by_role_in_team_mode() {
     // exist (404).
     let expected = |method: &Method, path: &str| -> &'static [u16] {
         match (method.as_str(), path) {
+            // P22 routes: the first allowed role acknowledges, then resolves; later roles find
+            // the alert resolved (ack 409 MRL-STATE-220, resolve answers it again).
+            ("POST", "/api/v1/runs:compare") => &[200],
+            ("POST", p) if p.starts_with("/api/v1/alerts/") && p.ends_with(":ack") => &[200, 409],
+            ("POST", p) if p.starts_with("/api/v1/alerts/") && p.ends_with(":resolve") => &[200],
             // P23 routes: the first allowed verify finds the file missing (CORRUPT, 200); later
             // ones meet a deleted checkpoint (409). Deleting is 204, also when already deleted.
             ("POST", p) if p.ends_with(":verify") => &[200, 409],

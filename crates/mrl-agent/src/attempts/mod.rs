@@ -442,10 +442,7 @@ impl Attempts {
                 .iter()
                 .any(|name| !p.creds.contains_key(name))
             {
-                return Err(AttemptError::state(
-                    &spec.attempt.attempt_id,
-                    "send the attempt credentials again before launch",
-                ));
+                return Err(AttemptError::CredentialsLost);
             }
         }
         let given = pending.get(&spec.attempt.attempt_id).map(|p| &p.creds);

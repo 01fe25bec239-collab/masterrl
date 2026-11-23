@@ -1204,11 +1204,17 @@ async fn staged_inputs_survive_a_restart() {
     };
     let refused = second.handle(&launch).await.unwrap();
     assert!(!refused.accepted);
-    assert!(refused
-        .failure
-        .unwrap()
-        .message
-        .contains("credentials again"));
+    let failure = refused.failure.unwrap();
+    assert_eq!(failure.sub_code, "MRL-STATE-210");
+    assert_eq!(
+        failure.class,
+        mrl_proto::common::v1::FailureClass::InfraTransient as i32
+    );
+    assert!(
+        mrl_agent::attempts::record::AttemptRecord::load(&ctx.state.job_dir("att_p"))
+            .unwrap()
+            .is_none()
+    );
     assert!(second.handle(&creds).await.unwrap().accepted);
     assert!(second.handle(&launch).await.unwrap().accepted);
     let rec = mrl_agent::attempts::record::AttemptRecord::load(&ctx.state.job_dir("att_p"))

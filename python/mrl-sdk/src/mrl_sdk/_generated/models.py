@@ -5,6 +5,71 @@ from __future__ import annotations
 from typing import Any, Literal, NotRequired, TypedDict
 
 
+class AlertPage(TypedDict):
+    """A page of alerts (OpenAPI name)."""
+
+    items: list[AlertView]
+    """Alerts."""
+
+    next_cursor: NotRequired[str | None]
+    """Pass as `cursor` for the next page; null on the last page."""
+
+
+class AlertView(TypedDict):
+    """One alert."""
+
+    acked_at: NotRequired[str | None]
+    """Acknowledged at."""
+
+    acked_by: NotRequired[str | None]
+    """Acknowledged by (principal id)."""
+
+    code: str
+    """Machine code, like `node.disk_low`."""
+
+    details: dict[str, Any]
+    """Extra facts."""
+
+    fire_count: int
+    """Times it fired while live."""
+
+    fired_at: str
+    """First fired."""
+
+    id: str
+    """`alr_…`."""
+
+    last_fired_at: str
+    """Last fired."""
+
+    project_id: NotRequired[str | None]
+    """`prj_…` for run alerts."""
+
+    resolved_at: NotRequired[str | None]
+    """Resolved at."""
+
+    resolved_by: NotRequired[str | None]
+    """Resolved by (principal id, or `system`)."""
+
+    scope_id: NotRequired[str | None]
+    """`run_…` or `node_…`; null for system alerts."""
+
+    scope_kind: str
+    """`run`, `node` or `system`."""
+
+    severity: str
+    """`info`, `warning`, `error` or `critical`."""
+
+    source: str
+    """Who raised it: `safety`, `node`, `budget`, `system` or `metric`."""
+
+    state: str
+    """`OPEN`, `ACKED` or `RESOLVED`."""
+
+    title: str
+    """What happened."""
+
+
 class Artifact(TypedDict):
     """A registered artifact."""
 
@@ -556,6 +621,41 @@ Lifecycle = Literal["STATIC", "EPHEMERAL"]
 """Node lifecycle (Doc 04 PBC-04-5)."""
 
 
+class LogEntryView(TypedDict):
+    """One log chunk."""
+
+    attempt_id: str
+    """`att_…`."""
+
+    id: int
+    """Position in the run's log (increasing)."""
+
+    offset: int
+    """Byte offset in the stream."""
+
+    rank: int
+    """Process rank."""
+
+    received_at: str
+    """When it arrived."""
+
+    stream: str
+    """`stdout`, `stderr`, `harness` or `agent` (the server's own notes)."""
+
+    text: str
+    """The text (invalid UTF-8 shown as �)."""
+
+
+class LogPage(TypedDict):
+    """A page of log chunks."""
+
+    items: list[LogEntryView]
+    """Chunks in log order."""
+
+    next_cursor: NotRequired[str | None]
+    """Pass as `cursor` to continue; null when nothing more is stored yet."""
+
+
 class LoginRequest(TypedDict):
     """Start a sign-in."""
 
@@ -605,6 +705,82 @@ class Me(TypedDict):
     """`tok_…` when the caller uses an access token."""
 
     user: NotRequired[dict[str, Any]]
+
+
+class MetricPointView(TypedDict):
+    """One point of a query answer."""
+
+    max: float
+    """Largest value in the group."""
+
+    min: float
+    """Smallest value in the group."""
+
+    n: int
+    """Points in the group."""
+
+    value: float
+    """Average of the group."""
+
+    x: int
+    """Start of the group: a step, or seconds since 1970 on the time axis."""
+
+
+class MetricQueryResult(TypedDict):
+    """`GET /runs/{run}/metrics/query`."""
+
+    axis: str
+    """`step` or `time`."""
+
+    max_points: int
+    """The limit used."""
+
+    run_id: str
+    """`run_…`."""
+
+    series: list[MetricSeriesPoints]
+    """The series asked for."""
+
+
+class MetricSeriesPoints(TypedDict):
+    """One series of a query answer."""
+
+    name: str
+    """Name."""
+
+    points: list[MetricPointView]
+    """At most `max_points` points."""
+
+    series_id: int
+    """Series id."""
+
+    split: str
+    """Split."""
+
+
+class MetricSeriesView(TypedDict):
+    """One metric series of a run."""
+
+    declared: bool
+    """False when the engine manifest does not declare this metric."""
+
+    freshness: str
+    """`live`, `sampled` or `delayed`."""
+
+    kind: str
+    """`gauge`, `counter` or `histogram_summary`."""
+
+    name: str
+    """Name, like `train/loss`."""
+
+    rank: NotRequired[int | None]
+    """Rank, or null for the aggregate."""
+
+    series_id: int
+    """Series id (use it in `series=`)."""
+
+    split: str
+    """Split, like `train` or `eval` (may be empty)."""
 
 
 class NewArtifact(TypedDict):
@@ -1064,6 +1240,25 @@ Relation = Literal[
 """How two entities are related (Doc 09 §3.10)."""
 
 
+class ResourceActualView(TypedDict):
+    """Peak resource use of one attempt, device and phase."""
+
+    attempt_id: str
+    """`att_…`."""
+
+    device: str
+    """Device, like `gpu0`; empty for the whole host."""
+
+    peak: float
+    """Highest value seen."""
+
+    phase: str
+    """Phase."""
+
+    signal: str
+    """What was measured, like `torch_allocated_peak`."""
+
+
 class RestoreRequest(TypedDict):
     """Restore a saved setup. Give the passphrase or the recovery key."""
 
@@ -1167,6 +1362,81 @@ class Run(TypedDict):
     """Why: `{code, message, problems?}`; for REJECTED, every problem with a hint."""
 
 
+class RunArtifactInput(TypedDict):
+    """A named input from a committed artifact."""
+
+    artifact_id: str
+    """Artifact id (`art_…`)."""
+
+    name: str
+    """Unique worker input name, also used as the staged filename."""
+
+    path: str
+    """File path as listed in the artifact manifest."""
+
+
+class RunCompareDiff(TypedDict):
+    """One config setting whose value differs between the runs."""
+
+    path: str
+    """JSON pointer into the resolved config, like `/hyperparameters/lr`."""
+
+    values: dict[str, Any]
+    """Value per `run_…` (null where a run doesn't have it)."""
+
+
+class RunCompareRequest(TypedDict):
+    """`POST /runs:compare` body."""
+
+    max_points: NotRequired[int | None]
+    """Points per overlay line, 2-10000 (default 1000)."""
+
+    metrics: NotRequired[list[str]]
+    """Metric names to overlay (each split separately); default: the names every run has"""
+
+    run_ids: list[str]
+    """2-10 different `run_…` ids."""
+
+
+class RunCompareResult(TypedDict):
+    """`POST /runs:compare` answer."""
+
+    config_diff: list[RunCompareDiff]
+    """Only the settings that differ."""
+
+    metrics: list[RunCompareSeries]
+    """Overlays."""
+
+    runs: list[RunCompareRun]
+    """The runs, in the order asked."""
+
+
+class RunCompareRun(TypedDict):
+    """One compared run."""
+
+    name: str
+    """Run name."""
+
+    run_id: str
+    """`run_…`."""
+
+    state: str
+    """Job state."""
+
+
+class RunCompareSeries(TypedDict):
+    """One metric overlaid across runs, on one step grid."""
+
+    name: str
+    """Metric name."""
+
+    runs: dict[str, Any]
+    """Points per `run_…` (runs without this metric are left out); groups start at the same"""
+
+    split: str
+    """Split."""
+
+
 class RunConfig(TypedDict):
     """The immutable config snapshot of a run."""
 
@@ -1199,6 +1469,21 @@ RunKind = Literal["TRAIN", "EVAL"]
 """Run kinds (other job kinds have no run)."""
 
 
+class RunMetrics(TypedDict):
+    """`GET /runs/{run}/metrics`."""
+
+    progress: NotRequired[dict[str, Any]]
+
+    resources: list[ResourceActualView]
+    """Peak resource use from `resource/…` metrics."""
+
+    run_id: str
+    """`run_…`."""
+
+    series: list[MetricSeriesView]
+    """Every series, oldest first."""
+
+
 class RunPage(TypedDict):
     """One page of results."""
 
@@ -1209,11 +1494,42 @@ class RunPage(TypedDict):
     """Pass as `cursor` for the next page; `null` on the last page."""
 
 
+class RunProgressView(TypedDict):
+    """The run's latest progress report."""
+
+    attempt_id: str
+    """The attempt that sent it, `att_…`."""
+
+    epoch: float
+    """Epoch (fractional)."""
+
+    eta_seconds: float
+    """Estimated seconds left."""
+
+    phase: str
+    """Phase, like `train` or `eval`."""
+
+    step: int
+    """Global step."""
+
+    tokens_seen: int
+    """Tokens seen so far."""
+
+    total_steps: int
+    """Planned steps."""
+
+    updated_at: str
+    """When it arrived."""
+
+
 class RunSubmission(TypedDict):
     """`POST /projects/{prj}/runs` body."""
 
     algorithm_id: str
     """The method, like `sft`, `dpo` or `grpo`."""
+
+    artifact_inputs: NotRequired[list[RunArtifactInput]]
+    """Committed artifact files to stage before launching the run."""
 
     base_model_version_id: str
     """The model version to start from, `mv_…`."""
@@ -1254,8 +1570,102 @@ class RunSubmission(TypedDict):
     reward_version_id: NotRequired[str | None]
     """The reward version, `rwdv_…`."""
 
+    secret_ids: NotRequired[list[str]]
+    """Secrets to grant to this run as worker environment variables."""
+
     seeds: NotRequired[dict[str, Any] | None]
     """Random seeds; the server picks `{"global": n}` when absent."""
+
+
+class SamplePage(TypedDict):
+    """A page of samples."""
+
+    items: list[SampleView]
+    """Samples, oldest batch first."""
+
+    next_cursor: NotRequired[str | None]
+    """Pass as `cursor` to continue; null at the end."""
+
+
+class SampleView(TypedDict):
+    """One generated sample."""
+
+    attempt_id: str
+    """`att_…`."""
+
+    batch_id: int
+    """The batch it came in."""
+
+    completion: str
+    """Generated text."""
+
+    completion_tokens: int
+    """Generated tokens."""
+
+    group_id: str
+    """Group (prompts sampled together)."""
+
+    policy_version: int
+    """Policy version that generated it."""
+
+    prompt: str
+    """Prompt text."""
+
+    reward_components: dict[str, Any]
+    """Reward per component."""
+
+    reward_total: NotRequired[float | None]
+    """Total reward, if scored."""
+
+    sample_id: str
+    """The worker's id for the sample."""
+
+    step: int
+    """Trainer step."""
+
+    truncated: bool
+    """True when generation hit the length limit."""
+
+
+class SchedulerQueue(TypedDict):
+    """The queue of a pool."""
+
+    jobs: list[SchedulerQueueEntry]
+    """The jobs the caller may see, first in line first."""
+
+    pool_id: str
+    """`pool_…`."""
+
+    total: int
+    """Jobs waiting for this pool that the caller may read."""
+
+
+class SchedulerQueueEntry(TypedDict):
+    """One waiting job."""
+
+    job_id: str
+    """`job_…`."""
+
+    position: int
+    """Position among jobs the caller can read."""
+
+    priority: int
+    """Higher goes first."""
+
+    project_id: str
+    """`prj_…`."""
+
+    queued_at: NotRequired[str | None]
+    """When it joined the queue."""
+
+    reason: NotRequired[str | None]
+    """Why it is still waiting, in plain words."""
+
+    reason_code: NotRequired[str | None]
+    """The reason's code, like `MRL-QUOTA-210`."""
+
+    run_id: NotRequired[str | None]
+    """`run_…`, for training and evaluation jobs."""
 
 
 class SecretMeta(TypedDict):
@@ -1574,6 +1984,8 @@ class WorkspacePage(TypedDict):
 
 
 __all__ = [
+    "AlertPage",
+    "AlertView",
     "Artifact",
     "Attempt",
     "AttemptPage",
@@ -1602,10 +2014,16 @@ __all__ = [
     "JobPage",
     "JobPatch",
     "Lifecycle",
+    "LogEntryView",
+    "LogPage",
     "LoginRequest",
     "LoginStarted",
     "Machine",
     "Me",
+    "MetricPointView",
+    "MetricQueryResult",
+    "MetricSeriesPoints",
+    "MetricSeriesView",
     "NewArtifact",
     "NewExperiment",
     "NewItem",
@@ -1632,14 +2050,27 @@ __all__ = [
     "Readiness",
     "Rejection",
     "Relation",
+    "ResourceActualView",
     "RestoreRequest",
     "Restored",
     "RoleInfo",
     "Run",
+    "RunArtifactInput",
+    "RunCompareDiff",
+    "RunCompareRequest",
+    "RunCompareResult",
+    "RunCompareRun",
+    "RunCompareSeries",
     "RunConfig",
     "RunKind",
+    "RunMetrics",
     "RunPage",
+    "RunProgressView",
     "RunSubmission",
+    "SamplePage",
+    "SampleView",
+    "SchedulerQueue",
+    "SchedulerQueueEntry",
     "SecretMeta",
     "SessionStarted",
     "SetupDone",

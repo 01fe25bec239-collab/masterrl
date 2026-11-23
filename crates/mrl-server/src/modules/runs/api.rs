@@ -5,6 +5,7 @@ use crate::app::AppState;
 use crate::error::{ApiError, ErrorCode, FieldError};
 use crate::http::idempotency::{IDEMPOTENCY_KEY, REPLAYED};
 use crate::http::pagination::{Page, PageQuery};
+use crate::modules::artifacts::{self, ArtifactsModule, InputFile};
 use crate::modules::jobs::model::reason;
 use crate::modules::jobs::scope::{self, resource};
 use crate::modules::jobs::transitions::attempt_cols;
@@ -12,6 +13,7 @@ use crate::modules::jobs::{
     codes, Attempt, AttemptRow, Chains, JobChange, JobSpec, JobTransitions, JobsError, NewJob,
     Projects, ResolveError, RetryRules, Validation,
 };
+use crate::modules::secrets::SecretResolver;
 use crate::seams::RequestContext;
 use crate::Db;
 use axum::body::Bytes;
@@ -20,8 +22,8 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use mrl_domain::ids::{
-    CheckpointId, DatasetVersionId, ExperimentId, JobId, ModelVersionId, ProjectId,
-    RewardVersionId, RunId,
+    ArtifactId, CheckpointId, DatasetVersionId, ExperimentId, JobId, ModelVersionId, ProjectId,
+    RewardVersionId, RunId, SecretId,
 };
 use mrl_domain::resources::{GpuConstraints, ResourceRequest, RoleRequest, WorkloadRole};
 use mrl_domain::state::{JobEvent, Owner};
@@ -107,6 +109,26 @@ pub struct RunSubmission {
     #[serde(default)]
     #[schema(value_type = Option<String>)]
     pub parent_checkpoint_id: Option<CheckpointId>,
+    /// Committed artifact files to stage before launching the run.
+    #[serde(default)]
+    pub artifact_inputs: Vec<RunArtifactInput>,
+    /// Secrets to grant to this run as worker environment variables.
+    #[serde(default)]
+    #[schema(value_type = Vec<String>)]
+    pub secret_ids: Vec<SecretId>,
+}
+
+/// A named input from a committed artifact.
+#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct RunArtifactInput {
+    /// Artifact id (`art_…`).
+    #[schema(value_type = String)]
+    pub artifact_id: ArtifactId,
+    /// File path as listed in the artifact manifest.
+    pub path: String,
+    /// Unique worker input name, also used as the staged filename.
+    pub name: String,
 }
 
 fn empty_object() -> Value {
@@ -465,6 +487,79 @@ fn replay(row: &RunRow, fingerprint: &[u8]) -> Result<Response, JobsError> {
     Ok(response)
 }
 
+fn launch_input_error(e: artifacts::Error) -> JobsError {
+    match e {
+        artifacts::Error::Api(e) => e.into(),
+        artifacts::Error::Coded {
+            code,
+            status,
+            detail,
+        } => match code.parse() {
+            Ok(code) => JobsError::domain(code, status, detail),
+            Err(_) => ApiError::new(
+                ErrorCode::Unavailable,
+                "The launch input could not be prepared.",
+            )
+            .into(),
+        },
+    }
+}
+
+async fn launch_inputs(
+    db: &Db,
+    state: &AppState,
+    ctx: &RequestContext,
+    org: &str,
+    inputs: &[RunArtifactInput],
+) -> Result<Vec<InputFile>, JobsError> {
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let store = ArtifactsModule::new(db.clone(), &state.config).store();
+    let mut files = Vec::with_capacity(inputs.len());
+    let mut names = std::collections::HashSet::new();
+    for input in inputs {
+        let name = &input.name;
+        if name.starts_with('.')
+            || name.ends_with('.')
+            || name.len() > 128
+            || !name
+                .as_bytes()
+                .first()
+                .is_some_and(u8::is_ascii_alphanumeric)
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+            || !names.insert(name.to_ascii_lowercase())
+        {
+            return Err(launch_input_error(artifacts::field(
+                "/artifact_inputs", "Give each input a distinct filename using letters, digits, dots, dashes or underscores.",
+            )));
+        }
+        let artifact = store
+            .get(org, input.artifact_id.as_uuid())
+            .await
+            .map_err(launch_input_error)?
+            .filter(|a| a.state == "COMMITTED")
+            .ok_or_else(|| JobsError::not_found("artifact"))?;
+        state
+            .authorize(ctx, artifacts::READ, &artifact.resource(org))
+            .await?;
+        let (key, file) = store
+            .download_source(org, &artifact, &input.path)
+            .await
+            .map_err(launch_input_error)?;
+        files.push(InputFile {
+            name: name.clone(),
+            key,
+            sha256: file.sha256,
+            size: file.size,
+            local_path: name.clone(),
+        });
+    }
+    Ok(files)
+}
+
 /// `POST /projects/{prj}/runs`. Needs `Idempotency-Key`.
 ///
 /// Creates the run, its config snapshot and its job, then validates: the answer is the
@@ -571,6 +666,31 @@ pub async fn submit(
             return Err(JobsError::not_found("parent run"));
         }
     }
+    if sub.artifact_inputs.len() > 64 {
+        return Err(launch_input_error(artifacts::field(
+            "/artifact_inputs",
+            "A run can use up to 64 artifact inputs.",
+        )));
+    }
+    if sub.secret_ids.len() > 64 {
+        return Err(launch_input_error(artifacts::field(
+            "/secret_ids",
+            "A run can use up to 64 secrets.",
+        )));
+    }
+    let storage_org = scope::org_text(org).unwrap_or_else(|| artifacts::LOCAL_ORG.to_owned());
+    let launch_inputs =
+        launch_inputs(&db, &state, &ctx, &storage_org, &sub.artifact_inputs).await?;
+    let resolver = SecretResolver::new(db.clone(), state.config.server.mode);
+    let mut grants = Vec::with_capacity(sub.secret_ids.len());
+    for id in &sub.secret_ids {
+        grants.push(
+            resolver
+                .prepare_grant(&state.seams, &ctx, &storage_org, *id, "env")
+                .await
+                .map_err(launch_input_error)?,
+        );
+    }
     let mut tx = db.begin().await?;
     let experiment = match sub.experiment_id {
         Some(e) => sqlx::query_scalar::<_, Uuid>(
@@ -628,9 +748,15 @@ pub async fn submit(
         }
         return Err(e);
     }
+    for grant in grants {
+        grant
+            .grant(&mut tx, RunId::from_uuid(run_id))
+            .await
+            .map_err(launch_input_error)?;
+    }
     sqlx::query(
         "INSERT INTO run_configs (run_id, org_id, submitted, resolved, resolved_sha256, \
-           dataset_version_ids, seeds) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+           dataset_version_ids, seeds, launch_inputs) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
     )
     .bind(run_id)
     .bind(org)
@@ -639,6 +765,7 @@ pub async fn submit(
     .bind(&resolved_sha256)
     .bind(&spec.dataset_version_ids)
     .bind(&seeds)
+    .bind(sqlx::types::Json(launch_inputs))
     .execute(&mut *tx)
     .await?;
     let job = JobTransitions::create(
