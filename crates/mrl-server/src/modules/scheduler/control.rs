@@ -840,15 +840,14 @@ pub(crate) async fn finalize(core: &Core, org: Uuid, job: Uuid) -> Result<(), Sc
     let Some(row) = row.filter(|r| r.state == "FINALIZING") else {
         return Ok(());
     };
-    let verdict = core.chains.verify(&row).await?;
-    let mut tx = core.db.begin().await?;
-    let Some(locked) = JobTransitions::lock(&mut tx, org, job).await? else {
-        return Ok(());
-    };
-    JobTransitions::verify_completion(&mut tx, &locked, verdict).await?;
-    core.audit_job(&mut tx, &locked, "scheduler.finalize")
-        .await?;
-    tx.commit().await?;
+    // P23's guarded path (INT-5): pending final, snapshot and evidence checks included.
+    crate::modules::checkpoints::verifier::finalize_job(
+        &core.db,
+        &core.chains,
+        &row,
+        Some("scheduler.finalize"),
+    )
+    .await?;
     Ok(())
 }
 

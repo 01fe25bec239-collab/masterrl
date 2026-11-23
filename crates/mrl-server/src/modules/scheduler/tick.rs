@@ -852,15 +852,23 @@ async fn hold_and_launch(
         Err(e) if e.is_unique_violation("one_holder_per_gpu") => return Ok(None),
         Err(e) => return Err(e),
     };
+    // INT-5: the attempt pins a verified COMMITTED checkpoint (verified at commit), the run's
+    // latest first, else its newest. The share lock holds it COMMITTED until this transaction
+    // commits the attempt that references it: corrupting or cleaning it needs the row lock, and
+    // cleanup keeps every checkpoint an attempt references.
     let resume: Option<Uuid> = match placed.run_id {
-        Some(run) => sqlx::query_scalar(
-            "SELECT latest_committed_checkpoint_id FROM runs WHERE id = $1 AND org_id = $2",
-        )
-        .bind(run)
-        .bind(placed.org_id)
-        .fetch_optional(&mut *tx)
-        .await?
-        .flatten(),
+        Some(run) => {
+            sqlx::query_scalar(
+                "SELECT c.id FROM checkpoints c JOIN runs r ON r.id = c.run_id
+             WHERE r.id = $1 AND r.org_id = $2 AND c.state = 'COMMITTED'
+             ORDER BY (c.id = r.latest_committed_checkpoint_id) DESC, c.global_step DESC, c.id DESC
+             LIMIT 1 FOR SHARE OF c",
+            )
+            .bind(run)
+            .bind(placed.org_id)
+            .fetch_optional(&mut *tx)
+            .await?
+        }
         None => None,
     };
     let (job, attempt) = JobTransitions::launch(&mut tx, &placed, resume).await?;

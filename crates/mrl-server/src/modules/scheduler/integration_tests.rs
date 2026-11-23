@@ -913,6 +913,109 @@ async fn a_killed_worker_retries_from_the_latest_checkpoint() {
     w.invariants().await;
 }
 
+/// Seeds a checkpoint of `run` from `attempt` (epoch 1) at `step` in `state`.
+async fn checkpoint(
+    w: &World,
+    run: Uuid,
+    job: Uuid,
+    attempt: Uuid,
+    step: i64,
+    state: &str,
+    is_final: bool,
+) -> Uuid {
+    let id = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO checkpoints (id, org_id, storage_org, run_id, job_id, attempt_id,
+           attempt_epoch, global_step, kind, layout, state, is_final)
+         VALUES ($1, $2, $3, $4, $5, $6, 1, $7, 'full_resume', 'fake-v1', $8, $9)",
+    )
+    .bind(id)
+    .bind(w.org)
+    .bind(mrl_domain::ids::OrgId::from_uuid(w.org).to_string())
+    .bind(run)
+    .bind(job)
+    .bind(attempt)
+    .bind(step)
+    .bind(state)
+    .bind(is_final)
+    .execute(w.db.pool())
+    .await
+    .unwrap();
+    id
+}
+
+/// INT-5: a retry pins a COMMITTED checkpoint in the attempt it creates, never one that is
+/// no longer COMMITTED even if the run still points at it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn a_retry_pins_a_committed_checkpoint_never_a_corrupt_one() {
+    let w = World::start(false).await;
+    let m = w.agent(1).await;
+    let run = w.run().await;
+    let job = w
+        .queue_with(
+            json!({"roles": [{"role": "trainer", "replicas": 1, "gpu_count": 1,
+            "cpu_millis": 100, "mem_bytes": 1 << 20}]}),
+            Some(run),
+        )
+        .await;
+    let first = w.running(job).await;
+    let good = checkpoint(&w, run, job, first, 1, "COMMITTED", false).await;
+    let bad = checkpoint(&w, run, job, first, 2, "CORRUPT", false).await;
+    sqlx::query("UPDATE runs SET latest_committed_checkpoint_id = $2 WHERE id = $1")
+        .bind(run)
+        .bind(bad)
+        .execute(w.db.pool())
+        .await
+        .unwrap();
+    m.script
+        .exit(first, ExitKind::Failed, Some(FailureClass::EngineError));
+    w.retry_now(job).await;
+    let second = w.running(job).await;
+    let resume: Option<Uuid> =
+        sqlx::query_scalar("SELECT resume_from_checkpoint_id FROM job_attempts WHERE id = $1")
+            .bind(second)
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(resume, Some(good));
+    w.invariants().await;
+}
+
+/// INT-5: the scheduler's finalize uses P23's guards: a final checkpoint still being saved
+/// keeps the job FINALIZING; once it is COMMITTED the job completes.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn the_scheduler_waits_for_a_final_checkpoint_still_being_saved() {
+    let w = World::start(false).await;
+    let m = w.agent(1).await;
+    let run = w.run().await;
+    let job = w
+        .queue_with(
+            json!({"roles": [{"role": "trainer", "replicas": 1, "gpu_count": 1,
+            "cpu_millis": 100, "mem_bytes": 1 << 20}]}),
+            Some(run),
+        )
+        .await;
+    let attempt = w.running(job).await;
+    let fin = checkpoint(&w, run, job, attempt, 5, "WRITING", true).await;
+    m.script.exit(attempt, ExitKind::Completed, None);
+    w.wait_state(job, "FINALIZING").await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        w.job(job).await.state,
+        "FINALIZING",
+        "the final is still being saved"
+    );
+    sqlx::query("UPDATE checkpoints SET state = 'COMMITTED' WHERE id = $1")
+        .bind(fin)
+        .execute(w.db.pool())
+        .await
+        .unwrap();
+    w.wait_state(job, "COMPLETED").await;
+    w.invariants().await;
+}
+
 /// The same terminal status sent again (new seq), an older status after it and a reconcile
 /// listing the ended attempt change nothing (A1 ruling: idempotent by content).
 #[tokio::test(flavor = "multi_thread")]

@@ -280,7 +280,7 @@ pub async fn finalize(service: &CheckpointService, chains: &Chains) -> Result<()
         };
         after = last.id;
         for job in jobs {
-            if let Err(e) = finalize_one(service, chains, &job).await {
+            if let Err(e) = finalize_job(service.db(), chains, &job, None).await {
                 tracing::warn!(code = e.code(), job = %job.id, "job completion was not decided: {e}");
             }
         }
@@ -289,12 +289,17 @@ pub async fn finalize(service: &CheckpointService, chains: &Chains) -> Result<()
     Ok(())
 }
 
-async fn finalize_one(
-    service: &CheckpointService,
+/// Decides one FINALIZING job with every guard (INT-5: the one path every finalize uses): no
+/// final checkpoint still being saved, and the run's final snapshot and the evidence unchanged
+/// between the verifiers and the decision, which is made under the job and run locks.
+/// `audit`: an action recorded (`system:scheduler`) with the decision.
+pub(crate) async fn finalize_job(
+    db: &Db,
     chains: &Chains,
     job: &JobRow,
+    audit: Option<&str>,
 ) -> Result<(), JobsError> {
-    let pool = service.db().pool();
+    let pool = db.pool();
     type Snapshot = (Option<Uuid>, Option<i64>, Option<Vec<u8>>);
     let snapshot: Option<Snapshot> = match job.run_id {
         Some(run) => {
@@ -322,7 +327,7 @@ async fn finalize_one(
         None => None,
     };
     let verdict = chains.verify(job).await?;
-    let mut tx = service.db().begin().await?;
+    let mut tx = db.begin().await?;
     let Some(locked) = JobTransitions::lock(&mut tx, job.org_id, job.id).await? else {
         return Ok(());
     };
@@ -348,6 +353,9 @@ async fn finalize_one(
     }
     match JobTransitions::verify_completion(&mut tx, &locked, verdict).await {
         Ok(done) => {
+            if let Some(action) = audit {
+                job_audit(&mut tx, db, &locked, action).await?;
+            }
             if done.state == "COMPLETED" {
                 if let Some(checkpoint) = evidence.filter(|e| e.resumed).and_then(|e| e.checkpoint)
                 {
@@ -368,13 +376,7 @@ async fn finalize_one(
                         .bind(checkpoint.id)
                         .execute(&mut *tx)
                         .await?;
-                    system_audit(
-                        &mut tx,
-                        service.db(),
-                        &checkpoint,
-                        "checkpoints.finalize_resume",
-                    )
-                    .await?;
+                    system_audit(&mut tx, db, &checkpoint, "checkpoints.finalize_resume").await?;
                 }
             }
             tx.commit().await.map_err(crate::db::DbError::from)?;
@@ -382,6 +384,32 @@ async fn finalize_one(
         Err(e) if e.code() == "MRL-CONFLICT-170" || e.code() == "MRL-STATE-170" => {}
         Err(e) => return Err(e),
     }
+    Ok(())
+}
+
+/// A `system:scheduler` audit row for `job`.
+async fn job_audit(
+    tx: &mut crate::db::Tx,
+    db: &Db,
+    job: &JobRow,
+    action: &str,
+) -> Result<(), JobsError> {
+    use crate::seams::{AuditEvent, AuditOutcome, AuditSink};
+    crate::modules::audit::PgAuditSink::new(db.clone())
+        .record_in(
+            tx,
+            AuditEvent {
+                at: time::OffsetDateTime::now_utc(),
+                actor: "system:scheduler".into(),
+                org: crate::modules::jobs::scope::org_text(job.org_id),
+                project: Some(mrl_domain::ids::ProjectId::from_uuid(job.project_id).to_string()),
+                action: action.to_owned(),
+                target: mrl_domain::ids::JobId::from_uuid(job.id).to_string(),
+                outcome: AuditOutcome::Success,
+                trace_id: Uuid::new_v4().simple().to_string(),
+            },
+        )
+        .await?;
     Ok(())
 }
 
