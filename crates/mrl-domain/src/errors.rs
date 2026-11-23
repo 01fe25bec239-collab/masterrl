@@ -682,6 +682,18 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         "The agent lost its credentials before launch.",
     ),
     // <mrl:errors P22> rows for P22 go right below this line.
+    (
+        code(ErrorFamily::Quota, 220),
+        "Too many live views are open.",
+    ),
+    (
+        code(ErrorFamily::State, 220),
+        "This alert is already resolved.",
+    ),
+    (
+        code(Store, 220),
+        "A saved log or sample file is missing or damaged.",
+    ),
     // <mrl:errors P23> rows for P23 go right below this line.
     // <mrl:errors P24> rows for P24 go right below this line.
     // <mrl:errors P25> rows for P25 go right below this line.

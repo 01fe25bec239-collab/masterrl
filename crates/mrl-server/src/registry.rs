@@ -24,6 +24,7 @@ pub fn consumers(db: &Db) -> Vec<Arc<dyn EventConsumer>> {
         // <mrl:consumers P21> P21 consumers go right below this line.
         Arc::new(crate::modules::scheduler::Wake),
         // <mrl:consumers P22> P22 consumers go right below this line.
+        Arc::new(crate::modules::alerts::NodeHealthAlerts),
         // <mrl:consumers P23> P23 consumers go right below this line.
         // <mrl:consumers P24> P24 consumers go right below this line.
         // </mrl:consumers>
@@ -66,6 +67,15 @@ pub fn modules(db: &Db, config: &crate::Config) -> Vec<Box<dyn ServerModule>> {
             config,
         )),
         // <mrl:register P22> P22 modules go right below this line.
+        Box::new(crate::modules::telemetry::TelemetryModule::new(
+            db.clone(),
+            config,
+        )),
+        Box::new(crate::modules::streams::StreamsModule::new(
+            db.clone(),
+            config.live.clone(),
+        )),
+        Box::new(crate::modules::alerts::AlertsModule::new(db.clone())),
         // <mrl:register P23> P23 modules go right below this line.
         // <mrl:register P24> P24 modules go right below this line.
         // </mrl:register>

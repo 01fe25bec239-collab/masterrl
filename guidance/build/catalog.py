@@ -1768,6 +1768,13 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
              'what_to_do': {'steps': ['Nothing to do; the job moves up as earlier ones start.',
                                       'Cancel jobs you no longer need to let this one through '
                                       'sooner.']}},
+            {'code': 'MRL-QUOTA-220',
+             'title': 'Too many live views are open.',
+             'why': 'Each sign-in may keep up to 10 live views (streams) open at once, each '
+                    'watching up to 50 things. This request would go over that.',
+             'what_to_do': {'steps': ['Close live views you no longer need, like old browser tabs '
+                                      'on run pages.',
+                                      'Watch fewer things in one view, then try again.']}},
             {'code': 'MRL-RES-001',
              'title': 'The item you asked for could not be found.',
              'why': 'It may have been deleted, or the link may point to the wrong item.',
@@ -1897,6 +1904,11 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                                       'has retries left.',
                                       'If the run stops, check that the agent stays online and '
                                       'submit it again.']}},
+            {'code': 'MRL-STATE-220',
+             'title': 'This alert is already resolved.',
+             'why': 'Someone resolved this alert, so it takes no more changes. If the problem '
+                    'comes back, a new alert opens.',
+             'what_to_do': {'steps': ['Refresh the alert list to see its current state.']}},
             {'code': 'MRL-STORE-001',
              'title': 'The app refused a storage path.',
              'why': "The path points outside your workspace's storage area, or it has a part the "
@@ -1986,6 +1998,14 @@ CATALOG: dict[str, Any] = {'schema_version': 1,
                     'size. Details list the parts.',
              'what_to_do': {'steps': ['Send the parts listed in Details again.',
                                       'Then finish the upload again.']}},
+            {'code': 'MRL-STORE-220',
+             'title': 'A saved log or sample file is missing or damaged.',
+             'why': 'Older logs and samples are kept as files in storage. The file for this part '
+                    "is missing, or its contents don't match the checksum saved when it was "
+                    'written.',
+             'what_to_do': {'steps': ['Check that the storage service is running and reachable.',
+                                      'If the file was deleted by a storage cleanup rule, this '
+                                      "part of the log can't be shown any more."]}},
             {'code': 'MRL-VAL-001',
              'title': 'The app could not read this request.',
              'why': 'The request is not in a format the app understands. Part of it may be '
