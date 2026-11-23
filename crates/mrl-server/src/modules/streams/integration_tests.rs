@@ -531,6 +531,79 @@ async fn an_open_stream_resyncs_if_a_chunk_is_pruned_before_the_next_poll() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL (just dev)"]
+async fn a_metric_poll_resyncs_when_its_partition_is_retired_concurrently() {
+    let w = World::solo().await;
+    let s = seed_run(&w.db, Uuid::nil(), json!({})).await;
+    sqlx::query(
+        "CREATE TABLE p22_retiring_week PARTITION OF metric_points
+                 FOR VALUES FROM ('2000-01-03 00:00:00+00') TO ('2000-01-10 00:00:00+00')",
+    )
+    .execute(w.db.pool())
+    .await
+    .unwrap();
+    let topic = format!("run:{}:metrics", s.run_id());
+    let (_, client, _) = open(&w, Who::Solo, &topic, None).await;
+    let mut client = client.unwrap();
+    let heartbeat = client.next(Duration::from_secs(5)).await.unwrap();
+    assert_eq!(heartbeat.event, "heartbeat");
+    drop(client);
+
+    send_metrics(&w, &s, 1, points("loss", 0..1, |_| 1.0)).await;
+    sqlx::query("UPDATE metric_points SET ts = '2000-01-04 00:00:00+00'")
+        .execute(w.db.pool())
+        .await
+        .unwrap();
+    let mut retirement = w.db.db().begin().await.unwrap();
+    sqlx::query("LOCK TABLE ONLY metric_points IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *retirement)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO telemetry_pruned (source, scope_id, xid, id)
+                 SELECT 'm', run_id, xid, id FROM metric_batches WHERE run_id = $1",
+    )
+    .bind(s.run)
+    .execute(&mut *retirement)
+    .await
+    .unwrap();
+
+    let (_, resumed, _) = open(&w, Who::Solo, &topic, heartbeat.id.as_deref()).await;
+    let mut resumed = resumed.unwrap();
+    // The poll must reach the lock before retirement commits, on either revision.
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let blocked: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_locks
+                    WHERE database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                      AND relation = 'metric_points'::regclass AND NOT granted)",
+            )
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap();
+            if blocked {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the metric poll should wait for the partition lock");
+    sqlx::query("DROP TABLE p22_retiring_week")
+        .execute(&mut *retirement)
+        .await
+        .unwrap();
+    retirement.commit().await.unwrap();
+
+    let events = resumed.until(|events| !events.is_empty()).await;
+    let event = events
+        .first()
+        .expect("retiring an unread partition must send resync");
+    assert_eq!(event.event, "resync");
+    assert_eq!(event.data["reason"], "too_old");
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
 async fn revisions_follow_write_order_when_a_transaction_gets_its_xid_early() {
     let w = World::solo().await;
     let s = seed_run(&w.db, Uuid::nil(), json!({})).await;

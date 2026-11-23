@@ -547,6 +547,12 @@ impl Live {
         sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
             .execute(&mut *tx)
             .await?;
+        if !self.sub.metrics.is_empty() {
+            // Partition drops can hide raw points from a snapshot that predates their prune marker.
+            sqlx::query("LOCK TABLE ONLY metric_points IN ACCESS SHARE MODE")
+                .execute(&mut *tx)
+                .await?;
+        }
         let xmin: i64 =
             sqlx::query_scalar("SELECT pg_snapshot_xmin(pg_current_snapshot())::text::bigint")
                 .fetch_one(&mut *tx)
