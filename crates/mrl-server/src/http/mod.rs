@@ -1,7 +1,7 @@
 //! HTTP framework: router composition from modules and the middleware every request passes.
 //!
 //! Order, outermost first: request ids and trace → metrics → compression → problem
-//! renderer → (solo: launch-secret check on every path) → body limit (2 MiB; ticket PUTs are
+//! renderer → (solo: launch-secret check on every path but ticket transfers) → body limit (2 MiB; ticket PUTs are
 //! exempt and capped by their ticket) → panic
 //! catcher → route. Module routes under `/api/v1` add, outermost first: authentication
 //! (team; solo already checked) → rate limit → idempotency → problem renderer.
@@ -129,7 +129,7 @@ fn finish(router: Router<AppState>, state: AppState, gate: bool) -> Router {
         }))
         .layer(from_fn(limit_body));
     let router = if gate {
-        router.layer(from_fn_with_state(state.clone(), authenticate))
+        router.layer(from_fn_with_state(state.clone(), solo_gate))
     } else {
         router
     };
@@ -257,6 +257,28 @@ async fn track_request(State(state): State<AppState>, req: Request, next: Next) 
         tracing::error!(status = res.status().as_u16(), route = %route, "request failed");
     }
     res
+}
+
+/// Solo mode's gate on every path, except `/api/v1/transfer/{ticket}`: there the ticket is
+/// the only credential, as in team mode, so agents never hold the owner's launch secret.
+async fn solo_gate(state: State<AppState>, req: Request, next: Next) -> Response {
+    if is_ticket_path(req.uri().path()) {
+        return next.run(req).await;
+    }
+    authenticate(state, req, next).await
+}
+
+/// `/api/v1/transfer/<one segment>`, the segment made of ticket characters only.
+fn is_ticket_path(path: &str) -> bool {
+    path.strip_prefix(API_PREFIX)
+        .and_then(|p| p.strip_prefix("/transfer/"))
+        .is_some_and(|t| {
+            !t.is_empty()
+                && t != "."
+                && t != ".."
+                && t.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        })
 }
 
 /// Authenticates through the `Authenticator` seam and sets `RequestContext`.
@@ -578,6 +600,27 @@ pub(crate) mod tests {
             }
             let r = req(Method::GET, path).body(Body::empty()).unwrap();
             assert_eq!(send(&app, r).await.0, with_secret, "{path}");
+        }
+    }
+
+    #[tokio::test]
+    async fn solo_lets_only_ticket_paths_through_without_the_secret() {
+        let app = app(Config::default());
+        // No such route in this app: 404 means the gate let it through.
+        let r = axum::http::Request::get("/api/v1/transfer/tkt_a-b.c")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(send(&app, r).await.0, StatusCode::NOT_FOUND);
+        for path in [
+            "/api/v1/transfer/",
+            "/api/v1/transfer/..",
+            "/api/v1/transfer/a/b",
+            "/api/v1/transfer/a%2Fb",
+            "/api/v1/transferx/a",
+            "/transfer/a",
+        ] {
+            let r = axum::http::Request::get(path).body(Body::empty()).unwrap();
+            assert_eq!(send(&app, r).await.0, StatusCode::UNAUTHORIZED, "{path}");
         }
     }
 
