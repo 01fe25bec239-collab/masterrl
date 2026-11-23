@@ -1,0 +1,44 @@
+{
+  "about": "QLoRA asked of the FakeEngine on a CPU machine",
+  "enabled": [
+    "cpu"
+  ],
+  "engine": "fake",
+  "expect": [
+    {
+      "code": "MRL-CAP-240",
+      "message": "Fake steps with Fake engine (testkit) can't use the `qlora` update strategy. It can use: full.",
+      "path": "/config/common/update_strategy"
+    },
+    {
+      "code": "MRL-CAP-018",
+      "message": "QLoRA trains with 4-bit bitsandbytes, which needs an NVIDIA GPU; this run asks for the processor only (no GPU).",
+      "path": "/resources"
+    }
+  ],
+  "request": {
+    "algorithm": "x-fake.steps",
+    "available": [
+      "cpu"
+    ],
+    "config": {
+      "common": {
+        "update_strategy": "qlora"
+      }
+    },
+    "datasets": [
+      {
+        "schema": "sft.messages.v1"
+      }
+    ],
+    "hardware": {
+      "gpus": 0,
+      "nodes": 1,
+      "wanted": "cpu"
+    },
+    "model": {
+      "family": "decoder",
+      "has_chat_template": true
+    }
+  }
+}

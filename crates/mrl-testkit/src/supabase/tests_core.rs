@@ -674,6 +674,14 @@ async fn every_route_answers_by_role_in_team_mode() {
             ))
             .await;
     }
+    // P24 routes: one listed engine with methods (the golden rejection fixture).
+    let golden = mrl_domain::capability::manifest::Bundle::parse(include_str!(
+        "../../../../tests/fixtures/rejections/engines/golden.json"
+    ))
+    .unwrap();
+    mrl_server::modules::engines::store::register(core.db.db(), &[&golden], true)
+        .await
+        .unwrap();
     // Compute (P18): a pool made over the API and one machine in it (no agent connected).
     let pool = core
         .call(
@@ -1076,6 +1084,31 @@ async fn every_route_answers_by_role_in_team_mode() {
             Method::DELETE,
             format!("/api/v1/checkpoints/{ckpt}"),
             Action::CheckpointsWrite,
+            None,
+        ),
+        // P24 routes: engines, capabilities and a method's form (every GET answers 200).
+        row(
+            Method::GET,
+            "/api/v1/engines".into(),
+            Action::EnginesRead,
+            None,
+        ),
+        row(
+            Method::GET,
+            "/api/v1/engines/golden/versions/1.0.0".into(),
+            Action::EnginesRead,
+            None,
+        ),
+        row(
+            Method::GET,
+            "/api/v1/capabilities".into(),
+            Action::EnginesRead,
+            None,
+        ),
+        row(
+            Method::GET,
+            "/api/v1/algorithms/sft/schema?engine_version=golden@1.0.0".into(),
+            Action::EnginesRead,
             None,
         ),
     ]);

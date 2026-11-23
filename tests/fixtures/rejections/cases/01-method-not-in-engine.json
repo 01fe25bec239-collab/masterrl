@@ -1,0 +1,35 @@
+{
+  "about": "PPO on an engine without it (row 1)",
+  "enabled": [
+    "nvidia"
+  ],
+  "engine": "golden",
+  "expect": [
+    {
+      "code": "MRL-CAP-001",
+      "message": "Golden has no method `ppo`.",
+      "path": "/algorithm_id"
+    }
+  ],
+  "request": {
+    "algorithm": "ppo",
+    "available": [
+      "nvidia"
+    ],
+    "config": {},
+    "datasets": [
+      {
+        "schema": "sft.messages.v1"
+      }
+    ],
+    "hardware": {
+      "gpus": 1,
+      "nodes": 1,
+      "wanted": "nvidia"
+    },
+    "model": {
+      "family": "decoder",
+      "has_chat_template": true
+    }
+  }
+}

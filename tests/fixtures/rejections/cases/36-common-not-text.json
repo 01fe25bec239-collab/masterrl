@@ -1,0 +1,39 @@
+{
+  "about": "A common setting that is not text",
+  "enabled": [
+    "nvidia"
+  ],
+  "engine": "golden",
+  "expect": [
+    {
+      "code": "MRL-VAL-003",
+      "message": "`update_strategy` must be text, like the names in the method's settings.",
+      "path": "/config/common/update_strategy"
+    }
+  ],
+  "request": {
+    "algorithm": "sft",
+    "available": [
+      "nvidia"
+    ],
+    "config": {
+      "common": {
+        "update_strategy": 4
+      }
+    },
+    "datasets": [
+      {
+        "schema": "sft.messages.v1"
+      }
+    ],
+    "hardware": {
+      "gpus": 1,
+      "nodes": 1,
+      "wanted": "nvidia"
+    },
+    "model": {
+      "family": "decoder",
+      "has_chat_template": true
+    }
+  }
+}

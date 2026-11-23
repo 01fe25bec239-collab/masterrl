@@ -1,0 +1,20 @@
+{
+  "about": "A capability listing (no config, no model or dataset given)",
+  "enabled": [
+    "nvidia"
+  ],
+  "engine": "golden",
+  "expect": [],
+  "request": {
+    "algorithm": "sft",
+    "available": [
+      "nvidia",
+      "apple"
+    ],
+    "hardware": {
+      "gpus": 0,
+      "nodes": 1,
+      "wanted": "any"
+    }
+  }
+}

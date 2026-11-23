@@ -704,6 +704,38 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         "This checkpoint is still in use, so it can't be deleted.",
     ),
     // <mrl:errors P24> rows for P24 go right below this line.
+    (
+        code(ErrorFamily::Cap, 240),
+        "This engine can't train with these settings.",
+    ),
+    (
+        code(ErrorFamily::Cap, 241),
+        "This engine hasn't been checked on this kind of machine yet.",
+    ),
+    (
+        code(ErrorFamily::Cap, 242),
+        "This method needs an input the run doesn't have.",
+    ),
+    (
+        code(ErrorFamily::Cap, 243),
+        "This dataset's format doesn't fit this method.",
+    ),
+    (
+        code(ErrorFamily::Cap, 244),
+        "This method can't train this kind of model.",
+    ),
+    (
+        code(ErrorFamily::Cap, 245),
+        "No connected machine has the hardware this run asks for.",
+    ),
+    (
+        code(Model, 240),
+        "The app has no record of this model version.",
+    ),
+    (
+        code(Data, 240),
+        "The app has no record of this dataset version.",
+    ),
     // <mrl:errors P25> rows for P25 go right below this line.
 ];
 

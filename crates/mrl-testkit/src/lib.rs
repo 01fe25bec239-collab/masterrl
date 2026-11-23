@@ -38,6 +38,11 @@ mod p22_telemetry;
 #[path = "../../mrl-server/src/modules/checkpoints/integration_tests.rs"]
 mod p23_checkpoints;
 // <mrl:testkit P24> P24 `pub mod` lines go right below this line.
+#[path = "../../mrl-server/src/modules/engines/testkit.rs"]
+pub mod engines;
+#[cfg(test)]
+#[path = "../../mrl-server/src/modules/engines/integration_tests.rs"]
+mod p24_engines;
 
 /// The version of this crate, taken from its `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

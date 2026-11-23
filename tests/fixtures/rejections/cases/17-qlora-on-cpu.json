@@ -1,0 +1,40 @@
+{
+  "about": "QLoRA on a CPU pool (row 17)",
+  "enabled": [
+    "nvidia",
+    "cpu"
+  ],
+  "engine": "golden",
+  "expect": [
+    {
+      "code": "MRL-CAP-018",
+      "message": "QLoRA trains with 4-bit bitsandbytes, which needs an NVIDIA GPU; this run asks for the processor only (no GPU).",
+      "path": "/resources"
+    }
+  ],
+  "request": {
+    "algorithm": "sft",
+    "available": [
+      "cpu"
+    ],
+    "config": {
+      "common": {
+        "update_strategy": "qlora"
+      }
+    },
+    "datasets": [
+      {
+        "schema": "sft.messages.v1"
+      }
+    ],
+    "hardware": {
+      "gpus": 0,
+      "nodes": 1,
+      "wanted": "cpu"
+    },
+    "model": {
+      "family": "decoder",
+      "has_chat_template": true
+    }
+  }
+}

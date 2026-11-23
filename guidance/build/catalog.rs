@@ -2220,6 +2220,72 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-CAP-240")),
+            ("title", Value::Str("This engine can't train with these settings.")),
+            ("why", Value::Str("The engine or method doesn't offer the update strategy, precision or parallelism you picked. Details name the setting and the choices that work.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Pick one of the choices listed in Details."),
+                    Value::Str("Or choose another engine that offers this setting."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CAP-241")),
+            ("title", Value::Str("This engine hasn't been checked on this kind of machine yet.")),
+            ("why", Value::Str("The app checks each engine on a connected machine before it runs jobs there. No check has passed yet for this kind of machine.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Keep a machine of this kind connected for a few minutes so the app can check it."),
+                    Value::Str("Open Machines and run the Environment Doctor if the check keeps failing."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CAP-242")),
+            ("title", Value::Str("This method needs an input the run doesn't have.")),
+            ("why", Value::Str("Some methods learn from a reward or a teacher model. This run doesn't include the one this method needs.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Attach the input named in Details."),
+                    Value::Str("Or choose a method that doesn't need it."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CAP-243")),
+            ("title", Value::Str("This dataset's format doesn't fit this method.")),
+            ("why", Value::Str("Each method reads data in certain formats. Details name the formats this method accepts.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Convert the dataset in Dataset Studio to a format listed in Details."),
+                    Value::Str("Or choose a method that reads this format."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CAP-244")),
+            ("title", Value::Str("This method can't train this kind of model.")),
+            ("why", Value::Str("Each method works with certain model types, like decoder models. This model is a different type.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Choose a model of a type listed in Details."),
+                    Value::Str("Or choose a method that trains this type of model."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CAP-245")),
+            ("title", Value::Str("No connected machine has the hardware this run asks for.")),
+            ("why", Value::Str("The run asks for a kind of machine, like one with an NVIDIA GPU. None of the connected machines has it.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Connect a machine of this kind in Machines."),
+                    Value::Str("Or change the run's hardware to match a connected machine."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-CONFLICT-001")),
             ("title", Value::Str("Someone changed this item after you opened it.")),
             ("why", Value::Str("The version you edited is older than the saved one.")),
@@ -2377,6 +2443,17 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Convert the column named in Details to text, then upload the file again."),
                     Value::Str("For images, store a reference to each image file instead of its bytes."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-DATA-240")),
+            ("title", Value::Str("The app has no record of this dataset version.")),
+            ("why", Value::Str("The run names a dataset version that isn't registered in your organization.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check the dataset version id in the run settings."),
+                    Value::Str("Import the dataset first if it isn't in the app yet."),
                 ])),
             ])),
         ]),
@@ -3134,6 +3211,17 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Check that the model folder has a `tokenizer.json` file."),
                     Value::Str("Download the model again if the file is damaged."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-MODEL-240")),
+            ("title", Value::Str("The app has no record of this model version.")),
+            ("why", Value::Str("The run names a model version that isn't registered in your organization.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check the model version id in the run settings."),
+                    Value::Str("Import the model first if it isn't in the app yet."),
                 ])),
             ])),
         ]),

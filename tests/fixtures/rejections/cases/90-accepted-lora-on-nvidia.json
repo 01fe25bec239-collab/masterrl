@@ -1,0 +1,38 @@
+{
+  "about": "SFT with LoRA on an NVIDIA machine: runs",
+  "enabled": [
+    "nvidia"
+  ],
+  "engine": "golden",
+  "expect": [],
+  "request": {
+    "algorithm": "sft",
+    "available": [
+      "nvidia",
+      "cpu"
+    ],
+    "config": {
+      "common": {
+        "precision": "bf16",
+        "update_strategy": "lora"
+      },
+      "engine": {
+        "learning_rate": 0.0002
+      }
+    },
+    "datasets": [
+      {
+        "schema": "sft.messages.v1"
+      }
+    ],
+    "hardware": {
+      "gpus": 1,
+      "nodes": 1,
+      "wanted": "nvidia"
+    },
+    "model": {
+      "family": "decoder",
+      "has_chat_template": true
+    }
+  }
+}

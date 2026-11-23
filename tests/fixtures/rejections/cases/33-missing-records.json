@@ -1,0 +1,35 @@
+{
+  "about": "Model and dataset ids with no record (registries come in wave 6)",
+  "enabled": [
+    "nvidia"
+  ],
+  "engine": "golden",
+  "expect": [
+    {
+      "code": "MRL-DATA-240",
+      "message": "The app has no record of this dataset version.",
+      "path": "/dataset_version_ids/0"
+    },
+    {
+      "code": "MRL-MODEL-240",
+      "message": "The app has no record of this model version.",
+      "path": "/base_model_version_id"
+    }
+  ],
+  "request": {
+    "algorithm": "sft",
+    "available": [
+      "nvidia"
+    ],
+    "config": {},
+    "datasets": [
+      "missing"
+    ],
+    "hardware": {
+      "gpus": 1,
+      "nodes": 1,
+      "wanted": "nvidia"
+    },
+    "model": "missing"
+  }
+}

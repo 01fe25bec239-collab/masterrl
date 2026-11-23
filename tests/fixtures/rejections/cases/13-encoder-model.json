@@ -1,0 +1,34 @@
+{
+  "about": "A causal-LM method on an encoder-only model (row 13)",
+  "enabled": [
+    "nvidia"
+  ],
+  "engine": "golden",
+  "expect": [
+    {
+      "code": "MRL-CAP-014",
+      "message": "SFT trains decoder or decoder-moe or vlm models; this model is encoder.",
+      "path": "/base_model_version_id"
+    }
+  ],
+  "request": {
+    "algorithm": "sft",
+    "available": [
+      "nvidia"
+    ],
+    "config": {},
+    "datasets": [
+      {
+        "schema": "sft.messages.v1"
+      }
+    ],
+    "hardware": {
+      "gpus": 1,
+      "nodes": 1,
+      "wanted": "nvidia"
+    },
+    "model": {
+      "family": "encoder"
+    }
+  }
+}

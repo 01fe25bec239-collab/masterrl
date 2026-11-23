@@ -94,6 +94,8 @@ pub struct Config {
     /// Checkpoint commit, verification, retention and cadence.
     pub checkpoints: crate::modules::checkpoints::CheckpointsConfig,
     // <mrl:config P24> P24 settings fields go right below this line.
+    /// Engine registry and probes.
+    pub engines: crate::modules::engines::EnginesConfig,
 }
 
 /// `[server]`.
@@ -508,6 +510,7 @@ impl Config {
         // <mrl:validate P23> P23 checks (push to `problems`) go right below this line.
         problems.extend(self.checkpoints.problems());
         // <mrl:validate P24> P24 checks (push to `problems`) go right below this line.
+        problems.extend(self.engines.problems());
         if problems.is_empty() {
             Ok(())
         } else {

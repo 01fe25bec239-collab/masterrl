@@ -96,6 +96,37 @@ paths:
           description: No such alert
         '409':
           description: The alert is resolved (MRL-STATE-220)
+  /api/v1/algorithms/{algo}/schema:
+    get:
+      tags:
+      - engines
+      operationId: get_algorithm_schema
+      parameters:
+      - name: algo
+        in: path
+        description: Method id, like `sft`.
+        required: true
+        schema:
+          type: string
+      - name: engine_version
+        in: query
+        description: '`<engine>@<version>`, like `trl@1.0.0`; default: the newest live version with the method.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The method's form.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlgorithmSchemaDoc'
+        '404':
+          description: No live engine version has this method.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/artifacts:
     get:
       tags:
@@ -414,6 +445,61 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /api/v1/capabilities:
+    get:
+      tags:
+      - engines
+      operationId: get_capabilities
+      parameters:
+      - name: model_version
+        in: query
+        description: '`mv_…`: check against this model.'
+        required: false
+        schema:
+          type: string
+      - name: dataset_version
+        in: query
+        description: '`dsv_…`: check against this training dataset.'
+        required: false
+        schema:
+          type: string
+      - name: project
+        in: query
+        description: Project in which model and dataset versions must be visible.
+        required: false
+        schema:
+          type: string
+      - name: pool
+        in: query
+        description: '`pool_…`: only this pool''s machines.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: What can run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilityReport'
+        '403':
+          description: The caller cannot read the requested compute or records.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: No visible pool or project has this id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: An id can't be read.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/checkpoints/{ckpt}:
     get:
       tags:
@@ -487,6 +573,49 @@ paths:
                 $ref: '#/components/schemas/CheckpointInfo'
         '409':
           description: The checkpoint is not COMMITTED (MRL-STATE-230).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/engines:
+    get:
+      tags:
+      - engines
+      operationId: list_engines
+      responses:
+        '200':
+          description: Engines.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EngineList'
+  /api/v1/engines/{eng}/versions/{ver}:
+    get:
+      tags:
+      - engines
+      operationId: get_engine_version
+      parameters:
+      - name: eng
+        in: path
+        description: Engine name, like `trl`.
+        required: true
+        schema:
+          type: string
+      - name: ver
+        in: path
+        description: Version, like `1.0.0`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EngineVersionDetail'
+        '404':
+          description: No such engine version.
           content:
             application/json:
               schema:
@@ -2441,6 +2570,68 @@ components:
         title:
           type: string
           description: What happened.
+    AlgorithmSchemaDoc:
+      type: object
+      description: '`GET /algorithms/{algo}/schema`.'
+      required:
+      - engine
+      - version
+      - algorithm
+      - display_name
+      - summary
+      - maturity
+      - fidelity
+      - switch
+      - defaults
+      - presets
+      properties:
+        algorithm:
+          type: string
+          description: Method id.
+        config_schema:
+          type:
+          - object
+          - 'null'
+          description: JSON Schema for `config.engine` (with `x-mrl-ui` hints), if the method has a form.
+        defaults:
+          type: object
+          description: Recommended values.
+        display_name:
+          type: string
+          description: Shown in the app.
+        engine:
+          type: string
+          description: Engine name.
+        fidelity:
+          type: string
+          description: full, partial or approximation.
+        fidelity_note:
+          type:
+          - string
+          - 'null'
+          description: Why fidelity is not full.
+        maturity:
+          type: string
+          description: stable, beta or experimental.
+        presets:
+          type: array
+          items:
+            type: object
+          description: 'Presets: `{id, title, tier, when, patch}` (JSON Merge Patch).'
+        summary:
+          type: string
+          description: One line.
+        switch:
+          type: object
+          description: Pinned engine fields (read-only in the form).
+        ui_schema:
+          type:
+          - object
+          - 'null'
+          description: UI hints file, if any.
+        version:
+          type: string
+          description: Engine version.
     Artifact:
       type: object
       description: A registered artifact.
@@ -2621,6 +2812,98 @@ components:
           - 'null'
           description: Name for that token.
       additionalProperties: false
+    CapabilityItem:
+      type: object
+      description: One method of one engine version.
+      required:
+      - engine
+      - version
+      - algorithm
+      - display_name
+      - maturity
+      - runnable
+      - update_strategies
+      - precision
+      - enabled_hardware
+      - problems
+      properties:
+        algorithm:
+          type: string
+          description: Method id.
+        display_name:
+          type: string
+          description: Shown in the app.
+        enabled_hardware:
+          type: array
+          items:
+            type: string
+          description: Hardware classes where the engine passed its probe.
+        engine:
+          type: string
+          description: Engine name.
+        maturity:
+          type: string
+          description: stable, beta or experimental.
+        precision:
+          type: array
+          items:
+            type: string
+          description: Precisions it offers.
+        problems:
+          type: array
+          items:
+            $ref: '#/components/schemas/CapabilityProblem'
+          description: Why it can't run.
+        runnable:
+          type: boolean
+          description: True when nothing stops it (settings are checked when you submit).
+        update_strategies:
+          type: array
+          items:
+            type: string
+          description: Update strategies it offers on the available hardware.
+        version:
+          type: string
+          description: Engine version.
+    CapabilityProblem:
+      type: object
+      description: One problem (same shape as a job rejection).
+      required:
+      - code
+      - message
+      - hint
+      properties:
+        code:
+          type: string
+          description: Catalog code, like `MRL-CAP-018`.
+        hint:
+          type: string
+          description: What to do.
+        message:
+          type: string
+          description: What is wrong.
+        path:
+          type:
+          - string
+          - 'null'
+          description: What it concerns, like `/resources`.
+    CapabilityReport:
+      type: object
+      description: '`GET /capabilities`.'
+      required:
+      - hardware
+      - items
+      properties:
+        hardware:
+          type: array
+          items:
+            type: string
+          description: Hardware classes of the connected machines considered.
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CapabilityItem'
+          description: Every method of every live engine version.
     CheckResult:
       type: object
       description: One readiness check result.
@@ -2957,6 +3240,143 @@ components:
             enum:
             - cloudflare_tunnel
       description: How the core dials one machine (stored in `compute_nodes.endpoint`).
+    EngineAlgorithm:
+      type: object
+      description: A method of one engine version.
+      required:
+      - id
+      - display_name
+      - summary
+      - maturity
+      - fidelity
+      - verified_hw
+      properties:
+        display_name:
+          type: string
+          description: Shown in the app.
+        fidelity:
+          type: string
+          description: full, partial or approximation.
+        id:
+          type: string
+          description: Method id.
+        maturity:
+          type: string
+          description: stable, beta or experimental.
+        summary:
+          type: string
+          description: One line.
+        verified_hw:
+          type: array
+          items:
+            type: string
+          description: Hardware classes with a passed probe.
+    EngineList:
+      type: object
+      description: '`GET /engines`.'
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/EngineSummary'
+          description: Engines by name.
+    EngineSummary:
+      type: object
+      description: One engine.
+      required:
+      - name
+      - kind
+      - display_name
+      - versions
+      properties:
+        description:
+          type:
+          - string
+          - 'null'
+          description: Longer text.
+        display_name:
+          type: string
+          description: Shown in the app.
+        kind:
+          type: string
+          description: '`engine` (training) or `builtin` (utility jobs).'
+        name:
+          type: string
+          description: Adapter name, like `trl`.
+        versions:
+          type: array
+          items:
+            $ref: '#/components/schemas/EngineVersionSummary'
+          description: Its versions, oldest first.
+    EngineVersionDetail:
+      type: object
+      description: '`GET /engines/{eng}/versions/{ver}`.'
+      required:
+      - name
+      - version
+      - status
+      - manifest_sha256
+      - probe_results
+      - manifest
+      - algorithms
+      properties:
+        algorithms:
+          type: array
+          items:
+            $ref: '#/components/schemas/EngineAlgorithm'
+          description: Its methods.
+        manifest:
+          type: object
+          description: The merged manifest.
+        manifest_sha256:
+          type: string
+          description: sha256 of the stored manifest.
+        name:
+          type: string
+          description: Adapter name.
+        probe_results:
+          type: object
+          description: Probe results per hardware class.
+        runtime_ref:
+          type:
+          - string
+          - 'null'
+          description: Lock hash or image of the trainer environment.
+        status:
+          type: string
+          description: Status.
+        version:
+          type: string
+          description: Version.
+    EngineVersionSummary:
+      type: object
+      description: One version in the engine list.
+      required:
+      - version
+      - status
+      - hardware
+      - algorithms
+      properties:
+        algorithms:
+          type: array
+          items:
+            type: string
+          description: Method ids.
+        hardware:
+          type: object
+          description: 'Probe outcome per hardware class (`cpu`, `nvidia`, …): ENABLED or FAILED.'
+          additionalProperties:
+            type: string
+          propertyNames:
+            type: string
+        status:
+          type: string
+          description: PENDING_APPROVAL, PROBING, ENABLED, DISABLED or REVOKED.
+        version:
+          type: string
+          description: Adapter version.
     Experiment:
       type: object
       description: An experiment, as the API shows it.
@@ -6108,3 +6528,5 @@ tags:
   description: 'Alerts: list, acknowledge and resolve.'
 - name: checkpoints
   description: 'Checkpoints: listing, verification and deletion.'
+- name: engines
+  description: Training engines, their methods and what can run where.

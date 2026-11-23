@@ -2161,6 +2161,72 @@
       }
     },
     {
+      "code": "MRL-CAP-240",
+      "title": "This engine can't train with these settings.",
+      "why": "The engine or method doesn't offer the update strategy, precision or parallelism you picked. Details name the setting and the choices that work.",
+      "what_to_do": {
+        "steps": [
+          "Pick one of the choices listed in Details.",
+          "Or choose another engine that offers this setting."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CAP-241",
+      "title": "This engine hasn't been checked on this kind of machine yet.",
+      "why": "The app checks each engine on a connected machine before it runs jobs there. No check has passed yet for this kind of machine.",
+      "what_to_do": {
+        "steps": [
+          "Keep a machine of this kind connected for a few minutes so the app can check it.",
+          "Open Machines and run the Environment Doctor if the check keeps failing."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CAP-242",
+      "title": "This method needs an input the run doesn't have.",
+      "why": "Some methods learn from a reward or a teacher model. This run doesn't include the one this method needs.",
+      "what_to_do": {
+        "steps": [
+          "Attach the input named in Details.",
+          "Or choose a method that doesn't need it."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CAP-243",
+      "title": "This dataset's format doesn't fit this method.",
+      "why": "Each method reads data in certain formats. Details name the formats this method accepts.",
+      "what_to_do": {
+        "steps": [
+          "Convert the dataset in Dataset Studio to a format listed in Details.",
+          "Or choose a method that reads this format."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CAP-244",
+      "title": "This method can't train this kind of model.",
+      "why": "Each method works with certain model types, like decoder models. This model is a different type.",
+      "what_to_do": {
+        "steps": [
+          "Choose a model of a type listed in Details.",
+          "Or choose a method that trains this type of model."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CAP-245",
+      "title": "No connected machine has the hardware this run asks for.",
+      "why": "The run asks for a kind of machine, like one with an NVIDIA GPU. None of the connected machines has it.",
+      "what_to_do": {
+        "steps": [
+          "Connect a machine of this kind in Machines.",
+          "Or change the run's hardware to match a connected machine."
+        ]
+      }
+    },
+    {
       "code": "MRL-CONFLICT-001",
       "title": "Someone changed this item after you opened it.",
       "why": "The version you edited is older than the saved one.",
@@ -2318,6 +2384,17 @@
         "steps": [
           "Convert the column named in Details to text, then upload the file again.",
           "For images, store a reference to each image file instead of its bytes."
+        ]
+      }
+    },
+    {
+      "code": "MRL-DATA-240",
+      "title": "The app has no record of this dataset version.",
+      "why": "The run names a dataset version that isn't registered in your organization.",
+      "what_to_do": {
+        "steps": [
+          "Check the dataset version id in the run settings.",
+          "Import the dataset first if it isn't in the app yet."
         ]
       }
     },
@@ -3075,6 +3152,17 @@
         "steps": [
           "Check that the model folder has a `tokenizer.json` file.",
           "Download the model again if the file is damaged."
+        ]
+      }
+    },
+    {
+      "code": "MRL-MODEL-240",
+      "title": "The app has no record of this model version.",
+      "why": "The run names a model version that isn't registered in your organization.",
+      "what_to_do": {
+        "steps": [
+          "Check the model version id in the run settings.",
+          "Import the model first if it isn't in the app yet."
         ]
       }
     },

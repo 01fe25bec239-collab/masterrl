@@ -28,9 +28,15 @@ pub fn pipeline(db: &Db, cfg: &SchedulerConfig) -> Pipeline {
         vec![
             Arc::new(RunConfigSpec::new(db.clone())),
             // <mrl:launch-contributors> Launch contributors (runtime, inputs, credentials) go right below this line.
+            Arc::new(crate::modules::engines::launch::EngineRuntime::new(
+                db.clone(),
+            )),
         ],
         vec![
             // <mrl:pause-support> Engines that can pause go right below this line.
+            Arc::new(crate::modules::engines::launch::EnginePause::new(
+                db.clone(),
+            )),
         ],
         vec![
             Arc::new(LocalAgentPool::new(db.clone())),
