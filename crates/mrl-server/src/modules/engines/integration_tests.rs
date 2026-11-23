@@ -217,20 +217,16 @@ async fn join_cpu_machine_answer(
     .link
     .node_id;
     let running = agent.run();
-    // The CPU fixture models a Linux x86-64 agent on every test host.
+    // The machine keeps the test host's real inventory (macOS on a laptop, Linux in CI).
     let id = NodeId::from_str(&node).unwrap().as_uuid();
-    wait_for("online CPU fixture", async || {
-        sqlx::query(
-            "UPDATE compute_nodes SET inventory = inventory ||
-                     jsonb_build_object('platform','PLATFORM_LINUX','arch','x86_64')
-                     WHERE id = $1 AND status = 'ONLINE'",
+    wait_for("online CPU machine", async || {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM compute_nodes WHERE id = $1 AND status = 'ONLINE')",
         )
         .bind(id)
-        .execute(db.pool())
+        .fetch_one(db.pool())
         .await
         .unwrap()
-        .rows_affected()
-            == 1
     })
     .await;
     (agent, running, node, pool)

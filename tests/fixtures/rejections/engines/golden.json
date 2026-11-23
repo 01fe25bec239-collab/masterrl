@@ -124,7 +124,7 @@
       ],
       "checkpoint": { "format": "golden-v1", "resumable": true, "portableWeights": true },
       "validate": { "l1": true },
-      "hardware": { "os": ["linux"], "accelerators": ["nvidia", "cpu"] }
+      "hardware": { "os": ["linux", "macos", "windows"], "accelerators": ["nvidia", "cpu"] }
     }
   },
   "schemas": {

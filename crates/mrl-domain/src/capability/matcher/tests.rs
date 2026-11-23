@@ -373,3 +373,40 @@ fn startup_rejects_generated_bundle_mistakes() {
         "{error}"
     );
 }
+
+#[test]
+fn processor_runtimes_run_on_any_allowed_platform_but_gpu_runtimes_need_their_own() {
+    // FakeEngine declares one CPU environment, built on linux/amd64.
+    let fake = bundle("fake");
+    let fake = fake.engine.as_ref().unwrap();
+    let mac = Machine {
+        platform: Some(Platform::AppleSilicon),
+        arch: "aarch64".into(),
+        devices: vec![],
+    };
+    assert!(mac.supports(fake, HardwareClass::Cpu));
+    let unknown = Machine {
+        platform: None,
+        arch: String::new(),
+        devices: vec![],
+    };
+    assert!(unknown.supports(fake, HardwareClass::Cpu));
+
+    // The manifest's OS list still applies to processor runtimes.
+    let mut linux_only = fake.clone();
+    linux_only.spec.hardware.as_mut().unwrap().os = Some(vec!["linux".into()]);
+    assert!(!mac.supports(&linux_only, HardwareClass::Cpu));
+
+    // A GPU runtime still needs its exact platform (golden's CUDA one is linux/amd64).
+    let golden = bundle("golden");
+    let golden = golden.engine.as_ref().unwrap();
+    let mut arm = linux(vec![device(HardwareClass::Nvidia, "8.0")]);
+    arm.arch = "aarch64".into();
+    assert!(!arm.supports(golden, HardwareClass::Nvidia));
+    assert!(arm.supports(golden, HardwareClass::Cpu));
+    let unknown_gpu = Machine {
+        platform: None,
+        ..arm
+    };
+    assert!(!unknown_gpu.supports(golden, HardwareClass::Nvidia));
+}

@@ -186,33 +186,48 @@ impl Machine {
             return None;
         }
         let hw = manifest.spec.hardware.as_ref();
-        let (os, target_os) = match self.platform? {
-            Platform::Linux => ("linux", "linux"),
-            Platform::Wsl2 => ("windows", "linux"),
-            Platform::Windows => ("windows", "windows"),
-            Platform::AppleSilicon => ("macos", "darwin"),
+        // A GPU runtime needs the machine's exact OS and CPU; a processor-only one does not
+        // (its uv lock resolves on the machine), so an unknown platform still runs on CPU.
+        let target = match self.platform {
+            Some(p) => Some(p),
+            None if class == HardwareClass::Cpu => None,
+            None => return None,
         };
-        if hw.is_some_and(|h| {
-            h.os.as_ref()
-                .is_some_and(|allowed| !allowed.iter().any(|o| o == os))
-                || (self.platform == Some(Platform::Wsl2) && h.wsl2 == Some(false))
-                || (self.platform == Some(Platform::AppleSilicon) && h.apple_silicon == Some(false))
-        }) {
-            return None;
+        if let Some(p) = target {
+            let os = match p {
+                Platform::Linux => "linux",
+                Platform::Wsl2 | Platform::Windows => "windows",
+                Platform::AppleSilicon => "macos",
+            };
+            if hw.is_some_and(|h| {
+                h.os.as_ref()
+                    .is_some_and(|allowed| !allowed.iter().any(|o| o == os))
+                    || (p == Platform::Wsl2 && h.wsl2 == Some(false))
+                    || (p == Platform::AppleSilicon && h.apple_silicon == Some(false))
+            }) {
+                return None;
+            }
         }
         let arch = match self.arch.as_str() {
             "x86_64" => "amd64",
             "aarch64" => "arm64",
             other => other,
         };
-        let platform = format!("{target_os}/{arch}");
+        let platform = target.map(|p| {
+            let target_os = match p {
+                Platform::Linux | Platform::Wsl2 => "linux",
+                Platform::Windows => "windows",
+                Platform::AppleSilicon => "darwin",
+            };
+            format!("{target_os}/{arch}")
+        });
         manifest
             .spec
             .runtime
             .environments
             .iter()
             .filter(|e| {
-                e.platform == platform
+                (class == HardwareClass::Cpu || platform.as_deref() == Some(e.platform.as_str()))
                     && environment.is_none_or(|id| id == e.id)
                     && e.accelerator
                         .as_ref()
