@@ -282,6 +282,8 @@ message CheckpointStaged {
   string manifest_sha256 = 7;
   map<string, double> metrics_at_step = 8;
   uint64 policy_version = 9;
+  // CheckpointRequest ids this checkpoint answers (an emergency request finds its own).
+  repeated string request_ids = 10;
 }
 
 enum CheckpointKind {

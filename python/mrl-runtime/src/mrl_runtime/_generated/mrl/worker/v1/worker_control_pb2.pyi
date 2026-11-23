@@ -784,6 +784,7 @@ class CheckpointStaged(_message.Message):
         "manifest_sha256",
         "metrics_at_step",
         "policy_version",
+        "request_ids",
     )
     class MetricsAtStepEntry(_message.Message):
         __slots__ = ("key", "value")
@@ -802,6 +803,7 @@ class CheckpointStaged(_message.Message):
     MANIFEST_SHA256_FIELD_NUMBER: _ClassVar[int]
     METRICS_AT_STEP_FIELD_NUMBER: _ClassVar[int]
     POLICY_VERSION_FIELD_NUMBER: _ClassVar[int]
+    REQUEST_IDS_FIELD_NUMBER: _ClassVar[int]
     checkpoint_id: str
     step: int
     format: str
@@ -811,6 +813,7 @@ class CheckpointStaged(_message.Message):
     manifest_sha256: str
     metrics_at_step: _containers.ScalarMap[str, float]
     policy_version: int
+    request_ids: _containers.RepeatedScalarFieldContainer[str]
     def __init__(
         self,
         checkpoint_id: _Optional[str] = ...,
@@ -822,6 +825,7 @@ class CheckpointStaged(_message.Message):
         manifest_sha256: _Optional[str] = ...,
         metrics_at_step: _Optional[_Mapping[str, float]] = ...,
         policy_version: _Optional[int] = ...,
+        request_ids: _Optional[_Iterable[str]] = ...,
     ) -> None: ...
 
 class FileEntry(_message.Message):

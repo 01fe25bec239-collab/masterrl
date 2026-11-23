@@ -678,6 +678,55 @@ mod tests {
         );
     }
 
+    /// INT-1: an upload's later result is its outcome, kept apart from the acceptance; the
+    /// first outcome per command id wins.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn an_uploads_outcome_is_kept_apart_from_its_acceptance() {
+        use mrl_proto::agent::v1::CommandResult;
+        let gw = GatewayHarness::start(TestDb::new().await).await;
+        let a = TestAgent::new(1, |_| {});
+        let node_s = a.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
+        let node = NodeId::from_str(&node_s).unwrap();
+        let s = CommandSender::new(&gw.gw, &[CommandKind::UploadArtifacts]);
+        let up = s
+            .send(
+                node,
+                NewCommand::new(Kind::UploadArtifacts(Default::default()))
+                    .attempt(mrl_domain::ids::AttemptId::new(), 1),
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_commands SET state = 'SENT' WHERE id = $1")
+            .bind(up.id)
+            .execute(gw.db.pool())
+            .await
+            .unwrap();
+        let result = |failure: Option<&str>| CommandResult {
+            command_id: up.id.to_string(),
+            accepted: true,
+            failure: failure.map(|m| mrl_proto::common::v1::Failure {
+                message: m.into(),
+                ..Default::default()
+            }),
+        };
+        for r in [result(None), result(Some("the PUT failed")), result(None)] {
+            let mut tx = gw.db.db().begin().await.unwrap();
+            mrl_server::modules::nodes::store::command_result(&mut tx, uuid_of(&node_s), &r)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+        }
+        let (state, outcome): (String, Option<Value>) =
+            sqlx::query_as("SELECT state, outcome FROM agent_commands WHERE id = $1")
+                .bind(up.id)
+                .fetch_one(gw.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(state, "COMPLETED");
+        assert_eq!(outcome.unwrap()["failure"]["message"], "the PUT failed");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs PostgreSQL (just test-integration)"]
     async fn a_relaunch_at_a_newer_epoch_gets_a_lease_after_the_old_one_was_cancelled() {

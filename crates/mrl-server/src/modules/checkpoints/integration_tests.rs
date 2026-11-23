@@ -22,8 +22,8 @@ use mrl_domain::state::{JobAttemptEvent, JobEvent, Owner};
 use mrl_proto::agent::v1::{agent_message, command, Command, WorkerRelay};
 use mrl_proto::common::v1::{AttemptRef, Failure};
 use mrl_proto::worker::v1::{
-    worker_message, CheckpointCommitRequest, CheckpointKind, CheckpointStaged, FileEntry,
-    WorkerMessage,
+    worker_message, CheckpointCommitRequest, CheckpointKind, CheckpointStaged, CommitState,
+    FileEntry, WorkerMessage,
 };
 use mrl_server::app::ServerModule;
 use mrl_server::config::Mode;
@@ -86,6 +86,10 @@ struct FakeEngine {
     run: Mutex<Option<Uuid>>,
     link: Mutex<Option<Arc<Link>>>,
     next_step: Mutex<u64>,
+    /// Request ids the next staged checkpoint answers.
+    requests: Mutex<Vec<String>>,
+    /// The core's decisions received (`CheckpointDecision`): checkpoint id and state.
+    decisions: Mutex<Vec<(String, i32)>>,
 }
 
 impl FakeEngine {
@@ -185,6 +189,7 @@ impl FakeEngine {
             manifest_sha256: msha.clone(),
             metrics_at_step: metrics.iter().map(|(k, v)| ((*k).to_owned(), *v)).collect(),
             policy_version: 0,
+            request_ids: std::mem::take(&mut *self.requests.lock().unwrap()),
         }));
         (id.as_uuid(), msha)
     }
@@ -239,10 +244,18 @@ impl CommandHandler for FakeEngine {
     async fn handle(&self, c: Command) -> Result<(), Failure> {
         match c.kind {
             Some(command::Kind::UploadArtifacts(u)) => self.upload(&u).await,
-            Some(command::Kind::CheckpointAttempt(_)) => {
+            Some(command::Kind::CheckpointDecision(d)) => {
+                self.decisions
+                    .lock()
+                    .unwrap()
+                    .push((d.checkpoint_id, d.state));
+                Ok(())
+            }
+            Some(command::Kind::CheckpointAttempt(c)) => {
                 if matches!(*self.fault.lock().unwrap(), Fault::NoCheckpoint) {
                     return Ok(());
                 }
+                self.requests.lock().unwrap().push(c.request_id);
                 let step = {
                     let mut n = self.next_step.lock().unwrap();
                     *n += 1;
@@ -368,6 +381,8 @@ impl Env {
             run: Mutex::default(),
             link: Mutex::default(),
             next_step: Mutex::new(100),
+            requests: Mutex::default(),
+            decisions: Mutex::default(),
         });
         let agent = TestAgent::new(1, |_| {});
         let mut env = Self {
@@ -410,7 +425,12 @@ impl Env {
         .node_id;
         env.node = NodeId::from_str(&node).unwrap().as_uuid();
         let link = Link::of(&env.agent.ctx).unwrap();
-        for kind in ["LaunchAttempt", "UploadArtifacts", "CheckpointAttempt"] {
+        for kind in [
+            "LaunchAttempt",
+            "UploadArtifacts",
+            "CheckpointAttempt",
+            "CheckpointDecision",
+        ] {
             link.register(kind, env.engine.clone());
         }
         *env.engine.link.lock().unwrap() = Some(link);
@@ -583,6 +603,19 @@ impl Env {
             .unwrap()
     }
 
+    /// Waits (≤ 20 s) until the agent got the core's decision `state` for checkpoint `id`.
+    async fn wait_decision(&self, id: Uuid, state: CommitState) {
+        let want = (CheckpointId::from_uuid(id).to_string(), state as i32);
+        for _ in 0..200 {
+            if self.engine.decisions.lock().unwrap().contains(&want) {
+                return;
+            }
+            self.service.tick(&self.chains).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        panic!("no {state:?} decision for {id}");
+    }
+
     async fn job_state(&self, job: Uuid) -> (String, Option<String>) {
         sqlx::query_as("SELECT state, failure_class FROM jobs WHERE id = $1")
             .bind(job)
@@ -676,6 +709,8 @@ async fn happy_path_commits_lists_verifies_and_completes_the_job() {
     let first = env.engine.checkpoint(10, false, &[("train/loss", 1.0)]);
     env.wait_state(first, "COMMITTED").await;
     assert_eq!(env.latest(run).await, Some(first));
+    // INT-1: the agent hears COMMITTED from the core, after its decision.
+    env.wait_decision(first, CommitState::Committed).await;
     let last = env.engine.checkpoint(20, true, &[("train/loss", 0.5)]);
     env.wait_state(last, "COMMITTED").await;
     assert_eq!(env.latest(run).await, Some(last));
@@ -917,6 +952,7 @@ async fn missing_short_and_changed_files_make_checkpoints_corrupt_and_resume_fal
     env.engine.set(Fault::Cut("weights.bin"));
     let short = env.engine.checkpoint(20, false, &[]);
     env.wait_state(short, "CORRUPT").await;
+    env.wait_decision(short, CommitState::Corrupt).await;
     let reason = env
         .service
         .find(short)
@@ -1386,6 +1422,14 @@ async fn emergency_and_time_based_checkpoints_reach_the_worker() {
         panic!("expected a committed checkpoint, got {out:?}");
     };
     assert_eq!(env.state(id).await, "COMMITTED");
+    // It is the checkpoint that answers this request (its id came back with it, INT-1).
+    let answers: Vec<String> =
+        sqlx::query_scalar("SELECT request_ids FROM checkpoints WHERE id = $1")
+            .bind(id)
+            .fetch_one(env.db.pool())
+            .await
+            .unwrap();
+    assert_eq!(answers.len(), 1, "{answers:?}");
     ticker.abort();
     let _ = ticker.await;
     // Nothing for a minute: the cadence asks for a checkpoint (once per period).

@@ -42,6 +42,7 @@ pub const KINDS: &[&str] = &[
     "UpdateCredentials",
     "Probe",
     "CheckpointAttempt",
+    "CheckpointDecision",
 ];
 
 /// How long a stopping agent waits for commands already running before it detaches.
@@ -426,6 +427,7 @@ mod tests {
             Kind::StopDeployment(Default::default()),
             Kind::Probe(Default::default()),
             Kind::CheckpointAttempt(Default::default()),
+            Kind::CheckpointDecision(Default::default()),
         ];
         let deployments = ["LaunchDeployment", "StopDeployment"];
         let mut served: Vec<&str> = all

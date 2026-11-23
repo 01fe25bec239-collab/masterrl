@@ -21,7 +21,9 @@ use mrl_agent::hw::fake::{FakeHw, Fault};
 use mrl_agent::hw::HwBackend;
 use mrl_agent::AgentContext;
 use mrl_proto::agent::v1::command::Kind;
-use mrl_proto::agent::v1::{AttemptPhase, Command, Lane, UploadArtifacts, UploadItem};
+use mrl_proto::agent::v1::{
+    AttemptPhase, CheckpointDecision, Command, Lane, UploadArtifacts, UploadItem,
+};
 use mrl_proto::common::v1::FailureClass;
 use mrl_proto::worker::v1::worker_message::Body;
 use mrl_proto::worker::v1::ExitKind;
@@ -216,6 +218,7 @@ async fn fake_engine_full_lifecycle_with_ticket_uploads() {
 
     // Answer each staged checkpoint with an UploadArtifacts command carrying tickets.
     let mut answered = std::collections::HashSet::new();
+    let (mut pending, mut decided_files, mut decisions) = (Vec::new(), 0usize, Vec::new());
     let decision = loop {
         for (_, b) in seen.bodies() {
             if let Body::CheckpointStaged(c) = b {
@@ -249,8 +252,39 @@ async fn fake_engine_full_lifecycle_with_ticket_uploads() {
                     };
                     let r = attempts.handle(&cmd).await.unwrap();
                     assert!(r.accepted, "{r:?}");
+                    let files = c.files.len();
+                    pending.push((c.checkpoint_id.clone(), files));
                 }
             }
+        }
+        // INT-1: the core commits once every file is stored, then sends its decision.
+        let stored = got.lock().unwrap().len();
+        let mut expected = decided_files;
+        pending.retain(|(id, files)| {
+            expected += files;
+            if stored < expected {
+                return true;
+            }
+            decided_files = expected;
+            let cmd = Command {
+                command_id: format!("dec-{id}"),
+                kind: Some(Kind::CheckpointDecision(CheckpointDecision {
+                    attempt: Some(mrl_proto::common::v1::AttemptRef {
+                        job_id: "job_t".into(),
+                        attempt_id: "att_life".into(),
+                        fencing_epoch: 1,
+                    }),
+                    checkpoint_id: id.clone(),
+                    state: mrl_proto::worker::v1::CommitState::Committed as i32,
+                    reason: String::new(),
+                })),
+            };
+            decisions.push(cmd);
+            false
+        });
+        for cmd in decisions.drain(..) {
+            let r = attempts.handle(&cmd).await.unwrap();
+            assert!(r.accepted, "{r:?}");
         }
         if let Ok(Some(d)) =
             tokio::time::timeout(Duration::from_millis(200), attempts.wait("att_life")).await

@@ -217,6 +217,7 @@ pub fn kind_name(kind: Option<&command::Kind>) -> &'static str {
         Some(K::StopDeployment(_)) => "StopDeployment",
         Some(K::Probe(_)) => "Probe",
         Some(K::CheckpointAttempt(_)) => "CheckpointAttempt",
+        Some(K::CheckpointDecision(_)) => "CheckpointDecision",
     }
 }
 

@@ -69,6 +69,15 @@ pub enum Control {
         /// Why.
         reason: String,
     },
+    /// The core's commit decision on a staged checkpoint (INT-1): told to the worker now.
+    Decision {
+        /// Checkpoint id.
+        checkpoint_id: String,
+        /// `CommitState` number.
+        state: i32,
+        /// Why, when not committed.
+        reason: String,
+    },
     /// Upload staged files (a checkpoint, or other outputs when `checkpoint_id` is empty).
     Upload {
         /// The command to report on when done.
@@ -681,6 +690,12 @@ impl Runner {
                     }
                     Some(Control::Upload { command_id, checkpoint_id, targets }) => {
                         self.accept_plan(checkpoint_id, command_id, targets).await;
+                    }
+                    Some(Control::Decision { checkpoint_id, state, .. }) => {
+                        // No worker yet: kept, and told when it connects.
+                        if let Some(ck) = self.rec.checkpoints.get_mut(&checkpoint_id) {
+                            ck.state = Some(state);
+                        }
                     }
                     Some(Control::Hw(events)) => {
                         for e in events {
@@ -1417,6 +1432,7 @@ impl Runner {
                         files: Vec::new(),
                         commit_requested: false,
                         state: Some(CommitState::Corrupt as i32),
+                        uploaded: false,
                     };
                     self.rec.checkpoints.insert(s.checkpoint_id.clone(), ck);
                     if !self.save() {
@@ -1447,6 +1463,7 @@ impl Runner {
                         .collect(),
                     commit_requested: false,
                     state: None,
+                    uploaded: false,
                 };
                 self.rec
                     .checkpoints
@@ -1514,7 +1531,9 @@ impl Runner {
         let Some(ck) = self.rec.checkpoints.get(id).cloned() else {
             return;
         };
-        if !ck.commit_requested || ck.state.is_some() || self.in_flight.contains(id) {
+        // Uploaded: only the core's decision is awaited (INT-1).
+        if !ck.commit_requested || ck.state.is_some() || ck.uploaded || self.in_flight.contains(id)
+        {
             return;
         }
         let dests: Vec<(StagedFile, Destination)> = match &self.rec.spec.upload_dir {
@@ -1589,13 +1608,21 @@ impl Runner {
         if let Some(id) = &u.checkpoint_id {
             self.in_flight.remove(id);
             self.ck_tasks.remove(id);
-            let (state, reason) = match &u.result {
-                Ok(()) => (CommitState::Committed, String::new()),
-                Err((s, r)) => (*s, r.clone()),
+            // An upload alone commits nothing (INT-1): the core decides and sends a
+            // `CheckpointDecision`. Only a failure here is known to the worker at once. A
+            // standalone run (`upload_dir`, no core) decides itself.
+            let local = self.rec.spec.upload_dir.is_some();
+            let decided = match &u.result {
+                Ok(()) if local => Some((CommitState::Committed, String::new())),
+                Ok(()) => None,
+                Err((s, r)) => Some((*s, r.clone())),
             };
             let prev = self.rec.checkpoints.get_mut(id).map(|ck| {
                 let prev = ck.state;
-                ck.state = Some(state as i32);
+                match &decided {
+                    Some((state, _)) => ck.state = Some(*state as i32),
+                    None => ck.uploaded = true,
+                }
                 prev
             });
             // The checkpoint's outcome and its command's result go into one save: after a
@@ -1606,6 +1633,7 @@ impl Runner {
                 // tick saves it again (no second upload), then reports it.
                 if let (Some(ck), Some(prev)) = (self.rec.checkpoints.get_mut(id), prev) {
                     ck.state = prev;
+                    ck.uploaded = false;
                 }
                 if let Some(command_id) = answered {
                     self.rec.results.remove(&command_id);
@@ -1617,7 +1645,7 @@ impl Runner {
                 self.unsaved.insert(id.clone(), u);
                 return;
             }
-            if let Some(role) = self.primary_role() {
+            if let (Some(role), Some((state, reason))) = (self.primary_role(), decided) {
                 self.send(&role, commit_ack(id, state, &reason)).await;
             }
             self.deliver_results().await;
@@ -1751,7 +1779,10 @@ impl Runner {
             .checkpoints
             .iter()
             .filter(|(id, c)| {
-                c.commit_requested && c.state.is_none() && !self.in_flight.contains(*id)
+                c.commit_requested
+                    && c.state.is_none()
+                    && !c.uploaded
+                    && !self.in_flight.contains(*id)
             })
             .map(|(id, _)| id.clone())
             .collect();
@@ -1856,6 +1887,29 @@ impl Runner {
                     Err(()) => return false,
                 }
             }
+            Control::Decision {
+                checkpoint_id,
+                state,
+                reason,
+            } => {
+                let Some(ck) = self.rec.checkpoints.get_mut(&checkpoint_id) else {
+                    return true; // not staged here (or already removed): nothing to tell
+                };
+                if ck.state == Some(state) {
+                    return true; // a replayed decision
+                }
+                let prev = ck.state.replace(state);
+                if !self.save() {
+                    if let Some(ck) = self.rec.checkpoints.get_mut(&checkpoint_id) {
+                        ck.state = prev;
+                    }
+                    return false;
+                }
+                if let (Some(role), Ok(s)) = (self.primary_role(), CommitState::try_from(state)) {
+                    self.send(&role, commit_ack(&checkpoint_id, s, &reason))
+                        .await;
+                }
+            }
             Control::Upload {
                 command_id,
                 checkpoint_id,
@@ -1901,9 +1955,15 @@ impl Runner {
                         .get(&checkpoint_id)
                         .and_then(|c| c.state)
                         .and_then(|s| CommitState::try_from(s).ok());
+                    let uploaded = self
+                        .rec
+                        .checkpoints
+                        .get(&checkpoint_id)
+                        .is_some_and(|c| c.uploaded);
                     match state {
-                        // Already decided: the saved outcome, no second upload.
+                        // Already decided or stored: the saved outcome, no second upload.
                         Some(CommitState::Committed) => self.command_done(command_id, None).await,
+                        None if uploaded => self.command_done(command_id, None).await,
                         Some(CommitState::Corrupt) => {
                             let why = format!("checkpoint {checkpoint_id} is corrupt");
                             self.command_done(command_id, Some(why)).await;

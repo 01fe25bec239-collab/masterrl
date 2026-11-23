@@ -220,6 +220,7 @@ message Command {
     StopDeployment stop_deployment = 20;
     Probe probe = 21;
     CheckpointAttempt checkpoint_attempt = 22;
+    CheckpointDecision checkpoint_decision = 23;
   }
 }
 
@@ -285,6 +286,15 @@ message CheckpointAttempt {
   mrl.common.v1.AttemptRef attempt = 1;
   string request_id = 2;
   uint32 deadline_s = 3;
+  string reason = 4;
+}
+
+// The core's durable decision on a staged checkpoint (COMMITTED, CORRUPT or REJECTED). The
+// agent tells the worker only after this, never on upload success alone.
+message CheckpointDecision {
+  mrl.common.v1.AttemptRef attempt = 1;
+  string checkpoint_id = 2;
+  mrl.worker.v1.CommitState state = 3;
   string reason = 4;
 }
 
