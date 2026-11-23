@@ -120,3 +120,24 @@ def test_heartbeats_never_collide_with_spooled_writes(tmp_path: Path) -> None:
     # Regression: concurrent call.write() from the heartbeat task killed the writer silently.
     for attempt in range(3):
         asyncio.run(_heartbeats_during_writes(tmp_path / str(attempt)))
+
+
+async def _mute_agent(tmp_path: Path) -> None:
+    agent = _agent(tmp_path)
+    agent.mute_hellos = 1
+    await agent.start()
+    session = WorkerSession(agent.target, pb.Hello(attempt_id="att_1"), Spool(tmp_path / "spool"))
+    session.hello_timeout_s = 0.5
+    session.start()
+    try:
+        session.send(pb.MetricsBatch(points=[pb.MetricPoint(name="m", step=1)]))
+        assert await session.wait_acked(10)
+        assert agent.sessions == 2
+        assert session.connections == 1
+    finally:
+        await session.close()
+        await agent.close()
+
+
+def test_an_agent_that_never_answers_the_hello_is_left_for_a_new_connection(tmp_path: Path) -> None:
+    asyncio.run(_mute_agent(tmp_path))
