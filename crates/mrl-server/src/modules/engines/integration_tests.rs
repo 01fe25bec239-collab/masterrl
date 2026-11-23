@@ -293,7 +293,8 @@ async fn startup_registers_bundles_once_and_lists_dev_engines_only_when_asked() 
     .await
     .unwrap();
     let names: Vec<_> = rows.iter().map(|r| r.0.as_str()).collect();
-    assert_eq!(names, ["fake", "golden", "mrl-builtin"]);
+    // TRL (P25) is a first-party bundle too.
+    assert_eq!(names, ["fake", "golden", "mrl-builtin", "trl"]);
     assert!(rows.iter().all(|r| r.2 == "PROBING"), "{rows:?}");
     let registered: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM outbox_events WHERE type = 'engine_version.registered'",
@@ -302,7 +303,7 @@ async fn startup_registers_bundles_once_and_lists_dev_engines_only_when_asked() 
     .await
     .unwrap();
     assert_eq!(
-        registered, 3,
+        registered, 4,
         "one registration event per version, across restarts"
     );
     let algos: Vec<String> =
@@ -310,7 +311,10 @@ async fn startup_registers_bundles_once_and_lists_dev_engines_only_when_asked() 
             .fetch_all(db.pool())
             .await
             .unwrap();
-    assert_eq!(algos, ["dpo", "grpo", "kto", "sft", "x-fake.steps"]);
+    assert_eq!(
+        algos,
+        ["cpt", "dpo", "grpo", "kto", "sft", "sft", "x-fake.steps"]
+    );
 
     // Without the dev flag the dev-only engines (FakeEngine, the golden fixture) are hidden.
     let s = start(
@@ -330,7 +334,7 @@ async fn startup_registers_bundles_once_and_lists_dev_engines_only_when_asked() 
         .iter()
         .map(|e| e["name"].as_str().unwrap().to_owned())
         .collect();
-    assert_eq!(names, ["mrl-builtin"]);
+    assert_eq!(names, ["mrl-builtin", "trl"]);
     assert_eq!(
         get(&s, "/api/v1/engines/fake/versions/0.1.0").await.status,
         404
