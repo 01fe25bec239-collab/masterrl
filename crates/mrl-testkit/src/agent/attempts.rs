@@ -2632,6 +2632,7 @@ mod session_wiring {
         let daemon = Daemon::start(&s.agent.ctx);
         let attempt = AttemptId::new();
         let id = attempt.to_string();
+        s.gw.track_attempt(attempt, 1).await;
         let l = s
             .sender
             .send(

@@ -1479,7 +1479,9 @@ pub async fn command_result(
 }
 
 /// Leases for the attempts a heartbeat reports: granted (pool `attempt_lease_ttl`) for each
-/// attempt this core launched on this node with that epoch and has not cancelled.
+/// attempt this core launched on this node with that epoch and has not cancelled, while the
+/// attempt is live and still its job's current one at that epoch (never for a LOST attempt or a
+/// superseded epoch: losing a lease bumps the job's epoch).
 pub async fn leases(
     db: &Db,
     node: Uuid,
@@ -1501,13 +1503,16 @@ pub async fn leases(
         let Ok(attempt) = AttemptId::from_str(&a.attempt_id) else {
             continue;
         };
-        // ponytail: lease = "launched here at this epoch and not cancelled"; P17 may refine with attempt state.
         // A cancellation counts for its own fencing epoch only (one without an epoch: for the
         // launches sent before it), so a relaunch at a newer epoch gets its lease.
         let renewed = sqlx::query(
             "UPDATE agent_commands l SET updated_at = now()
              WHERE l.node_id = $1 AND l.kind = 'LaunchAttempt' AND l.attempt_id = $2
                AND l.epoch = $3 AND l.state IN ('SENT','RECEIVED','COMPLETED')
+               AND EXISTS (SELECT 1 FROM job_attempts a JOIN jobs j ON j.id = a.job_id
+                    WHERE a.id = l.attempt_id AND a.epoch = l.epoch
+                      AND a.state IN ('PENDING','LAUNCHING','RUNNING')
+                      AND j.current_attempt_id = a.id AND j.epoch = a.epoch)
                AND NOT EXISTS (SELECT 1 FROM agent_commands c WHERE c.node_id = l.node_id
                     AND c.kind = 'CancelAttempt' AND c.attempt_id = l.attempt_id AND c.state = 'COMPLETED'
                     AND (c.epoch = l.epoch OR (c.epoch IS NULL AND c.seq > l.seq)))",

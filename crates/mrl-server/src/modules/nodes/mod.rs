@@ -79,6 +79,9 @@ pub struct GatewayConfig {
     pub min_disk_free_bytes: u64,
     /// GPU temperature at which the GPU, and its node, are DEGRADED (`gpu_hot`).
     pub gpu_hot_celsius: u32,
+    /// A gap this long between two health checks is a core outage: heartbeat ages count from
+    /// when checks resumed, so nodes are not called OFFLINE for the core's own downtime.
+    pub outage_threshold_seconds: u64,
 }
 
 impl Default for GatewayConfig {
@@ -104,6 +107,7 @@ impl Default for GatewayConfig {
             max_clock_skew_seconds: 30,
             min_disk_free_bytes: 5 << 30,
             gpu_hot_celsius: 90,
+            outage_threshold_seconds: 30,
         }
     }
 }
@@ -164,6 +168,18 @@ impl GatewayConfig {
             3600,
         );
         range("gpu_hot_celsius", self.gpu_hot_celsius.into(), 50, 120);
+        range(
+            "outage_threshold_seconds",
+            self.outage_threshold_seconds,
+            2,
+            3600,
+        );
+        if self.outage_threshold_seconds <= self.health_check_seconds {
+            p.push(format!(
+                "gateway.outage_threshold_seconds: {} must be more than gateway.health_check_seconds ({})",
+                self.outage_threshold_seconds, self.health_check_seconds
+            ));
+        }
         if self.offline_after_seconds < self.degraded_after_seconds {
             p.push(format!(
                 "gateway.offline_after_seconds: {} is less than gateway.degraded_after_seconds ({})",

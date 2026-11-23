@@ -9,6 +9,9 @@
 //! - DEGRADED → ONLINE once the heartbeat is fresh and no signal remains.
 //! - ONLINE/DEGRADED older than `offline_after_seconds` → OFFLINE (plus a `node_events` row).
 //!   Reconnecting brings it back ONLINE with `session_epoch + 1`.
+//! - After a core outage (no check for `outage_threshold_seconds`), heartbeat ages count from
+//!   when checks resumed, so the core's own downtime never makes a node DEGRADED or OFFLINE
+//!   (the scheduler gives leases the same grace).
 //! - Every decision is re-evaluated, from both thresholds and the signals, with the node row
 //!   locked, so a heartbeat that lands after the scan is never followed by a stale transition.
 //! - CONTROL messages a sink did not take yet (`node_control_inbox`) are delivered again.
@@ -87,6 +90,15 @@ pub fn decide(
 /// One pass: every ONLINE/DEGRADED node, then command deadlines.
 // ponytail: scans every live node each pass; page through ids if fleets reach many thousands.
 pub async fn check_once(gw: &Gateway) -> Result<(), NodesError> {
+    sqlx::query(
+        "INSERT INTO node_health_ticks (id, last_check_at, resumed_at) VALUES (1, now(), now())
+         ON CONFLICT (id) DO UPDATE SET last_check_at = now(),
+           resumed_at = CASE WHEN node_health_ticks.last_check_at < now() - make_interval(secs => $1)
+                             THEN now() ELSE node_health_ticks.resumed_at END",
+    )
+    .bind(gw.config.outage_threshold_seconds as f64)
+    .execute(gw.db.pool())
+    .await?;
     let nodes: Vec<Uuid> =
         sqlx::query_scalar("SELECT id FROM compute_nodes WHERE status IN ('ONLINE','DEGRADED')")
             .fetch_all(gw.db.pool())
@@ -117,13 +129,15 @@ pub async fn settle(gw: &Gateway, node: Uuid) -> Result<(), NodesError> {
                     NodesError::Db(d) => d,
                     o => crate::db::DbError::Query(sqlx::Error::Protocol(o.to_string())),
                 };
+                // A heartbeat's age counts from the last resume after an outage at the earliest.
                 let row: Option<(String, Option<String>, bool, bool, bool, bool)> = sqlx::query_as(
                     "SELECT status, status_reason,
-                            COALESCE(last_heartbeat_at < now() - make_interval(secs => $2), true),
-                            COALESCE(last_heartbeat_at < now() - make_interval(secs => $3), true),
+                            COALESCE(GREATEST(last_heartbeat_at, t.resumed_at) < now() - make_interval(secs => $2), true),
+                            COALESCE(GREATEST(last_heartbeat_at, t.resumed_at) < now() - make_interval(secs => $3), true),
                             COALESCE(abs(clock_skew_ms) > $4, false),
                             COALESCE((telemetry->>'disk_free_bytes')::numeric < $5, false)
-                     FROM compute_nodes WHERE id = $1 FOR UPDATE",
+                     FROM compute_nodes LEFT JOIN node_health_ticks t ON t.id = 1
+                     WHERE compute_nodes.id = $1 FOR UPDATE OF compute_nodes",
                 )
                 .bind(node)
                 .bind(c.degraded_after_seconds as f64)
