@@ -7,8 +7,9 @@
 //!   included. A bucket whose raw points are all gone keeps its rollup.
 //! - Partitions: weekly `metric_points_wYYYYMMDD`, last week to two weeks ahead, made at start
 //!   and every pass; a week older than `raw_retention_days` is dropped after the marks drained.
-//! - Retention (hourly): receipts with the raw points, `1m` rollups, sealed log segments and
-//!   sample files (object first, then the row).
+//! - Retention (hourly): delivery receipts after the longest data retention, `1m` rollups,
+//!   archived per-step values with the `1m` rollups (whole step buckets), sealed log segments
+//!   and sample files (object first, then the row).
 
 use super::ingest::STEP_BUCKET;
 use super::Telemetry;
@@ -281,6 +282,35 @@ async fn expire(t: &Telemetry, now: OffsetDateTime) -> Result<u64, JobsError> {
         now - Duration::days(c.sample_retention_days.into()),
     )
     .await?;
+    // A replay is dropped only while its receipt lives, so keep receipts as long as the
+    // longest-kept data a replay could duplicate.
+    let longest = c
+        .raw_retention_days
+        .max(c.log_retention_days)
+        .max(c.sample_retention_days);
+    n += sqlx::query("DELETE FROM telemetry_receipts WHERE received_at < $1")
+        .bind(now - Duration::days(longest.into()))
+        .execute(t.db.pool())
+        .await?
+        .rows_affected();
+    // Per-step values outlive the raw points only as long as the 1m rollups; after that a
+    // step query reads the step_bucket rollups. A bucket goes whole, and only once it has no
+    // raw points, so no query ever shows half a bucket.
+    n += sqlx::query(
+        "DELETE FROM metric_step_archive a
+          USING (SELECT DISTINCT series_id, step / $2 AS b FROM metric_step_archive WHERE ts < $1) old
+          WHERE a.series_id = old.series_id
+            AND a.step >= old.b * $2 AND a.step < (old.b + 1) * $2
+            AND NOT EXISTS (SELECT 1 FROM metric_step_archive k WHERE k.series_id = old.series_id
+                  AND k.step >= old.b * $2 AND k.step < (old.b + 1) * $2 AND k.ts >= $1)
+            AND NOT EXISTS (SELECT 1 FROM metric_points p WHERE p.series_id = old.series_id
+                  AND p.step >= old.b * $2 AND p.step < (old.b + 1) * $2)",
+    )
+    .bind(now - Duration::days(c.rollup_1m_retention_days.into()))
+    .bind(STEP_BUCKET)
+    .execute(t.db.pool())
+    .await?
+    .rows_affected();
     for table in ["telemetry_progress_events", "telemetry_alert_events"] {
         let sql = format!("DELETE FROM {table} WHERE captured_at < $1");
         n += sqlx::query(sqlx::AssertSqlSafe(sql))

@@ -604,6 +604,29 @@ async fn a_metric_poll_resyncs_when_its_partition_is_retired_concurrently() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL (just dev)"]
+async fn a_metric_stream_keeps_its_heartbeat_while_retirement_holds_the_table() {
+    let w = World::solo().await;
+    let s = seed_run(&w.db, Uuid::nil(), json!({})).await;
+    let topic = format!("run:{}:metrics", s.run_id());
+    let (_, client, _) = open(&w, Who::Solo, &topic, None).await;
+    let mut client = client.unwrap();
+    assert_eq!(
+        client.next(Duration::from_secs(5)).await.unwrap().event,
+        "heartbeat"
+    );
+    let mut retirement = w.db.db().begin().await.unwrap();
+    sqlx::query("LOCK TABLE ONLY metric_points IN ACCESS EXCLUSIVE MODE")
+        .execute(&mut *retirement)
+        .await
+        .unwrap();
+    // Heartbeats are 1 s apart; a poll gives up on the lock after 2 s.
+    let beat = client.next(Duration::from_secs(8)).await.unwrap();
+    assert_eq!(beat.event, "heartbeat");
+    retirement.rollback().await.unwrap();
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
 async fn revisions_follow_write_order_when_a_transaction_gets_its_xid_early() {
     let w = World::solo().await;
     let s = seed_run(&w.db, Uuid::nil(), json!({})).await;
