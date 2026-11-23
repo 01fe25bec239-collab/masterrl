@@ -589,6 +589,9 @@ class Harness:
                 self._step(event.step)
                 requests, self._checkpoint_requests = self._checkpoint_requests, []
                 staged = await self.provider.stage(event, {**self._metrics, **event.metrics})
+                # The requests this checkpoint answers go with it, so the core can match an
+                # emergency request to its own checkpoint.
+                staged.message.request_ids.extend(requests)
                 self.provider.submit(staged)
                 self._final_staged = self._final_staged or event.is_final
                 self._requests_by_checkpoint[staged.checkpoint_id] = requests

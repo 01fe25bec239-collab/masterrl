@@ -970,6 +970,18 @@ impl Attempts {
                 )
                 .await
             }
+            Kind::CheckpointDecision(d) => {
+                self.control(
+                    d.attempt.as_ref(),
+                    Control::Decision {
+                        checkpoint_id: d.checkpoint_id.clone(),
+                        state: d.state,
+                        reason: d.reason.clone(),
+                    },
+                    false,
+                )
+                .await
+            }
             Kind::CheckpointAttempt(c) => {
                 self.control(
                     c.attempt.as_ref(),

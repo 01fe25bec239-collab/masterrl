@@ -239,6 +239,9 @@ def test_on_demand_checkpoint_keeps_training(tmp_path: Path) -> None:
     assert report.kind == pb.EXIT_KIND_COMPLETED
     assert "c1" in report.acknowledged_requests
     assert len(r.committed()) == 2  # the requested one and the final one
+    # The requested checkpoint names its request, so the core can match it (INT-1).
+    staged = [m.checkpoint_staged for m in r.agent.of("checkpoint_staged")]
+    assert [list(s.request_ids) for s in staged] == [["c1"], []]
 
 
 def test_cancel_before_start(tmp_path: Path) -> None:

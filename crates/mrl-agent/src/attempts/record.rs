@@ -322,8 +322,11 @@ pub struct StagedCheckpoint {
     pub files: Vec<StagedFile>,
     /// The worker asked to commit it.
     pub commit_requested: bool,
-    /// `CommitState` number once decided.
+    /// `CommitState` number once decided (by the core, or a local failure).
     pub state: Option<i32>,
+    /// Every file is in storage; the core's decision is awaited (INT-1).
+    #[serde(default)]
+    pub uploaded: bool,
 }
 
 /// One staged file.

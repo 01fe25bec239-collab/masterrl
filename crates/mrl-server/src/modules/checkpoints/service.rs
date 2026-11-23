@@ -18,10 +18,12 @@ use crate::seams::{
 use mrl_domain::ids::{AttemptId, CheckpointId, JobId, NodeId, RunId};
 use mrl_domain::state::{Checkpoint, CheckpointEvent, CheckpointState, StateMachine};
 use mrl_proto::agent::v1::{
-    command::Kind, CheckpointAttempt, Command, UploadArtifacts, UploadItem,
+    command::Kind, CheckpointAttempt, CheckpointDecision, Command, UploadArtifacts, UploadItem,
 };
 use mrl_proto::common::v1::AttemptRef;
-use mrl_proto::worker::v1::{CheckpointCommitRequest, CheckpointKind, CheckpointStaged};
+use mrl_proto::worker::v1::{
+    CheckpointCommitRequest, CheckpointKind, CheckpointStaged, CommitState,
+};
 use mrl_storage::{StorageError, Store, TicketMethod, TransferOptions};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -51,7 +53,11 @@ const FILE_ROLES: &[&str] = &[
 /// File roles dropped by optimizer stripping.
 pub const STATE_ROLES: [&str; 4] = ["optimizer", "scheduler", "rng", "trainer_state"];
 
-static KINDS: &[CommandKind] = &[CommandKind::UploadArtifacts, CommandKind::CheckpointAttempt];
+static KINDS: &[CommandKind] = &[
+    CommandKind::UploadArtifacts,
+    CommandKind::CheckpointAttempt,
+    CommandKind::CheckpointDecision,
+];
 
 macro_rules! ckpt_cols {
     () => {
@@ -522,8 +528,9 @@ impl CheckpointService {
         let Some(row) = sqlx::query_as::<_, CheckpointRow>(concat!(
             "INSERT INTO checkpoints (id, org_id, storage_org, run_id, job_id, attempt_id, \
                attempt_epoch, global_step, policy_version, kind, layout, is_final, state, \
-               manifest_key, manifest_sha256, total_bytes, file_count, metrics_at_save, node_id, commit_requested_at) \
-             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'WRITING',$13,$14,$15,$16,$17,$18,$19) \
+               manifest_key, manifest_sha256, total_bytes, file_count, metrics_at_save, node_id, commit_requested_at, \
+               request_ids) \
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,'WRITING',$13,$14,$15,$16,$17,$18,$19,$20) \
              ON CONFLICT (id) DO NOTHING RETURNING ",
             ckpt_cols!()
         ))
@@ -550,6 +557,13 @@ impl CheckpointService {
         .bind(Value::Object(metrics))
         .bind(node)
         .bind(early.map(|(_, requested)| requested))
+        .bind(
+            s.request_ids
+                .iter()
+                .take(64)
+                .map(|r| r.replace('\0', ""))
+                .collect::<Vec<_>>(),
+        )
         .fetch_optional(&mut *tx)
         .await? else {
             return Ok(());
@@ -1238,7 +1252,8 @@ impl CheckpointService {
     ) -> Result<EmergencyOutcome, JobsError> {
         let since = OffsetDateTime::now_utc();
         let end = tokio::time::Instant::now() + deadline;
-        let Some((sent, attempt, epoch)) = self.request_checkpoint(job, reason, deadline).await?
+        let Some((sent, attempt, epoch, request)) =
+            self.request_checkpoint(job, reason, deadline).await?
         else {
             return Ok(EmergencyOutcome::Refused(
                 "the job has no running attempt".into(),
@@ -1248,15 +1263,19 @@ impl CheckpointService {
             if tokio::time::Instant::now() >= end {
                 return Ok(EmergencyOutcome::TimedOut);
             }
+            // Its own checkpoint (the request id came back with it, INT-1); a worker that
+            // does not echo ids: any checkpoint staged after the request.
             let done: Option<Uuid> = sqlx::query_scalar(
                 "SELECT id FROM checkpoints WHERE job_id = $1 AND state = 'COMMITTED' \
-                   AND created_at >= $2 AND attempt_id = $3 AND attempt_epoch = $4
-                 ORDER BY global_step DESC LIMIT 1",
+                   AND attempt_id = $3 AND attempt_epoch = $4 \
+                   AND ($5 = ANY(request_ids) OR (request_ids = '{}' AND created_at >= $2)) \
+                 ORDER BY ($5 = ANY(request_ids)) DESC, global_step DESC LIMIT 1",
             )
             .bind(job)
             .bind(since)
             .bind(attempt)
             .bind(epoch)
+            .bind(&request)
             .fetch_optional(self.db.pool())
             .await?;
             if let Some(id) = done {
@@ -1293,7 +1312,7 @@ impl CheckpointService {
         job: Uuid,
         reason: &str,
         deadline: Duration,
-    ) -> Result<Option<(Uuid, Uuid, i64)>, JobsError> {
+    ) -> Result<Option<(Uuid, Uuid, i64, String)>, JobsError> {
         let target: Option<(Uuid, i64, Uuid)> = sqlx::query_as(
             "SELECT a.id, a.epoch, c.node_id FROM jobs j \
              JOIN job_attempts a ON a.id = j.current_attempt_id AND a.epoch = j.epoch \
@@ -1310,13 +1329,14 @@ impl CheckpointService {
         };
         let attempt = AttemptId::from_uuid(attempt);
         let epoch = u64::try_from(epoch).unwrap_or(0);
+        let request_id = Uuid::now_v7().simple().to_string();
         let cmd = CheckpointAttempt {
             attempt: Some(AttemptRef {
                 job_id: JobId::from_uuid(job).to_string(),
                 attempt_id: attempt.to_string(),
                 fencing_epoch: epoch,
             }),
-            request_id: Uuid::now_v7().simple().to_string(),
+            request_id: request_id.clone(),
             deadline_s: u32::try_from(deadline.as_secs()).unwrap_or(u32::MAX),
             reason: reason.to_owned(),
         };
@@ -1330,7 +1350,75 @@ impl CheckpointService {
             )
             .await
             .map_err(|e| seam("commands", e))?;
-        Ok(Some((sent.id, attempt.as_uuid(), epoch as i64)))
+        Ok(Some((sent.id, attempt.as_uuid(), epoch as i64, request_id)))
+    }
+
+    /// INT-1: each decided checkpoint (COMMITTED or CORRUPT) of a live attempt gets one
+    /// `CheckpointDecision` to its agent; only then does the agent tell the worker. The command
+    /// and `decision_sent_at` are written in one transaction (the agent applies a decision once).
+    async fn send_decisions(&self) -> Result<(), JobsError> {
+        // (checkpoint, node, attempt, epoch, job, state, corrupt reason)
+        type Decided = (Uuid, Uuid, Uuid, i64, Uuid, String, Option<String>);
+        let rows: Vec<Decided> = sqlx::query_as(
+            "SELECT c.id, c.node_id, c.attempt_id, c.attempt_epoch, c.job_id, c.state, c.corrupt_reason
+             FROM checkpoints c JOIN job_attempts a ON a.id = c.attempt_id AND a.epoch = c.attempt_epoch
+             WHERE c.decision_sent_at IS NULL AND c.state IN ('COMMITTED','CORRUPT')
+               AND c.node_id IS NOT NULL AND a.state IN ('LAUNCHING','RUNNING')
+             ORDER BY c.created_at LIMIT 200",
+        )
+        .fetch_all(self.db.pool())
+        .await?;
+        for (id, node, attempt, epoch, job, state, reason) in rows {
+            let state = if state == "COMMITTED" {
+                CommitState::Committed
+            } else {
+                CommitState::Corrupt
+            };
+            let attempt_id = AttemptId::from_uuid(attempt);
+            let epoch = u64::try_from(epoch).unwrap_or(0);
+            let decision = CheckpointDecision {
+                attempt: Some(AttemptRef {
+                    job_id: JobId::from_uuid(job).to_string(),
+                    attempt_id: attempt_id.to_string(),
+                    fencing_epoch: epoch,
+                }),
+                checkpoint_id: CheckpointId::from_uuid(id).to_string(),
+                state: state as i32,
+                reason: reason.unwrap_or_default(),
+            };
+            let mut tx = self.db.begin().await?;
+            let unsent: bool = sqlx::query_scalar(
+                "SELECT decision_sent_at IS NULL FROM checkpoints WHERE id = $1 FOR UPDATE",
+            )
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?;
+            if !unsent {
+                continue;
+            }
+            match self
+                .commands
+                .send_in(
+                    &mut tx,
+                    NodeId::from_uuid(node),
+                    NewCommand::new(Kind::CheckpointDecision(decision)).attempt(attempt_id, epoch),
+                )
+                .await
+            {
+                Ok(_) => {}
+                // A removed machine has nobody to tell.
+                Err(crate::modules::nodes::NodesError::CommandRefused(why)) => {
+                    tracing::info!(checkpoint = %id, why, "checkpoint decision not sent");
+                }
+                Err(e) => return Err(seam("commands", e)),
+            }
+            sqlx::query("UPDATE checkpoints SET decision_sent_at = now() WHERE id = $1")
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await.map_err(DbError::from)?;
+        }
+        Ok(())
     }
 
     // ---- the fast background tick ----
@@ -1344,6 +1432,7 @@ impl CheckpointService {
             }
         };
         log("commits", self.pending_commits().await);
+        log("decisions", self.send_decisions().await);
         log("tickets", self.refresh_tickets().await);
         log("finalize", super::verifier::finalize(self, chains).await);
         log("cadence", self.time_based_cadence().await);
@@ -1404,7 +1493,10 @@ impl CheckpointService {
                AND (tickets_checked_at IS NULL OR tickets_checked_at < now() - interval '5 seconds')
                AND (tickets_expire_at IS NULL OR tickets_expire_at < now() + interval '30 seconds'
                     OR EXISTS (SELECT 1 FROM agent_commands a WHERE a.id = c.upload_command_id
-                               AND a.state IN ('EXPIRED','SUPERSEDED','FAILED')))
+                               AND (a.state IN ('EXPIRED','SUPERSEDED','FAILED')
+                                    -- The agent gave up uploading (INT-1): new tickets retry it.
+                                    OR (jsonb_typeof(a.outcome->'failure') = 'object'
+                                        AND a.outcome_at < now() - interval '30 seconds'))))
                AND EXISTS (SELECT 1 FROM jobs j JOIN job_attempts a ON a.id = c.attempt_id
                            WHERE j.id = c.job_id AND j.epoch = c.attempt_epoch AND a.epoch = j.epoch
                              AND j.state NOT IN ('CANCELLING','CANCELLED','COMPLETED','FAILED','REJECTED'))

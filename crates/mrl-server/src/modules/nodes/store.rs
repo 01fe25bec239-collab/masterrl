@@ -1472,7 +1472,22 @@ pub async fn command_result(
     .bind(json!({ "accepted": r.accepted, "failure": failure }))
     .execute(&mut **tx)
     .await?;
-    if done.rows_affected() == 0 {
+    if done.rows_affected() > 0 {
+        return Ok(());
+    }
+    // An upload's later result is its outcome (INT-1): kept apart from the acceptance, the
+    // first one per command id.
+    let kept = sqlx::query(
+        "UPDATE agent_commands SET outcome = $3, outcome_at = now(), updated_at = now()
+         WHERE id = $1 AND node_id = $2 AND kind = 'UploadArtifacts' AND state = 'COMPLETED'
+           AND outcome IS NULL",
+    )
+    .bind(id)
+    .bind(node)
+    .bind(json!({ "accepted": r.accepted, "failure": failure }))
+    .execute(&mut **tx)
+    .await?;
+    if kept.rows_affected() == 0 {
         tracing::debug!(node = %node, command = %id, "command result ignored (already final or unknown)");
     }
     Ok(())

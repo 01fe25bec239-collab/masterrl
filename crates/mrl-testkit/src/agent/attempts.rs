@@ -842,6 +842,7 @@ mod runner_tests {
             }],
             commit_requested: true,
             state,
+            uploaded: false,
         }
     }
 
@@ -1000,11 +1001,6 @@ mod runner_tests {
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, b"weights").unwrap();
         let (mut w, _) = fx.worker("trainer").await;
-        let got_ack = read_until(&mut w, |b| matches!(b, AgentBody::CheckpointCommitAck(_)))
-            .await
-            .unwrap();
-        assert!(matches!(got_ack.last(),
-            Some(AgentBody::CheckpointCommitAck(a)) if a.state == CommitState::Committed as i32));
         let done = fx
             .event(|e| match e {
                 AttemptEvent::CommandDone(r) => Some(r),
@@ -1014,6 +1010,21 @@ mod runner_tests {
         assert_eq!(done.command_id, "up-1");
         assert!(done.failure.is_none());
         assert_eq!(got.lock().unwrap().as_slice(), [b"weights".to_vec()]);
+        assert!(fx.saved().checkpoints["ckpt_1"].uploaded);
+        assert_eq!(
+            fx.saved().checkpoints["ckpt_1"].state,
+            None,
+            "not committed by the upload"
+        );
+        fx.control
+            .send(decided(CommitState::Committed))
+            .await
+            .unwrap();
+        let got_ack = read_until(&mut w, |b| matches!(b, AgentBody::CheckpointCommitAck(_)))
+            .await
+            .unwrap();
+        assert!(matches!(got_ack.last(),
+            Some(AgentBody::CheckpointCommitAck(a)) if a.state == CommitState::Committed as i32));
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1210,6 +1221,10 @@ mod runner_tests {
         assert_eq!(second.command_id, "up-new");
         assert!(second.failure.is_none(), "{second:?}");
         assert_eq!(got.lock().unwrap().as_slice(), [b"weights".to_vec()]);
+        fx.control
+            .send(decided(CommitState::Committed))
+            .await
+            .unwrap();
         let acks = read_until(&mut w, |b| {
             matches!(b, AgentBody::CheckpointCommitAck(a) if a.state == CommitState::Committed as i32)
         })
@@ -1460,6 +1475,15 @@ mod runner_tests {
         .await
     }
 
+    /// The core's decision for `ckpt_1` (INT-1: the worker hears COMMITTED only after it).
+    fn decided(state: CommitState) -> Control {
+        Control::Decision {
+            checkpoint_id: "ckpt_1".into(),
+            state: state as i32,
+            reason: String::new(),
+        }
+    }
+
     fn upload(id: &str, t: UploadTarget) -> Control {
         Control::Upload {
             command_id: id.into(),
@@ -1551,9 +1575,17 @@ mod runner_tests {
         assert!(early.is_err(), "no ack while the outcome can't be saved");
         tokio::time::sleep(Duration::from_millis(1500)).await;
         assert_eq!(got.lock().unwrap().len(), 1, "the PUT succeeded once");
-        // Saving works again (the ticket has expired): the kept result is saved and only then
-        // acknowledged, with no second upload.
+        // Saving works again (the ticket has expired): the kept result is saved, with no
+        // second upload; the core's decision is then acknowledged once saved.
         std::fs::remove_dir_all(&record).unwrap();
+        let r = done(&mut fx).await;
+        assert_eq!(r.command_id, "up-1");
+        assert!(r.failure.is_none());
+        assert_eq!(got.lock().unwrap().len(), 1, "uploaded exactly once");
+        fx.control
+            .send(decided(CommitState::Committed))
+            .await
+            .unwrap();
         let acks = read_until(&mut w, |b| matches!(b, AgentBody::CheckpointCommitAck(_)))
             .await
             .unwrap();
@@ -1563,10 +1595,6 @@ mod runner_tests {
             fx.saved().checkpoints["ckpt_1"].state,
             Some(CommitState::Committed as i32)
         );
-        let r = done(&mut fx).await;
-        assert_eq!(r.command_id, "up-1");
-        assert!(r.failure.is_none());
-        assert_eq!(got.lock().unwrap().len(), 1, "uploaded exactly once");
     }
 
     /// An accepted upload command always ends with one result: when the worker commits a
