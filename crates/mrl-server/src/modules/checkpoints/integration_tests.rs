@@ -1186,6 +1186,124 @@ async fn concurrent_commits_serialize_and_latest_is_the_highest_step() {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL (just test-integration)"]
+async fn resume_at_budget_adopts_only_the_reported_committed_resume_checkpoint() {
+    use mrl_domain::failure::{FailureClass, FailureCode};
+
+    let env = Env::start().await;
+    for (step, report_resume, expected) in [
+        (9, true, "FAILED"),
+        (10, false, "FAILED"),
+        (10, true, "COMPLETED"),
+        (11, true, "COMPLETED"),
+    ] {
+        let (run, job) = env
+            .running_run(json!({"common": {"max_steps": 10}, "metrics": {"required": ["loss"]}}))
+            .await;
+        let checkpoint = env.engine.checkpoint(step, false, &[("loss", 0.5)]);
+        env.wait_state(checkpoint, "COMMITTED").await;
+
+        let mut tx = env.db.db().begin().await.unwrap();
+        let row = env.lock(&mut tx, job).await;
+        let first =
+            JobTransitions::lock_attempt(&mut tx, Uuid::nil(), row.current_attempt_id.unwrap())
+                .await
+                .unwrap()
+                .unwrap();
+        JobTransitions::apply_attempt(
+            &mut tx,
+            &first,
+            JobAttemptEvent::Kill,
+            AttemptChange::default(),
+        )
+        .await
+        .unwrap();
+        let mut row = JobTransitions::fail_or_retry(
+            &mut tx,
+            &row,
+            FailureCode::class_only(FailureClass::NodeLost),
+            "node gone",
+        )
+        .await
+        .unwrap();
+        for event in [JobEvent::Retry, JobEvent::Place] {
+            row =
+                JobTransitions::apply(&mut tx, &row, event, Owner::Scheduler, JobChange::default())
+                    .await
+                    .unwrap();
+        }
+        let (row, mut resumed) = JobTransitions::launch(&mut tx, &row, Some(checkpoint))
+            .await
+            .unwrap();
+        for event in [JobAttemptEvent::Acknowledge, JobAttemptEvent::Start] {
+            resumed =
+                JobTransitions::apply_attempt(&mut tx, &resumed, event, AttemptChange::default())
+                    .await
+                    .unwrap();
+        }
+        let row = JobTransitions::apply(
+            &mut tx,
+            &row,
+            JobEvent::Start,
+            Owner::Jobs,
+            JobChange::default(),
+        )
+        .await
+        .unwrap();
+        let reported = if report_resume {
+            CheckpointId::from_uuid(checkpoint)
+        } else {
+            CheckpointId::new()
+        };
+        JobTransitions::apply_attempt(
+            &mut tx,
+            &resumed,
+            JobAttemptEvent::ExitOk,
+            AttemptChange {
+                exit_report: Some(json!({
+                    "last_committed_checkpoint_id": reported.to_string(),
+                    "final_metrics": {},
+                })),
+                ..AttemptChange::default()
+            },
+        )
+        .await
+        .unwrap();
+        JobTransitions::apply(
+            &mut tx,
+            &row,
+            JobEvent::Finish,
+            Owner::Jobs,
+            JobChange::default(),
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+
+        env.service.tick(&env.chains).await;
+        let (state, failure) = env.job_state(job).await;
+        assert_eq!(
+            state, expected,
+            "step {step}, reported resume {report_resume}"
+        );
+        if expected == "FAILED" {
+            assert_eq!(failure.as_deref(), Some("VERIFICATION_FAILED"));
+        }
+        let final_id: Option<Uuid> =
+            sqlx::query_scalar("SELECT final_checkpoint_id FROM runs WHERE id = $1")
+                .bind(run)
+                .fetch_one(env.db.pool())
+                .await
+                .unwrap();
+        assert_eq!(final_id, (expected == "COMPLETED").then_some(checkpoint));
+        let saved = env.service.find(checkpoint).await.unwrap().unwrap();
+        assert_eq!(saved.is_final, expected == "COMPLETED");
+        assert_eq!(saved.attempt_id, first.id);
+    }
+    env.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
 async fn a_finished_job_without_a_final_checkpoint_fails_verification() {
     let env = Env::start().await;
     let (_, job) = env.running_run(json!({})).await;
