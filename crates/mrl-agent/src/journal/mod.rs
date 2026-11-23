@@ -203,6 +203,15 @@ impl Journal {
             .collect()
     }
 
+    /// Highest seq up to which every journaled command has finished (none still `Received`).
+    pub fn settled_through(&self) -> u64 {
+        self.state
+            .entries
+            .iter()
+            .find(|(_, e)| e.step == Step::Received)
+            .map_or(self.state.last_seq, |(s, _)| s.saturating_sub(1))
+    }
+
     /// Commands left `Received` (the agent stopped while running them).
     pub fn interrupted(&self) -> Vec<(u64, String)> {
         self.state
@@ -217,6 +226,21 @@ impl Journal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settled_through_stops_before_the_first_running_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut j = Journal::open(&dir.path().join("journal.json")).unwrap();
+        assert_eq!(j.settled_through(), 0);
+        for seq in 1..=3 {
+            j.receive(seq, &format!("c{seq}")).unwrap();
+        }
+        j.complete(1, "c1", &Ok(())).unwrap();
+        assert_eq!(j.settled_through(), 1, "2 is still running");
+        j.complete(2, "c2", &Ok(())).unwrap();
+        j.complete(3, "c3", &Ok(())).unwrap();
+        assert_eq!(j.settled_through(), 3);
+    }
 
     #[test]
     fn repeats_are_never_new_even_after_reopening() {

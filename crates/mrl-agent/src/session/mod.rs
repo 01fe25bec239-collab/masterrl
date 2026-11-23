@@ -670,6 +670,11 @@ impl Link {
         self.journal.lock().map_or(0, |j| j.last_seq())
     }
 
+    /// Highest command seq up to which every journaled command has finished.
+    pub fn commands_through(&self) -> u64 {
+        self.journal.lock().map_or(0, |j| j.settled_through())
+    }
+
     /// CONTROL messages waiting for an ack.
     pub fn spooled(&self) -> usize {
         self.spool.lock().map_or(0, |s| s.len())

@@ -594,6 +594,8 @@ struct Script {
     running: Mutex<BTreeMap<String, AttemptRef>>,
     seen: Mutex<Vec<Command>>,
     refuse_unknown: bool,
+    /// Takes launches without starting them (an agent that died before the worker started).
+    silent: std::sync::atomic::AtomicBool,
 }
 
 struct Handler(Arc<Script>);
@@ -626,6 +628,7 @@ impl Script {
             running: Mutex::default(),
             seen: Mutex::default(),
             refuse_unknown: true,
+            silent: std::sync::atomic::AtomicBool::new(false),
         });
         for kind in [
             "LaunchAttempt",
@@ -674,6 +677,7 @@ impl Script {
             .send_control(Msg::Reconcile(ReconcileReport {
                 attempts,
                 deployments: vec![],
+                commands_through: self.link.commands_through(),
             }))
             .unwrap();
     }
@@ -713,6 +717,9 @@ impl CommandHandler for Handler {
             ..Failure::default()
         };
         match c.kind {
+            Some(Kind::LaunchAttempt(_)) if s.silent.load(std::sync::atomic::Ordering::SeqCst) => {
+                Ok(())
+            }
             Some(Kind::LaunchAttempt(l)) => {
                 let r = l.attempt.unwrap_or_default();
                 s.running
@@ -1056,6 +1063,7 @@ async fn repeated_and_stale_reports_make_no_second_transition() {
                 Some(FailureClass::EngineError),
             )],
             deployments: vec![],
+            commands_through: 0,
         }))
         .unwrap();
     // The RUNNING one is a live claim for an ended attempt: the machine is told to stop it.
@@ -1331,6 +1339,88 @@ async fn a_core_killed_before_a_cancel_commits_sends_it_once() {
     assert!(!failpoints::take("cancel.before_commit", w.org), "reached");
     assert_eq!(m.script.cancels().len(), 1);
     assert_eq!(w.commands(attempt, "CancelAttempt").await.len(), 1);
+    w.invariants().await;
+}
+
+/// INT-4: a launch the machine took but never started ends at once on a reconcile that covers
+/// it, and its GPU is freed (no terminal report will ever come).
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn a_reconcile_covering_a_launch_that_never_started_frees_the_gpu() {
+    let w = World::start(false).await;
+    let mut m = w.agent(1).await;
+    m.script
+        .silent
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let job = w.queue(1).await;
+    w.until("an attempt is placed", || async {
+        w.job(job).await.current_attempt_id.is_some()
+    })
+    .await;
+    let attempt = w.job(job).await.current_attempt_id.unwrap();
+    w.until("the launch is taken", || async {
+        w.commands(attempt, "LaunchAttempt")
+            .await
+            .iter()
+            .any(|(state, _)| state == "COMPLETED")
+    })
+    .await;
+    assert_eq!(w.attempt_state(attempt).await, "PENDING");
+    m.restart().await;
+    w.wait_attempt(attempt, "KILLED").await;
+    w.until("released", || async {
+        w.reservations(job).await[0].0 == "RELEASED"
+    })
+    .await;
+    assert!(
+        w.events(job).await.iter().all(|e| e != "job.failed"),
+        "the job retries"
+    );
+    w.invariants().await;
+}
+
+/// INT-4: a pause that expired while the machine was away is sent again when it is back.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn a_pause_that_expired_while_the_machine_was_away_is_sent_again() {
+    let w = World::start(true).await;
+    let mut m = w.agent(1).await;
+    let job = w.queue(1).await;
+    let attempt = w.running(job).await;
+    m.disconnect().await;
+    let mut tx = w.db.db().begin().await.unwrap();
+    let row = JobTransitions::lock(&mut tx, w.org, job)
+        .await
+        .unwrap()
+        .unwrap();
+    JobTransitions::apply(
+        &mut tx,
+        &row,
+        JobEvent::RequestPause,
+        Owner::Jobs,
+        JobChange::default(),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    w.until("the pause is written", || async {
+        !w.commands(attempt, "PauseAttempt").await.is_empty()
+    })
+    .await;
+    sqlx::query("UPDATE agent_commands SET state = 'EXPIRED' WHERE attempt_id = $1 AND kind = 'PauseAttempt'")
+        .bind(attempt)
+        .execute(w.db.pool())
+        .await
+        .unwrap();
+    m.reconnect();
+    w.wait_state(job, "PAUSED").await;
+    let states: Vec<String> = w
+        .commands(attempt, "PauseAttempt")
+        .await
+        .into_iter()
+        .map(|(s, _)| s)
+        .collect();
+    assert_eq!(states.len(), 2, "{states:?}");
     w.invariants().await;
 }
 
