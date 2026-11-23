@@ -3,3 +3,4 @@ spec:
   metrics:
     namespaces:
       gpu_mem: resource/gpu_mem_peak
+      prefix: resource

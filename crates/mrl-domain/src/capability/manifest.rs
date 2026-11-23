@@ -95,9 +95,36 @@ impl Bundle {
             .map_err(|e| ManifestError::Invalid(vec![format!("/metadata: {e}")]))?;
         let engine = match raw.kind {
             BundleKind::Builtin => {
-                if raw.manifest.get("apiVersion") != Some(&Value::from("mrl.dev/builtin/v1")) {
+                let text = |path| {
+                    raw.manifest
+                        .pointer(path)
+                        .and_then(Value::as_str)
+                        .is_some_and(|s| !s.is_empty())
+                };
+                let kinds = raw
+                    .manifest
+                    .pointer("/spec/jobKinds")
+                    .and_then(Value::as_array);
+                if raw.manifest.get("apiVersion") != Some(&Value::from("mrl.dev/builtin/v1"))
+                    || raw.manifest.get("kind") != Some(&Value::from("BuiltinManifest"))
+                    || ![
+                        "/metadata/name",
+                        "/metadata/version",
+                        "/metadata/displayName",
+                        "/spec/adapter/entrypoint",
+                        "/spec/adapter/adapterApi",
+                        "/spec/adapter/workerProtocol",
+                    ]
+                    .into_iter()
+                    .all(text)
+                    || !kinds.is_some_and(|rows| {
+                        rows.len() == 1
+                            && rows[0].get("kind").and_then(Value::as_str) == Some("DATA_PREP")
+                            && rows[0].get("sandbox").and_then(Value::as_str) == Some("data_prep")
+                    })
+                {
                     return Err(ManifestError::Invalid(vec![
-                        "/apiVersion: a built-in bundle must be mrl.dev/builtin/v1".into(),
+                        "the built-in bundle needs mrl.dev/builtin/v1, adapter metadata and the DATA_PREP sandbox".into(),
                     ]));
                 }
                 None
@@ -209,6 +236,8 @@ pub struct EngineSpec {
     /// Rejection rules over the validation document.
     #[serde(default)]
     pub constraints: Vec<Constraint>,
+    /// Workload roles and their runtime environments.
+    pub topology: Topology,
     /// Where it can run at all.
     #[serde(default)]
     pub hardware: Option<Hardware>,
@@ -229,6 +258,8 @@ pub struct Runtime {
 pub struct Environment {
     /// Environment id.
     pub id: String,
+    /// Target OS and CPU architecture.
+    pub platform: String,
     /// The accelerator it needs (none: processor only).
     #[serde(default)]
     pub accelerator: Option<Accelerator>,
@@ -236,9 +267,41 @@ pub struct Environment {
 
 /// `accelerator`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Accelerator {
     /// `nvidia`, `amd`, `apple` or `cpu`.
     pub vendor: HardwareClass,
+    /// Accelerator runtime, such as cuda12.
+    pub runtime: Option<String>,
+    /// Minimum driver version, when specified.
+    pub min_driver: Option<String>,
+    /// Minimum device compute capability, when specified.
+    pub min_compute_capability: Option<String>,
+}
+
+/// The launch topology.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct Topology {
+    /// Declared roles.
+    pub roles: Vec<TopologyRole>,
+}
+
+/// A declared launch role.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopologyRole {
+    /// Role identifier.
+    pub id: String,
+    /// Workload type.
+    pub kind: String,
+    /// Runtime environment name.
+    pub environment: String,
+    /// Minimum role count.
+    pub count: u32,
+    /// Minimum GPU count for the role.
+    pub gpus: Option<u32>,
+    /// Role sharing a machine with this one, if any.
+    pub colocated_with: Option<String>,
 }
 
 /// `spec.capabilities` (the fields L0 checks).
@@ -256,6 +319,8 @@ pub struct Capabilities {
     pub parallelism: Vec<String>,
     /// Can span machines.
     pub multi_node: bool,
+    /// Whether the engine allows models shipped with custom code.
+    pub trust_remote_code: String,
 }
 
 /// `spec.hardware`.
@@ -265,6 +330,13 @@ pub struct Hardware {
     /// Accelerators it runs on at all.
     #[serde(default)]
     pub accelerators: Option<Vec<HardwareClass>>,
+    /// Allowed operating systems.
+    pub os: Option<Vec<String>>,
+    /// Whether WSL2 is supported.
+    pub wsl2: Option<bool>,
+    /// Whether Apple Silicon is supported.
+    #[serde(rename = "apple_silicon")]
+    pub apple_silicon: Option<bool>,
     /// Fewest GPUs per machine.
     #[serde(default)]
     pub min_gpus: Option<u32>,
@@ -347,11 +419,18 @@ pub struct DatasetSchemas {
 
 /// `requires.signals` (the ones a submission can supply).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Signals {
     /// `required`, `optional` or `none`.
     pub reward: String,
     /// `required` or `none`.
     pub teacher: String,
+    /// `required`, `optional` or `none`.
+    pub reference: String,
+    /// `required` or `none`.
+    pub critic: String,
+    /// `required`, `optional` or `none`.
+    pub rollout_engine: String,
 }
 
 /// `supports`.
@@ -453,9 +532,28 @@ impl EngineManifest {
                         }
                     }
                 }
+                if let Some(path) = &form.ui_schema {
+                    if !schemas.get(path).is_some_and(Value::is_object) {
+                        problems.push(format!("/spec/algorithms/{}/config/uiSchema: `{path}` must name an inlined UI object", a.id));
+                    }
+                }
             }
         }
         for c in &m.spec.constraints {
+            if c.error.code.title().is_none() {
+                problems.push(format!(
+                    "/spec/constraints/{}/error/code: {} is not in the guidance catalog",
+                    c.id, c.error.code
+                ));
+            }
+            for method in &c.applies_to {
+                if m.algorithm(method).is_none() {
+                    problems.push(format!(
+                        "/spec/constraints/{}/appliesTo: unknown method `{method}`",
+                        c.id
+                    ));
+                }
+            }
             if let Err(e) = jsonschema::draft202012::new(&c.schema) {
                 problems.push(format!(
                     "/spec/constraints/{}/schema: not a usable JSON Schema: {}",
@@ -478,10 +576,14 @@ impl EngineManifest {
             .algorithms
             .iter()
             .flat_map(|a| a.metrics.iter().map(|m| &m.name));
+        // The runtime appends the original metric suffix to the mapping target.
         let mapped = self.spec.metrics.iter().flat_map(|m| m.namespaces.values());
         declared
-            .chain(mapped)
             .filter(|n| n.starts_with(RESERVED_METRIC_PREFIX))
+            .chain(mapped.filter(|n| {
+                n.starts_with(RESERVED_METRIC_PREFIX)
+                    || RESERVED_METRIC_PREFIX.starts_with(n.as_str())
+            }))
             .cloned()
             .collect::<BTreeSet<_>>()
             .into_iter()

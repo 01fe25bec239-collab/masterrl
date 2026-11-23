@@ -6,7 +6,7 @@
 //! the job is accepted when one passes. Otherwise it is rejected with the problems of the
 //! candidate that came closest (fewest problems, then engine name).
 
-use super::{store, EnginesError, Records};
+use super::{store, EnginesError, RecordScope, Records};
 use crate::db::Db;
 use crate::modules::jobs::{JobSpec, JobValidator, Rejection, Verdict};
 use crate::seams::SeamError;
@@ -103,6 +103,35 @@ fn engine_choice(config: &Value) -> Option<(String, Option<String>)> {
     })
 }
 
+fn malformed(config: &Value) -> Option<Problem> {
+    let path = ["common", "engine", "inputs", "rollout"]
+        .into_iter()
+        .find_map(|key| {
+            config
+                .get(key)
+                .filter(|v| !v.is_object())
+                .map(|_| format!("/config/{key}"))
+        })
+        .or_else(|| {
+            config
+                .pointer("/common/engine")
+                .filter(|v| {
+                    v.as_str().is_none_or(|s| {
+                        s.is_empty()
+                            || s.split_once('@')
+                                .is_some_and(|(n, v)| n.is_empty() || v.is_empty())
+                    })
+                })
+                .map(|_| "/config/common/engine".to_owned())
+        })?;
+    Some(Problem {
+        code: matcher::codes::FIELD_VALUE,
+        path: Some(path),
+        message: "Use the engine settings format shown by the form.".into(),
+        hint: None,
+    })
+}
+
 /// What the capability check decides for one job.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Pick {
@@ -122,8 +151,15 @@ impl CapabilityValidator {
     /// Candidates are the live versions declaring `spec.algorithm_id`, narrowed by
     /// `config.common.engine` (`name` or `name@version`).
     pub async fn pick(&self, spec: &JobSpec) -> Result<Pick, EnginesError> {
-        let mut candidates = store::candidates(&self.db, Some(&spec.algorithm_id)).await?;
         let choice = engine_choice(&spec.resolved);
+        if let Some(problems) = malformed(&spec.resolved) {
+            return Ok(Pick::Rejected(vec![rejection(problems)]));
+        }
+        let mut candidates = store::candidates(
+            &self.db,
+            choice.is_none().then_some(spec.algorithm_id.as_str()),
+        )
+        .await?;
         if let Some((name, version)) = &choice {
             candidates
                 .retain(|c| &c.name == name && version.as_ref().is_none_or(|v| &c.version == v));
@@ -146,10 +182,16 @@ impl CapabilityValidator {
             Ok(h) => h,
             Err(p) => return Ok(Pick::Rejected(vec![rejection(p)])),
         };
-        let org = spec.org_id;
+        let scope = RecordScope {
+            org_id: spec.org_id,
+            project_id: spec.project_id,
+        };
         let model = match self
             .records
-            .model(org, ModelVersionId::from_uuid(spec.base_model_version_id))
+            .model(
+                &scope,
+                ModelVersionId::from_uuid(spec.base_model_version_id),
+            )
             .await
         {
             Ok(Some(f)) => Lookup::Found(f),
@@ -161,7 +203,7 @@ impl CapabilityValidator {
             datasets.push(
                 match self
                     .records
-                    .dataset(org, DatasetVersionId::from_uuid(*d))
+                    .dataset(&scope, DatasetVersionId::from_uuid(*d))
                     .await
                     .map_err(EnginesError::Seam)?
                 {
@@ -170,7 +212,37 @@ impl CapabilityValidator {
                 },
             );
         }
-        let available = store::available_classes(&self.db, Some(org), None).await?;
+        let mut signals = std::collections::BTreeMap::new();
+        for (signal, path) in [
+            ("reference", "/inputs/reference_model_version_id"),
+            ("critic", "/inputs/critic_model_version_id"),
+            ("teacher", "/common/teacher_model_version_id"),
+        ] {
+            if let Some(raw) = spec.resolved.pointer(path) {
+                let Some(id) = raw.as_str().and_then(|v| v.parse::<ModelVersionId>().ok()) else {
+                    return Ok(Pick::Rejected(vec![Rejection::new(
+                        matcher::codes::FIELD_VALUE,
+                        Some(&format!("/config{path}")),
+                        "Use a model version id.",
+                    )]));
+                };
+                let found = self
+                    .records
+                    .model(&scope, id)
+                    .await
+                    .map_err(EnginesError::Seam)?;
+                signals.insert(
+                    signal.to_owned(),
+                    found.map_or(Lookup::Missing, Lookup::Found),
+                );
+            }
+        }
+        let rollout = spec
+            .resolved
+            .get("rollout")
+            .is_some_and(|value| value.is_object());
+        let machines = store::machines(&self.db, Some(spec.org_id), None).await?;
+        let available = machines.iter().flat_map(|m| m.classes()).collect();
         let req = Request {
             algorithm: spec.algorithm_id.clone(),
             config: Some(spec.resolved.clone()),
@@ -179,10 +251,14 @@ impl CapabilityValidator {
             reward_attached: spec.reward_version_id.is_some(),
             hardware,
             available,
+            model_signals: signals,
+            rollout,
+            resources: Some(spec.resources.clone()),
+            machines: Some(machines),
         };
         let mut best: Option<Vec<Problem>> = None;
         for c in &candidates {
-            let problems = matcher::check(
+            let mut problems = matcher::check(
                 Engine {
                     manifest: &c.manifest,
                     schemas: &c.schemas,
@@ -190,6 +266,15 @@ impl CapabilityValidator {
                 },
                 &req,
             );
+            if choice.is_some() {
+                for problem in &mut problems {
+                    if problem.code == Cap::NoEngineForMethod.code()
+                        || problem.code == Cap::PpoUnavailableOnTrl.code()
+                    {
+                        problem.path = Some("/config/common/engine".into());
+                    }
+                }
+            }
             if problems.is_empty() {
                 return Ok(Pick::Engine(c.id));
             }

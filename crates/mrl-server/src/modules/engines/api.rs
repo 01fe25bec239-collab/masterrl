@@ -8,7 +8,7 @@
 //! - `GET /algorithms/{algo}/schema?engine_version=<name>@<version>`: the method's config
 //!   form (JSON Schema with `x-mrl-ui` hints), UI schema, presets, pinned and default values.
 
-use super::{store, Records};
+use super::{store, RecordScope, Records};
 use crate::db::Db;
 use crate::error::{ApiError, ErrorCode, FieldError};
 use crate::seams::{RequestContext, Resource};
@@ -16,9 +16,8 @@ use crate::AppState;
 use axum::extract::{Path, Query, State};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
-use mrl_domain::capability::manifest::HardwareClass;
 use mrl_domain::capability::matcher::{self, Engine, HardwareRequest, Lookup, Request, Wanted};
-use mrl_domain::ids::{DatasetVersionId, ModelVersionId, OrgId, PoolId};
+use mrl_domain::ids::{DatasetVersionId, ModelVersionId, OrgId, PoolId, ProjectId};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sqlx::Row;
@@ -105,11 +104,14 @@ pub struct EngineVersionDetail {
 /// `GET /capabilities` query.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 pub struct CapabilitiesQuery {
     /// `mv_…`: check against this model.
     pub model_version: Option<String>,
     /// `dsv_…`: check against this training dataset.
     pub dataset_version: Option<String>,
+    /// Project in which model and dataset versions must be visible.
+    pub project: Option<String>,
     /// `pool_…`: only this pool's machines.
     pub pool: Option<String>,
 }
@@ -164,6 +166,7 @@ pub struct CapabilityReport {
 /// `GET /algorithms/{algo}/schema` query.
 #[derive(Debug, Clone, Deserialize, IntoParams)]
 #[serde(deny_unknown_fields)]
+#[into_params(parameter_in = Query)]
 pub struct AlgorithmSchemaQuery {
     /// `<engine>@<version>`, like `trl@1.0.0`; default: the newest live version with the method.
     pub engine_version: Option<String>,
@@ -391,7 +394,13 @@ async fn get_engine_version(
         status: row.try_get("status").map_err(internal)?,
         manifest_sha256: row.try_get("manifest_sha256").map_err(internal)?,
         runtime_ref: row.try_get("runtime_ref").map_err(internal)?,
-        probe_results: row.try_get("probe_results").map_err(internal)?,
+        probe_results: serde_json::to_value(
+            hardware_status(&row.try_get("probe_results").map_err(internal)?)
+                .into_iter()
+                .map(|(class, status)| (class, serde_json::json!({"status": status})))
+                .collect::<BTreeMap<_, _>>(),
+        )
+        .map_err(internal)?,
         manifest: row.try_get("manifest").map_err(internal)?,
         algorithms,
     }))
@@ -400,7 +409,8 @@ async fn get_engine_version(
 #[utoipa::path(get, path = "/capabilities", tag = "engines", operation_id = "get_capabilities",
     params(CapabilitiesQuery),
     responses((status = 200, description = "What can run.", body = CapabilityReport),
-              (status = 404, description = "No such pool.", body = crate::error::Problem),
+              (status = 403, description = "The caller cannot read the requested compute or records.", body = crate::error::Problem),
+              (status = 404, description = "No visible pool or project has this id.", body = crate::error::Problem),
               (status = 422, description = "An id can't be read.", body = crate::error::Problem)))]
 async fn get_capabilities(
     State(s): State<AppState>,
@@ -408,6 +418,14 @@ async fn get_capabilities(
     ctx: RequestContext,
     Query(q): Query<CapabilitiesQuery>,
 ) -> Result<Json<CapabilityReport>, ApiError> {
+    let ctx = match q.project.as_deref() {
+        Some(project) => ctx.with_project(
+            ProjectId::from_str(project)
+                .map_err(|_| missing("project"))?
+                .to_string(),
+        ),
+        None => ctx,
+    };
     read(&s, &ctx, None).await?;
     let org = caller_org(&ctx)?;
     let model = q
@@ -426,8 +444,12 @@ async fn get_capabilities(
                 .map_err(|_| field("/dataset_version", "Use a dataset version id like `dsv_…`."))
         })
         .transpose()?;
-    let pool = match q.pool.as_deref() {
-        None => None,
+    let (pool, pool_owner) = match q.pool.as_deref() {
+        None => {
+            s.authorize(&ctx, "compute.read", &Resource::kind("pool"))
+                .await?;
+            (None, None)
+        }
         Some(p) => {
             let gone = || ApiError::new(ErrorCode::NotFound, "No pool with this id exists.");
             let id = PoolId::from_str(p).map_err(|_| gone())?;
@@ -444,13 +466,54 @@ async fn get_capabilities(
                 ..Resource::kind("pool")
             };
             s.authorize(&ctx, "compute.read", &resource).await?;
-            Some(id.as_uuid())
+            (Some(id.as_uuid()), owner)
         }
     };
-    let records_org = org.unwrap_or(Uuid::nil());
+    let scope = match q.project.as_deref() {
+        Some(raw) => {
+            let id = ProjectId::from_str(raw).map_err(|_| missing("project"))?;
+            let owner: Option<Uuid> = sqlx::query_scalar(
+                "SELECT org_id FROM projects WHERE id = $1 AND deleted_at IS NULL",
+            )
+            .bind(id.as_uuid())
+            .fetch_optional(c.db.pool())
+            .await
+            .map_err(internal)?;
+            let owner = owner.ok_or_else(|| missing("project"))?;
+            let resource = Resource {
+                id: Some(id.to_string()),
+                org: Some(OrgId::from_uuid(owner).to_string()),
+                project: Some(id.to_string()),
+                ..Resource::kind("project")
+            };
+            if model.is_some() {
+                s.authorize(&ctx, "models.read", &resource).await?;
+            }
+            if dataset.is_some() {
+                s.authorize(&ctx, "datasets.read", &resource).await?;
+            }
+            if model.is_none() && dataset.is_none() {
+                s.authorize(&ctx, "engines.read", &resource).await?;
+            }
+            RecordScope {
+                org_id: owner,
+                project_id: id.as_uuid(),
+            }
+        }
+        None if model.is_some() || dataset.is_some() => {
+            return Err(field(
+                "/project",
+                "Name the project these versions are for.",
+            ));
+        }
+        None => RecordScope {
+            org_id: org.unwrap_or_default(),
+            project_id: Uuid::nil(),
+        },
+    };
     let model = match model {
         None => Lookup::NotGiven,
-        Some(m) => match c.records.model(records_org, m).await.map_err(internal)? {
+        Some(m) => match c.records.model(&scope, m).await.map_err(internal)? {
             Some(f) => Lookup::Found(f),
             None => Lookup::Missing,
         },
@@ -458,15 +521,20 @@ async fn get_capabilities(
     let datasets = match dataset {
         None => vec![],
         Some(d) => vec![
-            match c.records.dataset(records_org, d).await.map_err(internal)? {
+            match c.records.dataset(&scope, d).await.map_err(internal)? {
                 Some(f) => Lookup::Found(f),
                 None => Lookup::Missing,
             },
         ],
     };
-    let available = store::available_classes(&c.db, org, pool)
+    let org = q.project.as_ref().map_or(org, |_| Some(scope.org_id));
+    if q.project.is_some() && pool_owner.is_some() && pool_owner != org {
+        return Err(missing("pool"));
+    }
+    let machines = store::machines(&c.db, pool_owner.or(org), pool)
         .await
         .map_err(internal)?;
+    let available: BTreeSet<_> = machines.iter().flat_map(|m| m.classes()).collect();
     let candidates = store::candidates(&c.db, None).await.map_err(internal)?;
     let mut items = Vec::new();
     for cand in &candidates {
@@ -486,6 +554,10 @@ async fn get_capabilities(
                     gpu_mem_gib: None,
                 },
                 available: available.clone(),
+                machines: Some(machines.clone()),
+                resources: None,
+                model_signals: BTreeMap::new(),
+                rollout: false,
             };
             let problems = matcher::check(
                 Engine {
@@ -495,8 +567,12 @@ async fn get_capabilities(
                 },
                 &req,
             );
-            let cuda = available.contains(&HardwareClass::Nvidia)
-                && cand.enabled.contains(&HardwareClass::Nvidia);
+            let engine = Engine {
+                manifest: &cand.manifest,
+                schemas: &cand.schemas,
+                enabled: &cand.enabled,
+            };
+            let cuda = matcher::offers_qlora(engine, &req);
             let updates: Vec<String> = algo
                 .supports
                 .update_strategies

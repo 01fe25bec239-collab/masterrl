@@ -13,7 +13,7 @@ use super::{store, EnginesConfig, EnginesError};
 use crate::db::{Db, LeaderElection};
 use crate::modules::nodes::commands::{CommandKind, CommandSender, NewCommand};
 use crate::modules::nodes::lanes::{LaneItem, LaneKind, LaneSink, SinkError};
-use crate::modules::nodes::Gateway;
+use crate::modules::nodes::{Gateway, NodesError};
 use mrl_domain::capability::manifest::{EngineManifest, HardwareClass};
 use mrl_domain::ids::NodeId;
 use mrl_proto::agent::v1::{agent_message::Body, command::Kind, Probe, ProbeCheck, ProbeOutcome};
@@ -98,17 +98,20 @@ impl Prober {
         for r in rows {
             let id: Uuid = r.try_get("id")?;
             let kind: String = r.try_get("kind")?;
-            let classes: BTreeSet<HardwareClass> = if kind == "builtin" {
-                [HardwareClass::Cpu].into()
+            let manifest = if kind == "builtin" {
+                None
             } else {
-                match serde_json::from_value::<EngineManifest>(r.try_get("manifest")?) {
-                    Ok(m) => m.hardware_classes(),
-                    Err(_) => continue,
-                }
+                let m = serde_json::from_value::<EngineManifest>(r.try_get("manifest")?);
+                let Ok(m) = m else { continue };
+                Some(m)
             };
+            let classes: BTreeSet<_> = manifest.as_ref().map_or_else(
+                || [HardwareClass::Cpu].into(),
+                EngineManifest::hardware_classes,
+            );
             let enabled = store::enabled_classes(&r.try_get::<Value, _>("probe_results")?);
             for class in classes.difference(&enabled) {
-                if self.probe(id, *class).await? {
+                if self.probe(id, *class, manifest.as_ref()).await? {
                     sent += 1;
                 }
             }
@@ -117,57 +120,95 @@ impl Prober {
     }
 
     /// Sends one probe for `(version, class)` unless one is waiting or failed recently.
-    async fn probe(&self, version: Uuid, class: HardwareClass) -> Result<bool, EnginesError> {
+    async fn probe(
+        &self,
+        version: Uuid,
+        class: HardwareClass,
+        manifest: Option<&EngineManifest>,
+    ) -> Result<bool, EnginesError> {
+        let mut tx = self.db.begin().await?;
+        let Some((status, _, results)) = store::lock_version(&mut tx, version).await? else {
+            return Ok(false);
+        };
+        if !matches!(
+            status,
+            mrl_domain::state::EngineVersionState::Probing
+                | mrl_domain::state::EngineVersionState::Enabled
+        ) || store::enabled_classes(&results).contains(&class)
+        {
+            return Ok(false);
+        }
+        sqlx::query(
+            "UPDATE capability_evidence SET result = 'FAILED', decided_at = now(),
+                    detail = detail || jsonb_build_object('timed_out', true)
+             WHERE engine_version_id = $1 AND hardware_class = $2 AND source = 'probe'
+               AND result = 'PENDING'
+               AND at + make_interval(secs => COALESCE((detail->>'timeout_seconds')::float8, 300)) <= now()",
+        ).bind(version).bind(class.as_str()).execute(&mut *tx).await?;
         let busy: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM capability_evidence
                WHERE engine_version_id = $1 AND hardware_class = $2 AND source = 'probe'
-                 AND ((result = 'PENDING' AND at > now() - make_interval(secs => $3))
-                   OR (result = 'FAILED' AND decided_at > now() - make_interval(secs => $4))))",
+                 AND result = 'PENDING')",
         )
         .bind(version)
         .bind(class.as_str())
-        .bind(self.config.probe_timeout_seconds as f64)
-        .bind(self.config.probe_retry_seconds as f64)
-        .fetch_one(self.db.pool())
+        .fetch_one(&mut *tx)
         .await?;
         if busy {
+            tx.commit().await?;
             return Ok(false);
         }
-        let node: Option<Uuid> = sqlx::query_scalar(
-            "SELECT n.id FROM compute_nodes n
+        let rows = sqlx::query(
+            "SELECT n.id, n.inventory, COALESCE((
+                SELECT jsonb_agg(jsonb_build_object('vendor', g.vendor, 'memory', g.vram_total_bytes,
+                                                'index', g.index_on_node))
+                FROM gpu_devices g WHERE g.node_id = n.id AND g.present AND g.health = 'OK'
+             ), '[]') AS devices
+             FROM compute_nodes n LEFT JOIN LATERAL (
+                SELECT max(at) AS last_tried, max(decided_at) FILTER (
+                    WHERE detail ? 'results'
+                ) AS last_failed
+                FROM capability_evidence
+                WHERE engine_version_id = $2 AND hardware_class = $1 AND source = 'probe'
+                  AND node_id = n.id AND result = 'FAILED'
+             ) prior ON true
              WHERE n.status = 'ONLINE'
                AND ($1 = 'cpu' OR EXISTS (SELECT 1 FROM gpu_devices g WHERE g.node_id = n.id
                      AND g.present AND g.health = 'OK' AND g.vendor = $1))
-             ORDER BY n.last_heartbeat_at DESC NULLS LAST, n.id LIMIT 1",
-        )
-        .bind(class.as_str())
-        .fetch_optional(self.db.pool())
-        .await?;
-        let Some(node) = node else { return Ok(false) };
+               AND (prior.last_failed IS NULL OR prior.last_failed <= now() - make_interval(secs => $3))
+             ORDER BY prior.last_tried ASC NULLS FIRST, n.last_heartbeat_at DESC NULLS LAST, n.id",
+        ).bind(class.as_str()).bind(version).bind(self.config.probe_retry_seconds as f64)
+         .fetch_all(&mut *tx).await?;
+        let mut node = None;
+        for row in rows {
+            if manifest
+                .is_none_or(|m| store::machine_from_row(&row).is_ok_and(|i| i.supports(m, class)))
+            {
+                node = Some(row.try_get::<Uuid, _>("id")?);
+                break;
+            }
+        }
+        let Some(node) = node else {
+            tx.commit().await?;
+            return Ok(false);
+        };
         let checks: Vec<i32> = checks_for(class).into_iter().map(|c| c as i32).collect();
-        // The row comes first: a crash before the send leaves a PENDING row that times out.
         let evidence = Uuid::now_v7();
         sqlx::query(
             "INSERT INTO capability_evidence (id, engine_version_id, hardware_class, source, node_id, result, detail)
              VALUES ($1, $2, $3, 'probe', $4, 'PENDING', $5)",
-        )
-        .bind(evidence)
-        .bind(version)
-        .bind(class.as_str())
-        .bind(node)
-        .bind(json!({ "checks": checks }))
-        .execute(self.db.pool())
-        .await?;
+        ).bind(evidence).bind(version).bind(class.as_str()).bind(node)
+         .bind(json!({ "checks": checks, "timeout_seconds": self.config.probe_timeout_seconds }))
+         .execute(&mut *tx).await?;
+        tx.commit().await?;
         let probe = Kind::Probe(Probe {
             request_id: evidence.to_string(),
             checks,
             peer_node_id: String::new(),
         });
-        match self
-            .sender
-            .send(NodeId::from_uuid(node), NewCommand::new(probe))
-            .await
-        {
+        let command =
+            NewCommand::new(probe).deadline(Duration::from_secs(self.config.probe_timeout_seconds));
+        match self.sender.send(NodeId::from_uuid(node), command).await {
             Ok(c) => {
                 sqlx::query("UPDATE capability_evidence SET command_id = $2 WHERE id = $1")
                     .bind(evidence)
@@ -176,16 +217,19 @@ impl Prober {
                     .await?;
                 Ok(true)
             }
-            Err(e) => {
-                // Refused (the machine left or drains): the row proves nothing, so drop it
-                // and let the next pass pick another machine.
-                tracing::info!(code = e.code(), error = %e, "probe not sent");
-                sqlx::query("DELETE FROM capability_evidence WHERE id = $1 AND result = 'PENDING'")
-                    .bind(evidence)
-                    .execute(self.db.pool())
-                    .await?;
+            Err(e @ NodesError::CommandRefused(_)) => {
+                sqlx::query(
+                    "UPDATE capability_evidence SET result = 'FAILED', decided_at = now()
+                     WHERE id = $1 AND result = 'PENDING'",
+                )
+                .bind(evidence)
+                .execute(self.db.pool())
+                .await?;
+                tracing::info!(code = e.code(), error = %e, "probe refused");
                 Ok(false)
             }
+            // A database failure can lose the response to a committed send.
+            Err(e) => Err(e.into()),
         }
     }
 }
@@ -210,9 +254,20 @@ impl ProbeSink {
             return Ok(());
         };
         let mut tx = self.db.begin().await?;
+        let version: Option<Uuid> = sqlx::query_scalar(
+            "SELECT engine_version_id FROM capability_evidence WHERE id = $1 AND node_id = $2 AND result = 'PENDING'",
+        ).bind(evidence).bind(item.node_id).fetch_optional(&mut *tx).await?;
+        let Some(version) = version else {
+            return Ok(());
+        };
+        let Some(_) = store::lock_version(&mut tx, version).await? else {
+            return Ok(());
+        };
         let row = sqlx::query(
             "SELECT engine_version_id, hardware_class, detail FROM capability_evidence
-             WHERE id = $1 AND node_id = $2 AND source = 'probe' AND result = 'PENDING' FOR UPDATE",
+             WHERE id = $1 AND node_id = $2 AND source = 'probe' AND result = 'PENDING'
+               AND at + make_interval(secs => COALESCE((detail->>'timeout_seconds')::float8, 300)) > now()
+             FOR UPDATE",
         )
         .bind(evidence)
         .bind(item.node_id)
@@ -232,15 +287,13 @@ impl ProbeSink {
             .map(|a| a.iter().filter_map(Value::as_i64).collect())
             .unwrap_or_default();
         let ok = |o: i32| {
-            [
-                ProbeOutcome::Ok,
-                ProbeOutcome::Warning,
-                ProbeOutcome::NotApplicable,
-            ]
-            .iter()
-            .any(|x| *x as i32 == o)
+            [ProbeOutcome::Ok, ProbeOutcome::Warning]
+                .iter()
+                .any(|x| *x as i32 == o)
         };
-        let passed = p.checks.iter().all(|c| ok(c.outcome))
+        let passed = !asked.is_empty()
+            && p.checks.len() == asked.len()
+            && p.checks.iter().all(|c| ok(c.outcome))
             && asked
                 .iter()
                 .all(|a| p.checks.iter().any(|c| i64::from(c.check) == *a));

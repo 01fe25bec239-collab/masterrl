@@ -23,7 +23,7 @@ use mrl_proto::agent::v1::{
 use mrl_proto::common::v1::Failure;
 use mrl_server::modules::engines::probes::ProbeSink;
 use mrl_server::modules::engines::{
-    CapabilityValidator, EnginesConfig, Pick, Records, RegistryRecords,
+    CapabilityValidator, EnginesConfig, Pick, RecordScope, Records, RegistryRecords,
 };
 use mrl_server::modules::jobs::JobSpec;
 use mrl_server::modules::nodes::lanes::{LaneItem, LaneKind, LaneSink};
@@ -40,21 +40,34 @@ const GOLDEN: &str = include_str!("../../../../../tests/fixtures/rejections/engi
 /// Model and dataset records the test knows.
 #[derive(Default)]
 struct TestRecords {
+    scope: Option<RecordScope>,
     models: BTreeMap<ModelVersionId, ModelFacts>,
     datasets: BTreeMap<DatasetVersionId, DatasetFacts>,
 }
 
 #[async_trait]
 impl RegistryRecords for TestRecords {
-    async fn model(&self, _: Uuid, id: ModelVersionId) -> Result<Option<ModelFacts>, SeamError> {
-        Ok(self.models.get(&id).cloned())
+    async fn model(
+        &self,
+        scope: &RecordScope,
+        id: ModelVersionId,
+    ) -> Result<Option<ModelFacts>, SeamError> {
+        Ok(self
+            .scope
+            .is_none_or(|s| &s == scope)
+            .then(|| self.models.get(&id).cloned())
+            .flatten())
     }
     async fn dataset(
         &self,
-        _: Uuid,
+        scope: &RecordScope,
         id: DatasetVersionId,
     ) -> Result<Option<DatasetFacts>, SeamError> {
-        Ok(self.datasets.get(&id).cloned())
+        Ok(self
+            .scope
+            .is_none_or(|s| &s == scope)
+            .then(|| self.datasets.get(&id).cloned())
+            .flatten())
     }
 }
 
@@ -75,6 +88,7 @@ fn world() -> World {
             params: Some(1.0e8),
             has_chat_template: true,
             requires_remote_code: false,
+            remote_code_approved: false,
         },
     );
     r.datasets.insert(
@@ -150,12 +164,20 @@ impl CommandHandler for AnswerProbes {
 
 /// A CPU machine enrolled in a new pool that answers every probe OK: its agent, its loop
 /// (keep both alive while the test needs it), node id and pool id.
-async fn join_cpu_machine(s: &TestServer) -> (TestAgent, Running, String, String) {
+async fn join_cpu_machine(db: &TestDb, s: &TestServer) -> (TestAgent, Running, String, String) {
+    join_cpu_machine_answer(db, s, Some(ProbeOutcome::Ok)).await
+}
+
+async fn join_cpu_machine_answer(
+    db: &TestDb,
+    s: &TestServer,
+    outcome: Option<ProbeOutcome>,
+) -> (TestAgent, Running, String, String) {
     let pool = call(
         s,
         Method::POST,
         "/api/v1/pools",
-        Some(json!({"name": "p24"})),
+        Some(json!({"name": format!("p24-{}", Uuid::now_v7())})),
     )
     .await;
     assert_eq!(pool.status, 201, "{}", pool.text());
@@ -171,13 +193,17 @@ async fn join_cpu_machine(s: &TestServer) -> (TestAgent, Running, String, String
     let token = token.json()["token"].as_str().unwrap().to_owned();
     let agent = TestAgent::new(0, |_| {});
     let link = Link::of(&agent.ctx).unwrap();
-    link.register(
-        "Probe",
-        Arc::new(AnswerProbes {
-            link: link.clone(),
-            outcome: ProbeOutcome::Ok,
-        }),
-    );
+    if let Some(outcome) = outcome {
+        link.register(
+            "Probe",
+            Arc::new(AnswerProbes {
+                link: link.clone(),
+                outcome,
+            }),
+        );
+    } else {
+        link.expect(&["Probe"]);
+    }
     let grpc = s.running().grpc_addr().expect("grpc listener");
     let node = mrl_agent::enroll::enroll_dial(
         &agent.ctx,
@@ -191,6 +217,18 @@ async fn join_cpu_machine(s: &TestServer) -> (TestAgent, Running, String, String
     .link
     .node_id;
     let running = agent.run();
+    // The machine keeps the test host's real inventory (macOS on a laptop, Linux in CI).
+    let id = NodeId::from_str(&node).unwrap().as_uuid();
+    wait_for("online CPU machine", async || {
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS (SELECT 1 FROM compute_nodes WHERE id = $1 AND status = 'ONLINE')",
+        )
+        .bind(id)
+        .fetch_one(db.pool())
+        .await
+        .unwrap()
+    })
+    .await;
     (agent, running, node, pool)
 }
 
@@ -202,6 +240,23 @@ async fn wait_for(what: &str, mut ok: impl AsyncFnMut() -> bool) {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     panic!("timed out waiting for {what}");
+}
+
+async fn record_project(db: &TestDb) -> ProjectId {
+    let project = ProjectId::new();
+    let ws = Uuid::now_v7();
+    db.seed(&format!(
+        "INSERT INTO organizations (id, slug, name, kind) VALUES ('{}', 'p24', 'P24', 'team');
+         INSERT INTO workspaces (id, org_id, slug, name) VALUES ('{ws}', '{}', 'p24', 'P24');
+         INSERT INTO projects (id, org_id, workspace_id, slug, name)
+         VALUES ('{}', '{}', '{ws}', 'p24', 'P24');",
+        Uuid::nil(),
+        Uuid::nil(),
+        project.as_uuid(),
+        Uuid::nil(),
+    ))
+    .await;
+    project
 }
 
 async fn scalar_text(db: &TestDb, sql: &str) -> Option<String> {
@@ -324,6 +379,37 @@ async fn a_changed_manifest_under_the_same_version_or_a_reserved_metric_stops_st
         "{err}"
     );
 
+    let mut fresh: Value = serde_json::from_str(GOLDEN).unwrap();
+    fresh["manifest"]["metadata"]["name"] = json!("rolled-back");
+    assert!(start(
+        &db,
+        &secrets,
+        engines_config(true),
+        vec![fresh.to_string(), changed.to_string()],
+        Records::default()
+    )
+    .await
+    .is_err());
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM training_engines WHERE name = 'rolled-back'")
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+    let mut schema_only: Value = serde_json::from_str(GOLDEN).unwrap();
+    schema_only["schemas"]["schemas/sft.schema.json"]["properties"]["learning_rate"]["minimum"] =
+        json!(0.1);
+    assert!(start(
+        &db,
+        &secrets,
+        engines_config(true),
+        vec![schema_only.to_string()],
+        Records::default()
+    )
+    .await
+    .err()
+    .expect("schema-only change must fail startup")
+    .contains("already registered"));
     let mut reserved: Value = serde_json::from_str(GOLDEN).unwrap();
     reserved["manifest"]["metadata"]["name"] = json!("reserved");
     reserved["manifest"]["spec"]["algorithms"][0]["metrics"][0]["name"] =
@@ -391,7 +477,7 @@ async fn a_passed_probe_enables_cpu_then_runs_are_queued_or_rejected_by_l0() {
     assert_eq!(early["state_reason"]["code"], "MRL-CAP-245", "{early}");
 
     // A CPU machine joins and answers probes.
-    let (_agent, running, node, pool) = join_cpu_machine(&s).await;
+    let (_agent, running, node, pool) = join_cpu_machine(&db, &s).await;
 
     // Probes reach it; every engine version with a CPU setup is enabled on `cpu`.
     wait_for("fake ENABLED", async || {
@@ -426,7 +512,10 @@ async fn a_passed_probe_enables_cpu_then_runs_are_queued_or_rejected_by_l0() {
     assert!(enabled >= 2);
     let detail = get(&s, "/api/v1/engines/fake/versions/0.1.0").await;
     assert_eq!(detail.status, 200, "{}", detail.text());
-    assert_eq!(detail.json()["probe_results"]["cpu"]["status"], "ENABLED");
+    assert_eq!(
+        detail.json()["probe_results"]["cpu"],
+        json!({"status": "ENABLED"})
+    );
     assert_eq!(
         detail.json()["algorithms"][0]["verified_hw"],
         json!(["cpu"])
@@ -476,6 +565,27 @@ async fn a_passed_probe_enables_cpu_then_runs_are_queued_or_rejected_by_l0() {
         "{named}"
     );
 
+    let mut trl: Value = serde_json::from_str(GOLDEN).unwrap();
+    trl["manifest"]["metadata"]["name"] = json!("trl");
+    let trl = mrl_domain::capability::manifest::Bundle::parse(&trl.to_string()).unwrap();
+    mrl_server::modules::engines::store::register(db.db(), &[&trl], true)
+        .await
+        .unwrap();
+    let named_ppo = submit(
+        &s,
+        submission(&w, "ppo", json!({"common": {"engine": "trl"}}), 0),
+    )
+    .await;
+    assert_eq!(named_ppo["state_reason"]["code"], "MRL-CAP-002");
+    for config in [
+        json!({"common": []}),
+        json!({"engine": []}),
+        json!({"common": {"engine": true}}),
+    ] {
+        let malformed = submit(&s, submission(&w, "x-fake.steps", config, 0)).await;
+        assert_eq!(malformed["state_reason"]["code"], "MRL-VAL-003");
+    }
+
     // Unknown model and dataset records.
     let mut unknown = submission(&w, "x-fake.steps", json!({}), 0);
     unknown["base_model_version_id"] = json!(ModelVersionId::new().to_string());
@@ -489,11 +599,12 @@ async fn a_passed_probe_enables_cpu_then_runs_are_queued_or_rejected_by_l0() {
         .collect();
     assert_eq!(codes, ["MRL-DATA-240", "MRL-MODEL-240"]);
 
+    let project = record_project(&db).await;
     // Capabilities for the pool drive the UI: the fake method runs, QLoRA is not offered.
     let caps = get(
         &s,
         &format!(
-            "/api/v1/capabilities?model_version={}&dataset_version={}&pool={pool}",
+            "/api/v1/capabilities?model_version={}&dataset_version={}&pool={pool}&project={project}",
             w.model, w.dataset
         ),
     )
@@ -583,8 +694,8 @@ async fn probe_answers_count_once_and_only_from_the_machine_asked() {
     }
     sink.deliver(foreign).await.unwrap();
     assert_eq!(state().await.as_deref(), Some("PENDING"));
-    // A failed answer counts; a later (replayed or forged) passing one changes nothing.
-    sink.deliver(item(asked, ProbeOutcome::Failed))
+    // A required check that does not apply counts as a failure; a later (replayed or forged) passing one changes nothing.
+    sink.deliver(item(asked, ProbeOutcome::NotApplicable))
         .await
         .unwrap();
     sink.deliver(item(asked, ProbeOutcome::Ok)).await.unwrap();
@@ -603,6 +714,26 @@ async fn probe_answers_count_once_and_only_from_the_machine_asked() {
     )
     .await;
     assert_eq!(cpu.as_deref(), Some("FAILED"));
+    // A persisted command can answer even if its commit reply was lost before command_id was linked.
+    let unlinked = Uuid::now_v7();
+    db.seed(&format!(
+        "INSERT INTO capability_evidence (id, engine_version_id, hardware_class, source, node_id, result, detail)
+         VALUES ('{unlinked}', '{version}', 'cpu', 'probe', '{asked}', 'PENDING', jsonb_build_object('checks', ARRAY[1]))"
+    )).await;
+    let mut result = item(asked, ProbeOutcome::Ok);
+    if let Some(Msg::ProbeResult(p)) = &mut result.message.body {
+        p.request_id = unlinked.to_string();
+    }
+    sink.deliver(result).await.unwrap();
+    assert_eq!(
+        scalar_text(
+            &db,
+            &format!("SELECT result FROM capability_evidence WHERE id = '{unlinked}'")
+        )
+        .await
+        .as_deref(),
+        Some("PASSED")
+    );
     s.shutdown().await.unwrap();
 }
 
@@ -661,10 +792,11 @@ async fn algorithm_schema_and_version_routes_answer_and_refuse_bad_input() {
             .status,
         404
     );
+    let project = record_project(&db).await;
     let caps = get(
         &s,
         &format!(
-            "/api/v1/capabilities?model_version={}",
+            "/api/v1/capabilities?model_version={}&project={project}",
             ModelVersionId::new()
         ),
     )
@@ -693,7 +825,7 @@ async fn an_sft_run_on_the_tiny_fixtures_passes_l0_and_picks_the_fake_engine() {
     let s = start(&db, &secrets, engines_config(true), vec![], tiny.records())
         .await
         .unwrap();
-    let (_agent, running, _, _) = join_cpu_machine(&s).await;
+    let (_agent, running, _, _) = join_cpu_machine(&db, &s).await;
     wait_for("fake ENABLED", async || {
         scalar_text(&db, "SELECT ev.status FROM engine_versions ev JOIN training_engines te ON te.id = ev.engine_id WHERE te.name = 'fake'")
             .await
@@ -738,11 +870,129 @@ async fn an_sft_run_on_the_tiny_fixtures_passes_l0_and_picks_the_fake_engine() {
     // Another model is unknown to the fixture records.
     let other = JobSpec {
         base_model_version_id: Uuid::new_v4(),
-        ..spec
+        ..spec.clone()
     };
     match v.pick(&other).await.unwrap() {
         Pick::Rejected(r) => assert_eq!(r[0].code.to_string(), "MRL-MODEL-240"),
         p => panic!("expected a rejection, got {p:?}"),
     }
+    for scope in [
+        RecordScope {
+            org_id: org,
+            project_id: Uuid::now_v7(),
+        },
+        RecordScope {
+            org_id: Uuid::now_v7(),
+            project_id: spec.project_id,
+        },
+    ] {
+        let records = TestRecords {
+            scope: Some(scope),
+            models: [(tiny.model, TinyFixture::model_facts())].into(),
+            datasets: [(tiny.dataset, TinyFixture::dataset_facts())].into(),
+        };
+        let scoped = CapabilityValidator::with_records(
+            db.db().clone(),
+            Records::new(vec![Arc::new(records)]),
+        );
+        let missing = JobSpec {
+            base_model_version_id: Uuid::now_v7(),
+            dataset_version_ids: vec![Uuid::now_v7()],
+            ..spec.clone()
+        };
+        let missing = scoped.pick(&missing).await.unwrap();
+        assert_eq!(scoped.pick(&spec).await.unwrap(), missing);
+        let Pick::Rejected(problems) = missing else {
+            panic!("the missing records must be rejected")
+        };
+        assert_eq!(
+            problems.iter().map(|p| p.code.as_str()).collect::<Vec<_>>(),
+            ["MRL-DATA-240", "MRL-MODEL-240"]
+        );
+    }
     running.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn retries_move_on_from_expired_and_failed_probes() {
+    let db = TestDb::new().await;
+    let settings = engines_config(true);
+    let s = start(
+        &db,
+        &Arc::new(InMemorySecretStore::default()),
+        settings,
+        vec![],
+        Records::default(),
+    )
+    .await
+    .unwrap();
+    let (_silent, silent, silent_id, _) = join_cpu_machine_answer(&db, &s, None).await;
+    let pool = db.pool();
+    let decision = |node: String| async move {
+        let node = NodeId::from_str(&node).unwrap().as_uuid();
+        sqlx::query_scalar::<_, String>(
+            "SELECT ce.result FROM capability_evidence ce
+             JOIN engine_versions ev ON ev.id = ce.engine_version_id
+             JOIN training_engines te ON te.id = ev.engine_id
+             WHERE ce.node_id = $1 AND te.name = 'fake' ORDER BY ce.at DESC LIMIT 1",
+        )
+        .bind(node)
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    };
+    let first = || async {
+        sqlx::query_scalar::<_, Uuid>(
+            "SELECT ce.id FROM capability_evidence ce
+             JOIN engine_versions ev ON ev.id = ce.engine_version_id
+             JOIN training_engines te ON te.id = ev.engine_id
+             WHERE ce.node_id = $1 AND te.name = 'fake' AND ce.result = 'PENDING' LIMIT 1",
+        )
+        .bind(NodeId::from_str(&silent_id).unwrap().as_uuid())
+        .fetch_optional(pool)
+        .await
+        .unwrap()
+    };
+    wait_for("silent outstanding probe", async || first().await.is_some()).await;
+    let original = first().await.unwrap();
+    sqlx::query("UPDATE capability_evidence SET at = now() - interval '1 day' WHERE id = $1")
+        .bind(original)
+        .execute(pool)
+        .await
+        .unwrap();
+    wait_for(
+        "the lone machine is retried without the failure cooldown",
+        async || first().await.is_some_and(|id| id != original),
+    )
+    .await;
+    let retry = first().await.unwrap();
+    let (_failed, failed, failed_id, _) =
+        join_cpu_machine_answer(&db, &s, Some(ProbeOutcome::Failed)).await;
+    sqlx::query("UPDATE capability_evidence SET at = now() - interval '1 day' WHERE id = $1")
+        .bind(retry)
+        .execute(pool)
+        .await
+        .unwrap();
+    wait_for("failed fallback probe", async || {
+        decision(failed_id.clone()).await.as_deref() == Some("FAILED")
+    })
+    .await;
+    silent.stop().await;
+    sqlx::query("UPDATE compute_nodes SET status = 'OFFLINE' WHERE id = $1")
+        .bind(NodeId::from_str(&silent_id).unwrap().as_uuid())
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE capability_evidence SET at = now() - interval '1 day' WHERE node_id = $1 AND result = 'PENDING'")
+        .bind(NodeId::from_str(&silent_id).unwrap().as_uuid())
+        .execute(pool).await.unwrap();
+    let (_good, good, good_id, _) = join_cpu_machine(&db, &s).await;
+    wait_for("healthy fallback probe", async || {
+        decision(good_id.clone()).await.as_deref() == Some("PASSED")
+    })
+    .await;
+    failed.stop().await;
+    good.stop().await;
+    s.shutdown().await.unwrap();
 }
