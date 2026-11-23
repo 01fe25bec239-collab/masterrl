@@ -141,3 +141,31 @@ async def _mute_agent(tmp_path: Path) -> None:
 
 def test_an_agent_that_never_answers_the_hello_is_left_for_a_new_connection(tmp_path: Path) -> None:
     asyncio.run(_mute_agent(tmp_path))
+
+
+async def _deaf_agent(tmp_path: Path) -> None:
+    agent = _agent(tmp_path)
+    await agent.start()
+    session = WorkerSession(agent.target, pb.Hello(attempt_id="att_1"), Spool(tmp_path / "spool"))
+    session.ack_timeout_s = 0.5
+    session.start()
+    try:
+        assert await session.wait_acked(10)
+        agent.hold_acks = True  # takes messages, never answers: a stream left behind
+        session.send(pb.MetricsBatch(points=[pb.MetricPoint(name="m", step=1)]))
+        await agent.wait_for(lambda m: m.seq == 1)
+        for _ in range(100):
+            if session.connections >= 2:
+                break
+            await asyncio.sleep(0.05)
+        assert session.connections >= 2, "connected again"
+        assert agent.sessions >= 2
+        # The unacked message is sent again on the new stream.
+        await agent.wait_for(lambda m: m.seq == 1 and agent.duplicates >= 1)
+    finally:
+        await session.close()
+        await agent.close()
+
+
+def test_a_stream_the_agent_stopped_answering_is_replaced(tmp_path: Path) -> None:
+    asyncio.run(_deaf_agent(tmp_path))

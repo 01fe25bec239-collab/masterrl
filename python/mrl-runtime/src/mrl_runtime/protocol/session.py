@@ -9,6 +9,7 @@ keeps reconnecting while the worker keeps training and spooling.
 import asyncio
 import contextlib
 import logging
+import time
 from collections.abc import Sequence
 
 import grpc.aio
@@ -89,6 +90,10 @@ class WorkerSession:
         self._reconnect_max_s = reconnect_max_s
         # Longest wait for the agent's HelloAck before connecting again.
         self.hello_timeout_s = 10.0
+        # Longest silence from the agent while messages wait for its ack, before connecting
+        # again (a stream an old agent left behind is never answered).
+        self.ack_timeout_s = 20.0
+        self._heard = 0.0
         self._wake = asyncio.Event()
         self._write_lock = asyncio.Lock()  # gRPC allows one write at a time per stream
         self._acked = asyncio.Event()
@@ -198,20 +203,32 @@ class WorkerSession:
             self._spool.rewind(max(first.hello_ack.resume_from_seq, first.ack_seq + 1))
             self._call = call
             self.connections += 1
+            self._heard = time.monotonic()
             self.connected.set()
             self._wake.set()
             writer = asyncio.create_task(self._write_loop(call))
             reader = asyncio.create_task(self._read_loop(call))
+            watchdog = asyncio.create_task(self._watch_acks())
             try:
                 # Either side ending means the stream is gone: reconnect and replay.
-                done, _ = await asyncio.wait({reader, writer}, return_when=asyncio.FIRST_COMPLETED)
+                done, _ = await asyncio.wait(
+                    {reader, writer, watchdog}, return_when=asyncio.FIRST_COMPLETED
+                )
                 for task in done:
                     task.result()  # re-raise a stream error or a protocol violation
             finally:
-                for task in (reader, writer):
+                for task in (reader, writer, watchdog):
                     task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, *_STREAM_ERRORS):
-                    await asyncio.gather(reader, writer)
+                    await asyncio.gather(reader, writer, watchdog)
+
+    async def _watch_acks(self) -> None:
+        """Ends a stream the agent stopped answering: messages wait for an ack and nothing
+        came for `ack_timeout_s`. The session then connects again and replays them."""
+        while True:
+            await asyncio.sleep(min(1.0, self.ack_timeout_s / 4))
+            if len(self._spool) and time.monotonic() - self._heard > self.ack_timeout_s:
+                raise ConnectionError(f"no word from the agent in {self.ack_timeout_s:.0f} s")
 
     async def _write_loop(self, call: _Call) -> None:
         while True:
@@ -228,6 +245,7 @@ class WorkerSession:
             msg = await _read(call)
             if msg is None:
                 return
+            self._heard = time.monotonic()
             self._spool.ack(msg.ack_seq)
             if not len(self._spool):
                 self._acked.set()
