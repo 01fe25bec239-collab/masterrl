@@ -1,0 +1,56 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.masterrl.dev/datasets/mm.messages.v1.schema.json",
+  "title": "mm.messages.v1",
+  "description": "Multimodal chat: message content is a list of text and image parts.",
+  "x-mrl-rules": {
+    "role_order": "An optional first system message, then user and assistant alternating, starting with user and ending with assistant."
+  },
+  "type": "object",
+  "required": ["messages"],
+  "properties": {
+    "messages": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/message" }
+    },
+    "meta": { "$ref": "common.v1.schema.json#/$defs/meta" }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "message": {
+      "type": "object",
+      "required": ["role", "content"],
+      "properties": {
+        "role": { "$ref": "common.v1.schema.json#/$defs/role" },
+        "content": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/part" } }
+      },
+      "additionalProperties": false
+    },
+    "part": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type", "text"],
+          "properties": {
+            "type": { "const": "text" },
+            "text": { "$ref": "common.v1.schema.json#/$defs/text" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["type", "image_ref"],
+          "properties": {
+            "type": { "const": "image_ref" },
+            "image_ref": {
+              "description": "Content reference to the image, e.g. sha256:<hex>.",
+              "$ref": "common.v1.schema.json#/$defs/text"
+            }
+          },
+          "additionalProperties": false
+        }
+      ]
+    }
+  }
+}

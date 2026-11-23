@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.masterrl.dev/datasets/common.v1.schema.json",
+  "title": "Shared dataset parts",
+  "description": "Building blocks referenced by the dataset schemas. Not a dataset schema itself.",
+  "$defs": {
+    "text": {
+      "description": "Non-empty UTF-8 text.",
+      "type": "string",
+      "minLength": 1
+    },
+    "role": {
+      "enum": ["system", "user", "assistant"]
+    },
+    "message": {
+      "type": "object",
+      "required": ["role", "content"],
+      "properties": {
+        "role": { "$ref": "#/$defs/role" },
+        "content": { "$ref": "#/$defs/text" }
+      },
+      "additionalProperties": false
+    },
+    "messages": {
+      "description": "Chat messages in TRL conversational form.",
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/message" }
+    },
+    "textOrMessages": {
+      "description": "Plain text, or chat messages (TRL standard vs conversational form). Role order is not checked here.",
+      "anyOf": [{ "$ref": "#/$defs/text" }, { "$ref": "#/$defs/messages" }]
+    },
+    "meta": {
+      "description": "Free-form metadata kept with the record.",
+      "x-mrl-open": "user metadata has no fixed fields",
+      "type": "object"
+    }
+  }
+}

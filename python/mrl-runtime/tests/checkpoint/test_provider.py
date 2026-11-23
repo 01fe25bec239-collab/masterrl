@@ -73,11 +73,15 @@ async def _stage_and_commit(tmp_path: Path) -> None:
         is_final=True,
         adapter=AdapterInfo("lora", 8, 16.0, ("q_proj",)),
     )
-    staged = await provider.stage(ready, {"train/loss": 0.5})
+    staged = await provider.stage(
+        ready, {"train/loss": 0.5, "eval/loss": float("nan"), "train/grad_norm": float("inf")}
+    )
     assert not ready.path.exists()  # moved into staging
     doc = json.loads((staged.directory / MANIFEST_FILE).read_text())
     assert schema_errors(doc, "checkpoint-manifest/v1") == []
     assert doc["kind"] == "adapter_only"
+    assert doc["metrics"] == {"train/loss": 0.5}
+    assert dict(staged.message.metrics_at_step) == doc["metrics"]
     assert {f["path"] for f in doc["files"]} == {
         "model.safetensors",
         "optimizer.pt",
@@ -123,6 +127,36 @@ def test_stage_commit_and_max_pending(tmp_path: Path) -> None:
     asyncio.run(_stage_and_commit(tmp_path))
 
 
+def test_older_ack_does_not_replace_newer_committed_checkpoint(tmp_path: Path) -> None:
+    async def run() -> None:
+        sent: asyncio.Queue[object] = asyncio.Queue()
+        provider = CheckpointProvider(sent.put_nowait, _settings(tmp_path, max_pending=2))
+        checkpoints = [
+            await provider.stage(CheckpointReady(step, _engine_dir(tmp_path, step)), {})
+            for step in (2, 3)
+        ]
+        for checkpoint in checkpoints:
+            provider.submit(checkpoint)
+            assert isinstance(await asyncio.wait_for(sent.get(), 5), pb.CheckpointStaged)
+            provider.on_grant(pb.UploadGrant(checkpoint_id=checkpoint.checkpoint_id))
+
+        for _ in checkpoints:
+            assert isinstance(await asyncio.wait_for(sent.get(), 5), pb.CheckpointCommitRequest)
+        for checkpoint in reversed(checkpoints):
+            provider.on_ack(
+                pb.CheckpointCommitAck(
+                    checkpoint_id=checkpoint.checkpoint_id, state=pb.COMMIT_STATE_COMMITTED
+                )
+            )
+            await asyncio.sleep(0)
+
+        assert await provider.wait_all(5)
+        assert provider.last_committed_step == 3
+        assert provider.last_committed_id == checkpoints[-1].checkpoint_id
+
+    asyncio.run(run())
+
+
 async def _escape(tmp_path: Path) -> None:
     provider = CheckpointProvider(lambda _m: None, _settings(tmp_path))
     staged = await provider.stage(CheckpointReady(1, _engine_dir(tmp_path, 1)), {})
@@ -153,6 +187,18 @@ def test_restore_path_and_parent(tmp_path: Path) -> None:
         return json.loads((staged.directory / MANIFEST_FILE).read_text())["parent_checkpoint_id"]
 
     assert asyncio.run(go()) == "ckpt_parent"
+
+
+def test_a_resumed_attempt_reports_the_resumed_checkpoint_until_a_new_one_commits(
+    tmp_path: Path,
+) -> None:
+    resume = tmp_path / "resume"
+    resume.mkdir()
+    (resume / MANIFEST_FILE).write_text(json.dumps({"checkpoint_id": "ckpt_parent"}))
+    provider = CheckpointProvider(lambda _m: None, _settings(tmp_path, resume_from=resume))
+    assert provider.last_committed_id == "ckpt_parent"
+    fresh = CheckpointProvider(lambda _m: None, _settings(tmp_path))
+    assert fresh.last_committed_id == ""
 
 
 @pytest.mark.parametrize("state", [pb.COMMIT_STATE_CORRUPT, pb.COMMIT_STATE_REJECTED])

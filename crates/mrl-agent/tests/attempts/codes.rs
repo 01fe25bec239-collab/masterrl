@@ -30,6 +30,7 @@ fn every_attempt_code_is_registered() {
         },
         AttemptError::Draining(String::new()),
         AttemptError::Stopping,
+        AttemptError::CredentialsLost,
     ];
     for e in errors {
         let code: mrl_domain::errors::ErrorCode = e.code().parse().unwrap();

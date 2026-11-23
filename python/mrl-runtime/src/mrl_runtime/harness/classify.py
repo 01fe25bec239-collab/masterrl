@@ -211,6 +211,8 @@ class ExitState:
     final_commit: CommitResult | None = None
     cancelled: bool = False
     paused: bool = False
+    # False when the engine saves a checkpoint to pause and that checkpoint did not commit.
+    pause_saved: bool = True
 
 
 def _final_commit_failure(state: ExitState) -> common.Failure | None:
@@ -235,12 +237,21 @@ def _final_commit_failure(state: ExitState) -> common.Failure | None:
 def decide_exit(state: ExitState) -> tuple[pb.ExitKind, common.Failure | None]:
     """Exit precedence, highest first: harness-detected failure (stall, lease, divergence),
     engine failure, a final checkpoint that did not commit, user cancel, pause, completion.
-    A pause that arrived after the final checkpoint was written is a completion."""
+    A pause that arrived after the final checkpoint was written is a completion; a pause whose
+    checkpoint did not commit is a retryable failure (PAUSE_NOT_SAVED), never PAUSED."""
     fail = state.harness_failure or state.engine_failure or _final_commit_failure(state)
     if fail is not None:
         return pb.EXIT_KIND_FAILED, fail
     if state.cancelled:
         return pb.EXIT_KIND_CANCELLED, None
     if state.paused and not state.final_staged:
+        if not state.pause_saved:
+            return pb.EXIT_KIND_FAILED, failure(
+                common.FAILURE_CLASS_INFRA_TRANSIENT,
+                "PAUSE_NOT_SAVED",
+                "The run stopped to pause, but its checkpoint was not saved. "
+                "It will continue from the last saved checkpoint.",
+                retryable=True,
+            )
         return pb.EXIT_KIND_PAUSED, None
     return pb.EXIT_KIND_COMPLETED, None

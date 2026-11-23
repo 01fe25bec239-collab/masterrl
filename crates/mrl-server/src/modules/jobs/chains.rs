@@ -215,6 +215,9 @@ impl Chains {
             ],
             vec![
                 // <mrl:completion-verifiers> Verifiers go right below this line.
+                Arc::new(crate::modules::checkpoints::FinalCheckpointVerifier::new(
+                    db.clone(),
+                )),
             ],
             vec![
                 // <mrl:submission-resolvers> Resolvers go right below this line.

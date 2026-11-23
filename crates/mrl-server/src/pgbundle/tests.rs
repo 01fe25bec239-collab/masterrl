@@ -24,6 +24,28 @@ async fn binaries() -> Option<PgBinaries> {
     }
 }
 
+#[tokio::test]
+async fn a_lock_released_a_moment_later_is_taken_not_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let held = lock_data_dir(dir.path()).await.unwrap();
+    let release = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        drop(held);
+    });
+    lock_data_dir(dir.path()).await.unwrap();
+    release.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_lock_held_for_good_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let _held = lock_data_dir(dir.path()).await.unwrap();
+    let Err(err) = lock_data_dir(dir.path()).await else {
+        panic!("a held folder must be refused")
+    };
+    assert_eq!(err.code(), codes::DATA_DIR_LOCKED, "{err}");
+}
+
 fn options(dir: &Path, bins: PgBinaries, keep: usize) -> BundleOptions {
     BundleOptions {
         data_dir: dir.join("data"),

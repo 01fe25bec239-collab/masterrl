@@ -43,6 +43,7 @@ class AgentScript:
     max_message_bytes: int = 0
     auto_start: bool = True
     commit_state: pb.CommitState = pb.COMMIT_STATE_COMMITTED
+    answer_commits: bool = True  # False: commit requests are never answered (commit timeout)
     grant_prefix: str = ""  # non-empty: the grant moves each staged file under this prefix
 
 
@@ -73,6 +74,7 @@ class FakeAgent:
         self.accepted: int = 0  # highest contiguous seq received this agent lifetime
         self.durable: int = 0  # highest seq acked: survives restart()
         self.hold_acks = False  # True: receive but do not ack (messages stay non-durable)
+        self.mute_hellos = 0  # sessions that take the Hello and never answer (shutting down)
         self.received: list[pb.WorkerMessage] = []
         self.unsequenced: list[pb.WorkerMessage] = []
         self.sent: list[pb.AgentMessage] = []
@@ -160,6 +162,10 @@ class FakeAgent:
             return
         self.sessions += 1
         await self._record(first)
+        if self.mute_hellos > 0:
+            self.mute_hellos -= 1
+            await asyncio.sleep(3600)  # until the worker gives up and the stream is cancelled
+            return
         offered = set(first.hello.protocol_versions)
         common = [v for v in self.script.protocol_versions if v in offered]
         chosen = max(
@@ -266,6 +272,8 @@ class FakeAgent:
             manifest = next(f.path for f in staged.files if f.role == "manifest")
             where = self.script.staging_dir / self._grants[req.checkpoint_id][manifest]
             self.commits[req.checkpoint_id] = (state, staged.step, where.parent)
+            if not self.script.answer_commits:
+                return
             ack = pb.CheckpointCommitAck(
                 checkpoint_id=req.checkpoint_id, state=state, reason=reason
             )
