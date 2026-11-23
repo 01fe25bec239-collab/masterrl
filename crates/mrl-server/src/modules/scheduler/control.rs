@@ -740,8 +740,9 @@ pub(crate) async fn cancel(
         return Ok(());
     };
     let epoch = i64::try_from(attempt.fencing_epoch).unwrap_or(i64::MAX);
-    let prior: Option<(String, Vec<u8>, f64)> = sqlx::query_as(
-        "SELECT state, payload, extract(epoch from now() - updated_at)::float8
+    let prior: Option<(String, Vec<u8>, f64, i64)> = sqlx::query_as(
+        "SELECT state, payload, extract(epoch from now() - updated_at)::float8,
+                count(*) FILTER (WHERE state = 'FAILED') OVER ()
          FROM agent_commands WHERE node_id = $1 AND kind = 'CancelAttempt'
            AND attempt_id = $2 AND epoch = $3 ORDER BY seq DESC LIMIT 1",
     )
@@ -752,7 +753,7 @@ pub(crate) async fn cancel(
     .await?;
     let epoch = attempt.fencing_epoch;
     let request_id = format!("{}-{}-{epoch}", reason.to_lowercase(), attempt.attempt_id);
-    if prior.is_some_and(|(state, payload, age)| {
+    if prior.is_some_and(|(state, payload, age, failed)| {
         let same_request = matches!(
             mrl_proto::agent::v1::Command::decode(payload.as_slice()).map(|c| c.kind),
             Ok(Some(Kind::CancelAttempt(cmd))) if cmd.request_id == request_id
@@ -761,7 +762,7 @@ pub(crate) async fn cancel(
             && (matches!(
                 state.as_str(),
                 "PENDING" | "SENT" | "RECEIVED" | "COMPLETED"
-            ) || (state == "FAILED" && age < 5.0))
+            ) || (state == "FAILED" && age < refused_cancel_backoff(failed)))
     }) {
         return Ok(());
     }
@@ -783,6 +784,14 @@ pub(crate) async fn cancel(
         }
         Err(e) => Err(e.into()),
     }
+}
+
+/// Seconds to wait before sending a cancel again after `failed` refusals: 5, 10, 20, 40,
+/// then 60. A refusal can mean the launch is still being taken, so the cancel is retried; the
+/// lease ends an attempt the machine never runs.
+fn refused_cancel_backoff(failed: i64) -> f64 {
+    let doublings = u32::try_from(failed.saturating_sub(1).clamp(0, 4)).unwrap_or(4);
+    (5.0 * f64::from(1u32 << doublings)).min(60.0)
 }
 
 /// Runs the work queued after a commit.
@@ -829,6 +838,13 @@ pub(crate) async fn finalize(core: &Core, org: Uuid, job: Uuid) -> Result<(), Sc
 mod tests {
     use super::*;
     use mrl_proto::common::v1::Failure;
+
+    #[test]
+    fn refused_cancels_back_off_to_a_minute() {
+        let waits: Vec<f64> = (1..=7).map(super::refused_cancel_backoff).collect();
+        assert_eq!(waits, [5.0, 10.0, 20.0, 40.0, 60.0, 60.0, 60.0]);
+        assert_eq!(super::refused_cancel_backoff(0), 5.0);
+    }
 
     #[test]
     fn agent_text_is_stored_without_nul_and_bounded() {
