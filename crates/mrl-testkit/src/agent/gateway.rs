@@ -613,6 +613,71 @@ mod tests {
         assert!(dir.join("keys").exists());
     }
 
+    /// INT-2: one live command per (attempt, epoch, kind); a rolled-back transaction writes
+    /// none; a withdrawal supersedes unsent ones and drops their payload.
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn commands_are_written_in_the_callers_transaction_once_per_identity() {
+        let gw = GatewayHarness::start(TestDb::new().await).await;
+        let a = TestAgent::new(1, |_| {});
+        let node =
+            NodeId::from_str(&a.enroll(&gw, &gw.token(json!({})).await).await.unwrap()).unwrap();
+        let attempt = mrl_domain::ids::AttemptId::new();
+        let s = CommandSender::new(
+            &gw.gw,
+            &[CommandKind::LaunchAttempt, CommandKind::UpdateCredentials],
+        );
+        let launch = || {
+            NewCommand::new(Kind::LaunchAttempt(
+                mrl_proto::agent::v1::LaunchAttempt::default(),
+            ))
+            .attempt(attempt, 1)
+        };
+        let first = s.send(node, launch()).await.unwrap();
+        let again = s.send(node, launch()).await.unwrap();
+        assert!(first.new && !again.new);
+        assert_eq!(again.id, first.id, "the live launch is the same command");
+        let pool = gw.db.pool().clone();
+        let rows = |kind: &'static str| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query_as::<_, (String, Vec<u8>)>(
+                    "SELECT state, payload FROM agent_commands WHERE attempt_id = $1 AND kind = $2",
+                )
+                .bind(attempt.as_uuid())
+                .bind(kind)
+                .fetch_all(&pool)
+                .await
+                .unwrap()
+            }
+        };
+        assert_eq!(rows("LaunchAttempt").await.len(), 1);
+
+        let creds =
+            NewCommand::new(Kind::UpdateCredentials(Default::default())).attempt(attempt, 1);
+        let mut tx = gw.db.db().begin().await.unwrap();
+        s.send_in(&mut tx, node, creds.clone()).await.unwrap();
+        tx.rollback().await.unwrap();
+        assert!(rows("UpdateCredentials").await.is_empty(), "rolled back");
+
+        let mut tx = gw.db.db().begin().await.unwrap();
+        s.send_in(&mut tx, node, creds).await.unwrap();
+        let n = CommandSender::withdraw_in(
+            &mut tx,
+            attempt.as_uuid(),
+            1,
+            &[CommandKind::UpdateCredentials],
+        )
+        .await
+        .unwrap();
+        tx.commit().await.unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(
+            rows("UpdateCredentials").await,
+            vec![("SUPERSEDED".to_owned(), vec![])]
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[ignore = "needs PostgreSQL (just test-integration)"]
     async fn a_relaunch_at_a_newer_epoch_gets_a_lease_after_the_old_one_was_cancelled() {

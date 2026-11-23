@@ -68,6 +68,39 @@ pub mod codes {
     pub const STALE_RESERVATION: DomainCode = code(ErrorFamily::Conflict, 210);
 }
 
+/// A crash point: with the `failpoints` feature (tests), a name armed for `org` makes the next
+/// pass through it fail, as a core killed there would (its open transaction rolls back).
+pub(crate) fn failpoint(name: &'static str, org: Uuid) -> Result<(), SchedError> {
+    #[cfg(feature = "failpoints")]
+    if failpoints::take(name, org) {
+        return Err(SchedError::Internal(format!("crash point {name}")));
+    }
+    let _ = (name, org);
+    Ok(())
+}
+
+/// Test crash points (see `failpoint`).
+#[cfg(feature = "failpoints")]
+#[doc(hidden)]
+pub mod failpoints {
+    use std::sync::Mutex;
+    use uuid::Uuid;
+
+    static ARMED: Mutex<Vec<(&'static str, Uuid)>> = Mutex::new(Vec::new());
+
+    /// Arms `name` once for jobs of `org`.
+    pub fn arm(name: &'static str, org: Uuid) {
+        ARMED.lock().unwrap().push((name, org));
+    }
+
+    /// Disarms `name` for `org` and says whether it was armed.
+    pub fn take(name: &'static str, org: Uuid) -> bool {
+        let mut armed = ARMED.lock().unwrap();
+        let hit = armed.iter().position(|a| *a == (name, org));
+        hit.map(|i| armed.remove(i)).is_some()
+    }
+}
+
 /// What the scheduler fails with.
 #[derive(Debug, thiserror::Error)]
 pub enum SchedError {

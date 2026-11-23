@@ -25,7 +25,7 @@
 //! ```
 
 use super::{Gateway, NodesError};
-use crate::db::Db;
+use crate::db::{Db, DbError, Tx};
 use mrl_domain::ids::{AttemptId, NodeId};
 use mrl_proto::agent::v1::{command::Kind, Command};
 use prost::Message;
@@ -158,6 +158,8 @@ pub struct CommandRef {
     pub id: Uuid,
     /// Per-node sequence number.
     pub seq: u64,
+    /// False when an identical live command already existed (nothing new was written).
+    pub new: bool,
 }
 
 /// A command's state and result.
@@ -189,6 +191,55 @@ impl CommandSender {
 
     /// Writes the command for `node` (durable; delivered by whichever replica holds the stream).
     pub async fn send(&self, node: NodeId, cmd: NewCommand) -> Result<CommandRef, NodesError> {
+        let w = self.prepare(node, cmd)?;
+        let out = self
+            .db
+            .transaction(move |tx| {
+                let w = w.clone();
+                Box::pin(async move { w.write(tx).await })
+            })
+            .await?;
+        out.map_err(NodesError::CommandRefused)
+    }
+
+    /// Writes the command inside the caller's transaction (INT-2), so it exists exactly when
+    /// the caller's change commits: nothing reaches the agent from a rolled-back transaction.
+    /// The wake-up `pg_notify` is delivered at commit.
+    pub async fn send_in(
+        &self,
+        tx: &mut Tx,
+        node: NodeId,
+        cmd: NewCommand,
+    ) -> Result<CommandRef, NodesError> {
+        self.prepare(node, cmd)?
+            .write(tx)
+            .await?
+            .map_err(NodesError::CommandRefused)
+    }
+
+    /// Withdraws the attempt's unsent commands of `kinds` at `epoch` in the caller's
+    /// transaction: `PENDING` → `SUPERSEDED`, payloads emptied (a withdrawn credential never
+    /// stays stored). Returns how many.
+    pub async fn withdraw_in(
+        tx: &mut Tx,
+        attempt: Uuid,
+        epoch: i64,
+        kinds: &[CommandKind],
+    ) -> Result<u64, NodesError> {
+        let kinds: Vec<&str> = kinds.iter().map(|k| k.as_str()).collect();
+        Ok(sqlx::query(
+            "UPDATE agent_commands SET state = 'SUPERSEDED', payload = ''::bytea, updated_at = now()
+             WHERE attempt_id = $1 AND epoch = $2 AND state = 'PENDING' AND kind = ANY($3)",
+        )
+        .bind(attempt)
+        .bind(epoch)
+        .bind(&kinds)
+        .execute(&mut **tx)
+        .await?
+        .rows_affected())
+    }
+
+    fn prepare(&self, node: NodeId, cmd: NewCommand) -> Result<Write, NodesError> {
         let kind = CommandKind::of(&cmd.kind);
         if !self.kinds.contains(&kind) {
             return Err(NodesError::CommandRefused(format!(
@@ -196,7 +247,6 @@ impl CommandSender {
                 kind.as_str()
             )));
         }
-        let node = node.as_uuid();
         let deadline = time::Duration::try_from(cmd.deadline.unwrap_or(self.default_deadline))
             .unwrap_or(time::Duration::DAY);
         let (attempt, epoch) = match cmd.attempt {
@@ -209,7 +259,7 @@ impl CommandSender {
         let id = Uuid::now_v7();
         let command = Command {
             command_id: id.to_string(),
-            kind: Some(cmd.kind.clone()),
+            kind: Some(cmd.kind),
         };
         let size = envelope_len(&command);
         if size > crate::grpc::MAX_MESSAGE_BYTES {
@@ -218,76 +268,17 @@ impl CommandSender {
                 crate::grpc::MAX_MESSAGE_BYTES
             )));
         }
-        let payload = command.encode_to_vec();
-        let supersede = cmd.supersede;
-        let not_after = cmd.not_after;
-        let out = self
-            .db
-            .transaction(move |tx| {
-                let payload = payload.clone();
-                Box::pin(async move {
-                    let status: Option<String> =
-                        sqlx::query_scalar("SELECT status FROM compute_nodes WHERE id = $1 FOR UPDATE")
-                            .bind(node)
-                            .fetch_optional(&mut **tx)
-                            .await?;
-                    let refused = match status.as_deref() {
-                        None => Some("no machine has this id".to_owned()),
-                        Some("DECOMMISSIONED") => Some("the machine was removed".to_owned()),
-                        Some("DRAINING") if kind.starts_work() => {
-                            Some("the machine is draining and takes no new work".to_owned())
-                        }
-                        _ => None,
-                    };
-                    if let Some(r) = refused {
-                        return Ok(Err(r));
-                    }
-                    if supersede {
-                        sqlx::query(
-                            "UPDATE agent_commands SET state = 'SUPERSEDED', updated_at = now()
-                             WHERE node_id = $1 AND kind = $2 AND attempt_id IS NOT DISTINCT FROM $3
-                               AND state = 'PENDING'",
-                        )
-                        .bind(node)
-                        .bind(kind.as_str())
-                        .bind(attempt)
-                        .execute(&mut **tx)
-                        .await?;
-                    }
-                    let seq: i64 = sqlx::query_scalar(
-                        "UPDATE compute_nodes SET command_seq = command_seq + 1 WHERE id = $1 RETURNING command_seq",
-                    )
-                    .bind(node)
-                    .fetch_one(&mut **tx)
-                    .await?;
-                    sqlx::query(
-                        "INSERT INTO agent_commands (id, node_id, seq, kind, payload, attempt_id, epoch, state, deadline_at, not_after)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', LEAST(now() + $8, $9), $9)",
-                    )
-                    .bind(id)
-                    .bind(node)
-                    .bind(seq)
-                    .bind(kind.as_str())
-                    .bind(&payload)
-                    .bind(attempt)
-                    .bind(epoch)
-                    .bind(deadline)
-                    .bind(not_after)
-                    .execute(&mut **tx)
-                    .await?;
-                    sqlx::query("SELECT pg_notify($1, $2)")
-                        .bind(WAKE_CHANNEL)
-                        .bind(node.to_string())
-                        .execute(&mut **tx)
-                        .await?;
-                    Ok(Ok(seq.max(0) as u64))
-                })
-            })
-            .await?;
-        match out {
-            Ok(seq) => Ok(CommandRef { id, seq }),
-            Err(r) => Err(NodesError::CommandRefused(r)),
-        }
+        Ok(Write {
+            id,
+            node: node.as_uuid(),
+            kind,
+            payload: command.encode_to_vec(),
+            attempt,
+            epoch,
+            deadline,
+            not_after: cmd.not_after,
+            supersede: cmd.supersede,
+        })
     }
 
     /// The command's state and result.
@@ -306,6 +297,117 @@ impl CommandSender {
         .map_err(|e: sqlx::Error| e.into())
     }
 }
+
+/// One command ready to be written (see [`CommandSender::send`]).
+#[derive(Clone)]
+struct Write {
+    id: Uuid,
+    node: Uuid,
+    kind: CommandKind,
+    payload: Vec<u8>,
+    attempt: Option<Uuid>,
+    epoch: Option<i64>,
+    deadline: time::Duration,
+    not_after: Option<time::OffsetDateTime>,
+    supersede: bool,
+}
+
+impl Write {
+    /// `Err(reason)` when the machine refuses it. An attempt has one live command per kind
+    /// and epoch ([`IDENTITY_KINDS`]): writing it again returns the live one.
+    async fn write(&self, tx: &mut Tx) -> Result<Result<CommandRef, String>, DbError> {
+        let status: Option<String> =
+            sqlx::query_scalar("SELECT status FROM compute_nodes WHERE id = $1 FOR UPDATE")
+                .bind(self.node)
+                .fetch_optional(&mut **tx)
+                .await?;
+        let refused = match status.as_deref() {
+            None => Some("no machine has this id".to_owned()),
+            Some("DECOMMISSIONED") => Some("the machine was removed".to_owned()),
+            Some("DRAINING") if self.kind.starts_work() => {
+                Some("the machine is draining and takes no new work".to_owned())
+            }
+            _ => None,
+        };
+        if let Some(r) = refused {
+            return Ok(Err(r));
+        }
+        if self.supersede {
+            sqlx::query(
+                "UPDATE agent_commands SET state = 'SUPERSEDED', payload = ''::bytea, updated_at = now()
+                 WHERE node_id = $1 AND kind = $2 AND attempt_id IS NOT DISTINCT FROM $3
+                   AND state = 'PENDING'",
+            )
+            .bind(self.node)
+            .bind(self.kind.as_str())
+            .bind(self.attempt)
+            .execute(&mut **tx)
+            .await?;
+        }
+        if self.attempt.is_some() && IDENTITY_KINDS.contains(&self.kind) {
+            let live: Option<(Uuid, i64)> = sqlx::query_as(
+                "SELECT id, seq FROM agent_commands
+                 WHERE node_id = $1 AND kind = $2 AND attempt_id = $3 AND epoch IS NOT DISTINCT FROM $4
+                   AND state IN ('PENDING','SENT','RECEIVED')
+                 ORDER BY seq DESC LIMIT 1",
+            )
+            .bind(self.node)
+            .bind(self.kind.as_str())
+            .bind(self.attempt)
+            .bind(self.epoch)
+            .fetch_optional(&mut **tx)
+            .await?;
+            if let Some((id, seq)) = live {
+                return Ok(Ok(CommandRef {
+                    id,
+                    seq: seq.max(0) as u64,
+                    new: false,
+                }));
+            }
+        }
+        let seq: i64 = sqlx::query_scalar(
+            "UPDATE compute_nodes SET command_seq = command_seq + 1 WHERE id = $1 RETURNING command_seq",
+        )
+        .bind(self.node)
+        .fetch_one(&mut **tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO agent_commands (id, node_id, seq, kind, payload, attempt_id, epoch, state, deadline_at, not_after)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', LEAST(now() + $8, $9), $9)",
+        )
+        .bind(self.id)
+        .bind(self.node)
+        .bind(seq)
+        .bind(self.kind.as_str())
+        .bind(&self.payload)
+        .bind(self.attempt)
+        .bind(self.epoch)
+        .bind(self.deadline)
+        .bind(self.not_after)
+        .execute(&mut **tx)
+        .await?;
+        sqlx::query("SELECT pg_notify($1, $2)")
+            .bind(WAKE_CHANNEL)
+            .bind(self.node.to_string())
+            .execute(&mut **tx)
+            .await?;
+        Ok(Ok(CommandRef {
+            id: self.id,
+            seq: seq.max(0) as u64,
+            new: true,
+        }))
+    }
+}
+
+/// Kinds with one durable identity per (attempt, epoch): while one is live (`PENDING`, `SENT`,
+/// `RECEIVED`) another is not written (INT-2; the `agent_commands_one_live` index).
+pub const IDENTITY_KINDS: [CommandKind; 5] = [
+    CommandKind::LaunchAttempt,
+    CommandKind::StageArtifacts,
+    CommandKind::UpdateCredentials,
+    CommandKind::CancelAttempt,
+    CommandKind::PauseAttempt,
+];
 
 /// The largest the command's `CoreMessage` can be when sent (every envelope field at its
 /// widest), so a command that is stored can always be sent.

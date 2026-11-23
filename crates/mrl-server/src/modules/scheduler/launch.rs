@@ -14,7 +14,7 @@ use crate::db::Db;
 use crate::modules::artifacts::ArtifactStore;
 use crate::modules::compute::GpuSlot;
 use crate::modules::jobs::{AttemptRow, JobRow, JobTransitions};
-use crate::modules::nodes::commands::NewCommand;
+use crate::modules::nodes::commands::{CommandRef, NewCommand};
 use crate::modules::secrets::SecretResolver;
 use crate::seams::{Principal, PrincipalKind, RequestContext, Seams, SecretStore};
 use mrl_domain::failure::FailureClass;
@@ -488,17 +488,59 @@ pub(crate) async fn plan(
     Ok(Ok(plan))
 }
 
+/// Writes `cmd` in one transaction with the check that `attempt` is still its job's current
+/// PENDING attempt at this epoch (INT-2), so no command reaches a machine for an attempt that
+/// ended or was replaced meanwhile. `audit` is recorded with a newly written command, in the same
+/// transaction. `None`: not current any more, nothing written.
+async fn send_current(
+    core: &Core,
+    node: NodeId,
+    job: &JobRow,
+    attempt: &AttemptRow,
+    cmd: NewCommand,
+    audit: Option<&'static str>,
+) -> Result<Option<CommandRef>, SchedError> {
+    let mut tx = core.db.begin().await?;
+    // Attempt before job, the order `end_unstarted` locks them in.
+    let Some(a) = JobTransitions::lock_attempt(&mut tx, attempt.org_id, attempt.id).await? else {
+        return Ok(None);
+    };
+    let Some(j) = JobTransitions::lock(&mut tx, job.org_id, job.id).await? else {
+        return Ok(None);
+    };
+    if j.state != "PREPARING"
+        || j.current_attempt_id != Some(a.id)
+        || j.epoch != a.epoch
+        || a.state != "PENDING"
+    {
+        return Ok(None);
+    }
+    let sent = core.sender.send_in(&mut tx, node, cmd).await?;
+    if sent.new {
+        if let Some(action) = audit {
+            let target = AttemptId::from_uuid(a.id).to_string();
+            core.audit(&mut tx, j.org_id, Some(j.project_id), action, target)
+                .await?;
+        }
+    }
+    super::failpoint("launch.before_commit", j.org_id)?;
+    tx.commit().await?;
+    Ok(Some(sent))
+}
+
 /// Sends a prerequisite and waits for its saved result before moving to the next command.
 async fn prerequisite(
     core: &Core,
     node: NodeId,
+    job: &JobRow,
     attempt: &AttemptRow,
     kind: &str,
     command: NewCommand,
+    audit: Option<&'static str>,
 ) -> Result<bool, SchedError> {
     match latest_command(&core.db, kind, attempt).await? {
         None => {
-            core.sender.send(node, command).await?;
+            send_current(core, node, job, attempt, command, audit).await?;
             Ok(false)
         }
         Some(row) if row.in_flight() && !row.past_deadline => Ok(false),
@@ -547,7 +589,7 @@ async fn send(
             attempt: r.clone(),
             items: plan.stage,
         });
-        if !prerequisite(core, node, attempt, "StageArtifacts", command(k)).await? {
+        if !prerequisite(core, node, job, attempt, "StageArtifacts", command(k), None).await? {
             return Ok(());
         }
     }
@@ -556,29 +598,22 @@ async fn send(
             attempt: r,
             credentials: plan.credentials,
         });
-        let first = latest_command(&core.db, "UpdateCredentials", attempt)
-            .await?
-            .is_none();
-        let sent = prerequisite(core, node, attempt, "UpdateCredentials", command(k)).await?;
-        if first {
-            let mut tx = core.db.begin().await?;
-            let target = AttemptId::from_uuid(attempt.id).to_string();
-            core.audit(
-                &mut tx,
-                job.org_id,
-                Some(job.project_id),
-                "scheduler.credentials_sent",
-                target,
-            )
-            .await?;
-            tx.commit().await?;
-        }
+        let sent = prerequisite(
+            core,
+            node,
+            job,
+            attempt,
+            "UpdateCredentials",
+            command(k),
+            Some("scheduler.credentials_sent"),
+        )
+        .await?;
         if !sent {
             return Ok(());
         }
     }
     let k = Kind::LaunchAttempt(plan.launch);
-    core.sender.send(node, command(k).superseding()).await?;
+    send_current(core, node, job, attempt, command(k).superseding(), None).await?;
     Ok(())
 }
 
