@@ -2208,6 +2208,18 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-CAP-210")),
+            ("title", Value::Str("No machine in this pool can run this job as asked.")),
+            ("why", Value::Str("The job asks for more GPUs, GPU memory, a GPU type or memory than any machine in the pool has. The reason names what is missing.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Read the reason to see what the job needs that no machine has."),
+                    Value::Str("Ask for fewer or smaller GPUs, or add a machine that has them to the pool."),
+                    Value::Str("A job runs on one machine for now, so ask for 1 machine with more GPUs instead of several machines."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-CONFLICT-001")),
             ("title", Value::Str("Someone changed this item after you opened it.")),
             ("why", Value::Str("The version you edited is older than the saved one.")),
@@ -2300,6 +2312,17 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Delete the secret again to finish."),
                     Value::Str("Then create a new secret if you still need one."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CONFLICT-210")),
+            ("title", Value::Str("This reservation was changed by a newer holder.")),
+            ("why", Value::Str("Each reservation carries an epoch. A change made with an older epoch comes from work that was already replaced, so it doesn't count.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Read the reservation again and use its current epoch."),
+                    Value::Str("If your work was replaced, stop it; the newer holder owns the machine now."),
                 ])),
             ])),
         ]),
@@ -3296,6 +3319,16 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-PERM-210")),
+            ("title", Value::Str("No pool is open to this project.")),
+            ("why", Value::Str("Jobs run on the pools of their organization or on shared pools. None of them can take this job, or no pool exists yet.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Create a pool and add a machine to it, or ask an admin to open a pool to your organization."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-QUOTA-001")),
             ("title", Value::Str("Your team reached its limit on jobs or GPUs.")),
             ("why", Value::Str("Your org limits how many jobs and GPUs a project can use at once.")),
@@ -3324,6 +3357,39 @@ pub static CATALOG: Value = Value::Map(&[
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Wait about 1 minute, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-QUOTA-210")),
+            ("title", Value::Str("This job is waiting for a free machine.")),
+            ("why", Value::Str("A machine in the pool can run the job, but it is busy, offline or draining right now.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Nothing to do; the job starts by itself when a machine is free."),
+                    Value::Str("To start sooner, raise the job's priority or add a machine to the pool."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-QUOTA-211")),
+            ("title", Value::Str("This pool is paused and starts no new work.")),
+            ("why", Value::Str("An admin paused the pool (its `paused` flag is set). Work already running there goes on.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Wait until an admin resumes the pool."),
+                    Value::Str("Or ask an admin to open another pool to your project."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-QUOTA-212")),
+            ("title", Value::Str("Too many jobs of this project are ahead in the queue.")),
+            ("why", Value::Str("The scheduler places only a set number of each project's queued jobs at a time. That way one project can't fill every machine.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Nothing to do; the job moves up as earlier ones start."),
+                    Value::Str("Cancel jobs you no longer need to let this one through sooner."),
                 ])),
             ])),
         ]),
@@ -3533,6 +3599,17 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Wait for the attempt's current step to finish, then try again."),
                     Value::Str("If the run moved to another machine, act on it there."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STATE-210")),
+            ("title", Value::Str("The agent lost its credentials before launch.")),
+            ("why", Value::Str("The agent restarted before it started the run. Its saved metadata lists the required credentials, and the values were held in memory.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Wait for the scheduler to place another attempt if the run has retries left."),
+                    Value::Str("If the run stops, check that the agent stays online and submit it again."),
                 ])),
             ])),
         ]),
