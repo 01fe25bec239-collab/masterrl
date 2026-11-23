@@ -94,8 +94,18 @@ class Defect:
     message: str
 
 
+_PACKAGED = Path(__file__).resolve().parent / "schemas"
+
+
 def find_schema_dir(start: Path | None = None) -> Path:
-    """`schemas/datasets` of this checkout, found by walking up from this file."""
+    """The dataset schemas.
+
+    By default the copy shipped inside this package (written by `tools/gen/schemas.py`), so an
+    installed runtime has them. With `start`, or when that copy is missing, `schemas/datasets`
+    of the checkout found by walking up from `start` (default: this file).
+    """
+    if start is None and (_PACKAGED / "common.v1.schema.json").is_file():
+        return _PACKAGED
     here = (start or Path(__file__)).resolve()
     for parent in here.parents:
         candidate = parent / "schemas" / "datasets"

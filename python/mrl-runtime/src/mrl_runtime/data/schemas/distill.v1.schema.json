@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.masterrl.dev/datasets/distill.v1.schema.json",
+  "title": "distill.v1",
+  "description": "Distillation data: a prompt plus the teacher's completion, a reference to its logits, or both.",
+  "type": "object",
+  "required": ["prompt"],
+  "anyOf": [{ "required": ["teacher_completion"] }, { "required": ["teacher_logits_ref"] }],
+  "properties": {
+    "prompt": { "$ref": "common.v1.schema.json#/$defs/textOrMessages" },
+    "teacher_completion": { "$ref": "common.v1.schema.json#/$defs/text" },
+    "teacher_logits_ref": {
+      "description": "Content reference to stored teacher logits, e.g. sha256:<hex>.",
+      "$ref": "common.v1.schema.json#/$defs/text"
+    },
+    "meta": { "$ref": "common.v1.schema.json#/$defs/meta" }
+  },
+  "additionalProperties": false
+}
