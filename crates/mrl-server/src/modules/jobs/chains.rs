@@ -54,6 +54,8 @@ pub enum Verdict {
     Abstain,
     /// Checked and runnable: this validator vouches for the job.
     Accept,
+    /// Checked and runnable on this engine version (`engine_versions.id`); the run records it.
+    AcceptEngine(Uuid),
     /// Problems found; the job is REJECTED with them.
     Reject(Vec<Rejection>),
 }
@@ -156,8 +158,8 @@ impl JobValidator for SchemaChecks {
 /// The outcome of the validator chain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Validation {
-    /// Queue the job.
-    Accepted,
+    /// Queue the job, on the engine version a validator picked (if any).
+    Accepted(Option<Uuid>),
     /// Reject it with these problems (never empty).
     Rejected(Vec<Rejection>),
 }
@@ -242,10 +244,21 @@ impl Chains {
     pub async fn validate(&self, spec: &JobSpec) -> Result<Validation, SeamError> {
         let mut problems = Vec::new();
         let mut vouched = false;
+        let mut engine = None;
         for v in self.validators.iter() {
             match v.validate(spec).await? {
                 Verdict::Abstain => {}
                 Verdict::Accept => vouched = true,
+                Verdict::AcceptEngine(id) => {
+                    if engine.is_some_and(|e| e != id) {
+                        return Err(SeamError::new(
+                            "jobs",
+                            "Two validators picked different engine versions for this job.",
+                        ));
+                    }
+                    vouched = true;
+                    engine = Some(id);
+                }
                 Verdict::Reject(p) => problems.extend(p),
             }
         }
@@ -260,7 +273,7 @@ impl Chains {
             ));
         }
         Ok(if problems.is_empty() {
-            Validation::Accepted
+            Validation::Accepted(engine)
         } else {
             Validation::Rejected(problems)
         })
@@ -378,7 +391,7 @@ mod tests {
         let chains = Chains::new(vec![Arc::new(SchemaChecks), accept.clone()], vec![], vec![]);
         assert_eq!(
             chains.validate(&spec()).await.unwrap(),
-            Validation::Accepted
+            Validation::Accepted(None)
         );
         let reject = Arc::new(Fixed(Verdict::Reject(vec![Rejection::new(
             codes::NO_ENGINE,
@@ -390,6 +403,20 @@ mod tests {
             chains.validate(&spec()).await.unwrap(),
             Validation::Rejected(_)
         ));
+    }
+
+    #[tokio::test]
+    async fn the_picked_engine_is_kept_and_two_picks_must_agree() {
+        let (a, b) = (Uuid::from_u128(1), Uuid::from_u128(2));
+        let pick = |id| -> Arc<dyn JobValidator> { Arc::new(Fixed(Verdict::AcceptEngine(id))) };
+        let accept: Arc<dyn JobValidator> = Arc::new(Fixed(Verdict::Accept));
+        let chains = Chains::new(vec![accept, pick(a), pick(a)], vec![], vec![]);
+        assert_eq!(
+            chains.validate(&spec()).await.unwrap(),
+            Validation::Accepted(Some(a))
+        );
+        let chains = Chains::new(vec![pick(a), pick(b)], vec![], vec![]);
+        assert!(chains.validate(&spec()).await.is_err());
     }
 
     struct Says(Verification);

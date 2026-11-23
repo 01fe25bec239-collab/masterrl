@@ -521,9 +521,88 @@ async fn a_passed_probe_enables_cpu_then_runs_are_queued_or_rejected_by_l0() {
         json!(["cpu"])
     );
 
-    // The FakeEngine run passes L0 and is queued.
+    // The FakeEngine run passes L0 and is queued, on the engine version L0 picked.
     let run = submit(&s, submission(&w, "x-fake.steps", json!({}), 0)).await;
     assert_eq!(run["state"], "QUEUED", "{run}");
+    let fake: uuid::Uuid = sqlx::query_scalar(
+        "SELECT ev.id FROM engine_versions ev JOIN training_engines te ON te.id = ev.engine_id
+          WHERE te.name = 'fake' AND ev.version = '0.1.0'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(run["engine_version_id"], fake.to_string(), "{run}");
+
+    // The launch takes the FakeEngine's CPU runtime and names it; its method can pause.
+    {
+        use mrl_server::modules::engines::launch::{EnginePause, EngineRuntime};
+        use mrl_server::modules::jobs::JobTransitions;
+        use mrl_server::modules::scheduler::pipeline::{
+            LaunchContributor, LaunchPlan, PauseSupport, Placement,
+        };
+        let job = mrl_domain::ids::JobId::from_str(run["job_id"].as_str().unwrap())
+            .unwrap()
+            .as_uuid();
+        let org: Uuid = sqlx::query_scalar("SELECT org_id FROM jobs WHERE id = $1")
+            .bind(job)
+            .fetch_one(db.pool())
+            .await
+            .unwrap();
+        let attempt = Uuid::now_v7();
+        db.seed(&format!(
+            "INSERT INTO job_attempts (id, org_id, job_id, attempt_no, epoch, state)
+             VALUES ('{attempt}', '{org}', '{job}', 1, 1, 'PENDING')"
+        ))
+        .await;
+        let mut tx = db.db().begin().await.unwrap();
+        let row = JobTransitions::lock(&mut tx, org, job)
+            .await
+            .unwrap()
+            .unwrap();
+        let a = JobTransitions::lock_attempt(&mut tx, org, attempt)
+            .await
+            .unwrap()
+            .unwrap();
+        tx.rollback().await.unwrap();
+        let mut plan = LaunchPlan::default();
+        plan.launch.roles = vec![mrl_proto::agent::v1::RoleLaunch {
+            kind: "trainer".into(),
+            primary: true,
+            ..Default::default()
+        }];
+        let placement = Placement {
+            node_id: Uuid::nil(),
+            roles: vec![("trainer".into(), vec![])],
+            cpu_millis: 0,
+            mem_bytes: 0,
+        };
+        EngineRuntime::new(db.db().clone())
+            .contribute(&row, &a, &placement, &mut plan)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                plan.launch.engine_name.as_str(),
+                plan.launch.engine_version.as_str()
+            ),
+            ("fake", "0.1.0")
+        );
+        assert_eq!(
+            plan.launch.roles[0].runtime_ref,
+            format!(
+                "uv:sha256:{}",
+                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+            )
+        );
+        assert_eq!(plan.launch.environment_id, "cpu-uv");
+        assert_eq!(
+            EnginePause::new(db.db().clone())
+                .can_pause(&row)
+                .await
+                .unwrap(),
+            Some(true)
+        );
+    }
 
     // QLoRA on a CPU pool is rejected with the documented code.
     let qlora = submit(

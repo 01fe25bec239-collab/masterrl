@@ -13,6 +13,7 @@
 //! - [`api`] serves `/engines`, `/capabilities` and `/algorithms/{algo}/schema`.
 
 pub mod api;
+pub mod launch;
 pub mod probes;
 pub mod store;
 pub mod validator;

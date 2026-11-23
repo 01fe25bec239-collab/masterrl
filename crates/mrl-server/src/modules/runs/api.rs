@@ -795,7 +795,14 @@ pub async fn submit(
     )
     .await?;
     match verdict {
-        Validation::Accepted => {
+        Validation::Accepted(engine) => {
+            if let Some(engine) = engine {
+                sqlx::query("UPDATE runs SET engine_version_id = $2 WHERE id = $1")
+                    .bind(run_id)
+                    .bind(engine)
+                    .execute(&mut *tx)
+                    .await?;
+            }
             JobTransitions::apply(
                 &mut tx,
                 &job,

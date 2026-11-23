@@ -298,10 +298,10 @@ impl JobValidator for CapabilityValidator {
     }
 
     async fn validate(&self, spec: &JobSpec) -> Result<Verdict, SeamError> {
-        // `Verdict::Accept` carries no engine; callers that need the choice use `pick`.
+        // The chosen engine version is recorded on the run (`runs.engine_version_id`).
         Ok(match self.pick(spec).await.map_err(SeamError::from)? {
             Pick::NoEngine => Verdict::Abstain,
-            Pick::Engine(_) => Verdict::Accept,
+            Pick::Engine(id) => Verdict::AcceptEngine(id),
             Pick::Rejected(r) => Verdict::Reject(r),
         })
     }
