@@ -1,0 +1,141 @@
+{
+  "kind": "engine",
+  "source": "tests/fixtures/rejections/engines",
+  "dev_only": true,
+  "manifest": {
+    "apiVersion": "mrl.dev/engine/v1",
+    "kind": "EngineManifest",
+    "metadata": {
+      "name": "golden",
+      "version": "1.0.0",
+      "displayName": "Golden",
+      "description": "A TRL-shaped test engine for the rejection catalog tests.",
+      "license": "Apache-2.0"
+    },
+    "spec": {
+      "adapter": {
+        "entrypoint": "golden.engine:GoldenEngine",
+        "adapterApi": ">=1.0,<2",
+        "workerProtocol": ">=1.0,<2"
+      },
+      "upstream": [
+        { "name": "golden", "version": "1.0.0", "license": "Apache-2.0", "source": "https://masterrl.dev" }
+      ],
+      "runtime": {
+        "environments": [
+          {
+            "id": "cuda12-uv", "kind": "uv", "lockfile": "uv.lock",
+            "lockSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "python": "3.12", "platform": "linux/amd64",
+            "accelerator": { "vendor": "nvidia", "runtime": "cuda12", "minComputeCapability": "8.0" },
+            "mrlRuntime": "0.1.0"
+          },
+          {
+            "id": "cpu-uv", "kind": "uv", "lockfile": "uv.lock",
+            "lockSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "python": "3.12", "platform": "linux/amd64",
+            "accelerator": { "vendor": "cpu" },
+            "mrlRuntime": "0.1.0"
+          }
+        ]
+      },
+      "runtimes": [{ "role": "trainer", "runtime_ref": "cuda12-uv" }],
+      "capabilities": {
+        "updateStrategies": ["full", "lora", "qlora"],
+        "precision": ["bf16", "fp32"],
+        "quantizedTraining": ["bnb-4bit"],
+        "parallelism": ["single", "ddp"],
+        "multiNode": false,
+        "execution": { "modes": ["offline", "on_policy_sync"] },
+        "resume": true,
+        "pause": false,
+        "onDemandCheckpoint": true,
+        "trustRemoteCode": "never"
+      },
+      "topology": {
+        "roles": [{ "id": "trainer", "kind": "trainer", "environment": "cuda12-uv", "count": 1, "reportsVia": "worker_protocol" }],
+        "primary": "trainer",
+        "network": "none",
+        "launcher": "accelerate"
+      },
+      "algorithms": [
+        {
+          "id": "sft", "displayName": "SFT", "summary": "Supervised fine-tuning.",
+          "parent": "golden.SFTTrainer", "upstreamStatus": "stable", "maturity": "stable", "fidelity": "full",
+          "requires": {
+            "datasetSchemas": { "train": ["sft.messages.v1", "sft.prompt_completion.v1"] },
+            "signals": { "reward": "none", "reference": "none", "critic": "none", "rolloutEngine": "none", "teacher": "none" },
+            "modelFamilies": ["decoder", "decoder-moe", "vlm"]
+          },
+          "config": {
+            "schema": "schemas/sft.schema.json",
+            "presets": [{ "id": "qlora-low-vram", "title": "QLoRA — fits 24 GB", "tier": "beginner", "patch": { "learning_rate": 0.0002 } }]
+          },
+          "metrics": [{ "name": "train/loss", "source": "loss", "kind": "live", "required": true }],
+          "resume": true, "pause": false
+        },
+        {
+          "id": "dpo", "displayName": "DPO", "summary": "Direct preference optimization.",
+          "parent": "golden.DPOTrainer", "upstreamStatus": "stable", "maturity": "stable", "fidelity": "full",
+          "requires": {
+            "datasetSchemas": { "train": ["pref.pairwise.v1"] },
+            "signals": { "reward": "none", "reference": "optional", "critic": "none", "rolloutEngine": "none", "teacher": "none" },
+            "modelFamilies": ["decoder", "decoder-moe"]
+          },
+          "metrics": [{ "name": "train/loss", "kind": "live", "required": true }],
+          "resume": true, "pause": false
+        },
+        {
+          "id": "grpo", "displayName": "GRPO", "summary": "Group relative policy optimization.",
+          "parent": "golden.GRPOTrainer", "switch": { "loss_type": "grpo" },
+          "upstreamStatus": "stable", "maturity": "beta", "fidelity": "full",
+          "requires": {
+            "datasetSchemas": { "train": ["rl.prompt.v1"] },
+            "signals": { "reward": "required", "reference": "optional", "critic": "none", "rolloutEngine": "optional", "teacher": "none" }
+          },
+          "supports": { "updateStrategies": ["full", "lora"] },
+          "metrics": [{ "name": "train/reward", "kind": "live", "required": true }],
+          "resume": true, "pause": false
+        },
+        {
+          "id": "kto", "displayName": "KTO", "summary": "Kahneman-Tversky optimization.",
+          "parent": "golden.KTOTrainer", "upstreamStatus": "stable", "maturity": "stable", "fidelity": "full",
+          "requires": {
+            "datasetSchemas": { "train": ["pref.unpaired.v1"] },
+            "signals": { "reward": "none", "reference": "optional", "critic": "none", "rolloutEngine": "none", "teacher": "none" }
+          },
+          "metrics": [{ "name": "train/loss", "kind": "live", "required": true }],
+          "resume": true, "pause": false
+        }
+      ],
+      "constraints": [
+        {
+          "id": "kto-batch",
+          "appliesTo": ["kto"],
+          "schema": {
+            "properties": { "engine": { "properties": { "per_device_train_batch_size": { "minimum": 2 } } } }
+          },
+          "error": {
+            "code": "MRL-CAP-005",
+            "message": "KTO estimates its KL term across the batch, so it needs at least 2 examples per device.",
+            "hint": "Set the batch size per device to 2 or more."
+          }
+        }
+      ],
+      "checkpoint": { "format": "golden-v1", "resumable": true, "portableWeights": true },
+      "validate": { "l1": true },
+      "hardware": { "os": ["linux", "macos", "windows"], "accelerators": ["nvidia", "cpu"] }
+    }
+  },
+  "schemas": {
+    "schemas/sft.schema.json": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "type": "object",
+      "properties": {
+        "learning_rate": { "type": "number", "exclusiveMinimum": 0, "x-mrl-ui": { "tier": "beginner" } },
+        "num_train_epochs": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    }
+  }
+}

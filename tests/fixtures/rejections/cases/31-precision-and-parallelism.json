@@ -1,0 +1,45 @@
+{
+  "about": "Precision and parallelism the engine doesn't list",
+  "enabled": [
+    "nvidia"
+  ],
+  "engine": "golden",
+  "expect": [
+    {
+      "code": "MRL-CAP-240",
+      "message": "Golden can't train in `fp16`. It can use: bf16, fp32.",
+      "path": "/config/common/precision"
+    },
+    {
+      "code": "MRL-CAP-240",
+      "message": "SFT with Golden can't use `fsdp2` parallelism. It can use: single, ddp.",
+      "path": "/config/common/parallelism"
+    }
+  ],
+  "request": {
+    "algorithm": "sft",
+    "available": [
+      "nvidia"
+    ],
+    "config": {
+      "common": {
+        "parallelism": "fsdp2",
+        "precision": "fp16"
+      }
+    },
+    "datasets": [
+      {
+        "schema": "sft.messages.v1"
+      }
+    ],
+    "hardware": {
+      "gpus": 1,
+      "nodes": 1,
+      "wanted": "nvidia"
+    },
+    "model": {
+      "family": "decoder",
+      "has_chat_template": true
+    }
+  }
+}

@@ -9,6 +9,7 @@ for an ack at once, after which staging the next one waits for a slot.
 
 import asyncio
 import json
+import math
 import secrets
 import shutil
 import time
@@ -134,6 +135,7 @@ class CheckpointProvider:
         # The newest COMMITTED checkpoint this attempt knows: the resumed one until a new one
         # commits, so an attempt resumed at its step budget still reports its result.
         self.last_committed_id = self._parent
+        self.last_committed_step: int | None = None  # checkpoints committed in this attempt
         self.final_result: CommitResult | None = None
 
     def restore_path(self) -> Path | None:
@@ -151,7 +153,8 @@ class CheckpointProvider:
         """Wait for a commit slot, then move, hash and describe the checkpoint."""
         await self._slots.acquire()
         try:
-            return await asyncio.to_thread(self._stage_sync, ready, dict(metrics))
+            finite = {key: value for key, value in metrics.items() if math.isfinite(value)}
+            return await asyncio.to_thread(self._stage_sync, ready, finite)
         except BaseException:
             self._slots.release()
             raise
@@ -205,7 +208,9 @@ class CheckpointProvider:
         if problems:
             raise ValueError(f"checkpoint manifest does not match its schema: {problems}")
         manifest_path = target / MANIFEST_FILE
-        manifest_path.write_text(json.dumps(doc, indent=2, sort_keys=True), encoding="utf-8")
+        manifest_path.write_text(
+            json.dumps(doc, indent=2, sort_keys=True, allow_nan=False), encoding="utf-8"
+        )
         manifest_sha = sha256_file(manifest_path)
         self._parent = checkpoint_id
         prefix = target.relative_to(self._staging).as_posix()
@@ -263,8 +268,11 @@ class CheckpointProvider:
             self._pending.pop(staged.checkpoint_id, None)
             self._slots.release()
         self.results.append(result)
-        if result.committed:
+        if result.committed and (
+            self.last_committed_step is None or staged.step >= self.last_committed_step
+        ):
             self.last_committed_id = staged.checkpoint_id
+            self.last_committed_step = staged.step
         if staged.is_final:
             self.final_result = result
         return result

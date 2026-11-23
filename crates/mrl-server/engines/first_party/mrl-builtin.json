@@ -1,0 +1,29 @@
+{
+  "dev_only": false,
+  "kind": "builtin",
+  "manifest": {
+    "apiVersion": "mrl.dev/builtin/v1",
+    "kind": "BuiltinManifest",
+    "metadata": {
+      "displayName": "Built-in utilities",
+      "license": "Apache-2.0",
+      "name": "mrl-builtin",
+      "version": "0.1.0"
+    },
+    "spec": {
+      "adapter": {
+        "adapterApi": ">=1.0,<2",
+        "entrypoint": "mrl_runtime.builtin.engine:BuiltinEngine",
+        "workerProtocol": ">=1.0,<2"
+      },
+      "jobKinds": [
+        {
+          "kind": "DATA_PREP",
+          "sandbox": "data_prep"
+        }
+      ]
+    }
+  },
+  "schemas": {},
+  "source": "python/mrl-runtime/src/mrl_runtime/builtin/mrl-builtin.yaml"
+}

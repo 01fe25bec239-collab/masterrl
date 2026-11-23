@@ -1,0 +1,163 @@
+{
+  "dev_only": true,
+  "kind": "engine",
+  "manifest": {
+    "apiVersion": "mrl.dev/engine/v1",
+    "kind": "EngineManifest",
+    "metadata": {
+      "description": "Counts steps, emits a falling loss, writes small checkpoints.",
+      "displayName": "Fake engine (testkit)",
+      "license": "Apache-2.0",
+      "name": "fake",
+      "version": "0.1.0"
+    },
+    "spec": {
+      "adapter": {
+        "adapterApi": ">=1.0,<2",
+        "entrypoint": "mrl_runtime.testkit.fake:FakeEngine",
+        "workerProtocol": ">=1.0,<2"
+      },
+      "algorithms": [
+        {
+          "displayName": "Fake steps",
+          "fidelity": "full",
+          "id": "x-fake.steps",
+          "maturity": "experimental",
+          "metrics": [
+            {
+              "kind": "live",
+              "name": "train/loss",
+              "required": true,
+              "source": "loss"
+            },
+            {
+              "kind": "sampled",
+              "name": "train/learning_rate",
+              "required": true
+            }
+          ],
+          "parent": "mrl_runtime.testkit.fake.FakeEngine",
+          "pause": true,
+          "requires": {
+            "datasetSchemas": {
+              "train": [
+                "sft.messages.v1"
+              ]
+            },
+            "signals": {
+              "critic": "none",
+              "reference": "none",
+              "reward": "none",
+              "rolloutEngine": "none",
+              "teacher": "none"
+            }
+          },
+          "resume": true,
+          "samples": {
+            "emitted": true,
+            "fields": [
+              "prompt",
+              "completion"
+            ]
+          },
+          "summary": "Counts steps and emits a loss that falls with each step.",
+          "upstreamStatus": "stable"
+        }
+      ],
+      "capabilities": {
+        "execution": {
+          "modes": [
+            "offline"
+          ]
+        },
+        "multiNode": false,
+        "onDemandCheckpoint": true,
+        "parallelism": [
+          "single"
+        ],
+        "pause": true,
+        "precision": [
+          "fp32"
+        ],
+        "resume": true,
+        "trustRemoteCode": "never",
+        "updateStrategies": [
+          "full"
+        ]
+      },
+      "checkpoint": {
+        "format": "fake-v1",
+        "portableWeights": false,
+        "resumable": true
+      },
+      "exports": [
+        "hf-safetensors"
+      ],
+      "hardware": {
+        "accelerators": [
+          "cpu"
+        ],
+        "os": [
+          "linux",
+          "macos",
+          "windows"
+        ]
+      },
+      "metrics": {
+        "namespaces": {
+          "debug/": "fake/debug/",
+          "lr": "train/learning_rate"
+        }
+      },
+      "runtime": {
+        "environments": [
+          {
+            "accelerator": {
+              "vendor": "cpu"
+            },
+            "id": "cpu-uv",
+            "kind": "uv",
+            "lockSha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "lockfile": "uv.lock",
+            "mrlRuntime": "0.1.0",
+            "platform": "linux/amd64",
+            "python": "3.12"
+          }
+        ]
+      },
+      "runtimes": [
+        {
+          "role": "trainer",
+          "runtime_ref": "cpu-uv"
+        }
+      ],
+      "topology": {
+        "launcher": "inprocess",
+        "network": "none",
+        "primary": "trainer",
+        "roles": [
+          {
+            "count": 1,
+            "environment": "cpu-uv",
+            "id": "trainer",
+            "kind": "trainer",
+            "reportsVia": "worker_protocol"
+          }
+        ]
+      },
+      "upstream": [
+        {
+          "license": "Apache-2.0",
+          "name": "mrl-runtime",
+          "source": "https://masterrl.dev",
+          "version": "0.1.0"
+        }
+      ],
+      "validate": {
+        "l1": true
+      }
+    }
+  },
+  "schemas": {},
+  "source": "python/mrl-runtime/src/mrl_runtime/testkit/fake_engine"
+}

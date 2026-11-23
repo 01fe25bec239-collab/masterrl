@@ -196,7 +196,6 @@ class Harness:
         self._acknowledged: list[str] = []
         # Checkpoint id -> the requests it answers; acknowledged only once it committed.
         self._requests_by_checkpoint: dict[str, list[str]] = {}
-        self._pause_checkpoint = ""  # the first checkpoint staged after a pause request
         self._hard_deadline: float | None = None
         self._lease_deadline: float | None = None
         self._harness_failure: common.Failure | None = None
@@ -267,6 +266,7 @@ class Harness:
     ) -> tuple[pb.ExitKind, common.Failure | None]:
         assert self._prepare is not None
         assert self._start is not None
+        engine_stopped = False
         try:
             prepare = await self._await(self._prepare)
             ctx, spec = self._context(prepare)
@@ -279,7 +279,7 @@ class Harness:
             if str(spec.get("job_kind", "")).upper() in ("EXPORT", "CONVERT"):
                 await self._export(ctx, spec)
             else:
-                await self._run_engine(ctx, spec)
+                engine_stopped = await self._run_engine(ctx, spec)
         except _EndAttemptError as stop:
             if self._ctx is not None:
                 await self._cleanup(self._ctx)
@@ -294,7 +294,12 @@ class Harness:
                 final_commit=provider.final_result if provider else None,
                 cancelled=bool(self._cancel_request),
                 paused=bool(self._pause_request),
-                pause_saved=not self.manifest.pause or self._pause_checkpoint in self._committed(),
+                pause_saved=not self.manifest.pause
+                or (
+                    engine_stopped
+                    and provider is not None
+                    and provider.last_committed_step == self._last_step
+                ),
             )
         )
         if kind == pb.EXIT_KIND_CANCELLED:
@@ -465,7 +470,7 @@ class Harness:
 
     # ---- run loop ----
 
-    async def _run_engine(self, ctx: JobContext, spec: Mapping[str, Any]) -> None:
+    async def _run_engine(self, ctx: JobContext, spec: Mapping[str, Any]) -> bool:
         assert self.session is not None
         assert self._loop is not None
         self.provider = CheckpointProvider(
@@ -518,12 +523,14 @@ class Harness:
                     "[warning] the engine did not stop in time; leaving it to the agent"
                 )
                 break
-        if done.done() and (exc := done.result()) is not None:
+        stopped = done.done()
+        if stopped and (exc := done.result()) is not None:
             self._engine_failure = self._failure_for(exc, "run")
         remaining = self._settings.commit_timeout_s
         if self._hard_deadline is not None:
             remaining = max(0.0, self._hard_deadline - time.monotonic())
         await self.provider.wait_all(remaining)
+        return stopped
 
     def _supervise(self, ctx: JobContext) -> None:
         now = time.monotonic()
@@ -579,13 +586,12 @@ class Harness:
                 if not primary:
                     self._harness_line("[warning] a non-primary role yielded a checkpoint; ignored")
                     return
+                self._step(event.step)
                 requests, self._checkpoint_requests = self._checkpoint_requests, []
                 staged = await self.provider.stage(event, {**self._metrics, **event.metrics})
                 self.provider.submit(staged)
                 self._final_staged = self._final_staged or event.is_final
                 self._requests_by_checkpoint[staged.checkpoint_id] = requests
-                if self._pause_request and not self._pause_checkpoint:
-                    self._pause_checkpoint = staged.checkpoint_id
             case Log():
                 self._harness_line(f"[{event.level}] {event.message}")
             case EngineWarning():

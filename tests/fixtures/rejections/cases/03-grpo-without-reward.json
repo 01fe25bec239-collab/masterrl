@@ -1,0 +1,35 @@
+{
+  "about": "GRPO with no reward attached (row 3)",
+  "enabled": [
+    "nvidia"
+  ],
+  "engine": "golden",
+  "expect": [
+    {
+      "code": "MRL-CAP-004",
+      "message": "GRPO learns from a reward, but this run has none.",
+      "path": "/reward_version_id"
+    }
+  ],
+  "request": {
+    "algorithm": "grpo",
+    "available": [
+      "nvidia"
+    ],
+    "config": {},
+    "datasets": [
+      {
+        "schema": "rl.prompt.v1"
+      }
+    ],
+    "hardware": {
+      "gpus": 1,
+      "nodes": 1,
+      "wanted": "nvidia"
+    },
+    "model": {
+      "family": "decoder",
+      "has_chat_template": true
+    }
+  }
+}

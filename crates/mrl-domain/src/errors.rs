@@ -659,9 +659,83 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         "The agent was stopping and did not run the command.",
     ),
     // <mrl:errors P21> rows for P21 go right below this line.
+    (
+        code(ErrorFamily::Cap, 210),
+        "No machine in this pool can run this job as asked.",
+    ),
+    (code(Quota, 210), "This job is waiting for a free machine."),
+    (
+        code(Quota, 211),
+        "This pool is paused and starts no new work.",
+    ),
+    (
+        code(Quota, 212),
+        "Too many jobs of this project are ahead in the queue.",
+    ),
+    (code(Perm, 210), "No pool is open to this project."),
+    (
+        code(Conflict, 210),
+        "This reservation was changed by a newer holder.",
+    ),
+    (
+        code(ErrorFamily::State, 210),
+        "The agent lost its credentials before launch.",
+    ),
     // <mrl:errors P22> rows for P22 go right below this line.
+    (
+        code(ErrorFamily::Quota, 220),
+        "Too many live views are open.",
+    ),
+    (
+        code(ErrorFamily::State, 220),
+        "This alert is already resolved.",
+    ),
+    (
+        code(Store, 220),
+        "A saved log or sample file is missing or damaged.",
+    ),
     // <mrl:errors P23> rows for P23 go right below this line.
+    (
+        code(ErrorFamily::State, 230),
+        "This checkpoint isn't committed, so it can't be used yet.",
+    ),
+    (
+        code(Conflict, 230),
+        "This checkpoint is still in use, so it can't be deleted.",
+    ),
     // <mrl:errors P24> rows for P24 go right below this line.
+    (
+        code(ErrorFamily::Cap, 240),
+        "This engine can't train with these settings.",
+    ),
+    (
+        code(ErrorFamily::Cap, 241),
+        "This engine hasn't been checked on this kind of machine yet.",
+    ),
+    (
+        code(ErrorFamily::Cap, 242),
+        "This method needs an input the run doesn't have.",
+    ),
+    (
+        code(ErrorFamily::Cap, 243),
+        "This dataset's format doesn't fit this method.",
+    ),
+    (
+        code(ErrorFamily::Cap, 244),
+        "This method can't train this kind of model.",
+    ),
+    (
+        code(ErrorFamily::Cap, 245),
+        "No connected machine has the hardware this run asks for.",
+    ),
+    (
+        code(Model, 240),
+        "The app has no record of this model version.",
+    ),
+    (
+        code(Data, 240),
+        "The app has no record of this dataset version.",
+    ),
     // <mrl:errors P25> rows for P25 go right below this line.
     (
         code(ErrorFamily::Cap, 250),

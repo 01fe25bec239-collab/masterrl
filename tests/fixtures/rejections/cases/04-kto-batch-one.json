@@ -1,0 +1,39 @@
+{
+  "about": "KTO with batch size 1, from the manifest's constraints[] (row 4)",
+  "enabled": [
+    "nvidia"
+  ],
+  "engine": "golden",
+  "expect": [
+    {
+      "code": "MRL-CAP-005",
+      "hint": "Set the batch size per device to 2 or more.",
+      "message": "KTO estimates its KL term across the batch, so it needs at least 2 examples per device."
+    }
+  ],
+  "request": {
+    "algorithm": "kto",
+    "available": [
+      "nvidia"
+    ],
+    "config": {
+      "engine": {
+        "per_device_train_batch_size": 1
+      }
+    },
+    "datasets": [
+      {
+        "schema": "pref.unpaired.v1"
+      }
+    ],
+    "hardware": {
+      "gpus": 1,
+      "nodes": 1,
+      "wanted": "nvidia"
+    },
+    "model": {
+      "family": "decoder",
+      "has_chat_template": true
+    }
+  }
+}

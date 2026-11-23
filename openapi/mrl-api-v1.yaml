@@ -7,6 +7,126 @@ info:
     identifier: Apache-2.0
   version: 0.1.0
 paths:
+  /api/v1/alerts:
+    get:
+      tags:
+      - alerts
+      summary: '`GET /alerts`: the alerts you may see, newest first.'
+      operationId: list_alerts
+      parameters:
+      - name: state
+        in: query
+        description: '`OPEN`, `ACKED` or `RESOLVED`.'
+        required: false
+        schema:
+          type: string
+      - name: scope_kind
+        in: query
+        description: '`run`, `node` or `system`.'
+        required: false
+        schema:
+          type: string
+      - name: run
+        in: query
+        description: Only this run's alerts, `run_…` (needs `metrics_logs.read` on the run).
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertPage'
+  /api/v1/alerts/{alr}:ack:
+    post:
+      tags:
+      - alerts
+      summary: '`POST /alerts/{alr}:ack` and `POST /alerts/{alr}:resolve`.'
+      operationId: ack_alert
+      parameters:
+      - name: alr
+        in: path
+        description: '`alr_…`'
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertView'
+        '404':
+          description: No such alert
+        '409':
+          description: The alert is resolved (MRL-STATE-220)
+  /api/v1/alerts/{alr}:resolve:
+    post:
+      tags:
+      - alerts
+      summary: Resolve an alert.
+      operationId: resolve_alert
+      parameters:
+      - name: alr
+        in: path
+        description: '`alr_…`'
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlertView'
+        '404':
+          description: No such alert
+        '409':
+          description: The alert is resolved (MRL-STATE-220)
+  /api/v1/algorithms/{algo}/schema:
+    get:
+      tags:
+      - engines
+      operationId: get_algorithm_schema
+      parameters:
+      - name: algo
+        in: path
+        description: Method id, like `sft`.
+        required: true
+        schema:
+          type: string
+      - name: engine_version
+        in: query
+        description: '`<engine>@<version>`, like `trl@1.0.0`; default: the newest live version with the method.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The method's form.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AlgorithmSchemaDoc'
+        '404':
+          description: No live engine version has this method.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/artifacts:
     get:
       tags:
@@ -321,6 +441,181 @@ paths:
         '204':
           description: Revoked.
         '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/capabilities:
+    get:
+      tags:
+      - engines
+      operationId: get_capabilities
+      parameters:
+      - name: model_version
+        in: query
+        description: '`mv_…`: check against this model.'
+        required: false
+        schema:
+          type: string
+      - name: dataset_version
+        in: query
+        description: '`dsv_…`: check against this training dataset.'
+        required: false
+        schema:
+          type: string
+      - name: project
+        in: query
+        description: Project in which model and dataset versions must be visible.
+        required: false
+        schema:
+          type: string
+      - name: pool
+        in: query
+        description: '`pool_…`: only this pool''s machines.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: What can run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CapabilityReport'
+        '403':
+          description: The caller cannot read the requested compute or records.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: No visible pool or project has this id.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: An id can't be read.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/checkpoints/{ckpt}:
+    get:
+      tags:
+      - checkpoints
+      summary: '`GET /checkpoints/{ckpt}`.'
+      operationId: get_checkpoint
+      parameters:
+      - name: ckpt
+        in: path
+        description: Checkpoint id, `ckpt_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The checkpoint with its files.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckpointInfo'
+        '404':
+          description: No such checkpoint.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    delete:
+      tags:
+      - checkpoints
+      summary: |-
+        `DELETE /checkpoints/{ckpt}`: TOMBSTONED, objects deleted in the background. Refused while
+        the checkpoint is the run's final result, its resume point, or a starting point.
+      operationId: delete_checkpoint
+      parameters:
+      - name: ckpt
+        in: path
+        description: Checkpoint id, `ckpt_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '204':
+          description: Deleted (or already deleted).
+        '409':
+          description: Still in use (MRL-CONFLICT-230) or still being saved (MRL-STATE-230).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/checkpoints/{ckpt}:verify:
+    post:
+      tags:
+      - checkpoints
+      summary: |-
+        `POST /checkpoints/{ckpt}:verify` (axum sees `/checkpoints/{ckpt}` with the action in the
+        segment): re-reads every stored byte (`full_rehash`).
+      operationId: verify_checkpoint
+      parameters:
+      - name: ckpt
+        in: path
+        description: Checkpoint id, `ckpt_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: 'The checkpoint afterwards: COMMITTED at `full_rehash`, or CORRUPT with the reason.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckpointInfo'
+        '409':
+          description: The checkpoint is not COMMITTED (MRL-STATE-230).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/engines:
+    get:
+      tags:
+      - engines
+      operationId: list_engines
+      responses:
+        '200':
+          description: Engines.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EngineList'
+  /api/v1/engines/{eng}/versions/{ver}:
+    get:
+      tags:
+      - engines
+      operationId: get_engine_version
+      parameters:
+      - name: eng
+        in: path
+        description: Engine name, like `trl`.
+        required: true
+        schema:
+          type: string
+      - name: ver
+        in: path
+        description: Version, like `1.0.0`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/EngineVersionDetail'
+        '404':
+          description: No such engine version.
           content:
             application/json:
               schema:
@@ -1033,6 +1328,55 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /api/v1/queue:
+    get:
+      tags:
+      - compute
+      operationId: get_scheduler_queue
+      parameters:
+      - name: pool
+        in: path
+        description: '`pool_…` (required).'
+        required: true
+        schema:
+          type:
+          - string
+          - 'null'
+      - name: limit
+        in: path
+        description: Most jobs to list, 1–500 (default 100).
+        required: true
+        schema:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          minimum: 0
+      responses:
+        '200':
+          description: The pool's queue.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SchedulerQueue'
+        '403':
+          description: Pool access denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: No such pool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Bad query.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/runs/{run}:
     get:
       tags:
@@ -1091,6 +1435,44 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Page_Attempt'
+  /api/v1/runs/{run}/checkpoints:
+    get:
+      tags:
+      - checkpoints
+      summary: '`GET /runs/{run}/checkpoints`.'
+      operationId: list_checkpoints
+      parameters:
+      - name: run
+        in: path
+        description: Run id, `run_…`.
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The run's checkpoints (not deleted ones), highest step first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_CheckpointInfo'
+        '404':
+          description: No such run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/runs/{run}/config:
     get:
       tags:
@@ -1111,6 +1493,282 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RunConfig'
+  /api/v1/runs/{run}/logs:
+    get:
+      tags:
+      - telemetry
+      summary: '`GET /runs/{run}/logs`: the run''s log in order, hot and sealed, with filters and search.'
+      operationId: list_run_logs
+      parameters:
+      - name: run
+        in: path
+        description: '`run_…`'
+        required: true
+        schema:
+          type: string
+      - name: attempt
+        in: query
+        description: Only this attempt, `att_…`.
+        required: false
+        schema:
+          type: string
+      - name: rank
+        in: query
+        description: Only this rank.
+        required: false
+        schema:
+          type: string
+      - name: stream
+        in: query
+        description: 'Only this stream: `stdout`, `stderr`, `harness` or `agent`.'
+        required: false
+        schema:
+          type: string
+      - name: q
+        in: query
+        description: Only chunks containing this text (ignores case; at most 200 characters).
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–1000 (default 200).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogPage'
+        '404':
+          description: No such run
+        '503':
+          description: A sealed log file could not be read (MRL-STORE-220)
+  /api/v1/runs/{run}/logs:download:
+    get:
+      tags:
+      - telemetry
+      summary: '`GET /runs/{run}/logs:download`: the whole log (filters as for the list) as one text file.'
+      operationId: download_run_logs
+      parameters:
+      - name: run
+        in: path
+        description: '`run_…`'
+        required: true
+        schema:
+          type: string
+      - name: attempt
+        in: query
+        description: Only this attempt, `att_…`.
+        required: false
+        schema:
+          type: string
+      - name: rank
+        in: query
+        description: Only this rank.
+        required: false
+        schema:
+          type: string
+      - name: stream
+        in: query
+        description: 'Only this stream: `stdout`, `stderr`, `harness` or `agent`.'
+        required: false
+        schema:
+          type: string
+      - name: q
+        in: query
+        description: Only chunks containing this text (ignores case; at most 200 characters).
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–1000 (default 200).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The log text
+          content:
+            text/plain: {}
+        '404':
+          description: No such run
+  /api/v1/runs/{run}/metrics:
+    get:
+      tags:
+      - telemetry
+      summary: '`GET /runs/{run}/metrics`: every series, the latest progress and resource peaks.'
+      operationId: list_run_metrics
+      parameters:
+      - name: run
+        in: path
+        description: '`run_…`'
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunMetrics'
+        '404':
+          description: No such run
+  /api/v1/runs/{run}/metrics/query:
+    get:
+      tags:
+      - telemetry
+      summary: |-
+        `GET /runs/{run}/metrics/query`: at most `max_points` points per series, with a min/max
+        envelope; per step the latest attempt wins.
+      operationId: query_run_metrics
+      parameters:
+      - name: run
+        in: path
+        description: '`run_…`'
+        required: true
+        schema:
+          type: string
+      - name: series
+        in: query
+        description: |-
+          Comma-separated series IDs or names. Use `name:` before a numeric name.
+          A name selects every split. Defaults to the first 20 series.
+        required: false
+        schema:
+          type: string
+      - name: axis
+        in: query
+        description: '`step` (default) or `time`.'
+        required: false
+        schema:
+          type: string
+      - name: from_step
+        in: query
+        description: First step (step axis).
+        required: false
+        schema:
+          type: string
+      - name: to_step
+        in: query
+        description: Last step (step axis).
+        required: false
+        schema:
+          type: string
+      - name: from_time
+        in: query
+        description: First second since 1970 (time axis).
+        required: false
+        schema:
+          type: string
+      - name: to_time
+        in: query
+        description: Last second since 1970 (time axis).
+        required: false
+        schema:
+          type: string
+      - name: max_points
+        in: query
+        description: 2–10000, default 1000.
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MetricQueryResult'
+        '404':
+          description: No such run
+        '422':
+          description: A parameter is out of range
+  /api/v1/runs/{run}/samples:
+    get:
+      tags:
+      - telemetry
+      summary: '`GET /runs/{run}/samples`.'
+      operationId: list_run_samples
+      parameters:
+      - name: run
+        in: path
+        description: '`run_…`'
+        required: true
+        schema:
+          type: string
+      - name: step
+        in: query
+        description: Only this step.
+        required: false
+        schema:
+          type: string
+      - name: min_step
+        in: query
+        description: Steps from here.
+        required: false
+        schema:
+          type: string
+      - name: max_step
+        in: query
+        description: Steps up to here.
+        required: false
+        schema:
+          type: string
+      - name: min_reward
+        in: query
+        description: Only samples with at least this total reward.
+        required: false
+        schema:
+          type: string
+      - name: max_reward
+        in: query
+        description: Only samples with at most this total reward.
+        required: false
+        schema:
+          type: string
+      - name: q
+        in: query
+        description: Only samples whose prompt or completion contains this text (ignores case).
+        required: false
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: 1–500 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SamplePage'
+        '404':
+          description: No such run
+        '503':
+          description: A sample file could not be read (MRL-STORE-220)
   /api/v1/runs/{run}/timeline:
     get:
       tags:
@@ -1169,6 +1827,30 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /api/v1/runs:compare:
+    post:
+      tags:
+      - telemetry
+      summary: '`POST /runs:compare`: the config settings that differ, and metric overlays on one grid.'
+      operationId: compare_runs
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RunCompareRequest'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunCompareResult'
+        '403':
+          description: No permission to read a run's metrics or config
+        '404':
+          description: A run doesn't exist or is hidden
+        '422':
+          description: Fewer than 2 or more than 10 runs, or a repeated run
   /api/v1/secrets:
     get:
       tags:
@@ -1276,6 +1958,38 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /api/v1/streams:
+    get:
+      tags:
+      - streams
+      summary: '`GET /streams`: live events for the topics (server-sent events).'
+      operationId: open_stream
+      parameters:
+      - name: topics
+        in: query
+        description: Comma-separated topics, like `run:run_…:metrics,alerts`.
+        required: false
+        schema:
+          type: string
+      - name: Last-Event-ID
+        in: header
+        description: The last event id received, to resume
+        required: false
+        schema:
+          type:
+          - string
+          - 'null'
+      responses:
+        '200':
+          description: An event stream
+          content:
+            text/event-stream: {}
+        '403':
+          description: A topic is not allowed, hidden or missing
+        '422':
+          description: A topic is not understood
+        '429':
+          description: Too many streams or topics (MRL-QUOTA-220)
   /api/v1/sync/profile:
     get:
       tags:
@@ -1756,6 +2470,168 @@ paths:
                 $ref: '#/components/schemas/Readiness'
 components:
   schemas:
+    AlertPage:
+      type: object
+      description: A page of alerts (OpenAPI name).
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/AlertView'
+          description: Alerts.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; null on the last page.
+    AlertView:
+      type: object
+      description: One alert.
+      required:
+      - id
+      - scope_kind
+      - source
+      - code
+      - severity
+      - title
+      - details
+      - state
+      - fire_count
+      - fired_at
+      - last_fired_at
+      properties:
+        acked_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Acknowledged at.
+        acked_by:
+          type:
+          - string
+          - 'null'
+          description: Acknowledged by (principal id).
+        code:
+          type: string
+          description: Machine code, like `node.disk_low`.
+        details:
+          type: object
+          description: Extra facts.
+        fire_count:
+          type: integer
+          format: int32
+          description: Times it fired while live.
+        fired_at:
+          type: string
+          format: date-time
+          description: First fired.
+        id:
+          type: string
+          description: '`alr_…`.'
+        last_fired_at:
+          type: string
+          format: date-time
+          description: Last fired.
+        project_id:
+          type:
+          - string
+          - 'null'
+          description: '`prj_…` for run alerts.'
+        resolved_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Resolved at.
+        resolved_by:
+          type:
+          - string
+          - 'null'
+          description: Resolved by (principal id, or `system`).
+        scope_id:
+          type:
+          - string
+          - 'null'
+          description: '`run_…` or `node_…`; null for system alerts.'
+        scope_kind:
+          type: string
+          description: '`run`, `node` or `system`.'
+        severity:
+          type: string
+          description: '`info`, `warning`, `error` or `critical`.'
+        source:
+          type: string
+          description: 'Who raised it: `safety`, `node`, `budget`, `system` or `metric`.'
+        state:
+          type: string
+          description: '`OPEN`, `ACKED` or `RESOLVED`.'
+        title:
+          type: string
+          description: What happened.
+    AlgorithmSchemaDoc:
+      type: object
+      description: '`GET /algorithms/{algo}/schema`.'
+      required:
+      - engine
+      - version
+      - algorithm
+      - display_name
+      - summary
+      - maturity
+      - fidelity
+      - switch
+      - defaults
+      - presets
+      properties:
+        algorithm:
+          type: string
+          description: Method id.
+        config_schema:
+          type:
+          - object
+          - 'null'
+          description: JSON Schema for `config.engine` (with `x-mrl-ui` hints), if the method has a form.
+        defaults:
+          type: object
+          description: Recommended values.
+        display_name:
+          type: string
+          description: Shown in the app.
+        engine:
+          type: string
+          description: Engine name.
+        fidelity:
+          type: string
+          description: full, partial or approximation.
+        fidelity_note:
+          type:
+          - string
+          - 'null'
+          description: Why fidelity is not full.
+        maturity:
+          type: string
+          description: stable, beta or experimental.
+        presets:
+          type: array
+          items:
+            type: object
+          description: 'Presets: `{id, title, tier, when, patch}` (JSON Merge Patch).'
+        summary:
+          type: string
+          description: One line.
+        switch:
+          type: object
+          description: Pinned engine fields (read-only in the form).
+        ui_schema:
+          type:
+          - object
+          - 'null'
+          description: UI hints file, if any.
+        version:
+          type: string
+          description: Engine version.
     Artifact:
       type: object
       description: A registered artifact.
@@ -1936,6 +2812,98 @@ components:
           - 'null'
           description: Name for that token.
       additionalProperties: false
+    CapabilityItem:
+      type: object
+      description: One method of one engine version.
+      required:
+      - engine
+      - version
+      - algorithm
+      - display_name
+      - maturity
+      - runnable
+      - update_strategies
+      - precision
+      - enabled_hardware
+      - problems
+      properties:
+        algorithm:
+          type: string
+          description: Method id.
+        display_name:
+          type: string
+          description: Shown in the app.
+        enabled_hardware:
+          type: array
+          items:
+            type: string
+          description: Hardware classes where the engine passed its probe.
+        engine:
+          type: string
+          description: Engine name.
+        maturity:
+          type: string
+          description: stable, beta or experimental.
+        precision:
+          type: array
+          items:
+            type: string
+          description: Precisions it offers.
+        problems:
+          type: array
+          items:
+            $ref: '#/components/schemas/CapabilityProblem'
+          description: Why it can't run.
+        runnable:
+          type: boolean
+          description: True when nothing stops it (settings are checked when you submit).
+        update_strategies:
+          type: array
+          items:
+            type: string
+          description: Update strategies it offers on the available hardware.
+        version:
+          type: string
+          description: Engine version.
+    CapabilityProblem:
+      type: object
+      description: One problem (same shape as a job rejection).
+      required:
+      - code
+      - message
+      - hint
+      properties:
+        code:
+          type: string
+          description: Catalog code, like `MRL-CAP-018`.
+        hint:
+          type: string
+          description: What to do.
+        message:
+          type: string
+          description: What is wrong.
+        path:
+          type:
+          - string
+          - 'null'
+          description: What it concerns, like `/resources`.
+    CapabilityReport:
+      type: object
+      description: '`GET /capabilities`.'
+      required:
+      - hardware
+      - items
+      properties:
+        hardware:
+          type: array
+          items:
+            type: string
+          description: Hardware classes of the connected machines considered.
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/CapabilityItem'
+          description: Every method of every live engine version.
     CheckResult:
       type: object
       description: One readiness check result.
@@ -1954,6 +2922,121 @@ components:
         status:
           type: string
           description: '`ready` or `not_ready`.'
+    CheckpointFileInfo:
+      type: object
+      description: One file of a checkpoint.
+      required:
+      - path
+      - role
+      - size
+      - sha256
+      properties:
+        path:
+          type: string
+          description: Path inside the checkpoint.
+        role:
+          type: string
+          description: '`weights`, `optimizer`, `manifest`, ….'
+        sha256:
+          type: string
+          description: sha256 (hex).
+        size:
+          type: integer
+          format: int64
+          description: Size in bytes.
+    CheckpointInfo:
+      type: object
+      description: A checkpoint as the API shows it.
+      required:
+      - id
+      - run_id
+      - attempt_id
+      - attempt_epoch
+      - step
+      - kind
+      - layout
+      - is_final
+      - state
+      - metrics
+      - created_at
+      properties:
+        attempt_epoch:
+          type: integer
+          format: int64
+          description: That attempt's fencing epoch.
+        attempt_id:
+          type: string
+          description: The attempt that wrote it.
+        committed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Committed.
+        corrupt_reason:
+          type:
+          - string
+          - 'null'
+          description: Why it is CORRUPT.
+        created_at:
+          type: string
+          format: date-time
+          description: Staged.
+        file_count:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Number of files.
+        files:
+          type:
+          - array
+          - 'null'
+          items:
+            $ref: '#/components/schemas/CheckpointFileInfo'
+          description: The files (only on `GET /checkpoints/{ckpt}`).
+        id:
+          type: string
+          description: '`ckpt_…`.'
+        is_final:
+          type: boolean
+          description: The run's final checkpoint.
+        kind:
+          type: string
+          description: '`full_resume`, `weights_only` or `adapter_only`.'
+        layout:
+          type: string
+          description: Format tag, like `hf-trainer-v1`.
+        metrics:
+          type: object
+          description: Metrics at this step.
+        run_id:
+          type: string
+          description: '`run_…`.'
+        state:
+          type: string
+          description: '`WRITING`, `UPLOADED`, `VERIFYING`, `COMMITTED`, `CORRUPT` or `TOMBSTONED`.'
+        step:
+          type: integer
+          format: int64
+          description: Training step.
+        total_bytes:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Sum of file sizes.
+        verification_level:
+          type:
+          - string
+          - 'null'
+          description: '`manifest_head` (files present with their sizes) or `full_rehash` (every byte re-read).'
+        verified_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Last verified.
     CopyInfo:
       type: object
       description: A saved copy (metadata only).
@@ -2157,6 +3240,143 @@ components:
             enum:
             - cloudflare_tunnel
       description: How the core dials one machine (stored in `compute_nodes.endpoint`).
+    EngineAlgorithm:
+      type: object
+      description: A method of one engine version.
+      required:
+      - id
+      - display_name
+      - summary
+      - maturity
+      - fidelity
+      - verified_hw
+      properties:
+        display_name:
+          type: string
+          description: Shown in the app.
+        fidelity:
+          type: string
+          description: full, partial or approximation.
+        id:
+          type: string
+          description: Method id.
+        maturity:
+          type: string
+          description: stable, beta or experimental.
+        summary:
+          type: string
+          description: One line.
+        verified_hw:
+          type: array
+          items:
+            type: string
+          description: Hardware classes with a passed probe.
+    EngineList:
+      type: object
+      description: '`GET /engines`.'
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/EngineSummary'
+          description: Engines by name.
+    EngineSummary:
+      type: object
+      description: One engine.
+      required:
+      - name
+      - kind
+      - display_name
+      - versions
+      properties:
+        description:
+          type:
+          - string
+          - 'null'
+          description: Longer text.
+        display_name:
+          type: string
+          description: Shown in the app.
+        kind:
+          type: string
+          description: '`engine` (training) or `builtin` (utility jobs).'
+        name:
+          type: string
+          description: Adapter name, like `trl`.
+        versions:
+          type: array
+          items:
+            $ref: '#/components/schemas/EngineVersionSummary'
+          description: Its versions, oldest first.
+    EngineVersionDetail:
+      type: object
+      description: '`GET /engines/{eng}/versions/{ver}`.'
+      required:
+      - name
+      - version
+      - status
+      - manifest_sha256
+      - probe_results
+      - manifest
+      - algorithms
+      properties:
+        algorithms:
+          type: array
+          items:
+            $ref: '#/components/schemas/EngineAlgorithm'
+          description: Its methods.
+        manifest:
+          type: object
+          description: The merged manifest.
+        manifest_sha256:
+          type: string
+          description: sha256 of the stored manifest.
+        name:
+          type: string
+          description: Adapter name.
+        probe_results:
+          type: object
+          description: Probe results per hardware class.
+        runtime_ref:
+          type:
+          - string
+          - 'null'
+          description: Lock hash or image of the trainer environment.
+        status:
+          type: string
+          description: Status.
+        version:
+          type: string
+          description: Version.
+    EngineVersionSummary:
+      type: object
+      description: One version in the engine list.
+      required:
+      - version
+      - status
+      - hardware
+      - algorithms
+      properties:
+        algorithms:
+          type: array
+          items:
+            type: string
+          description: Method ids.
+        hardware:
+          type: object
+          description: 'Probe outcome per hardware class (`cpu`, `nvidia`, …): ENABLED or FAILED.'
+          additionalProperties:
+            type: string
+          propertyNames:
+            type: string
+        status:
+          type: string
+          description: PENDING_APPROVAL, PROBING, ENABLED, DISABLED or REVOKED.
+        version:
+          type: string
+          description: Adapter version.
     Experiment:
       type: object
       description: An experiment, as the API shows it.
@@ -2488,6 +3708,59 @@ components:
       enum:
       - STATIC
       - EPHEMERAL
+    LogEntryView:
+      type: object
+      description: One log chunk.
+      required:
+      - id
+      - attempt_id
+      - rank
+      - stream
+      - offset
+      - received_at
+      - text
+      properties:
+        attempt_id:
+          type: string
+          description: '`att_…`.'
+        id:
+          type: integer
+          format: int64
+          description: Position in the run's log (increasing).
+        offset:
+          type: integer
+          format: int64
+          description: Byte offset in the stream.
+        rank:
+          type: integer
+          format: int32
+          description: Process rank.
+        received_at:
+          type: string
+          format: date-time
+          description: When it arrived.
+        stream:
+          type: string
+          description: '`stdout`, `stderr`, `harness` or `agent` (the server''s own notes).'
+        text:
+          type: string
+          description: The text (invalid UTF-8 shown as �).
+    LogPage:
+      type: object
+      description: A page of log chunks.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/LogEntryView'
+          description: Chunks in log order.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` to continue; null when nothing more is stored yet.
     LoginRequest:
       type: object
       description: Start a sign-in.
@@ -2562,6 +3835,120 @@ components:
           - $ref: '#/components/schemas/UserInfo'
             description: The person (absent for an unknown principal).
           - type: 'null'
+    MetricPointView:
+      type: object
+      description: One point of a query answer.
+      required:
+      - x
+      - value
+      - min
+      - max
+      - n
+      properties:
+        max:
+          type: number
+          format: double
+          description: Largest value in the group.
+        min:
+          type: number
+          format: double
+          description: Smallest value in the group.
+        n:
+          type: integer
+          format: int64
+          description: Points in the group.
+        value:
+          type: number
+          format: double
+          description: Average of the group.
+        x:
+          type: integer
+          format: int64
+          description: 'Start of the group: a step, or seconds since 1970 on the time axis.'
+    MetricQueryResult:
+      type: object
+      description: '`GET /runs/{run}/metrics/query`.'
+      required:
+      - run_id
+      - axis
+      - max_points
+      - series
+      properties:
+        axis:
+          type: string
+          description: '`step` or `time`.'
+        max_points:
+          type: integer
+          format: int64
+          description: The limit used.
+        run_id:
+          type: string
+          description: '`run_…`.'
+        series:
+          type: array
+          items:
+            $ref: '#/components/schemas/MetricSeriesPoints'
+          description: The series asked for.
+    MetricSeriesPoints:
+      type: object
+      description: One series of a query answer.
+      required:
+      - series_id
+      - name
+      - split
+      - points
+      properties:
+        name:
+          type: string
+          description: Name.
+        points:
+          type: array
+          items:
+            $ref: '#/components/schemas/MetricPointView'
+          description: At most `max_points` points.
+        series_id:
+          type: integer
+          format: int64
+          description: Series id.
+        split:
+          type: string
+          description: Split.
+    MetricSeriesView:
+      type: object
+      description: One metric series of a run.
+      required:
+      - series_id
+      - name
+      - split
+      - kind
+      - freshness
+      - declared
+      properties:
+        declared:
+          type: boolean
+          description: False when the engine manifest does not declare this metric.
+        freshness:
+          type: string
+          description: '`live`, `sampled` or `delayed`.'
+        kind:
+          type: string
+          description: '`gauge`, `counter` or `histogram_summary`.'
+        name:
+          type: string
+          description: Name, like `train/loss`.
+        rank:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Rank, or null for the aggregate.
+        series_id:
+          type: integer
+          format: int64
+          description: Series id (use it in `series=`).
+        split:
+          type: string
+          description: Split, like `train` or `eval` (may be empty).
     NewArtifact:
       type: object
       description: '`POST /artifacts` body.'
@@ -3026,6 +4413,113 @@ components:
               trace_id:
                 type: string
                 description: Trace id.
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_CheckpointInfo:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: A checkpoint as the API shows it.
+            required:
+            - id
+            - run_id
+            - attempt_id
+            - attempt_epoch
+            - step
+            - kind
+            - layout
+            - is_final
+            - state
+            - metrics
+            - created_at
+            properties:
+              attempt_epoch:
+                type: integer
+                format: int64
+                description: That attempt's fencing epoch.
+              attempt_id:
+                type: string
+                description: The attempt that wrote it.
+              committed_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+                description: Committed.
+              corrupt_reason:
+                type:
+                - string
+                - 'null'
+                description: Why it is CORRUPT.
+              created_at:
+                type: string
+                format: date-time
+                description: Staged.
+              file_count:
+                type:
+                - integer
+                - 'null'
+                format: int32
+                description: Number of files.
+              files:
+                type:
+                - array
+                - 'null'
+                items:
+                  $ref: '#/components/schemas/CheckpointFileInfo'
+                description: The files (only on `GET /checkpoints/{ckpt}`).
+              id:
+                type: string
+                description: '`ckpt_…`.'
+              is_final:
+                type: boolean
+                description: The run's final checkpoint.
+              kind:
+                type: string
+                description: '`full_resume`, `weights_only` or `adapter_only`.'
+              layout:
+                type: string
+                description: Format tag, like `hf-trainer-v1`.
+              metrics:
+                type: object
+                description: Metrics at this step.
+              run_id:
+                type: string
+                description: '`run_…`.'
+              state:
+                type: string
+                description: '`WRITING`, `UPLOADED`, `VERIFYING`, `COMMITTED`, `CORRUPT` or `TOMBSTONED`.'
+              step:
+                type: integer
+                format: int64
+                description: Training step.
+              total_bytes:
+                type:
+                - integer
+                - 'null'
+                format: int64
+                description: Sum of file sizes.
+              verification_level:
+                type:
+                - string
+                - 'null'
+                description: '`manifest_head` (files present with their sizes) or `full_rehash` (every byte re-read).'
+              verified_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+                description: Last verified.
           description: The items on this page.
         next_cursor:
           type:
@@ -3922,6 +5416,32 @@ components:
       - exported_as
       - labelled_from
       - generated_by
+    ResourceActualView:
+      type: object
+      description: Peak resource use of one attempt, device and phase.
+      required:
+      - attempt_id
+      - device
+      - phase
+      - signal
+      - peak
+      properties:
+        attempt_id:
+          type: string
+          description: '`att_…`.'
+        device:
+          type: string
+          description: Device, like `gpu0`; empty for the whole host.
+        peak:
+          type: number
+          format: double
+          description: Highest value seen.
+        phase:
+          type: string
+          description: Phase.
+        signal:
+          type: string
+          description: What was measured, like `torch_allocated_peak`.
     RestoreRequest:
       type: object
       description: Restore a saved setup. Give the passphrase or the recovery key.
@@ -4072,6 +5592,127 @@ components:
           - object
           - 'null'
           description: 'Why: `{code, message, problems?}`; for REJECTED, every problem with a hint.'
+    RunArtifactInput:
+      type: object
+      description: A named input from a committed artifact.
+      required:
+      - artifact_id
+      - path
+      - name
+      properties:
+        artifact_id:
+          type: string
+          description: Artifact id (`art_…`).
+        name:
+          type: string
+          description: Unique worker input name, also used as the staged filename.
+        path:
+          type: string
+          description: File path as listed in the artifact manifest.
+      additionalProperties: false
+    RunCompareDiff:
+      type: object
+      description: One config setting whose value differs between the runs.
+      required:
+      - path
+      - values
+      properties:
+        path:
+          type: string
+          description: JSON pointer into the resolved config, like `/hyperparameters/lr`.
+        values:
+          type: object
+          description: Value per `run_…` (null where a run doesn't have it).
+    RunCompareRequest:
+      type: object
+      description: '`POST /runs:compare` body.'
+      required:
+      - run_ids
+      properties:
+        max_points:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Points per overlay line, 2–10000 (default 1000).
+        metrics:
+          type: array
+          items:
+            type: string
+          description: |-
+            Metric names to overlay (each split separately); default: the names every run has
+            (at most 20).
+        run_ids:
+          type: array
+          items:
+            type: string
+          description: 2–10 different `run_…` ids.
+      additionalProperties: false
+    RunCompareResult:
+      type: object
+      description: '`POST /runs:compare` answer.'
+      required:
+      - runs
+      - config_diff
+      - metrics
+      properties:
+        config_diff:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunCompareDiff'
+          description: Only the settings that differ.
+        metrics:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunCompareSeries'
+          description: Overlays.
+        runs:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunCompareRun'
+          description: The runs, in the order asked.
+    RunCompareRun:
+      type: object
+      description: One compared run.
+      required:
+      - run_id
+      - name
+      - state
+      properties:
+        name:
+          type: string
+          description: Run name.
+        run_id:
+          type: string
+          description: '`run_…`.'
+        state:
+          type: string
+          description: Job state.
+    RunCompareSeries:
+      type: object
+      description: One metric overlaid across runs, on one step grid.
+      required:
+      - name
+      - split
+      - runs
+      properties:
+        name:
+          type: string
+          description: Metric name.
+        runs:
+          type: object
+          description: |-
+            Points per `run_…` (runs without this metric are left out); groups start at the same
+            steps for every run.
+          additionalProperties:
+            type: array
+            items:
+              $ref: '#/components/schemas/MetricPointView'
+          propertyNames:
+            type: string
+        split:
+          type: string
+          description: Split.
     RunConfig:
       type: object
       description: The immutable config snapshot of a run.
@@ -4119,6 +5760,75 @@ components:
       enum:
       - TRAIN
       - EVAL
+    RunMetrics:
+      type: object
+      description: '`GET /runs/{run}/metrics`.'
+      required:
+      - run_id
+      - series
+      - resources
+      properties:
+        progress:
+          oneOf:
+          - $ref: '#/components/schemas/RunProgressView'
+            description: Latest progress, if any arrived.
+          - type: 'null'
+        resources:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResourceActualView'
+          description: Peak resource use from `resource/…` metrics.
+        run_id:
+          type: string
+          description: '`run_…`.'
+        series:
+          type: array
+          items:
+            $ref: '#/components/schemas/MetricSeriesView'
+          description: Every series, oldest first.
+    RunProgressView:
+      type: object
+      description: The run's latest progress report.
+      required:
+      - attempt_id
+      - step
+      - total_steps
+      - epoch
+      - phase
+      - tokens_seen
+      - eta_seconds
+      - updated_at
+      properties:
+        attempt_id:
+          type: string
+          description: The attempt that sent it, `att_…`.
+        epoch:
+          type: number
+          format: double
+          description: Epoch (fractional).
+        eta_seconds:
+          type: number
+          format: double
+          description: Estimated seconds left.
+        phase:
+          type: string
+          description: Phase, like `train` or `eval`.
+        step:
+          type: integer
+          format: int64
+          description: Global step.
+        tokens_seen:
+          type: integer
+          format: int64
+          description: Tokens seen so far.
+        total_steps:
+          type: integer
+          format: int64
+          description: Planned steps.
+        updated_at:
+          type: string
+          format: date-time
+          description: When it arrived.
     RunSubmission:
       type: object
       description: '`POST /projects/{prj}/runs` body.'
@@ -4130,6 +5840,11 @@ components:
         algorithm_id:
           type: string
           description: The method, like `sft`, `dpo` or `grpo`.
+        artifact_inputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunArtifactInput'
+          description: Committed artifact files to stage before launching the run.
         base_model_version_id:
           type: string
           description: The model version to start from, `mv_…`.
@@ -4187,12 +5902,165 @@ components:
           - string
           - 'null'
           description: The reward version, `rwdv_…`.
+        secret_ids:
+          type: array
+          items:
+            type: string
+          description: Secrets to grant to this run as worker environment variables.
         seeds:
           type:
           - object
           - 'null'
           description: 'Random seeds; the server picks `{"global": n}` when absent.'
       additionalProperties: false
+    SamplePage:
+      type: object
+      description: A page of samples.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/SampleView'
+          description: Samples, oldest batch first.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` to continue; null at the end.
+    SampleView:
+      type: object
+      description: One generated sample.
+      required:
+      - batch_id
+      - step
+      - attempt_id
+      - sample_id
+      - group_id
+      - prompt
+      - completion
+      - reward_components
+      - truncated
+      - completion_tokens
+      - policy_version
+      properties:
+        attempt_id:
+          type: string
+          description: '`att_…`.'
+        batch_id:
+          type: integer
+          format: int64
+          description: The batch it came in.
+        completion:
+          type: string
+          description: Generated text.
+        completion_tokens:
+          type: integer
+          format: int32
+          description: Generated tokens.
+          minimum: 0
+        group_id:
+          type: string
+          description: Group (prompts sampled together).
+        policy_version:
+          type: integer
+          format: int64
+          description: Policy version that generated it.
+          minimum: 0
+        prompt:
+          type: string
+          description: Prompt text.
+        reward_components:
+          type: object
+          description: Reward per component.
+          additionalProperties:
+            type: number
+            format: double
+          propertyNames:
+            type: string
+        reward_total:
+          type:
+          - number
+          - 'null'
+          format: double
+          description: Total reward, if scored.
+        sample_id:
+          type: string
+          description: The worker's id for the sample.
+        step:
+          type: integer
+          format: int64
+          description: Trainer step.
+        truncated:
+          type: boolean
+          description: True when generation hit the length limit.
+    SchedulerQueue:
+      type: object
+      description: The queue of a pool.
+      required:
+      - pool_id
+      - total
+      - jobs
+      properties:
+        jobs:
+          type: array
+          items:
+            $ref: '#/components/schemas/SchedulerQueueEntry'
+          description: The jobs the caller may see, first in line first.
+        pool_id:
+          type: string
+          description: '`pool_…`.'
+        total:
+          type: integer
+          format: int32
+          description: Jobs waiting for this pool that the caller may read.
+          minimum: 0
+    SchedulerQueueEntry:
+      type: object
+      description: One waiting job.
+      required:
+      - job_id
+      - project_id
+      - position
+      - priority
+      properties:
+        job_id:
+          type: string
+          description: '`job_…`.'
+        position:
+          type: integer
+          format: int32
+          description: Position among jobs the caller can read.
+          minimum: 0
+        priority:
+          type: integer
+          format: int32
+          description: Higher goes first.
+        project_id:
+          type: string
+          description: '`prj_…`.'
+        queued_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When it joined the queue.
+        reason:
+          type:
+          - string
+          - 'null'
+          description: Why it is still waiting, in plain words.
+        reason_code:
+          type:
+          - string
+          - 'null'
+          description: The reason's code, like `MRL-QUOTA-210`.
+        run_id:
+          type:
+          - string
+          - 'null'
+          description: '`run_…`, for training and evaluation jobs.'
     SecretMeta:
       type: object
       description: A secret reference. Never has the value.
@@ -4652,3 +6520,13 @@ tags:
   description: Where entities came from and what came from them.
 - name: secrets
   description: Secret references. Values are write-only.
+- name: telemetry
+  description: Metric history, logs, samples and run comparison.
+- name: streams
+  description: Live server-sent event streams.
+- name: alerts
+  description: 'Alerts: list, acknowledge and resolve.'
+- name: checkpoints
+  description: 'Checkpoints: listing, verification and deletion.'
+- name: engines
+  description: Training engines, their methods and what can run where.
