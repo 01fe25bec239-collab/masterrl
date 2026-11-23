@@ -253,6 +253,22 @@ impl GatewayHarness {
         r.json()["token"].as_str().unwrap_or_default().to_owned()
     }
 
+    /// Seeds a RUNNING job with `attempt` as its current attempt at `epoch`: the gateway only
+    /// renews leases of a live, current attempt (INT-3).
+    pub async fn track_attempt(&self, attempt: mrl_domain::ids::AttemptId, epoch: u64) {
+        let job = uuid::Uuid::now_v7();
+        self.db
+            .seed(&format!(
+                "INSERT INTO jobs (id, org_id, project_id, kind, state, epoch, resource_request, retry_policy, created_by)
+                 VALUES ('{job}', '{job}', '{job}', 'DATA_PREP', 'RUNNING', {epoch}, '{{}}', '{{}}', 'test');
+                 INSERT INTO job_attempts (id, org_id, job_id, attempt_no, epoch, state)
+                 VALUES ('{a}', '{job}', '{job}', 1, {epoch}, 'RUNNING');
+                 UPDATE jobs SET current_attempt_id = '{a}' WHERE id = '{job}';",
+                a = attempt.as_uuid(),
+            ))
+            .await;
+    }
+
     /// `GET /nodes/{node}` as JSON.
     pub async fn node(&self, node: &str) -> Value {
         let r = self.get(&format!("/api/v1/nodes/{node}")).await;
@@ -636,23 +652,80 @@ mod tests {
                 .await
                 .unwrap();
         }
+        // The attempt runs at epoch 2 and is its job's current attempt.
+        gw.track_attempt(attempt, 2).await;
         let running = |epoch| mrl_proto::common::v1::AttemptRef {
             attempt_id: attempt.to_string(),
             fencing_epoch: epoch,
             ..Default::default()
         };
-        let leases = mrl_server::modules::nodes::store::leases(
-            gw.db.db(),
-            uuid_of(&node_s),
-            &[running(1), running(2)],
-        )
-        .await
-        .unwrap();
-        let granted: Vec<u64> = leases
+        let granted = || async {
+            mrl_server::modules::nodes::store::leases(
+                gw.db.db(),
+                uuid_of(&node_s),
+                &[running(1), running(2)],
+            )
+            .await
+            .unwrap()
             .iter()
             .filter_map(|l| l.attempt.as_ref().map(|a| a.fencing_epoch))
-            .collect();
-        assert_eq!(granted, vec![2], "epoch 1 was cancelled, epoch 2 runs");
+            .collect::<Vec<u64>>()
+        };
+        assert_eq!(
+            granted().await,
+            vec![2],
+            "epoch 1 was cancelled, epoch 2 runs"
+        );
+
+        // INT-3: no renewal once the job's epoch moved on (a lost lease bumps it) …
+        gw.db.seed("UPDATE jobs SET epoch = 3").await;
+        assert_eq!(granted().await, Vec::<u64>::new(), "superseded epoch");
+        // … or once the attempt is LOST.
+        gw.db
+            .seed("UPDATE jobs SET epoch = 2; UPDATE job_attempts SET state = 'LOST'")
+            .await;
+        assert_eq!(granted().await, Vec::<u64>::new(), "lost attempt");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs PostgreSQL (just test-integration)"]
+    async fn after_a_core_outage_nodes_get_the_offline_time_again_before_going_offline() {
+        let mut cfg = fast_config();
+        cfg.offline_after_seconds = 6;
+        cfg.degraded_after_seconds = 5;
+        cfg.outage_threshold_seconds = 2;
+        let gw = GatewayHarness::start_with(
+            TestDb::new().await,
+            cfg,
+            Arc::new(InMemorySecretStore::default()),
+            LaneRouter::new(),
+        )
+        .await;
+        let a = TestAgent::new(1, |_| {});
+        let node = a.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
+        // The agent is not running: its last heartbeat (enrollment) is old, and so is the
+        // last health check, as after the core was down for a minute.
+        gw.db
+            .seed(&format!(
+                "UPDATE compute_nodes SET status = 'ONLINE', last_heartbeat_at = now() - interval '1 minute'
+                  WHERE id = '{}';
+                 INSERT INTO node_health_ticks (id, last_check_at, resumed_at)
+                   VALUES (1, now() - interval '1 minute', now() - interval '1 minute')
+                 ON CONFLICT (id) DO UPDATE SET last_check_at = EXCLUDED.last_check_at,
+                   resumed_at = EXCLUDED.resumed_at;",
+                uuid_of(&node)
+            ))
+            .await;
+        mrl_server::modules::nodes::health::check_once(&gw.gw)
+            .await
+            .unwrap();
+        assert_eq!(
+            gw.node(&node).await["status"],
+            "ONLINE",
+            "grace after the outage"
+        );
+        // Without heartbeats it still goes OFFLINE once the offline time has passed.
+        gw.wait_status(&node, "OFFLINE").await;
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -841,6 +914,7 @@ mod tests {
         let node_s = a.enroll(&gw, &gw.token(json!({})).await).await.unwrap();
         let node = NodeId::from_str(&node_s).unwrap();
         let attempt = mrl_domain::ids::AttemptId::new();
+        gw.track_attempt(attempt, 1).await;
         let launch = CommandSender::new(&gw.gw, &[CommandKind::LaunchAttempt])
             .send(
                 node,
