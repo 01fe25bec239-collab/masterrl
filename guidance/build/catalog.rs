@@ -2208,6 +2208,84 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-CAP-210")),
+            ("title", Value::Str("No machine in this pool can run this job as asked.")),
+            ("why", Value::Str("The job asks for more GPUs, GPU memory, a GPU type or memory than any machine in the pool has. The reason names what is missing.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Read the reason to see what the job needs that no machine has."),
+                    Value::Str("Ask for fewer or smaller GPUs, or add a machine that has them to the pool."),
+                    Value::Str("A job runs on one machine for now, so ask for 1 machine with more GPUs instead of several machines."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CAP-240")),
+            ("title", Value::Str("This engine can't train with these settings.")),
+            ("why", Value::Str("The engine or method doesn't offer the update strategy, precision or parallelism you picked. Details name the setting and the choices that work.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Pick one of the choices listed in Details."),
+                    Value::Str("Or choose another engine that offers this setting."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CAP-241")),
+            ("title", Value::Str("This engine hasn't been checked on this kind of machine yet.")),
+            ("why", Value::Str("The app checks each engine on a connected machine before it runs jobs there. No check has passed yet for this kind of machine.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Keep a machine of this kind connected for a few minutes so the app can check it."),
+                    Value::Str("Open Machines and run the Environment Doctor if the check keeps failing."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CAP-242")),
+            ("title", Value::Str("This method needs an input the run doesn't have.")),
+            ("why", Value::Str("Some methods learn from a reward or a teacher model. This run doesn't include the one this method needs.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Attach the input named in Details."),
+                    Value::Str("Or choose a method that doesn't need it."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CAP-243")),
+            ("title", Value::Str("This dataset's format doesn't fit this method.")),
+            ("why", Value::Str("Each method reads data in certain formats. Details name the formats this method accepts.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Convert the dataset in Dataset Studio to a format listed in Details."),
+                    Value::Str("Or choose a method that reads this format."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CAP-244")),
+            ("title", Value::Str("This method can't train this kind of model.")),
+            ("why", Value::Str("Each method works with certain model types, like decoder models. This model is a different type.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Choose a model of a type listed in Details."),
+                    Value::Str("Or choose a method that trains this type of model."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CAP-245")),
+            ("title", Value::Str("No connected machine has the hardware this run asks for.")),
+            ("why", Value::Str("The run asks for a kind of machine, like one with an NVIDIA GPU. None of the connected machines has it.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Connect a machine of this kind in Machines."),
+                    Value::Str("Or change the run's hardware to match a connected machine."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-CAP-250")),
             ("title", Value::Str("This setting needs an NVIDIA GPU.")),
             ("why", Value::Str("QLoRA, 8-bit optimizers and fp16 training use code that runs only on NVIDIA GPUs, and this machine has none. Details names the setting.")),
@@ -2326,6 +2404,28 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-CONFLICT-210")),
+            ("title", Value::Str("This reservation was changed by a newer holder.")),
+            ("why", Value::Str("Each reservation carries an epoch. A change made with an older epoch comes from work that was already replaced, so it doesn't count.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Read the reservation again and use its current epoch."),
+                    Value::Str("If your work was replaced, stop it; the newer holder owns the machine now."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CONFLICT-230")),
+            ("title", Value::Str("This checkpoint is still in use, so it can't be deleted.")),
+            ("why", Value::Str("It is the run's final result or its resume point, or another run starts from it. Deleting it would break that.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Wait until the run has finished, or delete the run that starts from it first."),
+                    Value::Str("The final checkpoint of a run stays as long as the run."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-DATA-001")),
             ("title", Value::Str("Your dataset did not pass its checks.")),
             ("why", Value::Str("Some rows are empty, are missing fields, or don't match the chosen format.")),
@@ -2365,6 +2465,17 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Convert the column named in Details to text, then upload the file again."),
                     Value::Str("For images, store a reference to each image file instead of its bytes."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-DATA-240")),
+            ("title", Value::Str("The app has no record of this dataset version.")),
+            ("why", Value::Str("The run names a dataset version that isn't registered in your organization.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check the dataset version id in the run settings."),
+                    Value::Str("Import the dataset first if it isn't in the app yet."),
                 ])),
             ])),
         ]),
@@ -3126,6 +3237,17 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-MODEL-240")),
+            ("title", Value::Str("The app has no record of this model version.")),
+            ("why", Value::Str("The run names a model version that isn't registered in your organization.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check the model version id in the run settings."),
+                    Value::Str("Import the model first if it isn't in the app yet."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-NODE-121")),
             ("title", Value::Str("The agent could not save or read its local files.")),
             ("why", Value::Str("The disk may be full, or the agent may not have permission to use its state folder.")),
@@ -3318,6 +3440,16 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-PERM-210")),
+            ("title", Value::Str("No pool is open to this project.")),
+            ("why", Value::Str("Jobs run on the pools of their organization or on shared pools. None of them can take this job, or no pool exists yet.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Create a pool and add a machine to it, or ask an admin to open a pool to your organization."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-QUOTA-001")),
             ("title", Value::Str("Your team reached its limit on jobs or GPUs.")),
             ("why", Value::Str("Your org limits how many jobs and GPUs a project can use at once.")),
@@ -3346,6 +3478,50 @@ pub static CATALOG: Value = Value::Map(&[
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Wait about 1 minute, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-QUOTA-210")),
+            ("title", Value::Str("This job is waiting for a free machine.")),
+            ("why", Value::Str("A machine in the pool can run the job, but it is busy, offline or draining right now.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Nothing to do; the job starts by itself when a machine is free."),
+                    Value::Str("To start sooner, raise the job's priority or add a machine to the pool."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-QUOTA-211")),
+            ("title", Value::Str("This pool is paused and starts no new work.")),
+            ("why", Value::Str("An admin paused the pool (its `paused` flag is set). Work already running there goes on.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Wait until an admin resumes the pool."),
+                    Value::Str("Or ask an admin to open another pool to your project."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-QUOTA-212")),
+            ("title", Value::Str("Too many jobs of this project are ahead in the queue.")),
+            ("why", Value::Str("The scheduler places only a set number of each project's queued jobs at a time. That way one project can't fill every machine.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Nothing to do; the job moves up as earlier ones start."),
+                    Value::Str("Cancel jobs you no longer need to let this one through sooner."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-QUOTA-220")),
+            ("title", Value::Str("Too many live views are open.")),
+            ("why", Value::Str("Each sign-in may keep up to 10 live views (streams) open at once, each watching up to 50 things. This request would go over that.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Close live views you no longer need, like old browser tabs on run pages."),
+                    Value::Str("Watch fewer things in one view, then try again."),
                 ])),
             ])),
         ]),
@@ -3548,6 +3724,39 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-STATE-210")),
+            ("title", Value::Str("The agent lost its credentials before launch.")),
+            ("why", Value::Str("The agent restarted before it started the run. Its saved metadata lists the required credentials, and the values were held in memory.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Wait for the scheduler to place another attempt if the run has retries left."),
+                    Value::Str("If the run stops, check that the agent stays online and submit it again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STATE-220")),
+            ("title", Value::Str("This alert is already resolved.")),
+            ("why", Value::Str("Someone resolved this alert, so it takes no more changes. If the problem comes back, a new alert opens.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Refresh the alert list to see its current state."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STATE-230")),
+            ("title", Value::Str("This checkpoint isn't committed, so it can't be used yet.")),
+            ("why", Value::Str("A checkpoint can be checked, promoted or deleted only once all its files are saved and confirmed. This one is still being saved, or it was found to be damaged or deleted.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Refresh to see the checkpoint's state."),
+                    Value::Str("If it is still being saved, wait a moment and try again."),
+                    Value::Str("If it is damaged, use an earlier checkpoint of the same run."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-STORE-001")),
             ("title", Value::Str("The app refused a storage path.")),
             ("why", Value::Str("The path points outside your workspace's storage area, or it has a part the app doesn't allow, like `..`.")),
@@ -3703,6 +3912,17 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Send the parts listed in Details again."),
                     Value::Str("Then finish the upload again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STORE-220")),
+            ("title", Value::Str("A saved log or sample file is missing or damaged.")),
+            ("why", Value::Str("Older logs and samples are kept as files in storage. The file for this part is missing, or its contents don't match the checksum saved when it was written.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check that the storage service is running and reachable."),
+                    Value::Str("If the file was deleted by a storage cleanup rule, this part of the log can't be shown any more."),
                 ])),
             ])),
         ]),

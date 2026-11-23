@@ -2160,6 +2160,84 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-CAP-210",
+      "title": "No machine in this pool can run this job as asked.",
+      "why": "The job asks for more GPUs, GPU memory, a GPU type or memory than any machine in the pool has. The reason names what is missing.",
+      "what_to_do": {
+        "steps": [
+          "Read the reason to see what the job needs that no machine has.",
+          "Ask for fewer or smaller GPUs, or add a machine that has them to the pool.",
+          "A job runs on one machine for now, so ask for 1 machine with more GPUs instead of several machines."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CAP-240",
+      "title": "This engine can't train with these settings.",
+      "why": "The engine or method doesn't offer the update strategy, precision or parallelism you picked. Details name the setting and the choices that work.",
+      "what_to_do": {
+        "steps": [
+          "Pick one of the choices listed in Details.",
+          "Or choose another engine that offers this setting."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CAP-241",
+      "title": "This engine hasn't been checked on this kind of machine yet.",
+      "why": "The app checks each engine on a connected machine before it runs jobs there. No check has passed yet for this kind of machine.",
+      "what_to_do": {
+        "steps": [
+          "Keep a machine of this kind connected for a few minutes so the app can check it.",
+          "Open Machines and run the Environment Doctor if the check keeps failing."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CAP-242",
+      "title": "This method needs an input the run doesn't have.",
+      "why": "Some methods learn from a reward or a teacher model. This run doesn't include the one this method needs.",
+      "what_to_do": {
+        "steps": [
+          "Attach the input named in Details.",
+          "Or choose a method that doesn't need it."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CAP-243",
+      "title": "This dataset's format doesn't fit this method.",
+      "why": "Each method reads data in certain formats. Details name the formats this method accepts.",
+      "what_to_do": {
+        "steps": [
+          "Convert the dataset in Dataset Studio to a format listed in Details.",
+          "Or choose a method that reads this format."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CAP-244",
+      "title": "This method can't train this kind of model.",
+      "why": "Each method works with certain model types, like decoder models. This model is a different type.",
+      "what_to_do": {
+        "steps": [
+          "Choose a model of a type listed in Details.",
+          "Or choose a method that trains this type of model."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CAP-245",
+      "title": "No connected machine has the hardware this run asks for.",
+      "why": "The run asks for a kind of machine, like one with an NVIDIA GPU. None of the connected machines has it.",
+      "what_to_do": {
+        "steps": [
+          "Connect a machine of this kind in Machines.",
+          "Or change the run's hardware to match a connected machine."
+        ]
+      }
+    },
+    {
       "code": "MRL-CAP-250",
       "title": "This setting needs an NVIDIA GPU.",
       "why": "QLoRA, 8-bit optimizers and fp16 training use code that runs only on NVIDIA GPUs, and this machine has none. Details names the setting.",
@@ -2278,6 +2356,28 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-CONFLICT-210",
+      "title": "This reservation was changed by a newer holder.",
+      "why": "Each reservation carries an epoch. A change made with an older epoch comes from work that was already replaced, so it doesn't count.",
+      "what_to_do": {
+        "steps": [
+          "Read the reservation again and use its current epoch.",
+          "If your work was replaced, stop it; the newer holder owns the machine now."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CONFLICT-230",
+      "title": "This checkpoint is still in use, so it can't be deleted.",
+      "why": "It is the run's final result or its resume point, or another run starts from it. Deleting it would break that.",
+      "what_to_do": {
+        "steps": [
+          "Wait until the run has finished, or delete the run that starts from it first.",
+          "The final checkpoint of a run stays as long as the run."
+        ]
+      }
+    },
+    {
       "code": "MRL-DATA-001",
       "title": "Your dataset did not pass its checks.",
       "why": "Some rows are empty, are missing fields, or don't match the chosen format.",
@@ -2317,6 +2417,17 @@ export const catalog = deepFreeze({
         "steps": [
           "Convert the column named in Details to text, then upload the file again.",
           "For images, store a reference to each image file instead of its bytes."
+        ]
+      }
+    },
+    {
+      "code": "MRL-DATA-240",
+      "title": "The app has no record of this dataset version.",
+      "why": "The run names a dataset version that isn't registered in your organization.",
+      "what_to_do": {
+        "steps": [
+          "Check the dataset version id in the run settings.",
+          "Import the dataset first if it isn't in the app yet."
         ]
       }
     },
@@ -3078,6 +3189,17 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-MODEL-240",
+      "title": "The app has no record of this model version.",
+      "why": "The run names a model version that isn't registered in your organization.",
+      "what_to_do": {
+        "steps": [
+          "Check the model version id in the run settings.",
+          "Import the model first if it isn't in the app yet."
+        ]
+      }
+    },
+    {
       "code": "MRL-NODE-121",
       "title": "The agent could not save or read its local files.",
       "why": "The disk may be full, or the agent may not have permission to use its state folder.",
@@ -3270,6 +3392,16 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-PERM-210",
+      "title": "No pool is open to this project.",
+      "why": "Jobs run on the pools of their organization or on shared pools. None of them can take this job, or no pool exists yet.",
+      "what_to_do": {
+        "steps": [
+          "Create a pool and add a machine to it, or ask an admin to open a pool to your organization."
+        ]
+      }
+    },
+    {
       "code": "MRL-QUOTA-001",
       "title": "Your team reached its limit on jobs or GPUs.",
       "why": "Your org limits how many jobs and GPUs a project can use at once.",
@@ -3298,6 +3430,50 @@ export const catalog = deepFreeze({
       "what_to_do": {
         "steps": [
           "Wait about 1 minute, then try again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-QUOTA-210",
+      "title": "This job is waiting for a free machine.",
+      "why": "A machine in the pool can run the job, but it is busy, offline or draining right now.",
+      "what_to_do": {
+        "steps": [
+          "Nothing to do; the job starts by itself when a machine is free.",
+          "To start sooner, raise the job's priority or add a machine to the pool."
+        ]
+      }
+    },
+    {
+      "code": "MRL-QUOTA-211",
+      "title": "This pool is paused and starts no new work.",
+      "why": "An admin paused the pool (its `paused` flag is set). Work already running there goes on.",
+      "what_to_do": {
+        "steps": [
+          "Wait until an admin resumes the pool.",
+          "Or ask an admin to open another pool to your project."
+        ]
+      }
+    },
+    {
+      "code": "MRL-QUOTA-212",
+      "title": "Too many jobs of this project are ahead in the queue.",
+      "why": "The scheduler places only a set number of each project's queued jobs at a time. That way one project can't fill every machine.",
+      "what_to_do": {
+        "steps": [
+          "Nothing to do; the job moves up as earlier ones start.",
+          "Cancel jobs you no longer need to let this one through sooner."
+        ]
+      }
+    },
+    {
+      "code": "MRL-QUOTA-220",
+      "title": "Too many live views are open.",
+      "why": "Each sign-in may keep up to 10 live views (streams) open at once, each watching up to 50 things. This request would go over that.",
+      "what_to_do": {
+        "steps": [
+          "Close live views you no longer need, like old browser tabs on run pages.",
+          "Watch fewer things in one view, then try again."
         ]
       }
     },
@@ -3500,6 +3676,39 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-STATE-210",
+      "title": "The agent lost its credentials before launch.",
+      "why": "The agent restarted before it started the run. Its saved metadata lists the required credentials, and the values were held in memory.",
+      "what_to_do": {
+        "steps": [
+          "Wait for the scheduler to place another attempt if the run has retries left.",
+          "If the run stops, check that the agent stays online and submit it again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STATE-220",
+      "title": "This alert is already resolved.",
+      "why": "Someone resolved this alert, so it takes no more changes. If the problem comes back, a new alert opens.",
+      "what_to_do": {
+        "steps": [
+          "Refresh the alert list to see its current state."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STATE-230",
+      "title": "This checkpoint isn't committed, so it can't be used yet.",
+      "why": "A checkpoint can be checked, promoted or deleted only once all its files are saved and confirmed. This one is still being saved, or it was found to be damaged or deleted.",
+      "what_to_do": {
+        "steps": [
+          "Refresh to see the checkpoint's state.",
+          "If it is still being saved, wait a moment and try again.",
+          "If it is damaged, use an earlier checkpoint of the same run."
+        ]
+      }
+    },
+    {
       "code": "MRL-STORE-001",
       "title": "The app refused a storage path.",
       "why": "The path points outside your workspace's storage area, or it has a part the app doesn't allow, like `..`.",
@@ -3655,6 +3864,17 @@ export const catalog = deepFreeze({
         "steps": [
           "Send the parts listed in Details again.",
           "Then finish the upload again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STORE-220",
+      "title": "A saved log or sample file is missing or damaged.",
+      "why": "Older logs and samples are kept as files in storage. The file for this part is missing, or its contents don't match the checksum saved when it was written.",
+      "what_to_do": {
+        "steps": [
+          "Check that the storage service is running and reachable.",
+          "If the file was deleted by a storage cleanup rule, this part of the log can't be shown any more."
         ]
       }
     },

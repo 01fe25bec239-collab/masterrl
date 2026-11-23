@@ -1,0 +1,1561 @@
+{
+  "dev_only": false,
+  "kind": "engine",
+  "manifest": {
+    "apiVersion": "mrl.dev/engine/v1",
+    "kind": "EngineManifest",
+    "metadata": {
+      "description": "Supervised fine-tuning and continued pre-training on Transformers, with full, LoRA or QLoRA updates.",
+      "displayName": "Hugging Face TRL",
+      "homepage": "https://huggingface.co/docs/trl",
+      "license": "Apache-2.0",
+      "maintainers": [
+        "MasterRL core"
+      ],
+      "name": "trl",
+      "version": "0.1.0"
+    },
+    "spec": {
+      "adapter": {
+        "adapterApi": ">=1.0,<2",
+        "entrypoint": "mrl_adapter_trl.sft:TrlSftEngine",
+        "workerProtocol": ">=1.0,<2"
+      },
+      "algorithms": [
+        {
+          "config": {
+            "presets": [
+              {
+                "id": "sft-lora-beginner",
+                "patch": {
+                  "common": {
+                    "update": {
+                      "lora": {
+                        "alpha": 16,
+                        "dropout": 0.05,
+                        "r": 8
+                      },
+                      "strategy": "lora"
+                    }
+                  },
+                  "engine": {
+                    "learning_rate": 0.0002,
+                    "max_length": 1024,
+                    "num_train_epochs": 1,
+                    "per_device_train_batch_size": 4
+                  }
+                },
+                "tier": "beginner",
+                "title": "LoRA, quick start"
+              },
+              {
+                "id": "sft-lora-standard",
+                "patch": {
+                  "common": {
+                    "update": {
+                      "lora": {
+                        "alpha": 32,
+                        "dropout": 0.05,
+                        "r": 16
+                      },
+                      "strategy": "lora"
+                    }
+                  },
+                  "engine": {
+                    "gradient_accumulation_steps": 4,
+                    "gradient_checkpointing": true,
+                    "learning_rate": 0.0001,
+                    "max_length": 2048,
+                    "num_train_epochs": 2,
+                    "per_device_train_batch_size": 4
+                  }
+                },
+                "tier": "beginner",
+                "title": "LoRA, balanced"
+              },
+              {
+                "id": "sft-full",
+                "patch": {
+                  "common": {
+                    "update": {
+                      "strategy": "full"
+                    }
+                  },
+                  "engine": {
+                    "gradient_accumulation_steps": 8,
+                    "gradient_checkpointing": true,
+                    "learning_rate": 2e-05,
+                    "max_length": 2048,
+                    "num_train_epochs": 2,
+                    "per_device_train_batch_size": 2,
+                    "weight_decay": 0.01
+                  }
+                },
+                "tier": "advanced",
+                "title": "Full fine-tune"
+              },
+              {
+                "id": "sft-qlora-24gb",
+                "patch": {
+                  "common": {
+                    "update": {
+                      "lora": {
+                        "alpha": 32,
+                        "dropout": 0.05,
+                        "r": 16
+                      },
+                      "strategy": "qlora"
+                    }
+                  },
+                  "engine": {
+                    "gradient_accumulation_steps": 8,
+                    "gradient_checkpointing": true,
+                    "learning_rate": 0.0002,
+                    "max_length": 2048,
+                    "num_train_epochs": 1,
+                    "optim": "paged_adamw_8bit",
+                    "per_device_train_batch_size": 2
+                  }
+                },
+                "tier": "beginner",
+                "title": "QLoRA, fits a 24 GB GPU",
+                "when": "hardware.accelerator == 'nvidia' && hardware.gpu_mem_gib <= 24"
+              }
+            ],
+            "schema": "config/sft.schema.json"
+          },
+          "displayName": "Supervised fine-tuning",
+          "fidelity": "full",
+          "id": "sft",
+          "maturity": "beta",
+          "metrics": [
+            {
+              "kind": "live",
+              "name": "train/loss",
+              "required": true,
+              "source": "loss"
+            },
+            {
+              "kind": "live",
+              "name": "train/learning_rate",
+              "required": true,
+              "source": "learning_rate"
+            },
+            {
+              "kind": "live",
+              "name": "train/grad_norm",
+              "required": false,
+              "source": "grad_norm"
+            },
+            {
+              "kind": "live",
+              "name": "train/entropy",
+              "required": false,
+              "source": "entropy"
+            },
+            {
+              "kind": "live",
+              "name": "train/mean_token_accuracy",
+              "required": false,
+              "source": "mean_token_accuracy"
+            },
+            {
+              "kind": "live",
+              "name": "train/num_tokens",
+              "required": false,
+              "source": "num_tokens",
+              "unit": "tokens"
+            },
+            {
+              "kind": "sampled",
+              "name": "eval/loss",
+              "required": false,
+              "source": "eval_loss",
+              "when": "datasets.eval"
+            },
+            {
+              "kind": "sampled",
+              "name": "eval/mean_token_accuracy",
+              "required": false,
+              "source": "eval_mean_token_accuracy",
+              "when": "datasets.eval"
+            }
+          ],
+          "objective": "autoregressive_likelihood",
+          "parent": "trl.SFTTrainer",
+          "pause": true,
+          "requires": {
+            "datasetSchemas": {
+              "eval": [
+                "sft.messages.v1",
+                "sft.prompt_completion.v1"
+              ],
+              "train": [
+                "sft.messages.v1",
+                "sft.prompt_completion.v1"
+              ]
+            },
+            "modelFamilies": [
+              "decoder",
+              "decoder-moe"
+            ],
+            "signals": {
+              "critic": "none",
+              "reference": "none",
+              "reward": "none",
+              "rolloutEngine": "none",
+              "teacher": "none"
+            }
+          },
+          "resume": true,
+          "samples": {
+            "emitted": true,
+            "fields": [
+              "prompt",
+              "completion"
+            ]
+          },
+          "summary": "Teach a model to answer like your examples, from conversations or prompt and completion pairs.",
+          "supports": {
+            "parallelism": [
+              "single"
+            ],
+            "updateStrategies": [
+              "full",
+              "lora",
+              "qlora"
+            ]
+          },
+          "switch": {
+            "loss_type": "nll"
+          },
+          "upstreamStatus": "stable"
+        },
+        {
+          "config": {
+            "schema": "config/cpt.schema.json"
+          },
+          "displayName": "Continued pre-training",
+          "fidelity": "full",
+          "id": "cpt",
+          "maturity": "beta",
+          "metrics": [
+            {
+              "kind": "live",
+              "name": "train/loss",
+              "required": true,
+              "source": "loss"
+            },
+            {
+              "kind": "live",
+              "name": "train/learning_rate",
+              "required": true,
+              "source": "learning_rate"
+            },
+            {
+              "kind": "live",
+              "name": "train/grad_norm",
+              "required": false,
+              "source": "grad_norm"
+            },
+            {
+              "kind": "live",
+              "name": "train/entropy",
+              "required": false,
+              "source": "entropy"
+            },
+            {
+              "kind": "live",
+              "name": "train/mean_token_accuracy",
+              "required": false,
+              "source": "mean_token_accuracy"
+            },
+            {
+              "kind": "live",
+              "name": "train/num_tokens",
+              "required": false,
+              "source": "num_tokens",
+              "unit": "tokens"
+            },
+            {
+              "kind": "sampled",
+              "name": "eval/loss",
+              "required": false,
+              "source": "eval_loss",
+              "when": "datasets.eval"
+            },
+            {
+              "kind": "sampled",
+              "name": "eval/mean_token_accuracy",
+              "required": false,
+              "source": "eval_mean_token_accuracy",
+              "when": "datasets.eval"
+            }
+          ],
+          "objective": "autoregressive_likelihood",
+          "parent": "trl.SFTTrainer",
+          "pause": true,
+          "requires": {
+            "datasetSchemas": {
+              "eval": [
+                "pretrain.text.v1"
+              ],
+              "train": [
+                "pretrain.text.v1"
+              ]
+            },
+            "modelFamilies": [
+              "decoder",
+              "decoder-moe"
+            ],
+            "signals": {
+              "critic": "none",
+              "reference": "none",
+              "reward": "none",
+              "rolloutEngine": "none",
+              "teacher": "none"
+            }
+          },
+          "resume": true,
+          "samples": {
+            "emitted": true,
+            "fields": [
+              "prompt",
+              "completion"
+            ]
+          },
+          "summary": "Keep training a model on raw text from your field, so it learns its words and facts.",
+          "supports": {
+            "parallelism": [
+              "single"
+            ],
+            "updateStrategies": [
+              "full",
+              "lora",
+              "qlora"
+            ]
+          },
+          "switch": {
+            "assistant_only_loss": false,
+            "completion_only_loss": false,
+            "loss_type": "nll"
+          },
+          "upstreamStatus": "stable"
+        }
+      ],
+      "capabilities": {
+        "execution": {
+          "modes": [
+            "offline"
+          ]
+        },
+        "gradientCheckpointing": true,
+        "multiNode": false,
+        "onDemandCheckpoint": true,
+        "parallelism": [
+          "single"
+        ],
+        "pause": true,
+        "precision": [
+          "bf16",
+          "fp16",
+          "fp32"
+        ],
+        "quantizedTraining": [
+          "bnb-4bit"
+        ],
+        "resume": true,
+        "streamingDatasets": false,
+        "trustRemoteCode": "never",
+        "updateStrategies": [
+          "full",
+          "lora",
+          "qlora"
+        ]
+      },
+      "checkpoint": {
+        "format": "hf-trainer-v1",
+        "portableWeights": true,
+        "resumable": true,
+        "stateFiles": "keep"
+      },
+      "constraints": [
+        {
+          "appliesTo": [
+            "sft",
+            "cpt"
+          ],
+          "error": {
+            "code": "MRL-CAP-250",
+            "hint": "Pick LoRA instead, or run on a machine with an NVIDIA GPU.",
+            "message": "QLoRA needs an NVIDIA GPU."
+          },
+          "id": "trl-qlora-nvidia",
+          "schema": {
+            "if": {
+              "properties": {
+                "common": {
+                  "properties": {
+                    "update": {
+                      "properties": {
+                        "strategy": {
+                          "const": "qlora"
+                        }
+                      },
+                      "required": [
+                        "strategy"
+                      ]
+                    }
+                  },
+                  "required": [
+                    "update"
+                  ]
+                }
+              },
+              "required": [
+                "common"
+              ]
+            },
+            "then": {
+              "properties": {
+                "hardware": {
+                  "properties": {
+                    "accelerator": {
+                      "pattern": "^nvidia",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "accelerator"
+                  ]
+                }
+              },
+              "required": [
+                "hardware"
+              ]
+            }
+          }
+        }
+      ],
+      "exports": [
+        "hf-safetensors",
+        "hf-peft-adapter",
+        "merged-safetensors"
+      ],
+      "hardware": {
+        "accelerators": [
+          "nvidia",
+          "apple",
+          "cpu"
+        ],
+        "apple_silicon": true,
+        "os": [
+          "linux",
+          "macos"
+        ],
+        "wsl2": true
+      },
+      "runtime": {
+        "environments": [
+          {
+            "accelerator": {
+              "minComputeCapability": "7.5",
+              "runtime": "cuda13",
+              "vendor": "nvidia"
+            },
+            "id": "cuda13-uv",
+            "kind": "uv",
+            "lockSha256": "1341ee05deec523beff0a5dc77c256a042768e77bd01146ff94506c75a80b3d9",
+            "lockfile": "uv.lock",
+            "mrlRuntime": "0.1.0",
+            "platform": "linux/amd64",
+            "python": "3.12"
+          },
+          {
+            "accelerator": {
+              "vendor": "cpu"
+            },
+            "id": "cpu-uv",
+            "kind": "uv",
+            "lockSha256": "1341ee05deec523beff0a5dc77c256a042768e77bd01146ff94506c75a80b3d9",
+            "lockfile": "uv.lock",
+            "mrlRuntime": "0.1.0",
+            "platform": "linux/amd64",
+            "python": "3.12"
+          },
+          {
+            "accelerator": {
+              "runtime": "mps",
+              "vendor": "apple"
+            },
+            "id": "mps-uv",
+            "kind": "uv",
+            "lockSha256": "1341ee05deec523beff0a5dc77c256a042768e77bd01146ff94506c75a80b3d9",
+            "lockfile": "uv.lock",
+            "mrlRuntime": "0.1.0",
+            "platform": "darwin/arm64",
+            "python": "3.12"
+          }
+        ]
+      },
+      "runtimes": [
+        {
+          "role": "trainer",
+          "runtime_ref": "cuda13-uv"
+        },
+        {
+          "role": "trainer",
+          "runtime_ref": "cpu-uv"
+        },
+        {
+          "role": "trainer",
+          "runtime_ref": "mps-uv"
+        }
+      ],
+      "topology": {
+        "launcher": "inprocess",
+        "network": "none",
+        "primary": "trainer",
+        "roles": [
+          {
+            "count": 1,
+            "environment": "cuda13-uv",
+            "id": "trainer",
+            "kind": "trainer",
+            "reportsVia": "worker_protocol"
+          }
+        ]
+      },
+      "upstream": [
+        {
+          "license": "Apache-2.0",
+          "name": "trl",
+          "source": "https://github.com/huggingface/trl",
+          "version": "1.17.1"
+        },
+        {
+          "license": "Apache-2.0",
+          "name": "transformers",
+          "source": "https://github.com/huggingface/transformers",
+          "version": "5.22.2"
+        },
+        {
+          "license": "Apache-2.0",
+          "name": "peft",
+          "source": "https://github.com/huggingface/peft",
+          "version": "0.21.2"
+        },
+        {
+          "license": "Apache-2.0",
+          "name": "accelerate",
+          "source": "https://github.com/huggingface/accelerate",
+          "version": "1.15.0"
+        },
+        {
+          "license": "Apache-2.0",
+          "name": "datasets",
+          "source": "https://github.com/huggingface/datasets",
+          "version": "5.1.0"
+        },
+        {
+          "license": "BSD-3-Clause",
+          "name": "torch",
+          "source": "https://github.com/pytorch/pytorch",
+          "version": "2.14.1"
+        },
+        {
+          "license": "MIT",
+          "name": "bitsandbytes",
+          "source": "https://github.com/bitsandbytes-foundation/bitsandbytes",
+          "version": "0.50.2"
+        }
+      ],
+      "validate": {
+        "l1": true
+      }
+    }
+  },
+  "schemas": {
+    "config/cpt.schema.json": {
+      "$defs": {
+        "CommonBlock": {
+          "description": "The keys of the platform's common block (mrl.dev/config/common/v1) this engine reads.",
+          "properties": {
+            "precision": {
+              "default": "auto",
+              "enum": [
+                "auto",
+                "bf16",
+                "fp16",
+                "fp32"
+              ],
+              "title": "Precision",
+              "type": "string",
+              "x-mrl-ui": {
+                "group": "run",
+                "help": "auto: bf16 on GPUs that support it, else fp16 or fp32.",
+                "order": 2,
+                "tier": "advanced"
+              }
+            },
+            "seed": {
+              "default": 0,
+              "maximum": 4294967295,
+              "minimum": 0,
+              "title": "Seed",
+              "type": "integer",
+              "x-mrl-ui": {
+                "group": "run",
+                "help": "Seed.",
+                "order": 1,
+                "tier": "advanced"
+              }
+            },
+            "update": {
+              "$ref": "#/$defs/UpdateSettings",
+              "default": {
+                "lora": {
+                  "alpha": 32.0,
+                  "dropout": 0.05,
+                  "r": 16,
+                  "target_modules": "all-linear"
+                },
+                "strategy": "lora"
+              }
+            }
+          },
+          "title": "CommonBlock",
+          "type": "object"
+        },
+        "CptEngine": {
+          "additionalProperties": false,
+          "description": "`cpt`: continued pre-training on raw text (pretrain.text.v1); loss on every token.",
+          "properties": {
+            "assistant_only_loss": {
+              "const": false,
+              "default": false,
+              "title": "Assistant Only Loss",
+              "type": "boolean",
+              "x-mrl-ui": {
+                "group": "loss",
+                "help": "Learn every token.",
+                "order": 2,
+                "pinned": true,
+                "tier": "expert"
+              }
+            },
+            "completion_only_loss": {
+              "const": false,
+              "default": false,
+              "title": "Completion Only Loss",
+              "type": "boolean",
+              "x-mrl-ui": {
+                "group": "loss",
+                "help": "Learn every token.",
+                "order": 3,
+                "pinned": true,
+                "tier": "expert"
+              }
+            },
+            "gradient_accumulation_steps": {
+              "default": 1,
+              "maximum": 4096,
+              "minimum": 1,
+              "title": "Gradient Accumulation Steps",
+              "type": "integer",
+              "x-mrl-ui": {
+                "group": "batch",
+                "help": "Steps summed before an update.",
+                "order": 2,
+                "tier": "advanced"
+              }
+            },
+            "gradient_checkpointing": {
+              "default": false,
+              "title": "Gradient Checkpointing",
+              "type": "boolean",
+              "x-mrl-ui": {
+                "group": "memory",
+                "help": "Less memory, about 30% slower.",
+                "order": 1,
+                "tier": "advanced"
+              }
+            },
+            "learning_rate": {
+              "default": 0.0001,
+              "exclusiveMinimum": 0,
+              "maximum": 1,
+              "title": "Learning Rate",
+              "type": "number",
+              "x-mrl-ui": {
+                "group": "optimizer",
+                "help": "Step size.",
+                "order": 1,
+                "tier": "advanced"
+              }
+            },
+            "logging_steps": {
+              "default": 10,
+              "maximum": 100000,
+              "minimum": 1,
+              "title": "Logging Steps",
+              "type": "integer",
+              "x-mrl-ui": {
+                "group": "checkpoints",
+                "help": "Steps between metric reports.",
+                "order": 2,
+                "tier": "expert"
+              }
+            },
+            "loss_type": {
+              "const": "nll",
+              "default": "nll",
+              "title": "Loss Type",
+              "type": "string",
+              "x-mrl-ui": {
+                "group": "loss",
+                "help": "Loss.",
+                "order": 1,
+                "pinned": true,
+                "tier": "expert"
+              }
+            },
+            "lr_scheduler_type": {
+              "default": "cosine",
+              "enum": [
+                "linear",
+                "cosine",
+                "constant",
+                "constant_with_warmup"
+              ],
+              "title": "Lr Scheduler Type",
+              "type": "string",
+              "x-mrl-ui": {
+                "group": "optimizer",
+                "help": "How the step size changes.",
+                "order": 2,
+                "tier": "advanced"
+              }
+            },
+            "max_grad_norm": {
+              "default": 1.0,
+              "exclusiveMinimum": 0,
+              "maximum": 1000000.0,
+              "title": "Max Grad Norm",
+              "type": "number",
+              "x-mrl-ui": {
+                "group": "optimizer",
+                "help": "Gradient clipping.",
+                "order": 5,
+                "tier": "expert"
+              }
+            },
+            "max_length": {
+              "default": 1024,
+              "maximum": 1048576,
+              "minimum": 16,
+              "title": "Max Length",
+              "type": "integer",
+              "x-mrl-ui": {
+                "group": "data",
+                "help": "Longest example in tokens; longer ones are cut.",
+                "order": 1,
+                "tier": "advanced",
+                "unit": "tokens"
+              }
+            },
+            "max_steps": {
+              "anyOf": [
+                {
+                  "maximum": 10000000,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Max Steps",
+              "x-mrl-ui": {
+                "group": "budget",
+                "help": "Stop after this many steps (overrides epochs).",
+                "order": 2,
+                "tier": "advanced"
+              }
+            },
+            "neftune_noise_alpha": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "maximum": 100,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Neftune Noise Alpha",
+              "x-mrl-ui": {
+                "group": "data",
+                "help": "NEFTune embedding noise.",
+                "order": 3,
+                "tier": "expert"
+              }
+            },
+            "num_train_epochs": {
+              "default": 1.0,
+              "exclusiveMinimum": 0,
+              "maximum": 1000,
+              "title": "Num Train Epochs",
+              "type": "number",
+              "x-mrl-ui": {
+                "group": "budget",
+                "help": "Passes over the data.",
+                "order": 1,
+                "tier": "beginner"
+              }
+            },
+            "optim": {
+              "default": "adamw_torch",
+              "enum": [
+                "adamw_torch",
+                "adamw_8bit",
+                "paged_adamw_8bit",
+                "sgd",
+                "adafactor"
+              ],
+              "title": "Optim",
+              "type": "string",
+              "x-mrl-ui": {
+                "group": "optimizer",
+                "help": "8-bit optimizers need an NVIDIA GPU.",
+                "order": 6,
+                "tier": "expert"
+              }
+            },
+            "packing": {
+              "default": false,
+              "title": "Packing",
+              "type": "boolean",
+              "x-mrl-ui": {
+                "group": "data",
+                "help": "Pack short examples together.",
+                "order": 2,
+                "tier": "advanced"
+              }
+            },
+            "per_device_train_batch_size": {
+              "default": 4,
+              "maximum": 4096,
+              "minimum": 1,
+              "title": "Per Device Train Batch Size",
+              "type": "integer",
+              "x-mrl-ui": {
+                "group": "batch",
+                "help": "Examples per step per GPU.",
+                "order": 1,
+                "tier": "advanced"
+              }
+            },
+            "samples_every": {
+              "default": 0,
+              "maximum": 10000000,
+              "minimum": 0,
+              "title": "Samples Every",
+              "type": "integer",
+              "x-mrl-ui": {
+                "group": "checkpoints",
+                "help": "Steps between sample answers (0: off).",
+                "order": 3,
+                "tier": "advanced"
+              }
+            },
+            "save_steps": {
+              "default": 500,
+              "maximum": 10000000,
+              "minimum": 1,
+              "title": "Save Steps",
+              "type": "integer",
+              "x-mrl-ui": {
+                "group": "checkpoints",
+                "help": "Steps between checkpoints.",
+                "order": 1,
+                "tier": "advanced"
+              }
+            },
+            "warmup_ratio": {
+              "default": 0.03,
+              "maximum": 0.5,
+              "minimum": 0,
+              "title": "Warmup Ratio",
+              "type": "number",
+              "x-mrl-ui": {
+                "group": "optimizer",
+                "help": "Share of steps to warm up.",
+                "order": 3,
+                "tier": "advanced"
+              }
+            },
+            "weight_decay": {
+              "default": 0.0,
+              "maximum": 1,
+              "minimum": 0,
+              "title": "Weight Decay",
+              "type": "number",
+              "x-mrl-ui": {
+                "group": "optimizer",
+                "help": "Weight decay.",
+                "order": 4,
+                "tier": "advanced"
+              }
+            }
+          },
+          "title": "CptEngine",
+          "type": "object"
+        },
+        "LoraSettings": {
+          "additionalProperties": false,
+          "description": "LoRA adapter shape. Used by the `lora` and `qlora` strategies.",
+          "properties": {
+            "alpha": {
+              "default": 32.0,
+              "exclusiveMinimum": 0,
+              "maximum": 4096,
+              "title": "Alpha",
+              "type": "number",
+              "x-mrl-ui": {
+                "group": "lora",
+                "help": "Adapter scale.",
+                "order": 2,
+                "tier": "advanced"
+              }
+            },
+            "dropout": {
+              "default": 0.05,
+              "exclusiveMaximum": 1,
+              "minimum": 0,
+              "title": "Dropout",
+              "type": "number",
+              "x-mrl-ui": {
+                "group": "lora",
+                "help": "Adapter dropout.",
+                "order": 3,
+                "tier": "advanced"
+              }
+            },
+            "r": {
+              "default": 16,
+              "maximum": 1024,
+              "minimum": 1,
+              "title": "R",
+              "type": "integer",
+              "x-mrl-ui": {
+                "group": "lora",
+                "help": "Adapter rank.",
+                "order": 1,
+                "tier": "advanced"
+              }
+            },
+            "target_modules": {
+              "anyOf": [
+                {
+                  "const": "all-linear",
+                  "type": "string"
+                },
+                {
+                  "items": {
+                    "pattern": "^[A-Za-z0-9_.]{1,128}$",
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              ],
+              "default": "all-linear",
+              "minLength": 1,
+              "title": "Target Modules",
+              "x-mrl-ui": {
+                "group": "lora",
+                "help": "Layers that get an adapter.",
+                "order": 4,
+                "tier": "expert"
+              }
+            }
+          },
+          "title": "LoraSettings",
+          "type": "object"
+        },
+        "UpdateSettings": {
+          "additionalProperties": false,
+          "properties": {
+            "lora": {
+              "$ref": "#/$defs/LoraSettings",
+              "default": {
+                "alpha": 32.0,
+                "dropout": 0.05,
+                "r": 16,
+                "target_modules": "all-linear"
+              }
+            },
+            "strategy": {
+              "default": "lora",
+              "enum": [
+                "full",
+                "lora",
+                "qlora"
+              ],
+              "title": "Strategy",
+              "type": "string",
+              "x-mrl-ui": {
+                "group": "update",
+                "help": "LoRA trains a small adapter; full updates every weight.",
+                "order": 1,
+                "tier": "beginner"
+              }
+            }
+          },
+          "title": "UpdateSettings",
+          "type": "object"
+        }
+      },
+      "$id": "https://schemas.masterrl.dev/engines/trl/cpt.schema.json",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "common": {
+          "$ref": "#/$defs/CommonBlock",
+          "default": {
+            "precision": "auto",
+            "seed": 0,
+            "update": {
+              "lora": {
+                "alpha": 32.0,
+                "dropout": 0.05,
+                "r": 16,
+                "target_modules": "all-linear"
+              },
+              "strategy": "lora"
+            }
+          }
+        },
+        "engine": {
+          "$ref": "#/$defs/CptEngine",
+          "default": {
+            "assistant_only_loss": false,
+            "completion_only_loss": false,
+            "gradient_accumulation_steps": 1,
+            "gradient_checkpointing": false,
+            "learning_rate": 0.0001,
+            "logging_steps": 10,
+            "loss_type": "nll",
+            "lr_scheduler_type": "cosine",
+            "max_grad_norm": 1.0,
+            "max_length": 1024,
+            "max_steps": null,
+            "neftune_noise_alpha": null,
+            "num_train_epochs": 1.0,
+            "optim": "adamw_torch",
+            "packing": false,
+            "per_device_train_batch_size": 4,
+            "samples_every": 0,
+            "save_steps": 500,
+            "warmup_ratio": 0.03,
+            "weight_decay": 0.0
+          }
+        }
+      },
+      "title": "TRL cpt config",
+      "type": "object"
+    },
+    "config/sft.schema.json": {
+      "$defs": {
+        "CommonBlock": {
+          "description": "The keys of the platform's common block (mrl.dev/config/common/v1) this engine reads.",
+          "properties": {
+            "precision": {
+              "default": "auto",
+              "enum": [
+                "auto",
+                "bf16",
+                "fp16",
+                "fp32"
+              ],
+              "title": "Precision",
+              "type": "string",
+              "x-mrl-ui": {
+                "group": "run",
+                "help": "auto: bf16 on GPUs that support it, else fp16 or fp32.",
+                "order": 2,
+                "tier": "advanced"
+              }
+            },
+            "seed": {
+              "default": 0,
+              "maximum": 4294967295,
+              "minimum": 0,
+              "title": "Seed",
+              "type": "integer",
+              "x-mrl-ui": {
+                "group": "run",
+                "help": "Seed.",
+                "order": 1,
+                "tier": "advanced"
+              }
+            },
+            "update": {
+              "$ref": "#/$defs/UpdateSettings",
+              "default": {
+                "lora": {
+                  "alpha": 32.0,
+                  "dropout": 0.05,
+                  "r": 16,
+                  "target_modules": "all-linear"
+                },
+                "strategy": "lora"
+              }
+            }
+          },
+          "title": "CommonBlock",
+          "type": "object"
+        },
+        "LoraSettings": {
+          "additionalProperties": false,
+          "description": "LoRA adapter shape. Used by the `lora` and `qlora` strategies.",
+          "properties": {
+            "alpha": {
+              "default": 32.0,
+              "exclusiveMinimum": 0,
+              "maximum": 4096,
+              "title": "Alpha",
+              "type": "number",
+              "x-mrl-ui": {
+                "group": "lora",
+                "help": "Adapter scale.",
+                "order": 2,
+                "tier": "advanced"
+              }
+            },
+            "dropout": {
+              "default": 0.05,
+              "exclusiveMaximum": 1,
+              "minimum": 0,
+              "title": "Dropout",
+              "type": "number",
+              "x-mrl-ui": {
+                "group": "lora",
+                "help": "Adapter dropout.",
+                "order": 3,
+                "tier": "advanced"
+              }
+            },
+            "r": {
+              "default": 16,
+              "maximum": 1024,
+              "minimum": 1,
+              "title": "R",
+              "type": "integer",
+              "x-mrl-ui": {
+                "group": "lora",
+                "help": "Adapter rank.",
+                "order": 1,
+                "tier": "advanced"
+              }
+            },
+            "target_modules": {
+              "anyOf": [
+                {
+                  "const": "all-linear",
+                  "type": "string"
+                },
+                {
+                  "items": {
+                    "pattern": "^[A-Za-z0-9_.]{1,128}$",
+                    "type": "string"
+                  },
+                  "type": "array"
+                }
+              ],
+              "default": "all-linear",
+              "minLength": 1,
+              "title": "Target Modules",
+              "x-mrl-ui": {
+                "group": "lora",
+                "help": "Layers that get an adapter.",
+                "order": 4,
+                "tier": "expert"
+              }
+            }
+          },
+          "title": "LoraSettings",
+          "type": "object"
+        },
+        "SftEngine": {
+          "additionalProperties": false,
+          "description": "`sft`: conversations (sft.messages.v1) or prompt/completion (sft.prompt_completion.v1).",
+          "properties": {
+            "assistant_only_loss": {
+              "default": true,
+              "title": "Assistant Only Loss",
+              "type": "boolean",
+              "x-mrl-ui": {
+                "group": "loss",
+                "help": "Conversations: learn only the assistant's turns.",
+                "order": 2,
+                "tier": "advanced"
+              }
+            },
+            "completion_only_loss": {
+              "default": true,
+              "title": "Completion Only Loss",
+              "type": "boolean",
+              "x-mrl-ui": {
+                "group": "loss",
+                "help": "Prompt/completion: learn only the completion.",
+                "order": 3,
+                "tier": "advanced"
+              }
+            },
+            "gradient_accumulation_steps": {
+              "default": 1,
+              "maximum": 4096,
+              "minimum": 1,
+              "title": "Gradient Accumulation Steps",
+              "type": "integer",
+              "x-mrl-ui": {
+                "group": "batch",
+                "help": "Steps summed before an update.",
+                "order": 2,
+                "tier": "advanced"
+              }
+            },
+            "gradient_checkpointing": {
+              "default": false,
+              "title": "Gradient Checkpointing",
+              "type": "boolean",
+              "x-mrl-ui": {
+                "group": "memory",
+                "help": "Less memory, about 30% slower.",
+                "order": 1,
+                "tier": "advanced"
+              }
+            },
+            "learning_rate": {
+              "default": 0.0001,
+              "exclusiveMinimum": 0,
+              "maximum": 1,
+              "title": "Learning Rate",
+              "type": "number",
+              "x-mrl-ui": {
+                "group": "optimizer",
+                "help": "Step size.",
+                "order": 1,
+                "tier": "advanced"
+              }
+            },
+            "logging_steps": {
+              "default": 10,
+              "maximum": 100000,
+              "minimum": 1,
+              "title": "Logging Steps",
+              "type": "integer",
+              "x-mrl-ui": {
+                "group": "checkpoints",
+                "help": "Steps between metric reports.",
+                "order": 2,
+                "tier": "expert"
+              }
+            },
+            "loss_type": {
+              "const": "nll",
+              "default": "nll",
+              "title": "Loss Type",
+              "type": "string",
+              "x-mrl-ui": {
+                "group": "loss",
+                "help": "Loss.",
+                "order": 1,
+                "pinned": true,
+                "tier": "expert"
+              }
+            },
+            "lr_scheduler_type": {
+              "default": "cosine",
+              "enum": [
+                "linear",
+                "cosine",
+                "constant",
+                "constant_with_warmup"
+              ],
+              "title": "Lr Scheduler Type",
+              "type": "string",
+              "x-mrl-ui": {
+                "group": "optimizer",
+                "help": "How the step size changes.",
+                "order": 2,
+                "tier": "advanced"
+              }
+            },
+            "max_grad_norm": {
+              "default": 1.0,
+              "exclusiveMinimum": 0,
+              "maximum": 1000000.0,
+              "title": "Max Grad Norm",
+              "type": "number",
+              "x-mrl-ui": {
+                "group": "optimizer",
+                "help": "Gradient clipping.",
+                "order": 5,
+                "tier": "expert"
+              }
+            },
+            "max_length": {
+              "default": 1024,
+              "maximum": 1048576,
+              "minimum": 16,
+              "title": "Max Length",
+              "type": "integer",
+              "x-mrl-ui": {
+                "group": "data",
+                "help": "Longest example in tokens; longer ones are cut.",
+                "order": 1,
+                "tier": "advanced",
+                "unit": "tokens"
+              }
+            },
+            "max_steps": {
+              "anyOf": [
+                {
+                  "maximum": 10000000,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Max Steps",
+              "x-mrl-ui": {
+                "group": "budget",
+                "help": "Stop after this many steps (overrides epochs).",
+                "order": 2,
+                "tier": "advanced"
+              }
+            },
+            "neftune_noise_alpha": {
+              "anyOf": [
+                {
+                  "exclusiveMinimum": 0,
+                  "maximum": 100,
+                  "type": "number"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Neftune Noise Alpha",
+              "x-mrl-ui": {
+                "group": "data",
+                "help": "NEFTune embedding noise.",
+                "order": 3,
+                "tier": "expert"
+              }
+            },
+            "num_train_epochs": {
+              "default": 1.0,
+              "exclusiveMinimum": 0,
+              "maximum": 1000,
+              "title": "Num Train Epochs",
+              "type": "number",
+              "x-mrl-ui": {
+                "group": "budget",
+                "help": "Passes over the data.",
+                "order": 1,
+                "tier": "beginner"
+              }
+            },
+            "optim": {
+              "default": "adamw_torch",
+              "enum": [
+                "adamw_torch",
+                "adamw_8bit",
+                "paged_adamw_8bit",
+                "sgd",
+                "adafactor"
+              ],
+              "title": "Optim",
+              "type": "string",
+              "x-mrl-ui": {
+                "group": "optimizer",
+                "help": "8-bit optimizers need an NVIDIA GPU.",
+                "order": 6,
+                "tier": "expert"
+              }
+            },
+            "packing": {
+              "default": false,
+              "title": "Packing",
+              "type": "boolean",
+              "x-mrl-ui": {
+                "group": "data",
+                "help": "Pack short examples together.",
+                "order": 2,
+                "tier": "advanced"
+              }
+            },
+            "per_device_train_batch_size": {
+              "default": 4,
+              "maximum": 4096,
+              "minimum": 1,
+              "title": "Per Device Train Batch Size",
+              "type": "integer",
+              "x-mrl-ui": {
+                "group": "batch",
+                "help": "Examples per step per GPU.",
+                "order": 1,
+                "tier": "advanced"
+              }
+            },
+            "samples_every": {
+              "default": 0,
+              "maximum": 10000000,
+              "minimum": 0,
+              "title": "Samples Every",
+              "type": "integer",
+              "x-mrl-ui": {
+                "group": "checkpoints",
+                "help": "Steps between sample answers (0: off).",
+                "order": 3,
+                "tier": "advanced"
+              }
+            },
+            "save_steps": {
+              "default": 500,
+              "maximum": 10000000,
+              "minimum": 1,
+              "title": "Save Steps",
+              "type": "integer",
+              "x-mrl-ui": {
+                "group": "checkpoints",
+                "help": "Steps between checkpoints.",
+                "order": 1,
+                "tier": "advanced"
+              }
+            },
+            "warmup_ratio": {
+              "default": 0.03,
+              "maximum": 0.5,
+              "minimum": 0,
+              "title": "Warmup Ratio",
+              "type": "number",
+              "x-mrl-ui": {
+                "group": "optimizer",
+                "help": "Share of steps to warm up.",
+                "order": 3,
+                "tier": "advanced"
+              }
+            },
+            "weight_decay": {
+              "default": 0.0,
+              "maximum": 1,
+              "minimum": 0,
+              "title": "Weight Decay",
+              "type": "number",
+              "x-mrl-ui": {
+                "group": "optimizer",
+                "help": "Weight decay.",
+                "order": 4,
+                "tier": "advanced"
+              }
+            }
+          },
+          "title": "SftEngine",
+          "type": "object"
+        },
+        "UpdateSettings": {
+          "additionalProperties": false,
+          "properties": {
+            "lora": {
+              "$ref": "#/$defs/LoraSettings",
+              "default": {
+                "alpha": 32.0,
+                "dropout": 0.05,
+                "r": 16,
+                "target_modules": "all-linear"
+              }
+            },
+            "strategy": {
+              "default": "lora",
+              "enum": [
+                "full",
+                "lora",
+                "qlora"
+              ],
+              "title": "Strategy",
+              "type": "string",
+              "x-mrl-ui": {
+                "group": "update",
+                "help": "LoRA trains a small adapter; full updates every weight.",
+                "order": 1,
+                "tier": "beginner"
+              }
+            }
+          },
+          "title": "UpdateSettings",
+          "type": "object"
+        }
+      },
+      "$id": "https://schemas.masterrl.dev/engines/trl/sft.schema.json",
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "common": {
+          "$ref": "#/$defs/CommonBlock",
+          "default": {
+            "precision": "auto",
+            "seed": 0,
+            "update": {
+              "lora": {
+                "alpha": 32.0,
+                "dropout": 0.05,
+                "r": 16,
+                "target_modules": "all-linear"
+              },
+              "strategy": "lora"
+            }
+          }
+        },
+        "engine": {
+          "$ref": "#/$defs/SftEngine",
+          "default": {
+            "assistant_only_loss": true,
+            "completion_only_loss": true,
+            "gradient_accumulation_steps": 1,
+            "gradient_checkpointing": false,
+            "learning_rate": 0.0001,
+            "logging_steps": 10,
+            "loss_type": "nll",
+            "lr_scheduler_type": "cosine",
+            "max_grad_norm": 1.0,
+            "max_length": 1024,
+            "max_steps": null,
+            "neftune_noise_alpha": null,
+            "num_train_epochs": 1.0,
+            "optim": "adamw_torch",
+            "packing": false,
+            "per_device_train_batch_size": 4,
+            "samples_every": 0,
+            "save_steps": 500,
+            "warmup_ratio": 0.03,
+            "weight_decay": 0.0
+          }
+        }
+      },
+      "title": "TRL sft config",
+      "type": "object"
+    }
+  },
+  "source": "python/adapters/mrl-adapter-trl/src/mrl_adapter_trl"
+}
