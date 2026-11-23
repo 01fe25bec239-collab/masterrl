@@ -183,16 +183,29 @@ fn parse_all<'a>(
         .collect()
 }
 
+/// Tenant and project in which a registry record must be visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecordScope {
+    /// Owning organization.
+    pub org_id: Uuid,
+    /// Project requesting access.
+    pub project_id: Uuid,
+}
+
 /// What the model and dataset registries know (Doc 05 §12.4). Wave 6 registries implement
-/// it; each answers `None` for records it doesn't hold.
+/// it; each answers `None` for missing, deleted, or out-of-scope records.
 #[async_trait]
 pub trait RegistryRecords: Send + Sync {
-    /// Facts about a model version of `org`, if it holds one with this id.
-    async fn model(&self, org: Uuid, id: ModelVersionId) -> Result<Option<ModelFacts>, SeamError>;
-    /// Facts about a dataset version of `org`, if it holds one with this id.
+    /// Facts about a model version visible in `scope`, if it holds one with this id.
+    async fn model(
+        &self,
+        scope: &RecordScope,
+        id: ModelVersionId,
+    ) -> Result<Option<ModelFacts>, SeamError>;
+    /// Facts about a dataset version visible in `scope`, if it holds one with this id.
     async fn dataset(
         &self,
-        org: Uuid,
+        scope: &RecordScope,
         id: DatasetVersionId,
     ) -> Result<Option<DatasetFacts>, SeamError>;
 }
@@ -220,11 +233,11 @@ impl Records {
     /// The model's facts; `None` when no member knows it.
     pub async fn model(
         &self,
-        org: Uuid,
+        scope: &RecordScope,
         id: ModelVersionId,
     ) -> Result<Option<ModelFacts>, SeamError> {
         for m in self.0.iter() {
-            if let Some(f) = m.model(org, id).await? {
+            if let Some(f) = m.model(scope, id).await? {
                 return Ok(Some(f));
             }
         }
@@ -234,11 +247,11 @@ impl Records {
     /// The dataset's facts; `None` when no member knows it.
     pub async fn dataset(
         &self,
-        org: Uuid,
+        scope: &RecordScope,
         id: DatasetVersionId,
     ) -> Result<Option<DatasetFacts>, SeamError> {
         for m in self.0.iter() {
-            if let Some(f) = m.dataset(org, id).await? {
+            if let Some(f) = m.dataset(scope, id).await? {
                 return Ok(Some(f));
             }
         }

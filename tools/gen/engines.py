@@ -23,6 +23,7 @@ from typing import Any, cast
 
 import yaml
 from jsonschema import Draft202012Validator
+from jsonschema.exceptions import SchemaError
 
 ROOT = Path(__file__).resolve().parents[2]
 OUT = ROOT / "crates/mrl-server/engines/first_party"
@@ -67,8 +68,15 @@ def merge(base: Any, extra: Any, where: str = "") -> Any:
 def reserved_metrics(spec: dict[str, Any]) -> list[str]:
     """Canonical metric names in the platform's reserved prefix."""
     names = [m["name"] for a in spec.get("algorithms", []) for m in a.get("metrics", [])]
-    names += list(spec.get("metrics", {}).get("namespaces", {}).values())
-    return sorted({n for n in names if n.startswith(RESERVED_METRIC_PREFIX)})
+    mapped = spec.get("metrics", {}).get("namespaces", {}).values()
+    bad = {n for n in names if n.startswith(RESERVED_METRIC_PREFIX)}
+    # The runtime appends the original metric suffix to the mapping target.
+    bad.update(
+        n
+        for n in mapped
+        if n.startswith(RESERVED_METRIC_PREFIX) or RESERVED_METRIC_PREFIX.startswith(n)
+    )
+    return sorted(bad)
 
 
 def check_manifest(doc: dict[str, Any], where: str) -> None:
@@ -83,6 +91,16 @@ def check_manifest(doc: dict[str, Any], where: str) -> None:
     ids = [a["id"] for a in spec["algorithms"]]
     if len(set(ids)) != len(ids):
         raise ManifestError(f"{where}: an algorithm id appears twice in {ids}")
+    catalog = json.loads((ROOT / "guidance/build/catalog.json").read_text(encoding="utf-8"))
+    codes = {e["code"] for e in catalog["errors"]}
+    for constraint in spec.get("constraints", []):
+        Draft202012Validator.check_schema(constraint["schema"])
+        if constraint["error"]["code"] not in codes:
+            raise ManifestError(f"{where}: {constraint['id']} uses an uncatalogued error code")
+        if unknown := set(constraint["appliesTo"]) - set(ids):
+            raise ManifestError(
+                f"{where}: {constraint['id']} names unknown methods {sorted(unknown)}"
+            )
     if bad := reserved_metrics(spec):
         raise ManifestError(
             f"{where}: metric names starting with `{RESERVED_METRIC_PREFIX}` belong to the "
@@ -108,16 +126,20 @@ def inline_schemas(doc: dict[str, Any], root: Path, where: str) -> dict[str, Any
                 raise ManifestError(f"{where}: {rel}: {exc}") from exc
             if key == "schema":
                 Draft202012Validator.check_schema(loaded)
+            if key == "uiSchema" and not isinstance(loaded, dict):
+                raise ManifestError(f"{where}: {rel}: the UI schema must be an object")
             out[rel] = loaded
     return out
 
 
 def load_engine(root: Path, dev_only: bool) -> tuple[str, dict[str, Any]]:
-    where = str(root.relative_to(ROOT)) if root.is_relative_to(ROOT) else str(root)
+    where = root.relative_to(ROOT).as_posix() if root.is_relative_to(ROOT) else str(root)
     doc = read_yaml(root / MANIFEST_FILE)
     for fragment in sorted((root / FRAGMENT_DIR).glob("*.yaml")):
         doc = cast(dict[str, Any], merge(doc, read_yaml(fragment)))
-    doc = json.loads(json.dumps(doc))  # YAML-only types (dates, ...) are not valid manifests
+    doc = json.loads(
+        json.dumps(doc, allow_nan=False)
+    )  # YAML-only types (dates, ...) are not valid manifests
     check_manifest(doc, where)
     bundle = {
         "kind": "engine",
@@ -130,15 +152,29 @@ def load_engine(root: Path, dev_only: bool) -> tuple[str, dict[str, Any]]:
 
 
 def load_builtin() -> tuple[str, dict[str, Any]]:
-    where = str(BUILTIN.relative_to(ROOT))
-    doc = json.loads(json.dumps(read_yaml(BUILTIN)))
+    where = BUILTIN.relative_to(ROOT).as_posix()
+    doc = json.loads(json.dumps(read_yaml(BUILTIN), allow_nan=False))
     if doc.get("apiVersion") != "mrl.dev/builtin/v1" or doc.get("kind") != "BuiltinManifest":
         raise ManifestError(
             f"{where}: expected apiVersion mrl.dev/builtin/v1, kind BuiltinManifest"
         )
     meta = doc.get("metadata", {})
-    if not meta.get("name") or not meta.get("version"):
-        raise ManifestError(f"{where}: metadata.name and metadata.version are required")
+    spec = doc.get("spec", {})
+    adapter = spec.get("adapter", {}) if isinstance(spec, dict) else {}
+    if (
+        not all(isinstance(v, dict) for v in (meta, spec, adapter))
+        or not all(
+            isinstance(meta.get(k), str) and meta[k] for k in ("name", "version", "displayName")
+        )
+        or not all(
+            isinstance(adapter.get(k), str) and adapter[k]
+            for k in ("entrypoint", "adapterApi", "workerProtocol")
+        )
+        or spec.get("jobKinds") != [{"kind": "DATA_PREP", "sandbox": "data_prep"}]
+    ):
+        raise ManifestError(
+            f"{where}: the built-in bundle needs adapter metadata and the DATA_PREP sandbox"
+        )
     bundle = {"kind": "builtin", "source": where, "dev_only": False, "manifest": doc, "schemas": {}}
     return meta["name"], bundle
 
@@ -170,7 +206,9 @@ def outputs() -> dict[Path, str]:
         raise ManifestError(f"two first-party engines share a name: {names}")
     files: dict[Path, str] = {}
     for name, bundle in sorted(bundles):
-        files[OUT / f"{name}.json"] = json.dumps(bundle, indent=2, sort_keys=True) + "\n"
+        files[OUT / f"{name}.json"] = (
+            json.dumps(bundle, indent=2, sort_keys=True, allow_nan=False) + "\n"
+        )
     rows = "".join(f'    include_str!("{name}.json"),\n' for name, _ in sorted(bundles))
     files[OUT / "embedded.rs"] = (
         "// Generated by tools/gen/engines.py; do not edit.\n"
@@ -189,7 +227,7 @@ def main() -> int:
             print("engines: the manifest is valid")
             return 0
         files = outputs()
-    except ManifestError as exc:
+    except (ManifestError, SchemaError, TypeError, ValueError) as exc:
         print(f"engines: {exc}", file=sys.stderr)
         return 1
     stale = {p for p in OUT.glob("*") if p.is_file()} - set(files)
@@ -202,7 +240,7 @@ def main() -> int:
     for p in stale:
         p.unlink()
     for p, text in files.items():
-        p.write_text(text, encoding="utf-8")
+        p.write_text(text, encoding="utf-8", newline="\n")
     print(f"engines: wrote {len(files) - 1} bundles to {OUT.relative_to(ROOT)}")
     return 0
 

@@ -81,6 +81,10 @@ fn request(c: &CaseRequest) -> Request {
             gpu_mem_gib: None,
         },
         available: c.available.clone(),
+        machines: None,
+        resources: None,
+        model_signals: BTreeMap::new(),
+        rollout: false,
     }
 }
 
@@ -202,4 +206,170 @@ fn hardware_classes_follow_environments_and_spec_hardware() {
     );
     let fake = bundle("fake").engine.unwrap();
     assert_eq!(fake.hardware_classes(), [HardwareClass::Cpu].into());
+}
+
+fn accepted_sft() -> Request {
+    let fixture = include_str!(
+        "../../../../../tests/fixtures/rejections/cases/90-accepted-lora-on-nvidia.json"
+    );
+    request(&serde_json::from_str::<Case>(fixture).unwrap().request)
+}
+
+fn device(class: HardwareClass, cc: &str) -> Device {
+    Device {
+        class,
+        memory: 24 << 30,
+        compute_capability: Some(cc.into()),
+        driver: Some("535.10".into()),
+    }
+}
+
+fn linux(devices: Vec<Device>) -> Machine {
+    Machine {
+        platform: Some(Platform::Linux),
+        arch: "x86_64".into(),
+        devices,
+    }
+}
+
+#[test]
+fn a_vendor_match_alone_does_not_make_a_runtime_eligible() {
+    let b = bundle("golden");
+    let manifest = b.engine.as_ref().unwrap();
+    let enabled = [HardwareClass::Nvidia].into();
+    let engine = Engine {
+        manifest,
+        enabled: &enabled,
+        schemas: &b.schemas,
+    };
+    let mut req = accepted_sft();
+    req.machines = Some(vec![linux(vec![device(HardwareClass::Nvidia, "7.5")])]);
+    assert_eq!(check(engine, &req)[0].code, Cap::NoEngineForHardware.code());
+
+    let mut good = linux(vec![device(HardwareClass::Nvidia, "8.0")]);
+    good.arch = "aarch64".into();
+    req.machines.as_mut().unwrap().push(good.clone());
+    assert_eq!(check(engine, &req)[0].code, Cap::NoEngineForHardware.code());
+    good.arch = "x86_64".into();
+    req.machines.as_mut().unwrap().push(good);
+    assert!(check(engine, &req).is_empty());
+}
+
+#[test]
+fn constraints_try_other_vendors_and_the_listing_checks_the_gpu_minimum() {
+    let b = bundle("golden");
+    let mut manifest = b.engine.unwrap();
+    let cuda = manifest.spec.runtime.environments[0].clone();
+    let mut amd = cuda.clone();
+    amd.id = "rocm".into();
+    let accelerator = amd.accelerator.as_mut().unwrap();
+    accelerator.vendor = HardwareClass::Amd;
+    accelerator.runtime = Some("rocm6".into());
+    manifest.spec.runtime.environments = vec![cuda, amd];
+    let hardware = manifest.spec.hardware.as_mut().unwrap();
+    hardware.accelerators = Some(vec![HardwareClass::Nvidia, HardwareClass::Amd]);
+    hardware.min_gpus = Some(1);
+    manifest.spec.constraints[0].applies_to = vec!["sft".into()];
+    manifest.spec.constraints[0].schema = json!({
+        "properties": {"hardware": {"properties": {"accelerator": {"const": "amd-rocm6"}}}}
+    });
+    let enabled = [HardwareClass::Nvidia, HardwareClass::Amd].into();
+    let engine = Engine {
+        manifest: &manifest,
+        enabled: &enabled,
+        schemas: &b.schemas,
+    };
+    let mut req = accepted_sft();
+    req.hardware.wanted = Wanted::AnyGpu;
+    req.available = enabled.clone();
+    let nvidia = linux(vec![device(HardwareClass::Nvidia, "8.0")]);
+    req.machines = Some(vec![nvidia.clone()]);
+    assert_eq!(check(engine, &req)[0].code, Cap::KtoBatchTooSmall.code());
+    req.machines
+        .as_mut()
+        .unwrap()
+        .push(linux(vec![device(HardwareClass::Amd, "8.0")]));
+    assert!(check(engine, &req).is_empty());
+
+    req.config = None;
+    req.hardware.wanted = Wanted::Any;
+    req.hardware.gpus = 0;
+    assert!(check(engine, &req).is_empty());
+    assert!(offers_qlora(engine, &req));
+    manifest.spec.capabilities.quantized_training.clear();
+    assert!(!offers_qlora(
+        Engine {
+            manifest: &manifest,
+            enabled: &enabled,
+            schemas: &b.schemas,
+        },
+        &req
+    ));
+}
+
+#[test]
+fn inputs_model_policy_streaming_and_selected_topology_are_checked() {
+    let b = bundle("golden");
+    let mut manifest = b.engine.unwrap();
+    manifest.spec.capabilities.multi_node = true;
+    manifest.spec.algorithms[0].requires.signals.rollout_engine = "required".into();
+    let enabled = [HardwareClass::Nvidia].into();
+    let engine = Engine {
+        manifest: &manifest,
+        enabled: &enabled,
+        schemas: &b.schemas,
+    };
+    let mut req = accepted_sft();
+    req.hardware.nodes = 2;
+    req.config = Some(json!({"common": {"parallelism": "single", "update_strategy": "lora"}}));
+    if let Lookup::Found(f) = &mut req.model {
+        f.requires_remote_code = true;
+    }
+    if let Lookup::Found(f) = &mut req.datasets[0] {
+        f.streaming = true;
+    }
+    req.model_signals.insert("critic".into(), Lookup::Missing);
+    req.model_signals
+        .insert("reference".into(), Lookup::Missing);
+    let problems = check(engine, &req);
+    for code in [
+        codes::INPUT_MISSING,
+        codes::MODEL_UNKNOWN,
+        Cap::ModelBlockedByPolicy.code(),
+        Cap::StreamingNeedsStepLimit.code(),
+        Cap::SingleMachineOnly.code(),
+    ] {
+        assert!(
+            problems.iter().any(|p| p.code == code),
+            "{code}: {problems:?}"
+        );
+    }
+    assert_eq!(
+        problems
+            .iter()
+            .filter(|p| p.code == codes::MODEL_UNKNOWN)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn startup_rejects_generated_bundle_mistakes() {
+    let b = bundle("golden");
+    let mut raw = b.raw.clone();
+    raw["spec"]["metrics"] = json!({"namespaces":{"host":"resource"}});
+    assert_eq!(
+        EngineManifest::check(&raw, &b.schemas).unwrap_err(),
+        ManifestError::ReservedMetrics(vec!["resource".into()])
+    );
+    raw = b.raw.clone();
+    raw["spec"]["constraints"][0]["error"]["code"] = json!("MRL-CAP-999");
+    raw["spec"]["algorithms"][0]["config"]["uiSchema"] = json!("missing.json");
+    let error = EngineManifest::check(&raw, &b.schemas)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("guidance catalog") && error.contains("missing.json"),
+        "{error}"
+    );
 }

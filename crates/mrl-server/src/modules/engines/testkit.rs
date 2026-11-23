@@ -18,7 +18,7 @@ use mrl_domain::ids::{DatasetVersionId, ModelVersionId};
 use mrl_server::app::ServerModule;
 use mrl_server::config::Mode;
 use mrl_server::modules::engines::{
-    CapabilityValidator, EnginesConfig, EnginesModule, Records, RegistryRecords,
+    CapabilityValidator, EnginesConfig, EnginesModule, RecordScope, Records, RegistryRecords,
 };
 use mrl_server::modules::jobs::{Chains, SchemaChecks};
 use mrl_server::modules::nodes::lanes::LaneRouter;
@@ -27,7 +27,6 @@ use mrl_server::modules::runs::RunsModule;
 use mrl_server::seams::SeamError;
 use serde_json::Value;
 use std::sync::Arc;
-use uuid::Uuid;
 
 const TINY_MODEL: &str = include_str!("../../../../../tests/fixtures/models/GOLDEN.json");
 const TINY_DATASET: &str =
@@ -36,7 +35,7 @@ const TINY_DATASET: &str =
 pub const TINY_DATASET_SCHEMA: &str = "sft.messages.v1";
 
 /// One model version and one dataset version that stand for the P03 tiny fixtures (new ids
-/// each time). Any org may read them; other ids are unknown.
+/// each time). They are visible in the test server’s solo tenant.
 #[derive(Debug, Clone, Copy)]
 pub struct TinyFixture {
     /// The tiny-llama model version.
@@ -69,6 +68,7 @@ impl TinyFixture {
             params: g["param_count"].as_f64(),
             has_chat_template: g["chat_template_sha256"].is_string(),
             requires_remote_code: false,
+            remote_code_approved: false,
         }
     }
 
@@ -94,16 +94,20 @@ impl TinyFixture {
 
 #[async_trait]
 impl RegistryRecords for TinyFixture {
-    async fn model(&self, _: Uuid, id: ModelVersionId) -> Result<Option<ModelFacts>, SeamError> {
-        Ok((id == self.model).then(Self::model_facts))
+    async fn model(
+        &self,
+        scope: &RecordScope,
+        id: ModelVersionId,
+    ) -> Result<Option<ModelFacts>, SeamError> {
+        Ok((scope.org_id.is_nil() && id == self.model).then(Self::model_facts))
     }
 
     async fn dataset(
         &self,
-        _: Uuid,
+        scope: &RecordScope,
         id: DatasetVersionId,
     ) -> Result<Option<DatasetFacts>, SeamError> {
-        Ok((id == self.dataset).then(Self::dataset_facts))
+        Ok((scope.org_id.is_nil() && id == self.dataset).then(Self::dataset_facts))
     }
 }
 

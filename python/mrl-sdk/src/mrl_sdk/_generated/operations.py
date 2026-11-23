@@ -189,23 +189,21 @@ OPERATIONS: dict[str, Operation] = {
     "get_algorithm_schema": Operation(
         "GET",
         "/api/v1/algorithms/{algo}/schema",
-        (
-            "algo",
-            "engine_version",
-        ),
-        (),
+        ("algo",),
+        ("engine_version",),
         (),
         False,
     ),
     "get_capabilities": Operation(
         "GET",
         "/api/v1/capabilities",
+        (),
         (
             "model_version",
             "dataset_version",
+            "project",
             "pool",
         ),
-        (),
         (),
         False,
     ),

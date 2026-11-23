@@ -20,13 +20,11 @@ paths:
         schema:
           type: string
       - name: engine_version
-        in: path
+        in: query
         description: '`<engine>@<version>`, like `trl@1.0.0`; default: the newest live version with the method.'
-        required: true
+        required: false
         schema:
-          type:
-          - string
-          - 'null'
+          type: string
       responses:
         '200':
           description: The method's form.
@@ -365,29 +363,29 @@ paths:
       operationId: get_capabilities
       parameters:
       - name: model_version
-        in: path
+        in: query
         description: '`mv_…`: check against this model.'
-        required: true
+        required: false
         schema:
-          type:
-          - string
-          - 'null'
+          type: string
       - name: dataset_version
-        in: path
+        in: query
         description: '`dsv_…`: check against this training dataset.'
-        required: true
+        required: false
         schema:
-          type:
-          - string
-          - 'null'
+          type: string
+      - name: project
+        in: query
+        description: Project in which model and dataset versions must be visible.
+        required: false
+        schema:
+          type: string
       - name: pool
-        in: path
+        in: query
         description: '`pool_…`: only this pool''s machines.'
-        required: true
+        required: false
         schema:
-          type:
-          - string
-          - 'null'
+          type: string
       responses:
         '200':
           description: What can run.
@@ -395,8 +393,14 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/CapabilityReport'
+        '403':
+          description: The caller cannot read the requested compute or records.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
         '404':
-          description: No such pool.
+          description: No visible pool or project has this id.
           content:
             application/json:
               schema:

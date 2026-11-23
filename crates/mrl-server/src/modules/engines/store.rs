@@ -5,6 +5,8 @@ use super::EnginesError;
 use crate::db::{Db, Tx};
 use crate::modules::events::{NewEvent, OutboxWriter};
 use mrl_domain::capability::manifest::{Bundle, BundleKind, EngineManifest, HardwareClass};
+use mrl_domain::capability::matcher::{Device, Machine};
+use mrl_domain::resources::Platform;
 use mrl_domain::state::{EngineVersion, EngineVersionEvent, EngineVersionState, StateMachine};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -59,10 +61,11 @@ pub async fn register(db: &Db, bundles: &[&Bundle], dev_engines: bool) -> Result
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext('mrl.engines.register'))")
         .execute(&mut *tx)
         .await?;
-    for b in bundles {
+    for b in bundles.iter().filter(|b| dev_engines || !b.dev_only) {
         register_one(&mut tx, b).await?;
     }
-    sqlx::query("UPDATE training_engines SET listed = (NOT dev_only OR $1) WHERE listed <> (NOT dev_only OR $1)")
+
+    sqlx::query("UPDATE training_engines SET listed = $1 WHERE dev_only AND listed <> $1")
         .bind(dev_engines)
         .execute(&mut *tx)
         .await?;
@@ -90,15 +93,16 @@ async fn register_one(tx: &mut Tx, b: &Bundle) -> Result<(), EnginesError> {
         .fetch_one(&mut **tx)
         .await?;
     let sha = manifest_sha256(&b.raw);
-    let stored: Option<String> = sqlx::query_scalar(
-        "SELECT manifest_sha256 FROM engine_versions WHERE engine_id = $1 AND version = $2",
+    let schemas = json!(b.schemas);
+    let stored: Option<(String, Value)> = sqlx::query_as(
+        "SELECT manifest_sha256, schemas FROM engine_versions WHERE engine_id = $1 AND version = $2",
     )
     .bind(engine)
     .bind(&b.version)
     .fetch_optional(&mut **tx)
     .await?;
     match stored {
-        Some(s) if s == sha => return Ok(()),
+        Some((s, stored_schemas)) if s == sha && stored_schemas == schemas => return Ok(()),
         Some(_) => {
             return Err(EnginesError::Changed {
                 name: b.name.clone(),
@@ -122,7 +126,7 @@ async fn register_one(tx: &mut Tx, b: &Bundle) -> Result<(), EnginesError> {
     .bind(engine)
     .bind(&b.version)
     .bind(&b.raw)
-    .bind(serde_json::to_value(&b.schemas).unwrap_or_else(|_| json!({})))
+    .bind(&schemas)
     .bind(&sha)
     .bind(runtime_ref(&b.raw))
     .bind(worker)
@@ -276,35 +280,75 @@ pub async fn candidates(db: &Db, algorithm: Option<&str>) -> Result<Vec<Candidat
     Ok(out)
 }
 
-/// Hardware classes of the machines that could take work: ONLINE or DEGRADED machines in
-/// platform pools and pools of `org` (platform pools only when `org` is `None`), only `pool`
-/// when given.
-/// Every machine offers its processor; machines with healthy GPUs add their maker.
-pub async fn available_classes(
+/// Read the eligible inventory in platform pools and pools of the supplied org.
+pub async fn machines(
     db: &Db,
     org: Option<Uuid>,
     pool: Option<Uuid>,
-) -> Result<BTreeSet<HardwareClass>, EnginesError> {
-    let vendors: Vec<String> = sqlx::query_scalar(
-        "SELECT DISTINCT COALESCE(g.vendor, 'cpu')
-         FROM compute_nodes n JOIN compute_pools p ON p.id = n.pool_id
-         LEFT JOIN gpu_devices g ON g.node_id = n.id AND g.present AND g.health = 'OK'
-         WHERE n.status IN ('ONLINE', 'DEGRADED')
-           AND (p.org_id IS NULL OR p.org_id = $1)
+) -> Result<Vec<Machine>, EnginesError> {
+    let rows = sqlx::query(
+        "SELECT n.inventory, COALESCE((
+          SELECT jsonb_agg(jsonb_build_object('vendor', g.vendor, 'memory', g.vram_total_bytes,
+                    'index', g.index_on_node))
+          FROM gpu_devices g WHERE g.node_id = n.id AND g.present AND g.health = 'OK'
+        ), '[]') AS devices
+        FROM compute_nodes n JOIN compute_pools p ON p.id = n.pool_id
+        WHERE n.status IN ('ONLINE', 'DEGRADED') AND (p.org_id IS NULL OR p.org_id = $1)
            AND ($2::uuid IS NULL OR p.id = $2)",
     )
     .bind(org)
     .bind(pool)
     .fetch_all(db.pool())
     .await?;
-    let mut out: BTreeSet<HardwareClass> = vendors
-        .iter()
-        .filter_map(|v| HardwareClass::parse(v))
-        .collect();
-    if !vendors.is_empty() {
-        out.insert(HardwareClass::Cpu);
-    }
-    Ok(out)
+    rows.iter().map(machine_from_row).collect()
+}
+
+pub(super) fn machine_from_row(row: &sqlx::postgres::PgRow) -> Result<Machine, EnginesError> {
+    let inventory: Option<Value> = row.try_get("inventory")?;
+    let inventory = inventory.unwrap_or_default();
+    let devices: Value = row.try_get("devices")?;
+    let text = |key| {
+        inventory
+            .get(key)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    };
+    let platform = match text("platform") {
+        "PLATFORM_LINUX" => Some(Platform::Linux),
+        "PLATFORM_WSL2" => Some(Platform::Wsl2),
+        "PLATFORM_WINDOWS" => Some(Platform::Windows),
+        "PLATFORM_MACOS" if inventory["apple_silicon"] == true => Some(Platform::AppleSilicon),
+        _ => None,
+    };
+    Ok(Machine {
+        platform,
+        arch: text("arch").to_owned(),
+        devices: devices
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|gpu| {
+                let class = HardwareClass::parse(gpu["vendor"].as_str()?)?;
+                let facts = inventory["gpus"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find(|d| d["index"] == gpu["index"]);
+                let fact = |k| {
+                    facts
+                        .and_then(|f| f[k].as_str())
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned)
+                };
+                Some(Device {
+                    class,
+                    memory: gpu["memory"].as_u64()?,
+                    compute_capability: fact("compute_capability"),
+                    driver: fact("driver_version"),
+                })
+            })
+            .collect(),
+    })
 }
 
 /// A version's status, version counter and probe results, locked for update.
