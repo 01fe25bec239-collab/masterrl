@@ -6,6 +6,5 @@
 !python/adapters/mrl-adapter-trl/uv.lock
 !python/adapters/mrl-adapter-trl/runtimes/trainer.lock
 !python/adapters/mrl-adapter-trl/src/
-!schemas/datasets/
 **/__pycache__
 **/.venv

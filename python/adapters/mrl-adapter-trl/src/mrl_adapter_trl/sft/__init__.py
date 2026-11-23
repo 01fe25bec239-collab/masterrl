@@ -12,8 +12,9 @@ optionally `eval` (any format the P15 readers read), `resume_from` (a committed 
 import importlib
 import json
 import shutil
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterable, Iterator, Mapping
 from functools import cache
+from itertools import chain, islice
 from pathlib import Path
 from typing import Any, Literal
 
@@ -132,7 +133,6 @@ def dataset_schema(algorithm: str, path: Path) -> str | None:
 def _rows(path: Path, schema: str, limit: int | None) -> Iterator[dict[str, Any]]:
     """Every record as a training row; any record that fails its schema stops the run (DATA)."""
     validator = RecordValidator(schema)
-    form: tuple[type, ...] | None = None
     for record in read_records(path, limits=Limits(max_records=limit)):
         where = f"Record {record.number} of {path.name}"
         if record.defect is not None:
@@ -144,39 +144,46 @@ def _rows(path: Path, schema: str, limit: int | None) -> Iterator[dict[str, Any]
                 DATASET_INVALID, f"{where}: {d.message} ({d.code} at {d.path or '/'})."
             )
         value: dict[str, Any] = record.value
-        extra = [k for k in UNSUPPORTED_FIELDS if k in value]
-        if extra:
-            raise DatasetError(
-                DATASET_INVALID,
-                f"{where} has {extra[0]}, which this engine version doesn't train on.",
-                f"Remove the {extra[0]} field from the dataset.",
-            )
+        if error := _unsupported_record(value, where):
+            raise error
         row = {k: value[k] for k in COLUMNS[schema]}
-        shape = tuple(type(v) for v in row.values())
-        if form is None:
-            form = shape
-        elif shape != form:
-            raise DatasetError(
-                DATASET_INVALID,
-                f"{where} mixes plain text and conversations; every record must use one form.",
-            )
+        if schema == "sft.prompt_completion.v1" and _conversational(row):
+            for key, role in (("prompt", "user"), ("completion", "assistant")):
+                if isinstance(row[key], str):
+                    row[key] = [{"role": role, "content": row[key]}]
         yield row
 
 
-def _load_dataset(path: Path, schema: str, limit: int | None) -> Any:
+def _unsupported_record(row: Mapping[str, Any], where: str) -> DatasetError | None:
+    for key in UNSUPPORTED_FIELDS:
+        if key in row:
+            return DatasetError(
+                DATASET_INVALID,
+                f"{where} has {key}, which this engine version doesn't train on.",
+                f"Remove the {key} field from the dataset.",
+            )
+    return None
+
+
+def _conversational(row: Mapping[str, Any]) -> bool:
+    return any(isinstance(row.get(key), list) for key in ("messages", "prompt", "completion"))
+
+
+def _load_dataset(path: Path, schema: str, limit: int | None) -> tuple[Any, ...]:
     import datasets  # noqa: PLC0415 (lazy: probe() reports a broken ML environment)
 
-    # ponytail: rows are held in memory; stream through Dataset.from_generator for corpora
-    # larger than host RAM.
-    rows = list(_rows(path, schema, limit))
-    if not rows:
+    # Arrow and TRL require a uniform form within each dataset.
+    groups: dict[bool, list[dict[str, Any]]] = {}
+    for row in _rows(path, schema, limit):
+        groups.setdefault(_conversational(row), []).append(row)
+    if not groups:
         raise DatasetError(DATASET_INVALID, f"{path.name} has no records.")
-    return datasets.Dataset.from_list(rows)
+    return tuple(datasets.Dataset.from_list(rows) for rows in groups.values())
 
 
-def _sample_prompts(dataset: Any, schema: str, tokenizer: Any) -> list[str]:
+def _sample_prompts(rows: Iterable[Mapping[str, Any]], schema: str, tokenizer: Any) -> list[str]:
     prompts: list[str] = []
-    for row in dataset.select(range(min(SAMPLE_PROMPTS, len(dataset)))):
+    for row in islice(rows, SAMPLE_PROMPTS):
         if schema == "sft.messages.v1":
             turns = row["messages"]
             last = max((i for i, m in enumerate(turns) if m["role"] == "assistant"), default=0)
@@ -196,34 +203,47 @@ def _sample_prompts(dataset: Any, schema: str, tokenizer: Any) -> list[str]:
     return prompts
 
 
-def _make_sampler(prompts: list[str]) -> Any:
+def _make_sampler(prompts: list[str], max_tokens: int) -> Any:
+    # Keep room for a completion even when the training context is short.
+    new_tokens = min(SAMPLE_NEW_TOKENS, max_tokens // 2)
+    prompt_tokens = max_tokens - new_tokens
+
     def sample(model: Any, tokenizer: Any, step: int) -> Samples | None:
         import torch  # noqa: PLC0415 (lazy: probe() reports a broken ML environment)
 
-        if model is None or tokenizer is None or not prompts:
+        if model is None or tokenizer is None or not prompts or not new_tokens:
             return None
         items: list[RolloutSample] = []
         was_training = model.training
         model.eval()
         try:
             for i, prompt in enumerate(prompts):
-                inputs = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+                encoded = tokenizer(prompt, return_tensors="pt", add_special_tokens=False)
+                # Keep the end: a chat prompt ends with the turn the model must answer.
+                inputs = {k: v[:, -prompt_tokens:] for k, v in encoded.items()}
+                input_ids = inputs["input_ids"][0]
+                if not len(input_ids):
+                    continue
+                cut = encoded["input_ids"].shape[1] > prompt_tokens
+                sample_prompt = tokenizer.decode(input_ids) if cut else prompt
                 inputs = {k: v.to(model.device) for k, v in inputs.items()}
                 with torch.no_grad():
                     out = model.generate(
                         **inputs,
-                        max_new_tokens=SAMPLE_NEW_TOKENS,
+                        max_new_tokens=new_tokens,
                         do_sample=False,
                         pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
                     )
                 new = out[0][inputs["input_ids"].shape[1] :]
                 text = tokenizer.decode(new, skip_special_tokens=True)
                 items.append(
-                    RolloutSample(f"step{step}-{i}", prompt, text, completion_tokens=len(new))
+                    RolloutSample(
+                        f"step{step}-{i}", sample_prompt, text, completion_tokens=len(new)
+                    )
                 )
         finally:
             model.train(was_training)
-        return Samples(step, tuple(items))
+        return Samples(step, tuple(items)) if items else None
 
     return sample
 
@@ -317,6 +337,17 @@ def _model_issues(inspection: ModelInspection, algorithm: str) -> list[Issue]:
     return []
 
 
+def _resume_step(path: Path) -> int:
+    try:
+        state = json.loads((path / "trainer_state.json").read_text(encoding="utf-8"))
+        step = state.get("global_step") if isinstance(state, dict) else None
+    except (OSError, ValueError):
+        step = None
+    if type(step) is not int or step < 0:
+        raise ConfigError(CANNOT_RESUME, "The checkpoint has no valid training step.")
+    return step
+
+
 def _resume_issues(path: Path, adapter: bool) -> list[Issue]:
     where = "/inputs/resume_from"
     manifest_path = path / CHECKPOINT_MANIFEST
@@ -348,6 +379,10 @@ def _resume_issues(path: Path, adapter: bool) -> list[Issue]:
                 hint="Resume from an earlier checkpoint, or start a new run.",
             )
         ]
+    try:
+        _resume_step(path)
+    except ConfigError as exc:
+        return [Issue(exc.code, exc.message, path=where)]
     return []
 
 
@@ -386,7 +421,24 @@ def _dataset_issues(
     role: str, path: Path, algorithm: str, inspection: ModelInspection | None
 ) -> list[Issue]:
     schema, issues = _dataset_report(role, path, algorithm)
-    if schema == "sft.messages.v1" and inspection and inspection.chat_template_sha256 is None:
+    if issues:
+        return issues
+    missing_template = inspection is not None and inspection.chat_template_sha256 is None
+    needs_template = schema == "sft.messages.v1"
+    if needs_template or (missing_template and schema == "sft.prompt_completion.v1"):
+        try:
+            for record in read_records(path, limits=Limits(max_records=L1_SAMPLE_RECORDS)):
+                if not isinstance(record.value, dict):
+                    continue
+                where = f"Record {record.number} of {path.name}"
+                if error := _unsupported_record(record.value, where):
+                    return [
+                        Issue(error.code, error.message, path=f"/inputs/{role}", hint=error.hint)
+                    ]
+                needs_template = needs_template or _conversational(record.value)
+        except ModelError as exc:
+            return [Issue(exc.code, exc.message, path=f"/inputs/{role}", hint=exc.detail)]
+    if missing_template and needs_template:
         issues.append(
             Issue(
                 NO_CHAT_TEMPLATE,
@@ -441,6 +493,7 @@ class TrlSftEngine(BaseEngine):
         self._bridge: Any = None
         self._inspection: ModelInspection | None = None
         self._total_steps = 0
+        self._start_step = 0
         self._export_model: Path | None = None
         self._resume: Path | None = None
 
@@ -542,6 +595,7 @@ class TrlSftEngine(BaseEngine):
         model_dir = ctx.staged_paths["model"]
         self._inspection = inspect_model(model_dir)
         self._resume = ctx.resume_from
+        self._start_step = _resume_step(self._resume) if self._resume is not None else 0
         limit = DRY_RUN_RECORDS if ctx.dry_run else None
         schema = dataset_schema(cfg.algorithm, ctx.staged_paths["train"])
         if schema is None:
@@ -564,6 +618,8 @@ class TrlSftEngine(BaseEngine):
         trainer = self._trainer
         if trainer is None:
             raise ConfigError(FIELD_INVALID, "run() was called before prepare().")
+        if self._resume is not None and self._start_step >= self._total_steps:
+            return
         resume = str(self._resume) if self._resume is not None else None
         yield from drain(self._bridge, lambda: trainer.train(resume_from_checkpoint=resume))
 
@@ -640,11 +696,18 @@ class TrlSftEngine(BaseEngine):
         return issues
 
     def _build(
-        self, ctx: JobContext, settings: Settings, schema: str, train: Any, evaluation: Any
+        self,
+        ctx: JobContext,
+        settings: Settings,
+        schema: str,
+        train: tuple[Any, ...],
+        evaluation: tuple[Any, ...] | None,
     ) -> tuple[Any, Any]:
         from peft import LoraConfig  # noqa: PLC0415 (lazy: probe() reports a broken ML environment)
         from transformers import AutoTokenizer, BitsAndBytesConfig, PrinterCallback  # noqa: PLC0415 (lazy: probe() reports a broken ML environment)
-        from trl import SFTConfig, SFTTrainer  # noqa: PLC0415 (lazy: probe() reports a broken ML environment)
+        from trl import SFTConfig  # noqa: PLC0415 (lazy: probe() reports a broken ML environment)
+
+        from mrl_adapter_trl.sft.trainer import SftTrainer  # noqa: PLC0415 (loads TRL)
 
         device = detect_device()
         precision = _precision(settings, device)
@@ -690,9 +753,7 @@ class TrlSftEngine(BaseEngine):
             packing=e.packing,
             loss_type=e.loss_type,
             assistant_only_loss=e.assistant_only_loss and schema == "sft.messages.v1",
-            completion_only_loss=e.completion_only_loss
-            if schema == "sft.prompt_completion.v1"
-            else False,
+            completion_only_loss=e.completion_only_loss,
             neftune_noise_alpha=e.neftune_noise_alpha,
             dataset_text_field="text",
             model_init_kwargs=model_kwargs,
@@ -719,21 +780,29 @@ class TrlSftEngine(BaseEngine):
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_compute_dtype=compute,
             )
-        prompts = _sample_prompts(train, schema, tokenizer) if e.samples_every else []
+        prompts = (
+            _sample_prompts(chain.from_iterable(train), schema, tokenizer)
+            if e.samples_every
+            else []
+        )
+        context = self._inspection.context_length if self._inspection is not None else None
+        sample_tokens = min(e.max_length, context or e.max_length)
         flags = Flags(self.pause_requested, self.cancel_requested, self.checkpoint_requested)
         bridge = make_bridge(
             flags,
             sources=_metric_sources(settings.algorithm),
             kind="full_resume" if strategy == "full" else "adapter_only",
             method=strategy,
-            sampler=_make_sampler(prompts) if prompts else None,
+            sampler=_make_sampler(prompts, sample_tokens) if prompts else None,
             samples_every=e.samples_every,
         )
-        trainer = SFTTrainer(
+        trainer = SftTrainer(
             model=str(model_dir),
             args=args,
-            train_dataset=train,
-            eval_dataset=evaluation,
+            train_dataset=train[0],
+            eval_dataset=evaluation[0] if evaluation else None,
+            datasets={"train": train, "eval": evaluation},
+            mask_assistant=e.assistant_only_loss,
             processing_class=tokenizer,
             peft_config=peft_config,
             quantization_config=quantization,
