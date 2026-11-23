@@ -1083,6 +1083,19 @@ class Run(TypedDict):
     """Why: `{code, message, problems?}`; for REJECTED, every problem with a hint."""
 
 
+class RunArtifactInput(TypedDict):
+    """A named input from a committed artifact."""
+
+    artifact_id: str
+    """Artifact id (`art_…`)."""
+
+    name: str
+    """Unique worker input name, also used as the staged filename."""
+
+    path: str
+    """File path as listed in the artifact manifest."""
+
+
 class RunConfig(TypedDict):
     """The immutable config snapshot of a run."""
 
@@ -1131,6 +1144,9 @@ class RunSubmission(TypedDict):
     algorithm_id: str
     """The method, like `sft`, `dpo` or `grpo`."""
 
+    artifact_inputs: NotRequired[list[RunArtifactInput]]
+    """Committed artifact files to stage before launching the run."""
+
     base_model_version_id: str
     """The model version to start from, `mv_…`."""
 
@@ -1169,6 +1185,9 @@ class RunSubmission(TypedDict):
 
     reward_version_id: NotRequired[str | None]
     """The reward version, `rwdv_…`."""
+
+    secret_ids: NotRequired[list[str]]
+    """Secrets to grant to this run as worker environment variables."""
 
     seeds: NotRequired[dict[str, Any] | None]
     """Random seeds; the server picks `{"global": n}` when absent."""
@@ -1590,6 +1609,7 @@ __all__ = [
     "Restored",
     "RoleInfo",
     "Run",
+    "RunArtifactInput",
     "RunConfig",
     "RunKind",
     "RunPage",

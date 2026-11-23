@@ -110,6 +110,7 @@ pub struct NewCommand {
     kind: Kind,
     attempt: Option<(AttemptId, u64)>,
     deadline: Option<Duration>,
+    not_after: Option<time::OffsetDateTime>,
     supersede: bool,
 }
 
@@ -120,6 +121,7 @@ impl NewCommand {
             kind,
             attempt: None,
             deadline: None,
+            not_after: None,
             supersede: false,
         }
     }
@@ -133,6 +135,12 @@ impl NewCommand {
     /// Fails (EXPIRED) unless sent within `d`.
     pub fn deadline(mut self, d: Duration) -> Self {
         self.deadline = Some(d);
+        self
+    }
+
+    /// Keeps this command's delivery deadline no later than an absolute expiry.
+    pub(crate) fn not_after(mut self, at: Option<time::OffsetDateTime>) -> Self {
+        self.not_after = at;
         self
     }
 
@@ -212,6 +220,7 @@ impl CommandSender {
         }
         let payload = command.encode_to_vec();
         let supersede = cmd.supersede;
+        let not_after = cmd.not_after;
         let out = self
             .db
             .transaction(move |tx| {
@@ -252,8 +261,8 @@ impl CommandSender {
                     .fetch_one(&mut **tx)
                     .await?;
                     sqlx::query(
-                        "INSERT INTO agent_commands (id, node_id, seq, kind, payload, attempt_id, epoch, state, deadline_at)
-                         VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', now() + $8)",
+                        "INSERT INTO agent_commands (id, node_id, seq, kind, payload, attempt_id, epoch, state, deadline_at, not_after)
+                         VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', LEAST(now() + $8, $9), $9)",
                     )
                     .bind(id)
                     .bind(node)
@@ -263,6 +272,7 @@ impl CommandSender {
                     .bind(attempt)
                     .bind(epoch)
                     .bind(deadline)
+                    .bind(not_after)
                     .execute(&mut **tx)
                     .await?;
                     sqlx::query("SELECT pg_notify($1, $2)")

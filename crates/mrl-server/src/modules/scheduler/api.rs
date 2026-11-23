@@ -3,7 +3,7 @@
 //! Needs `compute.read` on the pool (a missing or hidden pool is 404). Each job is listed
 //! only when the caller may read it (`runs.read`). Totals and positions use that same scope.
 
-use super::{Core, SchedError};
+use super::Core;
 use crate::error::{ApiError, ErrorCode};
 use crate::modules::jobs::scope;
 use crate::seams::{RequestContext, Resource};
@@ -131,48 +131,69 @@ async fn get_queue(
         ..Resource::kind("pool")
     };
     s.authorize(&ctx, "compute.read", &res).await?;
-    let mut total = 0u32;
-    let mut jobs = Vec::new();
-    let mut cursor = None;
-    loop {
-        let rows = queued_for(&core, &info, cursor)
+    // P16 grants runs.read at project scope. Resolve it once for each candidate project,
+    // then let the database count and sort only rows in the resulting scope.
+    let projects: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT DISTINCT org_id, project_id FROM jobs WHERE state = 'QUEUED'
+         AND ($1::uuid IS NULL OR org_id = $1) AND (pool_id IS NULL OR pool_id = $2)",
+    )
+    .bind(info.org_id)
+    .bind(info.id)
+    .fetch_all(core.db.pool())
+    .await
+    .map_err(unavailable)?;
+    let mut orgs = Vec::new();
+    let mut visible = Vec::new();
+    for (org, project) in projects {
+        let res = scope::resource("job", None, org, project);
+        if scope::allowed(&s, &ctx, "runs.read", &res)
             .await
-            .map_err(unavailable)?;
-        let Some(last) = rows.last() else { break };
-        cursor = Some((last.priority, last.queued_at, last.id));
-        for r in rows {
-            let job = JobId::from_uuid(r.id).to_string();
-            let res = scope::resource("job", Some(job.clone()), r.org_id, r.project_id);
-            if !scope::allowed(&s, &ctx, "runs.read", &res)
-                .await
-                .map_err(unavailable)?
-            {
-                continue;
-            }
-            total = total.saturating_add(1);
-            if jobs.len() >= limit as usize {
-                continue;
-            }
-            jobs.push(SchedulerQueueEntry {
-                job_id: job,
-                run_id: r.run_id.map(|x| RunId::from_uuid(x).to_string()),
-                project_id: ProjectId::from_uuid(r.project_id).to_string(),
-                position: total,
-                priority: r.priority,
-                queued_at: r.queued_at,
-                reason: r
-                    .reason
-                    .as_ref()
-                    .and_then(|v| v["message"].as_str())
-                    .map(str::to_owned),
-                reason_code: r
-                    .reason
-                    .as_ref()
-                    .and_then(|v| v["code"].as_str())
-                    .map(str::to_owned),
-            });
+            .map_err(unavailable)?
+        {
+            orgs.push(org);
+            visible.push(project);
         }
     }
+    let rows: Vec<Queued> = sqlx::query_as(
+        "SELECT id, project_id, run_id, priority, queued_at, state_reason AS reason,
+                count(*) OVER () AS total
+         FROM jobs WHERE state = 'QUEUED'
+           AND (pool_id IS NULL OR pool_id = $1)
+           AND (org_id, project_id) IN (SELECT * FROM unnest($2::uuid[], $3::uuid[]))
+         ORDER BY priority DESC, queued_at, id LIMIT $4",
+    )
+    .bind(info.id)
+    .bind(&orgs)
+    .bind(&visible)
+    .bind(i64::from(limit))
+    .fetch_all(core.db.pool())
+    .await
+    .map_err(unavailable)?;
+    let total = rows
+        .first()
+        .map_or(0, |r| u32::try_from(r.total).unwrap_or(u32::MAX));
+    let jobs = rows
+        .into_iter()
+        .zip(1..)
+        .map(|(r, position)| SchedulerQueueEntry {
+            job_id: JobId::from_uuid(r.id).to_string(),
+            run_id: r.run_id.map(|x| RunId::from_uuid(x).to_string()),
+            project_id: ProjectId::from_uuid(r.project_id).to_string(),
+            position,
+            priority: r.priority,
+            queued_at: r.queued_at,
+            reason: r
+                .reason
+                .as_ref()
+                .and_then(|v| v["message"].as_str())
+                .map(str::to_owned),
+            reason_code: r
+                .reason
+                .as_ref()
+                .and_then(|v| v["code"].as_str())
+                .map(str::to_owned),
+        })
+        .collect();
     Ok(Json(SchedulerQueue {
         pool_id: PoolId::from_uuid(pool).to_string(),
         total,
@@ -183,36 +204,10 @@ async fn get_queue(
 #[derive(sqlx::FromRow)]
 struct Queued {
     id: Uuid,
-    org_id: Uuid,
     project_id: Uuid,
     run_id: Option<Uuid>,
     priority: i32,
     queued_at: Option<OffsetDateTime>,
     reason: Option<serde_json::Value>,
-}
-
-type QueueCursor = (i32, Option<OffsetDateTime>, Uuid);
-
-/// One page of QUEUED jobs that may use `pool`, in placement order.
-async fn queued_for(
-    core: &Core,
-    pool: &super::pipeline::PoolInfo,
-    cursor: Option<QueueCursor>,
-) -> Result<Vec<Queued>, SchedError> {
-    let (priority, at, id) = cursor.map_or((0, None, None), |(p, t, id)| (p, t, Some(id)));
-    Ok(sqlx::query_as(
-        "SELECT id, org_id, project_id, run_id, priority, queued_at, state_reason AS reason
-         FROM jobs WHERE state = 'QUEUED'
-           AND ($1::uuid IS NULL OR org_id = $1) AND (pool_id IS NULL OR pool_id = $2)
-           AND ($5::uuid IS NULL OR (-priority::bigint, COALESCE(queued_at, 'infinity'), id) >
-             (-$3::bigint, COALESCE($4::timestamptz, 'infinity'), $5))
-         ORDER BY priority DESC, queued_at, id LIMIT 500",
-    )
-    .bind(pool.org_id)
-    .bind(pool.id)
-    .bind(priority as i64)
-    .bind(at)
-    .bind(id)
-    .fetch_all(core.db.pool())
-    .await?)
+    total: i64,
 }

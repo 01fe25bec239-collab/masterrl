@@ -162,7 +162,7 @@ pub struct SchedulerConfig {
     pub cancel_deadline_seconds: u64,
     /// Queued jobs of one project that may be placed; later ones wait.
     pub max_queued_per_project: u32,
-    /// Maximum jobs placed per tick. Also the queue page size.
+    /// Maximum queued jobs considered per tick.
     pub max_jobs_per_tick: u32,
 }
 
@@ -260,6 +260,7 @@ pub struct Core {
     pub(crate) pipeline: Pipeline,
     pub(crate) transfer: launch::Transfer,
     pub(crate) wake: tokio::sync::Notify,
+    pub(crate) queue_scan: tokio::sync::Mutex<tick::QueueScan>,
 }
 
 impl Core {
@@ -363,6 +364,8 @@ pub struct ReservationRequest {
 pub enum Reserved {
     /// Held.
     Held(Box<ReservationRow>),
+    /// This request already ended. A new hold requires a fresh request id.
+    Ended(Box<ReservationRow>),
     /// Not now (plain reason); try again later.
     Busy(String),
     /// Never in this pool (plain reason).
@@ -462,14 +465,19 @@ impl Scheduler {
         .map_err(|e| SchedError::internal(e.to_string()))?;
         if let Some(row) = reservations::lock_for(&mut tx, req.request_id, Some(req.org_id)).await?
         {
-            let saved: Option<serde_json::Value> = sqlx::query_scalar(
-                "SELECT reserve_request FROM resource_reservations WHERE id = $1",
+            let (saved, live): (Option<serde_json::Value>, bool) = sqlx::query_as(
+                "SELECT reserve_request, lease_expires_at > clock_timestamp()
+                 FROM resource_reservations WHERE id = $1",
             )
             .bind(req.request_id)
             .fetch_one(&mut *tx)
             .await?;
             if saved.as_ref() == Some(&request) {
-                return Ok(Reserved::Held(Box::new(row)));
+                return Ok(if matches!(row.state.as_str(), "HELD" | "ACTIVE") && live {
+                    Reserved::Held(Box::new(row))
+                } else {
+                    Reserved::Ended(Box::new(row))
+                });
             }
             return Err(SchedError::changed("reservation request"));
         }
@@ -644,6 +652,7 @@ impl SchedulerModule {
             pipeline,
             transfer,
             wake: tokio::sync::Notify::new(),
+            queue_scan: tokio::sync::Mutex::default(),
         });
         lanes.register(Arc::new(control::ControlSink::new(core.clone())));
         Self { core }

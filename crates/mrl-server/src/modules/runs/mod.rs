@@ -59,7 +59,7 @@ impl RunsModule {
     ),
     components(schemas(
         experiments::Experiment, experiments::NewExperiment, experiments::ExperimentPatch,
-        api::Run, api::RunSubmission, api::RunKind, api::RunConfig, api::TimelineEntry,
+        api::Run, api::RunSubmission, api::RunKind, api::RunArtifactInput, api::RunConfig, api::TimelineEntry,
         jobs::Job, jobs::Attempt, jobs::Rejection, jobs::api::JobPatch,
     )),
     tags(

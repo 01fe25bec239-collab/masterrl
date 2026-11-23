@@ -3533,6 +3533,17 @@
       }
     },
     {
+      "code": "MRL-STATE-210",
+      "title": "The agent lost its credentials before launch.",
+      "why": "The agent restarted before it started the run. Its saved metadata lists the required credentials, and the values were held in memory.",
+      "what_to_do": {
+        "steps": [
+          "Wait for the scheduler to place another attempt if the run has retries left.",
+          "If the run stops, check that the agent stays online and submit it again."
+        ]
+      }
+    },
+    {
       "code": "MRL-STORE-001",
       "title": "The app refused a storage path.",
       "why": "The path points outside your workspace's storage area, or it has a part the app doesn't allow, like `..`.",
