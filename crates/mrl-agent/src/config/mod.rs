@@ -20,6 +20,8 @@
 //!
 //! [transfer]
 //! server_url = "https://core.example:8443"
+//! # Solo only. This file contains the launch secret of the same HTTP server.
+//! # server_launch_secret_file = "/path/to/launch-secret"
 //! bandwidth_bytes_per_sec = 50_000_000
 //! ```
 
@@ -192,6 +194,8 @@ impl Default for ExecConfig {
 pub struct TransferConfig {
     /// Base URL for server-proxied tickets (`/api/v1/transfer/...`).
     pub server_url: Option<String>,
+    /// File with the Solo server's launch secret for proxied transfers.
+    pub server_launch_secret_file: Option<PathBuf>,
     /// Node-wide transfer speed limit. Default: none.
     pub bandwidth_bytes_per_sec: Option<u64>,
     /// Tries per transfer after the first one fails.
@@ -204,6 +208,7 @@ impl Default for TransferConfig {
     fn default() -> Self {
         Self {
             server_url: None,
+            server_launch_secret_file: None,
             bandwidth_bytes_per_sec: None,
             retries: 5,
             connect_timeout_secs: 30,

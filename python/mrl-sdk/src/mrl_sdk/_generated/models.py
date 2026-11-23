@@ -1083,6 +1083,19 @@ class Run(TypedDict):
     """Why: `{code, message, problems?}`; for REJECTED, every problem with a hint."""
 
 
+class RunArtifactInput(TypedDict):
+    """A named input from a committed artifact."""
+
+    artifact_id: str
+    """Artifact id (`art_…`)."""
+
+    name: str
+    """Unique worker input name, also used as the staged filename."""
+
+    path: str
+    """File path as listed in the artifact manifest."""
+
+
 class RunConfig(TypedDict):
     """The immutable config snapshot of a run."""
 
@@ -1131,6 +1144,9 @@ class RunSubmission(TypedDict):
     algorithm_id: str
     """The method, like `sft`, `dpo` or `grpo`."""
 
+    artifact_inputs: NotRequired[list[RunArtifactInput]]
+    """Committed artifact files to stage before launching the run."""
+
     base_model_version_id: str
     """The model version to start from, `mv_…`."""
 
@@ -1170,8 +1186,52 @@ class RunSubmission(TypedDict):
     reward_version_id: NotRequired[str | None]
     """The reward version, `rwdv_…`."""
 
+    secret_ids: NotRequired[list[str]]
+    """Secrets to grant to this run as worker environment variables."""
+
     seeds: NotRequired[dict[str, Any] | None]
     """Random seeds; the server picks `{"global": n}` when absent."""
+
+
+class SchedulerQueue(TypedDict):
+    """The queue of a pool."""
+
+    jobs: list[SchedulerQueueEntry]
+    """The jobs the caller may see, first in line first."""
+
+    pool_id: str
+    """`pool_…`."""
+
+    total: int
+    """Jobs waiting for this pool that the caller may read."""
+
+
+class SchedulerQueueEntry(TypedDict):
+    """One waiting job."""
+
+    job_id: str
+    """`job_…`."""
+
+    position: int
+    """Position among jobs the caller can read."""
+
+    priority: int
+    """Higher goes first."""
+
+    project_id: str
+    """`prj_…`."""
+
+    queued_at: NotRequired[str | None]
+    """When it joined the queue."""
+
+    reason: NotRequired[str | None]
+    """Why it is still waiting, in plain words."""
+
+    reason_code: NotRequired[str | None]
+    """The reason's code, like `MRL-QUOTA-210`."""
+
+    run_id: NotRequired[str | None]
+    """`run_…`, for training and evaluation jobs."""
 
 
 class SecretMeta(TypedDict):
@@ -1549,10 +1609,13 @@ __all__ = [
     "Restored",
     "RoleInfo",
     "Run",
+    "RunArtifactInput",
     "RunConfig",
     "RunKind",
     "RunPage",
     "RunSubmission",
+    "SchedulerQueue",
+    "SchedulerQueueEntry",
     "SecretMeta",
     "SessionStarted",
     "SetupDone",

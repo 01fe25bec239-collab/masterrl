@@ -253,6 +253,17 @@ OPERATIONS: dict[str, Operation] = {
         (),
         False,
     ),
+    "get_scheduler_queue": Operation(
+        "GET",
+        "/api/v1/queue",
+        (
+            "pool",
+            "limit",
+        ),
+        (),
+        (),
+        False,
+    ),
     "get_secret": Operation(
         "GET",
         "/api/v1/secrets/{sec}",

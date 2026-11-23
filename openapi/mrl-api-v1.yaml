@@ -1033,6 +1033,55 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /api/v1/queue:
+    get:
+      tags:
+      - compute
+      operationId: get_scheduler_queue
+      parameters:
+      - name: pool
+        in: path
+        description: '`pool_…` (required).'
+        required: true
+        schema:
+          type:
+          - string
+          - 'null'
+      - name: limit
+        in: path
+        description: Most jobs to list, 1–500 (default 100).
+        required: true
+        schema:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          minimum: 0
+      responses:
+        '200':
+          description: The pool's queue.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SchedulerQueue'
+        '403':
+          description: Pool access denied.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: No such pool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: Bad query.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/runs/{run}:
     get:
       tags:
@@ -4072,6 +4121,24 @@ components:
           - object
           - 'null'
           description: 'Why: `{code, message, problems?}`; for REJECTED, every problem with a hint.'
+    RunArtifactInput:
+      type: object
+      description: A named input from a committed artifact.
+      required:
+      - artifact_id
+      - path
+      - name
+      properties:
+        artifact_id:
+          type: string
+          description: Artifact id (`art_…`).
+        name:
+          type: string
+          description: Unique worker input name, also used as the staged filename.
+        path:
+          type: string
+          description: File path as listed in the artifact manifest.
+      additionalProperties: false
     RunConfig:
       type: object
       description: The immutable config snapshot of a run.
@@ -4130,6 +4197,11 @@ components:
         algorithm_id:
           type: string
           description: The method, like `sft`, `dpo` or `grpo`.
+        artifact_inputs:
+          type: array
+          items:
+            $ref: '#/components/schemas/RunArtifactInput'
+          description: Committed artifact files to stage before launching the run.
         base_model_version_id:
           type: string
           description: The model version to start from, `mv_…`.
@@ -4187,12 +4259,83 @@ components:
           - string
           - 'null'
           description: The reward version, `rwdv_…`.
+        secret_ids:
+          type: array
+          items:
+            type: string
+          description: Secrets to grant to this run as worker environment variables.
         seeds:
           type:
           - object
           - 'null'
           description: 'Random seeds; the server picks `{"global": n}` when absent.'
       additionalProperties: false
+    SchedulerQueue:
+      type: object
+      description: The queue of a pool.
+      required:
+      - pool_id
+      - total
+      - jobs
+      properties:
+        jobs:
+          type: array
+          items:
+            $ref: '#/components/schemas/SchedulerQueueEntry'
+          description: The jobs the caller may see, first in line first.
+        pool_id:
+          type: string
+          description: '`pool_…`.'
+        total:
+          type: integer
+          format: int32
+          description: Jobs waiting for this pool that the caller may read.
+          minimum: 0
+    SchedulerQueueEntry:
+      type: object
+      description: One waiting job.
+      required:
+      - job_id
+      - project_id
+      - position
+      - priority
+      properties:
+        job_id:
+          type: string
+          description: '`job_…`.'
+        position:
+          type: integer
+          format: int32
+          description: Position among jobs the caller can read.
+          minimum: 0
+        priority:
+          type: integer
+          format: int32
+          description: Higher goes first.
+        project_id:
+          type: string
+          description: '`prj_…`.'
+        queued_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When it joined the queue.
+        reason:
+          type:
+          - string
+          - 'null'
+          description: Why it is still waiting, in plain words.
+        reason_code:
+          type:
+          - string
+          - 'null'
+          description: The reason's code, like `MRL-QUOTA-210`.
+        run_id:
+          type:
+          - string
+          - 'null'
+          description: '`run_…`, for training and evaluation jobs.'
     SecretMeta:
       type: object
       description: A secret reference. Never has the value.
