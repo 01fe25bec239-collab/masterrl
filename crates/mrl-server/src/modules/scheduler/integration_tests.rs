@@ -1092,29 +1092,42 @@ async fn an_agent_that_forgot_its_attempt_loses_it_at_once() {
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL (just test-integration)"]
 async fn a_control_plane_gap_extends_leases_first() {
-    let w = World::start(false).await;
+    let mut w = World::start(false).await;
     let mut m = w.agent(1).await;
     let job = w.queue(1).await;
     let attempt = w.running(job).await;
+    w.server.take().unwrap().shutdown().await.unwrap();
     m.disconnect().await;
-    // As if the scheduler had been down for an hour: no grant since, and the lease ran out.
-    sqlx::query(
+    // Seed the outage while the scheduler is stopped so the first tick sees it
+    // before checking leases.
+    let outage_end: time::OffsetDateTime = sqlx::query_scalar(
         "WITH t AS (UPDATE scheduler_ticks SET last_tick_at = now() - interval '1 hour'),
               g AS (UPDATE agent_commands SET updated_at = now() - interval '1 minute'
                     WHERE attempt_id = $1 AND kind = 'LaunchAttempt')
-         UPDATE job_attempts SET lease_expires_at = now() - interval '1 minute' WHERE id = $1",
+         UPDATE job_attempts SET lease_expires_at = now() - interval '1 minute'
+         WHERE id = $1 AND state = 'RUNNING' RETURNING now()",
     )
     .bind(attempt)
-    .execute(w.db.pool())
+    .fetch_one(w.db.pool())
     .await
     .unwrap();
-    tokio::time::sleep(Duration::from_secs(4)).await;
-    assert_eq!(
-        w.attempt_state(attempt).await,
-        "RUNNING",
-        "the gap extended the lease"
-    );
+    w.restart().await;
     w.wait_attempt(attempt, "LOST").await;
+
+    let (lease, ended): (time::OffsetDateTime, time::OffsetDateTime) =
+        sqlx::query_as("SELECT lease_expires_at, ended_at FROM job_attempts WHERE id = $1")
+            .bind(attempt)
+            .fetch_one(w.db.pool())
+            .await
+            .unwrap();
+    assert!(
+        lease >= outage_end + time::Duration::seconds(10),
+        "the gap should grant a full lease, got {lease} after outage at {outage_end}"
+    );
+    assert!(
+        ended >= lease,
+        "the attempt ended at {ended} before the extended lease expired at {lease}"
+    );
     w.invariants().await;
 }
 
