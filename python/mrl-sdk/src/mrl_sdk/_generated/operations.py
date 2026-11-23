@@ -170,6 +170,14 @@ OPERATIONS: dict[str, Operation] = {
         (),
         False,
     ),
+    "delete_checkpoint": Operation(
+        "DELETE",
+        "/api/v1/checkpoints/{ckpt}",
+        ("ckpt",),
+        (),
+        (),
+        False,
+    ),
     "download": Operation(
         "GET",
         "/api/v1/transfer/{ticket}",
@@ -213,6 +221,14 @@ OPERATIONS: dict[str, Operation] = {
         "DELETE",
         "/api/v1/auth/session",
         (),
+        (),
+        (),
+        False,
+    ),
+    "get_checkpoint": Operation(
+        "GET",
+        "/api/v1/checkpoints/{ckpt}",
+        ("ckpt",),
         (),
         (),
         False,
@@ -352,6 +368,17 @@ OPERATIONS: dict[str, Operation] = {
         (),
         (
             "kind",
+            "limit",
+            "cursor",
+        ),
+        (),
+        False,
+    ),
+    "list_checkpoints": Operation(
+        "GET",
+        "/api/v1/runs/{run}/checkpoints",
+        ("run",),
+        (
             "limit",
             "cursor",
         ),
@@ -718,5 +745,13 @@ OPERATIONS: dict[str, Operation] = {
         (),
         (),
         True,
+    ),
+    "verify_checkpoint": Operation(
+        "POST",
+        "/api/v1/checkpoints/{ckpt}:verify",
+        ("ckpt",),
+        (),
+        (),
+        False,
     ),
 }

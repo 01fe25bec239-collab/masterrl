@@ -91,6 +91,8 @@ pub struct Config {
     /// Live run data: metric history, logs, samples, streams and alerts.
     pub live: crate::modules::telemetry::LiveConfig,
     // <mrl:config P23> P23 settings fields go right below this line.
+    /// Checkpoint commit, verification, retention and cadence.
+    pub checkpoints: crate::modules::checkpoints::CheckpointsConfig,
     // <mrl:config P24> P24 settings fields go right below this line.
 }
 
@@ -504,6 +506,7 @@ impl Config {
         // <mrl:validate P22> P22 checks (push to `problems`) go right below this line.
         problems.extend(self.live.problems());
         // <mrl:validate P23> P23 checks (push to `problems`) go right below this line.
+        problems.extend(self.checkpoints.problems());
         // <mrl:validate P24> P24 checks (push to `problems`) go right below this line.
         if problems.is_empty() {
             Ok(())

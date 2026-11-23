@@ -34,6 +34,9 @@ mod p21_scheduler;
 #[path = "../../mrl-server/src/modules/telemetry/integration_tests.rs"]
 mod p22_telemetry;
 // <mrl:testkit P23> P23 `pub mod` lines go right below this line.
+#[cfg(test)]
+#[path = "../../mrl-server/src/modules/checkpoints/integration_tests.rs"]
+mod p23_checkpoints;
 // <mrl:testkit P24> P24 `pub mod` lines go right below this line.
 
 /// The version of this crate, taken from its `Cargo.toml`.

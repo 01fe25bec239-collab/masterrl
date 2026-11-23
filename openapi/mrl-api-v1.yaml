@@ -414,6 +414,83 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /api/v1/checkpoints/{ckpt}:
+    get:
+      tags:
+      - checkpoints
+      summary: '`GET /checkpoints/{ckpt}`.'
+      operationId: get_checkpoint
+      parameters:
+      - name: ckpt
+        in: path
+        description: Checkpoint id, `ckpt_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The checkpoint with its files.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckpointInfo'
+        '404':
+          description: No such checkpoint.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    delete:
+      tags:
+      - checkpoints
+      summary: |-
+        `DELETE /checkpoints/{ckpt}`: TOMBSTONED, objects deleted in the background. Refused while
+        the checkpoint is the run's final result, its resume point, or a starting point.
+      operationId: delete_checkpoint
+      parameters:
+      - name: ckpt
+        in: path
+        description: Checkpoint id, `ckpt_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '204':
+          description: Deleted (or already deleted).
+        '409':
+          description: Still in use (MRL-CONFLICT-230) or still being saved (MRL-STATE-230).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/checkpoints/{ckpt}:verify:
+    post:
+      tags:
+      - checkpoints
+      summary: |-
+        `POST /checkpoints/{ckpt}:verify` (axum sees `/checkpoints/{ckpt}` with the action in the
+        segment): re-reads every stored byte (`full_rehash`).
+      operationId: verify_checkpoint
+      parameters:
+      - name: ckpt
+        in: path
+        description: Checkpoint id, `ckpt_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: 'The checkpoint afterwards: COMMITTED at `full_rehash`, or CORRUPT with the reason.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CheckpointInfo'
+        '409':
+          description: The checkpoint is not COMMITTED (MRL-STATE-230).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/experiments/{exp}:
     get:
       tags:
@@ -1229,6 +1306,44 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Page_Attempt'
+  /api/v1/runs/{run}/checkpoints:
+    get:
+      tags:
+      - checkpoints
+      summary: '`GET /runs/{run}/checkpoints`.'
+      operationId: list_checkpoints
+      parameters:
+      - name: run
+        in: path
+        description: Run id, `run_…`.
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The run's checkpoints (not deleted ones), highest step first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_CheckpointInfo'
+        '404':
+          description: No such run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/runs/{run}/config:
     get:
       tags:
@@ -2524,6 +2639,121 @@ components:
         status:
           type: string
           description: '`ready` or `not_ready`.'
+    CheckpointFileInfo:
+      type: object
+      description: One file of a checkpoint.
+      required:
+      - path
+      - role
+      - size
+      - sha256
+      properties:
+        path:
+          type: string
+          description: Path inside the checkpoint.
+        role:
+          type: string
+          description: '`weights`, `optimizer`, `manifest`, ….'
+        sha256:
+          type: string
+          description: sha256 (hex).
+        size:
+          type: integer
+          format: int64
+          description: Size in bytes.
+    CheckpointInfo:
+      type: object
+      description: A checkpoint as the API shows it.
+      required:
+      - id
+      - run_id
+      - attempt_id
+      - attempt_epoch
+      - step
+      - kind
+      - layout
+      - is_final
+      - state
+      - metrics
+      - created_at
+      properties:
+        attempt_epoch:
+          type: integer
+          format: int64
+          description: That attempt's fencing epoch.
+        attempt_id:
+          type: string
+          description: The attempt that wrote it.
+        committed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Committed.
+        corrupt_reason:
+          type:
+          - string
+          - 'null'
+          description: Why it is CORRUPT.
+        created_at:
+          type: string
+          format: date-time
+          description: Staged.
+        file_count:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Number of files.
+        files:
+          type:
+          - array
+          - 'null'
+          items:
+            $ref: '#/components/schemas/CheckpointFileInfo'
+          description: The files (only on `GET /checkpoints/{ckpt}`).
+        id:
+          type: string
+          description: '`ckpt_…`.'
+        is_final:
+          type: boolean
+          description: The run's final checkpoint.
+        kind:
+          type: string
+          description: '`full_resume`, `weights_only` or `adapter_only`.'
+        layout:
+          type: string
+          description: Format tag, like `hf-trainer-v1`.
+        metrics:
+          type: object
+          description: Metrics at this step.
+        run_id:
+          type: string
+          description: '`run_…`.'
+        state:
+          type: string
+          description: '`WRITING`, `UPLOADED`, `VERIFYING`, `COMMITTED`, `CORRUPT` or `TOMBSTONED`.'
+        step:
+          type: integer
+          format: int64
+          description: Training step.
+        total_bytes:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Sum of file sizes.
+        verification_level:
+          type:
+          - string
+          - 'null'
+          description: '`manifest_head` (files present with their sizes) or `full_rehash` (every byte re-read).'
+        verified_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Last verified.
     CopyInfo:
       type: object
       description: A saved copy (metadata only).
@@ -3763,6 +3993,113 @@ components:
               trace_id:
                 type: string
                 description: Trace id.
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_CheckpointInfo:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: A checkpoint as the API shows it.
+            required:
+            - id
+            - run_id
+            - attempt_id
+            - attempt_epoch
+            - step
+            - kind
+            - layout
+            - is_final
+            - state
+            - metrics
+            - created_at
+            properties:
+              attempt_epoch:
+                type: integer
+                format: int64
+                description: That attempt's fencing epoch.
+              attempt_id:
+                type: string
+                description: The attempt that wrote it.
+              committed_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+                description: Committed.
+              corrupt_reason:
+                type:
+                - string
+                - 'null'
+                description: Why it is CORRUPT.
+              created_at:
+                type: string
+                format: date-time
+                description: Staged.
+              file_count:
+                type:
+                - integer
+                - 'null'
+                format: int32
+                description: Number of files.
+              files:
+                type:
+                - array
+                - 'null'
+                items:
+                  $ref: '#/components/schemas/CheckpointFileInfo'
+                description: The files (only on `GET /checkpoints/{ckpt}`).
+              id:
+                type: string
+                description: '`ckpt_…`.'
+              is_final:
+                type: boolean
+                description: The run's final checkpoint.
+              kind:
+                type: string
+                description: '`full_resume`, `weights_only` or `adapter_only`.'
+              layout:
+                type: string
+                description: Format tag, like `hf-trainer-v1`.
+              metrics:
+                type: object
+                description: Metrics at this step.
+              run_id:
+                type: string
+                description: '`run_…`.'
+              state:
+                type: string
+                description: '`WRITING`, `UPLOADED`, `VERIFYING`, `COMMITTED`, `CORRUPT` or `TOMBSTONED`.'
+              step:
+                type: integer
+                format: int64
+                description: Training step.
+              total_bytes:
+                type:
+                - integer
+                - 'null'
+                format: int64
+                description: Sum of file sizes.
+              verification_level:
+                type:
+                - string
+                - 'null'
+                description: '`manifest_head` (files present with their sizes) or `full_rehash` (every byte re-read).'
+              verified_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+                description: Last verified.
           description: The items on this page.
         next_cursor:
           type:
@@ -5769,3 +6106,5 @@ tags:
   description: Live server-sent event streams.
 - name: alerts
   description: 'Alerts: list, acknowledge and resolve.'
+- name: checkpoints
+  description: 'Checkpoints: listing, verification and deletion.'

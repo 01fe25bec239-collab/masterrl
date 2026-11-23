@@ -307,6 +307,30 @@ fn series_view(r: &sqlx::postgres::PgRow) -> Result<MetricSeriesView, sqlx::Erro
 
 const SERIES_COLS: &str = "id, name, split, rank, kind, freshness, declared";
 
+/// The last stored value of each aggregate (rank-less) series of `run`, by name: the
+/// highest step, the latest attempt winning. P23's completion check reads it.
+pub async fn final_values(db: &Db, run: Uuid) -> Result<BTreeMap<String, f64>, DbError> {
+    let rows = sqlx::query(
+        "SELECT s.name, p.value FROM metric_series s
+           CROSS JOIN LATERAL (
+             SELECT value FROM metric_points WHERE series_id = s.id
+              ORDER BY step DESC, attempt_no DESC, ts DESC, batch_id DESC LIMIT 1) p
+          WHERE s.run_id = $1 AND s.rank IS NULL
+          ORDER BY s.name, s.split",
+    )
+    .bind(run)
+    .fetch_all(db.pool())
+    .await?;
+    let mut out = BTreeMap::new();
+    for r in rows {
+        let value: f64 = r.try_get("value")?;
+        if value.is_finite() {
+            out.entry(r.try_get("name")?).or_insert(value);
+        }
+    }
+    Ok(out)
+}
+
 /// The latest progress of `run`.
 pub async fn progress(db: &Db, run: Uuid) -> Result<Option<RunProgressView>, DbError> {
     let r = sqlx::query(

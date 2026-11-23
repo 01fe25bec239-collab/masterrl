@@ -695,6 +695,14 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         "A saved log or sample file is missing or damaged.",
     ),
     // <mrl:errors P23> rows for P23 go right below this line.
+    (
+        code(ErrorFamily::State, 230),
+        "This checkpoint isn't committed, so it can't be used yet.",
+    ),
+    (
+        code(Conflict, 230),
+        "This checkpoint is still in use, so it can't be deleted.",
+    ),
     // <mrl:errors P24> rows for P24 go right below this line.
     // <mrl:errors P25> rows for P25 go right below this line.
 ];
