@@ -20,6 +20,10 @@
         {
           "kind": "DATA_PREP",
           "sandbox": "data_prep"
+        },
+        {
+          "kind": "IMPORT",
+          "sandbox": "fetch"
         }
       ]
     }

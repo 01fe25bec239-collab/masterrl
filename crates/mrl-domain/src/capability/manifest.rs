@@ -118,9 +118,17 @@ impl Bundle {
                     .into_iter()
                     .all(text)
                     || !kinds.is_some_and(|rows| {
-                        rows.len() == 1
-                            && rows[0].get("kind").and_then(Value::as_str) == Some("DATA_PREP")
-                            && rows[0].get("sandbox").and_then(Value::as_str) == Some("data_prep")
+                        fn field<'a>(row: &'a Value, key: &str) -> Option<&'a str> {
+                            row.get(key)
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                        }
+                        rows.iter().all(|row| {
+                            field(row, "kind").is_some() && field(row, "sandbox").is_some()
+                        }) && rows.iter().any(|row| {
+                            field(row, "kind") == Some("DATA_PREP")
+                                && field(row, "sandbox") == Some("data_prep")
+                        })
                     })
                 {
                     return Err(ManifestError::Invalid(vec![

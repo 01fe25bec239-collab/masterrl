@@ -96,6 +96,11 @@ pub struct Config {
     // <mrl:config P24> P24 settings fields go right below this line.
     /// Engine registry and probes.
     pub engines: crate::modules::engines::EnginesConfig,
+    // <mrl:config P26> P26 settings fields go right below this line.
+    // <mrl:config P27> P27 settings fields go right below this line.
+    // <mrl:config P28> P28 settings fields go right below this line.
+    // <mrl:config P29> P29 settings fields go right below this line.
+    // <mrl:config P30> P30 settings fields go right below this line.
 }
 
 /// `[server]`.
@@ -519,6 +524,11 @@ impl Config {
                 problems.join("; "),
             ))
         }
+        // <mrl:validate P26> P26 checks (push to `problems`) go right below this line.
+        // <mrl:validate P27> P27 checks (push to `problems`) go right below this line.
+        // <mrl:validate P28> P28 checks (push to `problems`) go right below this line.
+        // <mrl:validate P29> P29 checks (push to `problems`) go right below this line.
+        // <mrl:validate P30> P30 checks (push to `problems`) go right below this line.
     }
 
     /// True when this process takes on `role`.

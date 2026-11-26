@@ -682,6 +682,11 @@ async fn every_route_answers_by_role_in_team_mode() {
     mrl_server::modules::engines::store::register(core.db.db(), &[&golden], true)
         .await
         .unwrap();
+    // <mrl:roles-seed P26> P26 seed data for the role table goes right below this line.
+    // <mrl:roles-seed P27> P27 seed data for the role table goes right below this line.
+    // <mrl:roles-seed P28> P28 seed data for the role table goes right below this line.
+    // <mrl:roles-seed P29> P29 seed data for the role table goes right below this line.
+    // <mrl:roles-seed P30> P30 seed data for the role table goes right below this line.
     // Compute (P18): a pool made over the API and one machine in it (no agent connected).
     let pool = core
         .call(
@@ -1111,6 +1116,11 @@ async fn every_route_answers_by_role_in_team_mode() {
             Action::EnginesRead,
             None,
         ),
+        // <mrl:roles-routes P26> P26 role-table rows go right below this line.
+        // <mrl:roles-routes P27> P27 role-table rows go right below this line.
+        // <mrl:roles-routes P28> P28 role-table rows go right below this line.
+        // <mrl:roles-routes P29> P29 role-table rows go right below this line.
+        // <mrl:roles-routes P30> P30 role-table rows go right below this line.
     ]);
     // A run submission needs an Idempotency-Key (keys are per person).
     let key_for = |method: &Method, path: &str| -> &'static [(&'static str, &'static str)] {
@@ -1156,6 +1166,11 @@ async fn every_route_answers_by_role_in_team_mode() {
             // ones meet a deleted checkpoint (409). Deleting is 204, also when already deleted.
             ("POST", p) if p.ends_with(":verify") => &[200, 409],
             ("DELETE", p) if p.starts_with("/api/v1/checkpoints/") => &[204],
+            // <mrl:roles-expected P26> P26 expected-status arms go right below this line.
+            // <mrl:roles-expected P27> P27 expected-status arms go right below this line.
+            // <mrl:roles-expected P28> P28 expected-status arms go right below this line.
+            // <mrl:roles-expected P29> P29 expected-status arms go right below this line.
+            // <mrl:roles-expected P30> P30 expected-status arms go right below this line.
             (_, p) if p.starts_with("/api/v1/sync/") => &[409],
             ("POST", "/api/v1/auth/session") | ("POST", "/api/v1/auth/tokens") => &[201],
             ("DELETE", "/api/v1/auth/session") => &[204],

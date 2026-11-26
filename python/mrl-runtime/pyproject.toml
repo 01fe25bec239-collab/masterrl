@@ -15,6 +15,9 @@ dependencies = [
     "jinja2==3.1.6",
     "pyarrow==26.0.1",
     "tokenizers==0.23.3",
+    # <mrl:deps P26> P26 dependencies go right below this line.
+    # <mrl:deps P27> P27 dependencies go right below this line.
+    # <mrl:deps P29> P29 dependencies go right below this line.
 ]
 
 [project.scripts]
@@ -30,6 +33,9 @@ fake = "mrl_runtime.testkit.fake:conformance_profile"
 
 [project.entry-points."mrl_runtime.builtin_tasks"]
 hash_files = "mrl_runtime.builtin.tasks:HASH_FILES"
+# <mrl:builtin-tasks P26> P26 tasks go right below this line.
+# <mrl:builtin-tasks P27> P27 tasks go right below this line.
+# <mrl:builtin-tasks P29> P29 tasks go right below this line.
 
 [dependency-groups]
 dev = ["hypothesis==6.170.14"]

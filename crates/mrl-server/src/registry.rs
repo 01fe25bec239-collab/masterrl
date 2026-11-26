@@ -27,6 +27,11 @@ pub fn consumers(db: &Db) -> Vec<Arc<dyn EventConsumer>> {
         Arc::new(crate::modules::alerts::NodeHealthAlerts),
         // <mrl:consumers P23> P23 consumers go right below this line.
         // <mrl:consumers P24> P24 consumers go right below this line.
+        // <mrl:consumers P26> P26 consumers go right below this line.
+        // <mrl:consumers P27> P27 consumers go right below this line.
+        // <mrl:consumers P28> P28 consumers go right below this line.
+        // <mrl:consumers P29> P29 consumers go right below this line.
+        // <mrl:consumers P30> P30 consumers go right below this line.
         // </mrl:consumers>
     ]
 }
@@ -86,6 +91,11 @@ pub fn modules(db: &Db, config: &crate::Config) -> Vec<Box<dyn ServerModule>> {
             db.clone(),
             config,
         )),
+        // <mrl:register P26> P26 modules go right below this line.
+        // <mrl:register P27> P27 modules go right below this line.
+        // <mrl:register P28> P28 modules go right below this line.
+        // <mrl:register P29> P29 modules go right below this line.
+        // <mrl:register P30> P30 modules go right below this line.
         // </mrl:register>
     ]
 }

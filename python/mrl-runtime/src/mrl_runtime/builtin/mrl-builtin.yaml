@@ -17,3 +17,8 @@ spec:
   jobKinds:
     - kind: DATA_PREP
       sandbox: data_prep   # no network, no secrets, no GPU
+    - kind: IMPORT
+      sandbox: fetch       # network, no secrets beyond its grant, no GPU; writes only to staging
+    # <mrl:job-kinds P26> P26 job kinds go right below this line.
+    # <mrl:job-kinds P27> P27 job kinds go right below this line.
+    # <mrl:job-kinds P29> P29 job kinds go right below this line.

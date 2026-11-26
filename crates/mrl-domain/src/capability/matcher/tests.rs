@@ -446,3 +446,19 @@ fn a_whole_config_schema_checks_the_config_and_an_engine_schema_the_block() {
         .iter()
         .all(|p| p.code != codes::FIELD_VALUE));
 }
+
+#[test]
+fn a_builtin_bundle_needs_data_prep_and_a_sandbox_for_every_job_kind() {
+    let path = root().join("crates/mrl-server/engines/first_party/mrl-builtin.json");
+    let good: Value = serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    assert!(Bundle::parse(&good.to_string()).is_ok());
+    for kinds in [
+        json!([{"kind": "IMPORT", "sandbox": "fetch"}]),
+        json!([{"kind": "DATA_PREP", "sandbox": "data_prep"}, {"kind": "IMPORT"}]),
+        json!([{"kind": "DATA_PREP", "sandbox": "data_prep"}, {"kind": "", "sandbox": "fetch"}]),
+    ] {
+        let mut bad = good.clone();
+        bad["manifest"]["spec"]["jobKinds"] = kinds.clone();
+        assert!(Bundle::parse(&bad.to_string()).is_err(), "{kinds}");
+    }
+}
