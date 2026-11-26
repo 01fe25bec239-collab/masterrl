@@ -2640,6 +2640,7 @@ dependencies = [
  "git-version",
  "hmac",
  "hyper-util",
+ "jsonschema",
  "jsonwebtoken",
  "keyring",
  "mrl-domain",

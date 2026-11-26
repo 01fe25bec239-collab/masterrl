@@ -2378,6 +2378,17 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-CONFLICT-290",
+      "title": "A reward with this name already exists in this project.",
+      "why": "Reward names are unique within a project so you can tell them apart.",
+      "what_to_do": {
+        "steps": [
+          "Pick another name.",
+          "Or add a new version to the existing reward."
+        ]
+      }
+    },
+    {
       "code": "MRL-DATA-001",
       "title": "Your dataset did not pass its checks.",
       "why": "Some rows are empty, are missing fields, or don't match the chosen format.",
@@ -3632,6 +3643,109 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-RWD-290",
+      "title": "This reward uses a learned reward model or a judge model, which isn't available yet.",
+      "why": "Rewards that call a trained reward model or a judge model arrive in a later release. Today a reward can use built-in components and your own code.",
+      "what_to_do": {
+        "steps": [
+          "Remove the `model.*` or `judge` components from the reward.",
+          "Use built-in components, like `builtin/math.verify@1`, or your own code instead."
+        ]
+      }
+    },
+    {
+      "code": "MRL-RWD-291",
+      "title": "The reward service sent an answer the app can't trust.",
+      "why": "The answer had the wrong number of scores, scores for other samples, or values that aren't numbers. The app counts those samples as failed instead of guessing.",
+      "what_to_do": {
+        "steps": [
+          "Look at the reward diagnostics for the samples marked failed.",
+          "If your own reward code returns the scores, check that it returns one finite number per sample."
+        ]
+      }
+    },
+    {
+      "code": "MRL-RWD-292",
+      "title": "The reward service runs a different reward than this job uses.",
+      "why": "The job pins one reward version by its content hash. The reward service reported another hash, so its files changed or belong to another version.",
+      "what_to_do": {
+        "steps": [
+          "Start the job again so the app sends the pinned reward files.",
+          "If it happens again, test the reward version again and use the new result."
+        ]
+      }
+    },
+    {
+      "code": "MRL-RWD-293",
+      "title": "The reward service stopped working.",
+      "why": "The reward service didn't answer, or too many samples failed, and one retry didn't help. The job stops instead of training on missing rewards.",
+      "what_to_do": {
+        "steps": [
+          "Look at the job log for the reward service's last messages.",
+          "Check that the reward doesn't run longer than its time limit per sample.",
+          "Retry the job. It may have been a short problem on the machine."
+        ]
+      }
+    },
+    {
+      "code": "MRL-RWD-294",
+      "title": "The sandbox stopped the reward code.",
+      "why": "The reward code tried something the reward sandbox doesn't allow, like opening a network connection or reading another job's files.",
+      "what_to_do": {
+        "steps": [
+          "Look at the audit log entry for what the code tried.",
+          "Change the reward code so it only reads its inputs and returns a score."
+        ]
+      }
+    },
+    {
+      "code": "MRL-RWD-295",
+      "title": "Custom reward code can't run on this machine.",
+      "why": "Custom reward code runs only in the reward sandbox. That sandbox needs Linux with bubblewrap, so macOS and Windows machines refuse custom code.",
+      "what_to_do": {
+        "steps": [
+          "Run the reward on a Linux machine with bubblewrap installed.",
+          "Or use only built-in components, which run everywhere."
+        ],
+        "linux": [
+          "Run `sudo apt install bubblewrap` on Ubuntu or Debian."
+        ]
+      }
+    },
+    {
+      "code": "MRL-RWD-296",
+      "title": "The reward preview can't write answers on this machine.",
+      "why": "Writing fresh answers with a model needs PyTorch and Transformers in the preview's environment. This machine's environment doesn't have them.",
+      "what_to_do": {
+        "steps": [
+          "Preview with the answers stored in the dataset (`completions` set to `stored`).",
+          "Or run the preview on a machine whose environment has PyTorch and Transformers."
+        ]
+      }
+    },
+    {
+      "code": "MRL-RWD-297",
+      "title": "The results of a reward check could not be read.",
+      "why": "The reward check finished, but its report is missing, damaged or doesn't match the reward version.",
+      "what_to_do": {
+        "steps": [
+          "Run the check again.",
+          "If it fails again, look at the job log for the reason."
+        ]
+      }
+    },
+    {
+      "code": "MRL-RWD-298",
+      "title": "The command took too long or printed too much.",
+      "why": "Commands in the command sandbox have a time limit and a limit on how much they print. This command passed one of them, so the app stopped it.",
+      "what_to_do": {
+        "steps": [
+          "Make the command finish sooner, or print less.",
+          "Raise the limit in the provider settings if the command needs more."
+        ]
+      }
+    },
+    {
       "code": "MRL-STATE-160",
       "title": "Setup sync isn't turned on yet.",
       "why": "Sync needs a passphrase first. The app locks your setup with it before it leaves this computer.",
@@ -3705,6 +3819,28 @@ export const catalog = deepFreeze({
           "Refresh to see the checkpoint's state.",
           "If it is still being saved, wait a moment and try again.",
           "If it is damaged, use an earlier checkpoint of the same run."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STATE-290",
+      "title": "This reward version can't take that step right now.",
+      "why": "Each step needs a certain state. For example, only a published version can be deprecated, and a version being tested can't be tested again.",
+      "what_to_do": {
+        "steps": [
+          "Refresh to see the version's state.",
+          "Create a new version if you need to change the reward."
+        ]
+      }
+    },
+    {
+      "code": "MRL-STATE-291",
+      "title": "This reward version can't be published until its checks pass.",
+      "why": "A version is published only after its test cases pass in the sandbox. When an earlier version is published, a comparison with it must also exist.",
+      "what_to_do": {
+        "steps": [
+          "Run the version's tests, and fix the reward if a case fails.",
+          "If an earlier version is published, run the comparison with it, then publish again."
         ]
       }
     },
@@ -4095,6 +4231,17 @@ export const catalog = deepFreeze({
         "steps": [
           "Use a path inside the attempt folder, like `data/train.jsonl`.",
           "If the app sent the path, report it as a problem with the app."
+        ]
+      }
+    },
+    {
+      "code": "MRL-VAL-290",
+      "title": "A reward test case can't be read.",
+      "why": "Each test case needs a name, a sample with a prompt and an answer, and at least one expected result. Details names the case and the field.",
+      "what_to_do": {
+        "steps": [
+          "Fix the test case named in the details.",
+          "See the reward docs for the test case format."
         ]
       }
     },

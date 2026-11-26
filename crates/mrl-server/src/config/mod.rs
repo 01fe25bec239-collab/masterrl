@@ -100,6 +100,8 @@ pub struct Config {
     // <mrl:config P27> P27 settings fields go right below this line.
     // <mrl:config P28> P28 settings fields go right below this line.
     // <mrl:config P29> P29 settings fields go right below this line.
+    /// Reward Studio: test case, code bundle and preview limits.
+    pub rewards: crate::modules::rewards::RewardsConfig,
     // <mrl:config P30> P30 settings fields go right below this line.
 }
 

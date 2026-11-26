@@ -686,6 +686,27 @@ async fn every_route_answers_by_role_in_team_mode() {
     // <mrl:roles-seed P27> P27 seed data for the role table goes right below this line.
     // <mrl:roles-seed P28> P28 seed data for the role table goes right below this line.
     // <mrl:roles-seed P29> P29 seed data for the role table goes right below this line.
+    // P29 routes: one reward with a DRAFT version (no tests yet), made by the seeder.
+    let p29_policy = |w: f64| {
+        json!({"apiVersion": "mrl.dev/reward/v1", "kind": "RewardPolicy",
+            "metadata": {"name": "rbac", "signal": "scalar.sequence"},
+            "spec": {"components": [{"id": "c", "use": "builtin/math.verify@1", "weight": w}],
+                "aggregation": {"method": "weighted_sum", "where": "platform"},
+                "failure": {"on_timeout": {"action": "mask"}, "on_error": {"action": "mask"},
+                    "max_failure_rate": 0.5}, "tests": "tests.yaml"}})
+    };
+    let p29_made = core
+        .call(
+            Method::POST,
+            &format!("/api/v1/projects/{prj}/rewards"),
+            &Auth::Bearer(seed_jwt.clone()),
+            Some(json!({"name": "rbac-seed", "version": {"policy": p29_policy(1.0)}})),
+        )
+        .await;
+    assert_eq!(p29_made.status, 201, "{}", p29_made.text());
+    let p29_made = p29_made.json();
+    let p29_rwd = p29_made["id"].as_str().unwrap().to_owned();
+    let p29_rwdv = p29_made["versions"][0]["id"].as_str().unwrap().to_owned();
     // <mrl:roles-seed P30> P30 seed data for the role table goes right below this line.
     // Compute (P18): a pool made over the API and one machine in it (no agent connected).
     let pool = core
@@ -1120,6 +1141,57 @@ async fn every_route_answers_by_role_in_team_mode() {
         // <mrl:roles-routes P27> P27 role-table rows go right below this line.
         // <mrl:roles-routes P28> P28 role-table rows go right below this line.
         // <mrl:roles-routes P29> P29 role-table rows go right below this line.
+        // P29 routes: the first allowed role creates the reward and the new version; later
+        // roles meet a taken name (409) and the same content (200). The DRAFT version has no
+        // passing tests, so publishing (and deprecating) answers 409.
+        row(
+            Method::GET,
+            format!("/api/v1/projects/{prj}/rewards"),
+            Action::RewardsRead,
+            None,
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/projects/{prj}/rewards"),
+            Action::RewardsWrite,
+            Some(json!({"name": "rbac-new"})),
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/rewards/{p29_rwd}"),
+            Action::RewardsRead,
+            None,
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/rewards/{p29_rwd}/versions"),
+            Action::RewardsWrite,
+            Some(json!({"policy": p29_policy(2.0)})),
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/reward-versions/{p29_rwdv}"),
+            Action::RewardsRead,
+            None,
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/reward-versions/{p29_rwdv}:publish"),
+            Action::RewardsWrite,
+            None,
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/reward-versions/{p29_rwdv}:deprecate"),
+            Action::RewardsWrite,
+            None,
+        ),
+        row(
+            Method::GET,
+            "/api/v1/reward-components".into(),
+            Action::RewardsRead,
+            None,
+        ),
         // <mrl:roles-routes P30> P30 role-table rows go right below this line.
     ]);
     // A run submission needs an Idempotency-Key (keys are per person).
@@ -1170,6 +1242,11 @@ async fn every_route_answers_by_role_in_team_mode() {
             // <mrl:roles-expected P27> P27 expected-status arms go right below this line.
             // <mrl:roles-expected P28> P28 expected-status arms go right below this line.
             // <mrl:roles-expected P29> P29 expected-status arms go right below this line.
+            ("POST", p) if p.ends_with("/rewards") => &[201, 409],
+            ("POST", p) if p.starts_with("/api/v1/rewards/") && p.ends_with("/versions") => {
+                &[201, 200]
+            }
+            ("POST", p) if p.starts_with("/api/v1/reward-versions/") => &[409],
             // <mrl:roles-expected P30> P30 expected-status arms go right below this line.
             (_, p) if p.starts_with("/api/v1/sync/") => &[409],
             ("POST", "/api/v1/auth/session") | ("POST", "/api/v1/auth/tokens") => &[201],
