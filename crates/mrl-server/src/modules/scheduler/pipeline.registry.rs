@@ -34,6 +34,9 @@ pub fn pipeline(db: &Db, cfg: &SchedulerConfig) -> Pipeline {
             Arc::new(crate::modules::checkpoints::resume::ResumeInputs::new(
                 db.clone(),
             )),
+            // <mrl:launch-contributors P26> P26 launch contributors go right below this line.
+            // <mrl:launch-contributors P27> P27 launch contributors go right below this line.
+            // <mrl:launch-contributors P29> P29 launch contributors go right below this line.
         ],
         vec![
             // <mrl:pause-support> Engines that can pause go right below this line.

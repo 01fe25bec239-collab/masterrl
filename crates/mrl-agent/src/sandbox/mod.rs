@@ -57,12 +57,23 @@ pub fn data_prep() -> SandboxProfile {
     }
 }
 
+/// Downloads and uploads (Hub imports, exports): network, no GPUs, writes only to staging.
+pub fn fetch() -> SandboxProfile {
+    SandboxProfile {
+        name: "fetch",
+        description: "downloads and uploads: network, no GPUs, writes only to staging",
+        network: true,
+        gpu_devices: false,
+    }
+}
+
 /// Every registered sandbox profile.
 pub fn profiles() -> Vec<SandboxProfile> {
     vec![
         // <mrl:register>
         worker(),
         data_prep(),
+        fetch(),
         // </mrl:register>
     ]
 }

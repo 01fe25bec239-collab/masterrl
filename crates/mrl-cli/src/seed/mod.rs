@@ -37,6 +37,8 @@ pub fn steps() -> Vec<Box<dyn SeedStep>> {
         Box::new(steps::tenancy::Workspace),
         Box::new(steps::tenancy::Project),
         // <mrl:seed-steps> Later parts' steps go right below this line.
+        // <mrl:seed-steps P26> P26 steps go right below this line.
+        // <mrl:seed-steps P27> P27 steps go right below this line.
     ]
 }
 

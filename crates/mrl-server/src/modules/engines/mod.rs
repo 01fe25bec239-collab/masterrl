@@ -222,6 +222,8 @@ impl Records {
         let _ = db;
         let members: Vec<Arc<dyn RegistryRecords>> = vec![
             // <mrl:engine-records> Registry lookups go right below this line.
+            // <mrl:engine-records P26> P26 lookups go right below this line.
+            // <mrl:engine-records P27> P27 lookups go right below this line.
         ];
         Self(members.into())
     }

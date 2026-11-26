@@ -169,12 +169,27 @@ impl SandboxBackend for Bubblewrap {
 
 #[cfg(all(test, unix))] // bubblewrap is Linux-only; the expected paths use `/`.
 mod tests {
-    use super::super::{data_prep, worker};
+    use super::super::{data_prep, fetch, worker};
     use super::*;
 
     fn pos(args: &[String], needle: &[&str]) -> Option<usize> {
         args.windows(needle.len())
             .position(|w| w.iter().zip(needle).all(|(a, b)| a == b))
+    }
+
+    #[test]
+    fn fetch_gets_the_network_but_no_gpu() {
+        let spec = ExecSpec::new("j", "python3", &["fetch.py"], Path::new("/s/j"));
+        let gpus = vec![PathBuf::from("/dev/nvidia0")];
+        let b = Bubblewrap::new(Some("/usr/bin/bwrap".into()));
+        let a = b.args(&fetch(), &spec, &[], &gpus);
+        assert!(pos(&a, &["--share-net"]).is_some());
+        assert!(pos(&a, &["--dev-bind-try"]).is_none(), "no GPUs for fetch");
+        assert_eq!(
+            a.iter().filter(|x| *x == "--bind").count(),
+            1,
+            "writes only to staging"
+        );
     }
 
     #[test]

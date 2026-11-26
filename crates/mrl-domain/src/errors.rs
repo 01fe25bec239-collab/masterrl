@@ -745,6 +745,11 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         code(ErrorFamily::Cap, 251),
         "This checkpoint can't resume training.",
     ),
+    // <mrl:errors P26> rows for P26 go right below this line.
+    // <mrl:errors P27> rows for P27 go right below this line.
+    // <mrl:errors P28> rows for P28 go right below this line.
+    // <mrl:errors P29> rows for P29 go right below this line.
+    // <mrl:errors P30> rows for P30 go right below this line.
 ];
 
 /// Every code with its title: the registry plus every capability rejection.

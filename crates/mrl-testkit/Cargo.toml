@@ -55,6 +55,11 @@ toml = "=1.2.0"
 # <mrl:deps P22> P22 dependencies go right below this line.
 # <mrl:deps P23> P23 dependencies go right below this line.
 # <mrl:deps P24> P24 dependencies go right below this line.
+# <mrl:deps P26> P26 dependencies go right below this line.
+# <mrl:deps P27> P27 dependencies go right below this line.
+# <mrl:deps P28> P28 dependencies go right below this line.
+# <mrl:deps P29> P29 dependencies go right below this line.
+# <mrl:deps P30> P30 dependencies go right below this line.
 
 [dev-dependencies]
 rcgen = { workspace = true }
