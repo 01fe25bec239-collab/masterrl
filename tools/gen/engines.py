@@ -151,7 +151,6 @@ def load_engine(root: Path, dev_only: bool) -> tuple[str, dict[str, Any]]:
     return doc["metadata"]["name"], bundle
 
 
-
 def _job_kinds_ok(kinds: object) -> bool:
     """Every job kind names a sandbox; DATA_PREP is there and runs in data_prep."""
     if not isinstance(kinds, list) or not all(isinstance(k, dict) for k in kinds):
@@ -159,6 +158,7 @@ def _job_kinds_ok(kinds: object) -> bool:
     if not all(isinstance(k.get(f), str) and k[f] for k in kinds for f in ("kind", "sandbox")):
         return False
     return {"kind": "DATA_PREP", "sandbox": "data_prep"} in kinds
+
 
 def load_builtin() -> tuple[str, dict[str, Any]]:
     where = BUILTIN.relative_to(ROOT).as_posix()
