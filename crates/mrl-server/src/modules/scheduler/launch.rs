@@ -166,6 +166,7 @@ impl Transfer {
                     seconds: t.expires_at.unix_timestamp(),
                     nanos: 0,
                 }),
+                headers: t.headers.into_iter().collect(),
             });
         }
         if let Some(run) = secrets {

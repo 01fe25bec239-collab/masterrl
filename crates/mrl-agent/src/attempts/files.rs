@@ -89,7 +89,12 @@ pub async fn stage_inputs(
             }
         }
         read_only(&dest)?;
-        staged.insert(input.name.clone(), dest.display().to_string());
+        let shown = if input.is_folder() {
+            inputs_dir.join(&input.name)
+        } else {
+            dest
+        };
+        staged.insert(input.name.clone(), shown.display().to_string());
     }
     Ok(staged)
 }

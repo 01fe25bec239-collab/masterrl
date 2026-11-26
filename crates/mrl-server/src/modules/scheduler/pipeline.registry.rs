@@ -31,6 +31,9 @@ pub fn pipeline(db: &Db, cfg: &SchedulerConfig) -> Pipeline {
             Arc::new(crate::modules::engines::launch::EngineRuntime::new(
                 db.clone(),
             )),
+            Arc::new(crate::modules::checkpoints::resume::ResumeInputs::new(
+                db.clone(),
+            )),
         ],
         vec![
             // <mrl:pause-support> Engines that can pause go right below this line.

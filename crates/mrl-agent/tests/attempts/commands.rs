@@ -456,6 +456,7 @@ async fn a_rejected_launch_keeps_its_inputs_and_an_id_launches_once() {
                     seconds: time::OffsetDateTime::now_utc().unix_timestamp() + 600,
                     nanos: 0,
                 }),
+                headers: Default::default(),
             }],
         })),
     };
@@ -556,6 +557,7 @@ async fn a_stage_racing_its_launch_is_kept_or_refused() {
                     seconds: time::OffsetDateTime::now_utc().unix_timestamp() + 600,
                     nanos: 0,
                 }),
+                headers: Default::default(),
             }],
         })),
     };
@@ -1155,6 +1157,7 @@ async fn staged_inputs_survive_a_restart() {
                     seconds: time::OffsetDateTime::now_utc().unix_timestamp() + 600,
                     nanos: 0,
                 }),
+                headers: Default::default(),
             }],
         })),
     };

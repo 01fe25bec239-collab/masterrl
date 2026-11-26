@@ -19,6 +19,7 @@
 
 pub mod api;
 pub mod cleanup;
+pub mod resume;
 pub mod service;
 pub mod sink;
 pub mod verifier;

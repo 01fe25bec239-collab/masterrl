@@ -410,3 +410,39 @@ fn processor_runtimes_run_on_any_allowed_platform_but_gpu_runtimes_need_their_ow
     };
     assert!(!unknown_gpu.supports(golden, HardwareClass::Nvidia));
 }
+
+#[test]
+fn a_whole_config_schema_checks_the_config_and_an_engine_schema_the_block() {
+    // TRL's schema describes the whole config (`common` + `engine`).
+    let b = bundle("trl");
+    let enabled = [HardwareClass::Nvidia].into();
+    let engine = Engine {
+        manifest: b.engine.as_ref().unwrap(),
+        enabled: &enabled,
+        schemas: &b.schemas,
+    };
+    let field = |req: &Request| -> Vec<Option<String>> {
+        check(engine, req)
+            .into_iter()
+            .filter(|p| p.code == codes::FIELD_VALUE)
+            .map(|p| p.path)
+            .collect()
+    };
+    let mut req = accepted_sft();
+    req.config = Some(json!({"common": {"update": {"strategy": "full"}},
+        "engine": {"max_steps": 12, "save_steps": 6, "learning_rate": 0.003}}));
+    assert!(field(&req).is_empty(), "{:?}", field(&req));
+    req.config = Some(json!({"engine": {"max_stepz": 12}}));
+    assert_eq!(field(&req), [Some("/config/engine".to_owned())]);
+    // The golden bundle's schema is the engine block alone.
+    let g = bundle("golden");
+    let engine = Engine {
+        manifest: g.engine.as_ref().unwrap(),
+        enabled: &enabled,
+        schemas: &g.schemas,
+    };
+    req.config = Some(json!({"engine": {"learning_rate": 0.1}}));
+    assert!(check(engine, &req)
+        .iter()
+        .all(|p| p.code != codes::FIELD_VALUE));
+}

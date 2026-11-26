@@ -188,6 +188,11 @@ class FakeEngine(BaseEngine):
             wanted = self.checkpoint_requested.is_set() or self.pause_requested.is_set()
             if final or wanted or (every and step % every == 0):
                 self.checkpoint_requested.clear()
+                # One log line per checkpoint. stderr: the harness captures it into LogChunks,
+                # and stdout stays clean for callers that run the engine in-process and parse it.
+                print(
+                    f"fake: checkpoint at step {step}, loss {loss:.4f}", file=sys.stderr, flush=True
+                )
                 yield CheckpointReady(
                     step, self._write(ctx, step, seed), is_final=final, metrics={"train/loss": loss}
                 )

@@ -60,13 +60,16 @@ def file_role(rel_path: str) -> str:
     return next((role for hint, role in _ROLES if hint in name), "other")
 
 
+_CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+
 def new_checkpoint_id() -> str:
-    """ckpt_ + a UUIDv7 (time-ordered)."""
+    """ckpt_ + a UUIDv7 (time-ordered) as 26 Crockford base32 characters: the core's id
+    format (mrl-domain `ids`), which it reads back into the same UUID."""
     value = (time.time_ns() // 1_000_000) << 80 | secrets.randbits(80)
     value = (value & ~(0xF << 76)) | (0x7 << 76)  # version 7
     value = (value & ~(0x3 << 62)) | (0x2 << 62)  # RFC 4122 variant
-    h = f"{value:032x}"
-    return f"ckpt_{h[:8]}-{h[8:12]}-{h[12:16]}-{h[16:20]}-{h[20:]}"
+    return "ckpt_" + "".join(_CROCKFORD[(value >> (5 * i)) & 0x1F] for i in range(25, -1, -1))
 
 
 @dataclass
