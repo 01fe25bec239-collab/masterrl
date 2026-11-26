@@ -37,6 +37,8 @@ jobs:
       - run: uv run --locked pytest
       - name: spike lock is current
         run: uv lock --check --project tools/fixtures/spike
+      - name: FakeEngine env lock is current
+        run: uv lock --check --project python/fake-engine-env
 
   macos:
     # mrl-runtime and mrl-rewards run on Linux and macOS (Windows machines run them in WSL2).

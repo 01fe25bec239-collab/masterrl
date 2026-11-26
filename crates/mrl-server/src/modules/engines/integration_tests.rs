@@ -595,7 +595,13 @@ async fn a_passed_probe_enables_cpu_then_runs_are_queued_or_rejected_by_l0() {
             plan.launch.roles[0].runtime_ref,
             format!(
                 "uv:sha256:{}",
-                "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                mrl_storage::sha256_hex(
+                    &std::fs::read(concat!(
+                        env!("CARGO_MANIFEST_DIR"),
+                        "/../../python/fake-engine-env/uv.lock"
+                    ))
+                    .unwrap()
+                )
             )
         );
         assert_eq!(plan.launch.environment_id, "cpu-uv");

@@ -226,6 +226,18 @@ pub struct InputSpec {
     /// Local runs only: copy this file instead of downloading.
     #[serde(default)]
     pub file: Option<PathBuf>,
+    /// Headers to send with `url` exactly as given (part of a presigned URL's signature).
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
+}
+
+impl InputSpec {
+    /// A folder input: its file sits under `<name>/` (one input per file of a model or a
+    /// checkpoint), and the worker gets the folder `<inputs>/<name>`. Others are one file.
+    pub fn is_folder(&self) -> bool {
+        let path = Path::new(&self.local_path);
+        path.components().count() > 1 && path.starts_with(&self.name)
+    }
 }
 
 /// A secret the worker gets as an environment variable.
@@ -439,7 +451,8 @@ impl AttemptSpec {
                 ));
             }
         }
-        let mut names = std::collections::BTreeSet::new();
+        // name -> whether it is a folder input (see [`InputSpec::is_folder`]).
+        let mut names = std::collections::BTreeMap::new();
         let mut paths: Vec<PathBuf> = Vec::new();
         for input in &self.inputs {
             let p = safe_relative(&input.local_path)?;
@@ -464,7 +477,10 @@ impl AttemptSpec {
                     input.name
                 ));
             }
-            if !names.insert(input.name.clone()) {
+            // A folder input lists one input per file, all under `<name>/`.
+            let folder = input.is_folder();
+            let before = names.insert(input.name.clone(), folder);
+            if before.is_some() && !(folder && before == Some(true)) {
                 return bad(format!("input {} is listed twice", input.name));
             }
         }
@@ -532,6 +548,7 @@ fn input_from_stage(item: &StageItem) -> Result<InputSpec, AttemptError> {
         url: Some(item.url.clone()),
         expires_at: Some(expires_at),
         file: None,
+        headers: item.headers.clone().into_iter().collect(),
     })
 }
 
@@ -546,7 +563,7 @@ impl InputSpec {
             expires_at: self.expires_at?,
             url: url.clone(),
             presigned: url.starts_with("http://") || url.starts_with("https://"),
-            headers: BTreeMap::new(),
+            headers: self.headers.clone(),
         })
     }
 }
@@ -623,6 +640,7 @@ mod tests {
                 seconds: 2_000_000_000,
                 nanos: 0,
             }),
+            headers: [("if-match".to_owned(), "\"e1\"".to_owned())].into(),
         };
         let spec = AttemptSpec::from_launch(&launch(), &[item], Path::new("/s")).unwrap();
         assert_eq!(spec.attempt.fencing_epoch, 3);
@@ -634,6 +652,11 @@ mod tests {
         );
         let t = spec.inputs[0].ticket().unwrap();
         assert!(t.presigned && t.method == TicketMethod::Get);
+        // A presigned URL's signed headers reach the download.
+        assert_eq!(
+            t.headers.get("if-match").map(String::as_str),
+            Some("\"e1\"")
+        );
         assert_eq!(spec.workers()[0].0, "trainer");
     }
 
@@ -668,6 +691,7 @@ mod tests {
             url: None,
             expires_at: None,
             file: Some("/f".into()),
+            headers: BTreeMap::new(),
         };
         let mut two = AttemptSpec::from_launch(&launch(), &[], Path::new("/s")).unwrap();
         two.inputs = vec![input("model", "m/w.bin"), input("dataset.train", "m/w.bin")];
@@ -687,6 +711,23 @@ mod tests {
             input("dataset.train", "d/t.jsonl"),
         ];
         assert!(two.validate().is_ok());
+        // A folder input: one input per file, all under `<name>/`.
+        two.inputs = vec![
+            input("resume_from", "resume_from/trainer_state.json"),
+            input("resume_from", "resume_from/weights.bin"),
+        ];
+        assert!(two.validate().is_ok(), "folder input");
+        assert!(two.inputs.iter().all(InputSpec::is_folder));
+        two.inputs = vec![input("model", "m/a.bin"), input("model", "m/b.bin")];
+        assert!(two.validate().is_err(), "a file input listed twice");
+        two.inputs = vec![
+            input("resume_from", "resume_from/a.bin"),
+            input("resume_from", "b.bin"),
+        ];
+        assert!(
+            two.validate().is_err(),
+            "a folder input with a file outside it"
+        );
         for bad in ["", "/etc/passwd", "../x", "a/../../b", "a\\b"] {
             assert!(safe_relative(bad).is_err(), "{bad}");
         }

@@ -35,6 +35,8 @@ Thumbs.db
 *.gguf
 *.pt
 checkpoints/
+# ...but not the server's checkpoints source module.
+!/crates/mrl-server/src/modules/checkpoints/
 wandb/
 mlruns/
 .cache/

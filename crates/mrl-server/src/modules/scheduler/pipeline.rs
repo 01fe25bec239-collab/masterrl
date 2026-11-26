@@ -380,6 +380,12 @@ impl Pipeline {
         }
     }
 
+    /// The same pipeline with `contributor` last in the launch chain (test and dev builds).
+    pub fn with_launch(mut self, contributor: Arc<dyn LaunchContributor>) -> Self {
+        self.launch.push(contributor);
+        self
+    }
+
     /// The strategy `pool` asks for; an unknown name falls back to the default.
     pub fn strategy(&self, pool: &PoolInfo) -> Option<Arc<dyn PlacementStrategy>> {
         let name = pool.scheduling_policy["placement"]

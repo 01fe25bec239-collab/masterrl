@@ -48,7 +48,14 @@ def test_ids_and_roles() -> None:
     a, b = new_checkpoint_id(), new_checkpoint_id()
     assert a.startswith("ckpt_")
     assert a != b
-    assert a[5:].split("-")[2][0] == "7"  # UUIDv7
+    # The core's id format: 26 Crockford base32 characters of a UUIDv7.
+    assert len(a) == 5 + 26
+    assert set(a[5:]) <= set("0123456789ABCDEFGHJKMNPQRSTVWXYZ")
+    value = 0
+    for c in a[5:]:
+        value = value * 32 + "0123456789ABCDEFGHJKMNPQRSTVWXYZ".index(c)
+    assert value < 1 << 128
+    assert (value >> 76) & 0xF == 7  # UUIDv7
     assert [
         file_role(p)
         for p in (

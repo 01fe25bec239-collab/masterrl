@@ -711,11 +711,21 @@ pub fn check(engine: Engine<'_>, req: &Request) -> Vec<Problem> {
         let block = config.get("engine").cloned().unwrap_or_else(|| json!({}));
         if let Some(form) = &algo.config {
             if let Some(schema) = engine.schemas.get(&form.schema) {
+                // A schema for the whole config (`common` and `engine` blocks, like TRL's)
+                // checks the config; one for the engine block alone checks `config.engine`.
+                let whole = ["common", "engine"]
+                    .iter()
+                    .any(|k| schema["properties"].get(k).is_some());
+                let (doc, at) = if whole {
+                    (config.clone(), "/config")
+                } else {
+                    (block.clone(), "/config/engine")
+                };
                 match jsonschema::draft202012::new(schema) {
-                    Ok(v) => out.extend(v.iter_errors(&block).map(|e| {
+                    Ok(v) => out.extend(v.iter_errors(&doc).map(|e| {
                         Problem::new(
                             codes::FIELD_VALUE,
-                            Some(&format!("/config/engine{}", e.instance_path().as_str())),
+                            Some(&format!("{at}{}", e.instance_path().as_str())),
                             format!(
                                 "This setting doesn't fit {}: {}.",
                                 algo.display_name,

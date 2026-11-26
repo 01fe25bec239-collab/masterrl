@@ -786,6 +786,73 @@ async fn happy_path_commits_lists_verifies_and_completes_the_job() {
     env.stop().await;
 }
 
+/// A retry's launch stages its pinned COMMITTED checkpoint as the `resume_from` folder (one
+/// input per file); a pin that is no longer COMMITTED fails the launch.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn a_retry_stages_its_resume_checkpoint_as_a_folder() {
+    use mrl_server::modules::checkpoints::resume::{ResumeInputs, RESUME_INPUT};
+    use mrl_server::modules::jobs::AttemptRow;
+    use mrl_server::modules::scheduler::pipeline::{
+        LaunchContributor, LaunchError, LaunchPlan, Placement,
+    };
+    let env = Env::start().await;
+    let (_run, job) = env.running_run(json!({"common": {"max_steps": 20}})).await;
+    let first = env.engine.checkpoint(10, false, &[("train/loss", 1.0)]);
+    env.wait_state(first, "COMMITTED").await;
+    let job_row: JobRow = sqlx::query_as("SELECT * FROM jobs WHERE id = $1")
+        .bind(job)
+        .fetch_one(env.db.pool())
+        .await
+        .unwrap();
+    let mut attempt: AttemptRow =
+        sqlx::query_as("SELECT * FROM job_attempts WHERE job_id = $1 ORDER BY attempt_no DESC")
+            .bind(job)
+            .fetch_one(env.db.pool())
+            .await
+            .unwrap();
+    attempt.resume_from_checkpoint_id = Some(first);
+    let placement = Placement {
+        node_id: Uuid::nil(),
+        roles: vec![],
+        cpu_millis: 0,
+        mem_bytes: 0,
+    };
+    let resume = ResumeInputs::new(env.db.db().clone());
+    let mut plan = LaunchPlan::default();
+    resume
+        .contribute(&job_row, &attempt, &placement, &mut plan)
+        .await
+        .unwrap();
+    let files = env.service.files(first).await.unwrap();
+    assert_eq!(plan.inputs.len(), files.len());
+    for input in &plan.inputs {
+        assert_eq!(input.name, RESUME_INPUT);
+        let path = input.local_path.strip_prefix("resume_from/").unwrap();
+        assert!(files.iter().any(|f| f.path == path), "{path}");
+        assert_eq!(input.sha256.len(), 64);
+    }
+    // No pin, no inputs; a pin no longer COMMITTED fails the launch (the next retry re-picks).
+    attempt.resume_from_checkpoint_id = None;
+    let mut none = LaunchPlan::default();
+    resume
+        .contribute(&job_row, &attempt, &placement, &mut none)
+        .await
+        .unwrap();
+    assert!(none.inputs.is_empty());
+    sqlx::query("UPDATE checkpoints SET state = 'CORRUPT' WHERE id = $1")
+        .bind(first)
+        .execute(env.db.pool())
+        .await
+        .unwrap();
+    attempt.resume_from_checkpoint_id = Some(first);
+    let gone = resume
+        .contribute(&job_row, &attempt, &placement, &mut LaunchPlan::default())
+        .await;
+    assert!(matches!(gone, Err(LaunchError::Fail(..))), "{gone:?}");
+    env.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs PostgreSQL (just test-integration)"]
 async fn reorder_replay_and_final_replacement_keep_published_bytes_immutable() {

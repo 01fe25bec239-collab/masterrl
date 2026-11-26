@@ -1,4 +1,5 @@
 import copy
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -70,6 +71,14 @@ def test_fake_manifest_merges_its_fragment() -> None:
     assert isinstance(load_engine(m), FakeEngine)
     assert resolve_engine("fake").raw == m.raw
     assert resolve_engine(str(MANIFEST_DIR / "mrl-engine.yaml")).raw == m.raw
+
+
+def test_fake_environments_pin_the_fake_env_lock() -> None:
+    # An agent installs python/fake-engine-env and refuses a lock whose hash differs.
+    lock = ROOT / "python" / "fake-engine-env" / "uv.lock"
+    digest = hashlib.sha256(lock.read_bytes()).hexdigest()
+    for env in load_manifest(MANIFEST_DIR).raw["spec"]["runtime"]["environments"]:
+        assert env["lockSha256"] == digest, env["id"]
 
 
 def test_fragment_may_add_but_not_change(tmp_path: Path) -> None:

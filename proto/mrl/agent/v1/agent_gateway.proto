@@ -314,6 +314,9 @@ message StageItem {
   // Path relative to the staging directory.
   string local_path = 5;
   google.protobuf.Timestamp expires_at = 6;
+  // Headers the agent must send with `url` exactly as given (a presigned URL signs them,
+  // like the `if-match` that pins one object version).
+  map<string, string> headers = 7;
 }
 
 // Upload staged outputs (checkpoint files) with short-lived, attempt-scoped URLs.
