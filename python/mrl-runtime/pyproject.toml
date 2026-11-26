@@ -35,6 +35,10 @@ fake = "mrl_runtime.testkit.fake:conformance_profile"
 hash_files = "mrl_runtime.builtin.tasks:HASH_FILES"
 # <mrl:builtin-tasks P26> P26 tasks go right below this line.
 # <mrl:builtin-tasks P27> P27 tasks go right below this line.
+data_prep = "mrl_runtime.builtin.data_prep:DATA_PREP"
+import_dataset = "mrl_runtime.builtin.import_dataset:IMPORT_DATASET"
+transform = "mrl_runtime.builtin.transform:TRANSFORM"
+materialize_dataset = "mrl_runtime.builtin.materialize_dataset:MATERIALIZE_DATASET"
 # <mrl:builtin-tasks P29> P29 tasks go right below this line.
 
 [dependency-groups]
