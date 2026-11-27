@@ -989,6 +989,61 @@ async fn a_retry_pins_a_committed_checkpoint_never_a_corrupt_one() {
     w.invariants().await;
 }
 
+/// A run branched from another run's checkpoint starts its first attempt from it; once it has
+/// a checkpoint of its own, a retry resumes from that instead.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn a_branched_run_starts_from_its_parent_checkpoint() {
+    let w = World::start(false).await;
+    let m = w.agent(2).await;
+    let one_gpu = json!({"roles": [{"role": "trainer", "replicas": 1, "gpu_count": 1,
+        "cpu_millis": 100, "mem_bytes": 1 << 20}]});
+    let parent_run = w.run().await;
+    let parent_job = w.queue_with(one_gpu.clone(), Some(parent_run)).await;
+    let parent_attempt = w.running(parent_job).await;
+    let parent = checkpoint(
+        &w,
+        parent_run,
+        parent_job,
+        parent_attempt,
+        7,
+        "COMMITTED",
+        false,
+    )
+    .await;
+    let run = w.run().await;
+    sqlx::query("UPDATE runs SET parent_run_id = $2, parent_checkpoint_id = $3 WHERE id = $1")
+        .bind(run)
+        .bind(parent_run)
+        .bind(parent)
+        .execute(w.db.pool())
+        .await
+        .unwrap();
+    let job = w.queue_with(one_gpu, Some(run)).await;
+    let first = w.running(job).await;
+    let pool = w.db.pool().clone();
+    let resume = |a: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, Option<Uuid>>(
+                "SELECT resume_from_checkpoint_id FROM job_attempts WHERE id = $1",
+            )
+            .bind(a)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    assert_eq!(resume(first).await, Some(parent));
+    let own = checkpoint(&w, run, job, first, 1, "COMMITTED", false).await;
+    m.script
+        .exit(first, ExitKind::Failed, Some(FailureClass::EngineError));
+    w.retry_now(job).await;
+    let second = w.running(job).await;
+    assert_eq!(resume(second).await, Some(own));
+    w.invariants().await;
+}
+
 /// INT-5: the scheduler's finalize uses P23's guards: a final checkpoint still being saved
 /// keeps the job FINALIZING; once it is COMMITTED the job completes.
 #[tokio::test(flavor = "multi_thread")]
