@@ -239,6 +239,7 @@ pub async fn action(
     ctx: RequestContext,
     Path(segment): Path<String>,
 ) -> Result<Response, JobsError> {
+    // <mrl:checkpoint-actions P26> P26 actions (`:promote`) go right below this line.
     let Some(ckpt) = segment.strip_suffix(":verify") else {
         return Err(ApiError::new(ErrorCode::RouteNotFound, "No endpoint has this path.").into());
     };
