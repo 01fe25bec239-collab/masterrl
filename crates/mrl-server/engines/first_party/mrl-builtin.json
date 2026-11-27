@@ -25,7 +25,22 @@
           "kind": "IMPORT",
           "sandbox": "fetch"
         }
-      ]
+      ],
+      "runtime": {
+        "environments": [
+          {
+            "accelerator": {
+              "vendor": "cpu"
+            },
+            "id": "cpu-uv",
+            "kind": "uv",
+            "lockSha256": "860527baf427a68a8049bbb5f8a2a7d5cbfe41e0450a220af03b3d364cdd0344",
+            "lockfile": "uv.lock",
+            "mrlRuntime": "0.1.0",
+            "python": "3.12"
+          }
+        ]
+      }
     }
   },
   "schemas": {},

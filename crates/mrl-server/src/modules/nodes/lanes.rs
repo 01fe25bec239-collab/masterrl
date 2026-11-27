@@ -517,6 +517,7 @@ pub fn control_kind(msg: &AgentMessage) -> &'static str {
         Some(WorkerBody::PolicyVersion(_)) => "worker.policy_version",
         Some(WorkerBody::RolloutBatch(_)) => "worker.rollout_batch",
         Some(WorkerBody::RewardBatchStats(_)) => "worker.reward_batch_stats",
+        Some(WorkerBody::OutputsStaged(_)) => "worker.outputs_staged",
     }
 }
 
