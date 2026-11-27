@@ -861,7 +861,9 @@ impl Runner {
                         .as_str()
                         .unwrap_or("worker"),
                 )?;
-                let wrapped = backend.wrap(&profile, spec, &allowed)?;
+                // Hardened profiles (reward, code_exec, …) get P29's limits and isolation.
+                let wrapped =
+                    crate::sandbox::profiles::wrap(backend.as_ref(), &profile, spec, &allowed)?;
                 #[cfg(unix)]
                 let wrapped = if backend.isolates() {
                     keep_alive(wrapped)
