@@ -117,6 +117,8 @@ pub struct SubmitScope {
     pub base_model_version_id: Uuid,
     /// Dataset versions.
     pub dataset_version_ids: Vec<Uuid>,
+    /// The reward version, if any.
+    pub reward_version_id: Option<Uuid>,
     /// The checkpoint the run starts from; submit has already checked the caller may read it.
     pub parent_checkpoint_id: Option<Uuid>,
     /// What the job asks the scheduler for. A resolver may narrow it (like a role's
@@ -600,6 +602,7 @@ mod tests {
             algorithm_id: "sft".into(),
             base_model_version_id: Uuid::nil(),
             dataset_version_ids: vec![],
+            reward_version_id: None,
             parent_checkpoint_id: None,
             resources: crate::modules::runs::api::default_resources(),
             estimate_id: None,
