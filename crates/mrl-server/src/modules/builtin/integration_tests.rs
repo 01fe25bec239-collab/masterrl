@@ -443,7 +443,7 @@ async fn a_builtin_job_runs_its_task_in_its_sandbox_and_registers_its_outputs() 
     assert!(plan.launch.roles[0].runtime_ref.starts_with("uv:sha256:"));
     assert_eq!(plan.launch.environment_id, "cpu-uv");
 
-    // Not finished yet: the verifier waits.
+    // Not finished yet: the verifier waits (an error keeps the job FINALIZING).
     let verifier = OutputsVerifier::new(env.db.db().clone());
     let manifest = env.write_outputs();
     env.relay(&at, manifest.to_string());

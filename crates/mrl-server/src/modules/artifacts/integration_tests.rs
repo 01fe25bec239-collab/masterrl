@@ -13,7 +13,8 @@ use axum::body::Body;
 use axum::http::Method;
 use mrl_server::config::{Config, Mode};
 use mrl_server::modules::artifacts::{
-    ArtifactStore, ArtifactsModule, NewArtifact, NodeLookup, TICKET_KEY_NAME,
+    Artifact, ArtifactStore, ArtifactsModule, DownloadGuard, NewArtifact, NodeLookup,
+    TICKET_KEY_NAME,
 };
 use mrl_server::modules::secrets::SecretResolver;
 use mrl_server::seams::{
@@ -182,6 +183,28 @@ impl NodeLookup for KindLookup {
     }
 }
 
+/// Refuses downloads of artifacts named `guarded`.
+struct NameGuard;
+
+#[async_trait]
+impl DownloadGuard for NameGuard {
+    async fn check(
+        &self,
+        _: &mrl_server::app::AppState,
+        _: &RequestContext,
+        _: &str,
+        artifact: &Artifact,
+    ) -> Result<(), mrl_server::modules::artifacts::Error> {
+        if artifact.name != "guarded" {
+            return Ok(());
+        }
+        Err(
+            mrl_server::error::ApiError::new(mrl_server::error::ErrorCode::Forbidden, "Guarded.")
+                .into(),
+        )
+    }
+}
+
 /// The kinds the test lookups cover.
 const LOOKED_UP: [&str; 3] = ["run", "dsv", "ckpt"];
 
@@ -286,6 +309,7 @@ impl Env {
         for k in LOOKED_UP {
             store.add_lineage_lookup(k, Arc::new(KindLookup(k, known.clone())));
         }
+        store.add_download_guard(Arc::new(NameGuard));
         let mut seams = ts::build(builder, Mode::Team);
         if !secret_store {
             seams.secrets = None;
@@ -1465,6 +1489,24 @@ async fn artifacts_register_and_download(kind: Kind) {
         )
         .await;
     assert_eq!(r.status, 422);
+    // A module's download guard can refuse.
+    let folder = put_files(&e, "evals/guarded/", &[("g.txt", b"g")]).await;
+    let art = e
+        .register_from("guarded", "evals/guarded/", folder)
+        .await
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let r = e
+        .call(
+            Method::POST,
+            &format!("/api/v1/artifacts/{art}:download"),
+            A,
+            Some(json!({"path": "g.txt"})),
+        )
+        .await;
+    assert_eq!(r.status, 403, "{}", r.text());
 }
 
 #[tokio::test]
