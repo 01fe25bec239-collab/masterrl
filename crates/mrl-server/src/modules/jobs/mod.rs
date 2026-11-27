@@ -15,7 +15,7 @@ pub mod transitions;
 
 pub use chains::{
     Chains, Completion, CompletionVerifier, JobSpec, JobValidator, ResolveError, SchemaChecks,
-    SubmissionResolver, Validation, Verdict, Verification,
+    SubmissionResolver, SubmitScope, Validation, Verdict, Verification,
 };
 pub use error::{codes, DomainProblem, JobsError};
 pub use model::{Attempt, AttemptRow, Job, JobRow, Rejection};

@@ -855,15 +855,18 @@ async fn hold_and_launch(
         Err(e) => return Err(e),
     };
     // INT-5: the attempt pins a verified COMMITTED checkpoint (verified at commit), the run's
-    // latest first, else its newest. The share lock holds it COMMITTED until this transaction
+    // latest first, else its newest, else the parent checkpoint it was branched from (checked
+    // readable at submit; the first attempt starts from it). The share lock holds it COMMITTED until this transaction
     // commits the attempt that references it: corrupting or cleaning it needs the row lock, and
     // cleanup keeps every checkpoint an attempt references.
     let resume: Option<Uuid> = match placed.run_id {
         Some(run) => {
             sqlx::query_scalar(
-                "SELECT c.id FROM checkpoints c JOIN runs r ON r.id = c.run_id
-             WHERE r.id = $1 AND r.org_id = $2 AND c.state = 'COMMITTED'
-             ORDER BY (c.id = r.latest_committed_checkpoint_id) DESC, c.global_step DESC, c.id DESC
+                "SELECT c.id FROM checkpoints c
+               JOIN runs r ON c.run_id = r.id OR c.id = r.parent_checkpoint_id
+             WHERE r.id = $1 AND r.org_id = $2 AND c.org_id = r.org_id AND c.state = 'COMMITTED'
+             ORDER BY (c.run_id = r.id) DESC, (c.id = r.latest_committed_checkpoint_id) DESC,
+                      c.global_step DESC, c.id DESC
              LIMIT 1 FOR SHARE OF c",
             )
             .bind(run)

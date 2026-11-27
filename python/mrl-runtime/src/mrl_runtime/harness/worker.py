@@ -66,7 +66,7 @@ from mrl_runtime.checkpoint.provider import CheckpointProvider, CheckpointSettin
 from mrl_runtime.errors import FIELD_INVALID, FIELD_MISSING, METHOD_UNSUPPORTED
 from mrl_runtime.harness.classify import ExitState, Phase, classify, decide_exit, failure
 from mrl_runtime.logs import FdCapture, LogStream
-from mrl_runtime.metrics import MetricsMapper, SampleEmitter
+from mrl_runtime.metrics import MetricsMapper, SampleEmitter, add_resource_peaks
 from mrl_runtime.protocol.session import WorkerSession
 from mrl_runtime.protocol.spool import Spool
 from mrl_runtime.redact import Redactor
@@ -587,6 +587,7 @@ class Harness:
                 for point in batch.points:
                     self._metrics[point.name] = point.value
                 self._watch_divergence(batch)
+                add_resource_peaks(batch, event.step)
                 if primary:
                     self.session.send(batch)
             case Samples():

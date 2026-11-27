@@ -216,7 +216,8 @@ class Suite:
         run = await self.good_run()
         metrics = self.p.manifest.algorithms[self.p.algorithm]
         declared = {m.name for m in metrics}
-        emitted = run.points()
+        # `resource/…` is the harness's own memory sampling, never an engine metric.
+        emitted = [p for p in run.points() if not p.name.startswith("resource/")]
         undeclared = sorted({p.name for p in emitted if p.undeclared or p.name not in declared})
         _require(not undeclared, f"undeclared metrics emitted: {undeclared}")
         required = {m.name for m in metrics if m.required}
