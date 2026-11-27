@@ -28,6 +28,7 @@ LOCAL_ONLY = ("docs/architecture/", "docs/implementation/", "AGENTS.md", "CLAUDE
 # Generated files any lane may commit; the integrator regenerates them at merge (README §3.4).
 GENERATED = (
     "guidance/build/",
+    "crates/mrl-server/engines/first_party/",
     "openapi/",
     "packages/api-client/src/generated/",
     "python/mrl-sdk/src/mrl_sdk/_generated/",
@@ -158,8 +159,19 @@ def is_generated(path: str) -> bool:
     return path.rsplit("/", 1)[-1] in LOCKFILES or path.startswith(GENERATED)
 
 
-def violations(changed: list[str], patterns: list[re.Pattern[str]]) -> list[str]:
+def pins_only(diff: str) -> bool:
+    """True if a `git diff -U0` changes only `lockSha256:` lines (`just gen` writes those)."""
+    lines = [ln for ln in diff.splitlines() if ln[:1] in "+-" and ln[:3] not in ("+++", "---")]
+    return bool(lines) and all(
+        re.match(r"^[+-]\s*lockSha256:\s*[0-9a-f]{64}\s*$", ln) for ln in lines
+    )
+
+
+def violations(
+    changed: list[str], patterns: list[re.Pattern[str]], diff_of=lambda path: ""
+) -> list[str]:
     skip = [f for f in changed if is_local_only(f) or is_generated(f)]
+    skip += [f for f in changed if f.endswith("mrl-engine.yaml") and pins_only(diff_of(f))]
     return [f for f in changed if f not in skip and not any(p.fullmatch(f) for p in patterns)]
 
 
@@ -202,7 +214,7 @@ def main(argv: list[str]) -> int:
         return 2
     base = base or default_base()
     changed = git("diff", "--name-only", f"{base}...HEAD").splitlines()
-    bad = violations(changed, patterns)
+    bad = violations(changed, patterns, lambda f: git("diff", "-U0", f"{base}...HEAD", "--", f))
     for path in bad:
         print(f"not owned by {part}: {path}")
     if bad:

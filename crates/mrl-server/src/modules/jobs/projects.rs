@@ -115,6 +115,11 @@ impl RehomeLocalRows {
                (aggregate_kind = 'attempt' AND aggregate_id IN \
                   (SELECT a.id FROM job_attempts a JOIN jobs j ON j.id = a.job_id \
                    WHERE j.project_id = ANY($2))))",
+            // Later parts' project-scoped rows ($1 team org, $2 projects, $3 nil org).
+            // <mrl:rehome P26> P26 statements go right below this line.
+            // <mrl:rehome P27> P27 statements go right below this line.
+            // <mrl:rehome P28> P28 statements go right below this line.
+            // <mrl:rehome P29> P29 statements go right below this line.
         ] {
             sqlx::query(sql)
                 .bind(org)
