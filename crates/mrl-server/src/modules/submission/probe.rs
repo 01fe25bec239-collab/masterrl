@@ -735,7 +735,10 @@ mod tests {
             wall,
             assumptions,
         } = sanitize(&p);
-        assert!(ok);
+        assert!(
+            !ok,
+            "blocking issues take precedence over the worker's ok flag"
+        );
         let issues = issues.as_array().unwrap();
         assert_eq!(issues.len(), 100);
         assert_eq!(issues[0]["code"], "MRL-CAP-250");
