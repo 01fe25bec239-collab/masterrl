@@ -68,7 +68,12 @@ impl crate::modules::artifacts::NodeLookup for DatasetRecords {
         let Some(row) = lineage_version(&self.db, id).await? else {
             return Ok(None);
         };
-        if crate::modules::checkpoints::service::storage_org(row.org_id) != org {
+        let owns_node = if org == crate::modules::artifacts::LOCAL_ORG {
+            super::store::is_local_lineage_org(self.db.pool(), row.org_id).await?
+        } else {
+            crate::modules::checkpoints::service::storage_org(row.org_id) == org
+        };
+        if !owns_node {
             return Ok(None);
         }
         Ok(Some((

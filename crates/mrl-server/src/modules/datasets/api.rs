@@ -429,7 +429,7 @@ fn name_taken(e: JobsError) -> JobsError {
 
 // ---- authorization ----
 
-fn dataset_resource(org: Uuid, project: Uuid, id: Uuid) -> Resource {
+pub(super) fn dataset_resource(org: Uuid, project: Uuid, id: Uuid) -> Resource {
     scope::resource(
         "dataset",
         Some(DatasetId::from_uuid(id).to_string()),
@@ -1518,6 +1518,9 @@ pub(super) async fn export_links(
     })
 }
 
+pub(super) const EXPORT_REFUSED_DETAIL: &str =
+    "This dataset is marked restricted personal data, so its files can't be exported or pushed to the Hub.";
+
 /// 403 MRL-PERM-270 for `restricted-pii` datasets.
 pub fn export_allowed(v: &VersionRow) -> Result<(), JobsError> {
     if DatasetPolicy::of(&v.sensitivity).export_allowed {
@@ -1526,6 +1529,6 @@ pub fn export_allowed(v: &VersionRow) -> Result<(), JobsError> {
     Err(JobsError::domain(
         codes::EXPORT_REFUSED,
         StatusCode::FORBIDDEN,
-        "This dataset is marked restricted personal data, so its files can't be exported or pushed to the Hub.",
+        EXPORT_REFUSED_DETAIL,
     ))
 }

@@ -11,6 +11,7 @@
 //! Register with `Box::new(crate::modules::datasets::DatasetsModule::new(db.clone(), config)),`.
 
 pub mod api;
+pub(crate) mod downloads;
 pub mod expr;
 pub mod launch;
 pub mod records;
@@ -20,6 +21,7 @@ mod submit;
 pub mod work;
 
 use crate::app::{AppState, ServerModule};
+use crate::config::Mode;
 use crate::db::Db;
 use crate::modules::artifacts::{ArtifactStore, ArtifactsModule};
 use crate::modules::jobs::Projects;
@@ -62,6 +64,7 @@ pub struct Datasets {
 /// The module: dataset and version routes.
 pub struct DatasetsModule {
     svc: Arc<Datasets>,
+    mode: Mode,
 }
 
 impl DatasetsModule {
@@ -69,17 +72,18 @@ impl DatasetsModule {
     pub fn new(db: Db, config: &crate::Config) -> Self {
         let store = ArtifactsModule::new(db.clone(), config).store();
         let projects = Projects::registered(&db);
-        Self::with_parts(db, store, projects)
+        Self::with_parts(db, store, projects, config.server.mode)
     }
 
     /// The module with explicit parts (tests).
-    pub fn with_parts(db: Db, store: Arc<ArtifactStore>, projects: Projects) -> Self {
+    pub fn with_parts(db: Db, store: Arc<ArtifactStore>, projects: Projects, mode: Mode) -> Self {
         Self {
             svc: Arc::new(Datasets {
                 db,
                 store,
                 projects,
             }),
+            mode,
         }
     }
 }
@@ -153,12 +157,13 @@ impl ServerModule for DatasetsModule {
 
     fn background_tasks(&self) -> Vec<crate::app::Task> {
         let svc = self.svc.clone();
+        let mode = self.mode;
         vec![crate::app::Task::new(
             "datasets.outputs",
             crate::config::Role::Background,
             move |cancel| async move {
                 loop {
-                    if let Err(error) = work::check_pending(&svc).await {
+                    if let Err(error) = work::check_pending(&svc, mode).await {
                         tracing::warn!(%error, "could not check dataset outputs");
                     }
                     tokio::select! {

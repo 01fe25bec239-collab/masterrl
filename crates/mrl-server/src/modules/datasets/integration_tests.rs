@@ -79,9 +79,13 @@ async fn person(core: &CoreServer, sb: &MockSupabase, name: &str, org: OrgId, ro
 
 impl Env {
     async fn start() -> Self {
+        Self::start_mode(Mode::Team).await
+    }
+
+    async fn start_mode(mode: Mode) -> Self {
         let sb = MockSupabase::start().await;
         let objects = tempfile::tempdir().unwrap();
-        let mut cfg = config(Mode::Team, &sb);
+        let mut cfg = config(mode, &sb);
         // These fixtures supply worker outputs explicitly, with no scheduler or real node.
         cfg.server
             .roles
@@ -96,11 +100,20 @@ impl Env {
             .unwrap_or_else(|e| panic!("{}", e.explain()));
         let store = ArtifactsModule::new(core.db.db().clone(), &cfg).store();
         let (org, far_org) = (OrgId::new(), OrgId::new());
+        let org = if mode == Mode::Solo {
+            let id: Uuid = sqlx::query_scalar("SELECT id FROM organizations WHERE kind='personal'")
+                .fetch_one(core.db.pool())
+                .await
+                .unwrap();
+            OrgId::from_uuid(id)
+        } else {
+            org
+        };
         let (prj, side, far) = (ProjectId::new(), ProjectId::new(), ProjectId::new());
         for (o, projects) in [(org, vec![prj, side]), (far_org, vec![far])] {
             let (o, w) = (o.as_uuid(), WorkspaceId::new().as_uuid());
             let mut sql = format!(
-                "INSERT INTO organizations (id, slug, name, kind) VALUES ('{o}', '{o}', 'Lab', 'team');
+                "INSERT INTO organizations (id, slug, name, kind) VALUES ('{o}', '{o}', 'Lab', 'team') ON CONFLICT (id) DO NOTHING;
                  INSERT INTO workspaces (id, org_id, slug, name) VALUES ('{w}', '{o}', 'main', 'Main');"
             );
             for p in projects {
@@ -112,9 +125,15 @@ impl Env {
             }
             core.db.seed(&sql).await;
         }
-        let owner = person(&core, &sb, "owner", org, Role::Owner).await;
-        let outsider = person(&core, &sb, "outsider", far_org, Role::Owner).await;
-        let viewer = person(&core, &sb, "viewer", org, Role::Viewer).await;
+        let (owner, outsider, viewer) = if mode == Mode::Solo {
+            (Auth::Launch, Auth::None, Auth::None)
+        } else {
+            (
+                person(&core, &sb, "owner", org, Role::Owner).await,
+                person(&core, &sb, "outsider", far_org, Role::Owner).await,
+                person(&core, &sb, "viewer", org, Role::Viewer).await,
+            )
+        };
         Self {
             core,
             store,
@@ -243,6 +262,7 @@ impl Env {
         let changed = store::record_version(
             &mut tx,
             &PgAuditSink::new(self.core.db.db().clone()),
+            self.core.config.server.mode,
             version,
             &checked,
         )
@@ -429,6 +449,7 @@ async fn job_outputs_make_a_ready_version_once_and_the_same_bytes_the_same_hash(
     assert!(!store::record_version(
         &mut tx,
         &PgAuditSink::new(env.core.db.db().clone()),
+        Mode::Team,
         v,
         &checked
     )
@@ -1273,10 +1294,7 @@ async fn upload_to_ready_and_transform_use_int6_and_retry_unregistered_outputs()
     use mrl_server::modules::jobs::CompletionVerifier as _;
     let verifier =
         mrl_server::modules::datasets::work::DatasetVerifier::new(env.core.db.db().clone());
-    assert!(matches!(
-        verifier.verify(&row).await.unwrap(),
-        mrl_server::modules::jobs::Verification::RetryLater(_)
-    ));
+    assert!(verifier.verify(&row).await.is_err());
     let artifact = env.register_manifest(env.publish("ready").await).await;
     sqlx::query("UPDATE builtin_jobs SET artifact_id=$2 WHERE job_id=$1")
         .bind(job)
@@ -1400,4 +1418,126 @@ async fn hub_pinned_revision_reaches_prep_and_registered_output_sets_invalid() {
     let missing = env.call(&env.outsider, Method::POST, &format!("/datasets/{ds}/versions"),
         Some(json!({"source":"remote","schema_id":"sft.messages.v1","url":"https://example.org/data"}))).await;
     assert_eq!(missing.0, 404);
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn solo_dataset_lineage_uses_the_local_storage_namespace() {
+    use mrl_server::modules::artifacts::{NodeLookup, LOCAL_ORG};
+
+    let env = Env::start_mode(Mode::Solo).await;
+    let ds = env.dataset("local chats", json!({})).await;
+    let parent = env.ready(&ds, "ready", None).await;
+    let child = env.ready(&ds, "filtered", Some(parent)).await;
+    let edge_org: String = sqlx::query_scalar(
+        "SELECT org_id FROM lineage_edges WHERE from_kind='dsv' AND from_id=$1
+         AND relation='derived_from' AND to_kind='dsv' AND to_id=$2",
+    )
+    .bind(child)
+    .bind(parent)
+    .fetch_one(env.core.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(edge_org, LOCAL_ORG);
+    let records = DatasetRecords::new(env.core.db.db().clone());
+    let (_, resource) = records.find(LOCAL_ORG, child).await.unwrap().unwrap();
+    assert_eq!(resource.org.as_deref(), Some(env.org.to_string().as_str()));
+    assert!(records
+        .find(&env.far_org.to_string(), child)
+        .await
+        .unwrap()
+        .is_none());
+
+    env.core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn generic_artifact_downloads_follow_the_datasets_export_policy() {
+    use mrl_domain::ids::{ArtifactId, AttemptId};
+
+    let env = Env::start().await;
+    let ds = env.dataset("job outputs", json!({})).await;
+    let version = env.ready(&ds, "ready", None).await;
+    let manifest = env.blob_manifest(&[("data.jsonl", b"{}\n")]).await;
+    let unrelated = env.register_manifest(manifest.clone()).await;
+    let version_output = env.register_manifest(manifest.clone()).await;
+    let job_output = env.register_manifest(manifest.clone()).await;
+    let pending_output = env.register_manifest(manifest).await;
+    sqlx::query("UPDATE dataset_versions SET artifact_id=$2 WHERE id=$1")
+        .bind(version)
+        .bind(version_output)
+        .execute(env.core.db.pool())
+        .await
+        .unwrap();
+    let (status, work) = env
+        .call(
+            &env.owner,
+            Method::POST,
+            &format!("/datasets/{ds}/versions"),
+            Some(json!({"source":"hub","repo":"openai/gsm8k","schema_id":"sft.messages.v1"})),
+        )
+        .await;
+    assert_eq!(status, 202, "{work}");
+    sqlx::query("UPDATE builtin_jobs SET artifact_id=$2 WHERE job_id=$1")
+        .bind(uuid_job(&work))
+        .bind(job_output)
+        .execute(env.core.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE artifacts SET created_by='system:builtin', name=$2 WHERE id=$1")
+        .bind(pending_output)
+        .bind(format!(
+            "{}-{}",
+            work["job_id"].as_str().unwrap(),
+            AttemptId::new()
+        ))
+        .execute(env.core.db.pool())
+        .await
+        .unwrap();
+    let core = &env.core;
+    let download = |auth, artifact| async move {
+        core.call(
+            Method::POST,
+            &format!(
+                "/api/v1/artifacts/{}:download",
+                ArtifactId::from_uuid(artifact)
+            ),
+            auth,
+            Some(json!({"path":"data.jsonl"})),
+        )
+        .await
+    };
+    assert_eq!(download(&env.viewer, unrelated).await.status, 200);
+    for artifact in [version_output, job_output, pending_output] {
+        assert_eq!(download(&env.owner, artifact).await.status, 200);
+        assert_eq!(download(&env.viewer, artifact).await.status, 403);
+        assert_eq!(download(&env.outsider, artifact).await.status, 404);
+    }
+    let (status, value) = env
+        .call(
+            &env.owner,
+            Method::PATCH,
+            &format!("/datasets/{ds}"),
+            Some(json!({"sensitivity":"restricted-pii"})),
+        )
+        .await;
+    assert_eq!(status, 200, "{value}");
+    for artifact in [version_output, job_output, pending_output] {
+        let response = download(&env.owner, artifact).await;
+        assert_eq!(
+            (response.status, response.json()["code"].as_str()),
+            (403, Some("MRL-PERM-270")),
+            "{}",
+            response.text()
+        );
+    }
+    let (status, _) = env
+        .call(&env.owner, Method::DELETE, &format!("/datasets/{ds}"), None)
+        .await;
+    assert_eq!(status, 204);
+    for artifact in [version_output, job_output, pending_output] {
+        assert_eq!(download(&env.owner, artifact).await.status, 404);
+    }
+    env.core.stop().await;
 }

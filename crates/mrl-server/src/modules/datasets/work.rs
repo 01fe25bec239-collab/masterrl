@@ -2,6 +2,7 @@
 
 use super::store::{self, Checked, Outputs, OutputsError};
 use super::Datasets;
+use crate::config::Mode;
 use crate::db::{Db, Tx};
 use crate::modules::artifacts::InputFile;
 use crate::modules::audit::PgAuditSink;
@@ -153,8 +154,9 @@ impl CompletionVerifier for DatasetVerifier {
             .map_err(verifier_error)?
             .is_none()
         {
-            return Ok(Verification::RetryLater(
-                "The dataset job's outputs are still being saved.".into(),
+            return Err(SeamError::new(
+                "datasets",
+                "The dataset job's outputs are still being saved.",
             ));
         }
         if !done && failure.is_none() {
@@ -302,7 +304,12 @@ pub(super) fn artifact_inputs(
         .collect()
 }
 
-async fn save(svc: &Datasets, p: &Pending, decision: Decision) -> Result<(), JobsError> {
+async fn save(
+    svc: &Datasets,
+    mode: Mode,
+    p: &Pending,
+    decision: Decision,
+) -> Result<(), JobsError> {
     let mut tx = svc.db.begin().await?;
     let Some(job_row) = JobTransitions::lock(&mut tx, p.org_id, p.job_id).await? else {
         return Ok(());
@@ -366,7 +373,7 @@ async fn save(svc: &Datasets, p: &Pending, decision: Decision) -> Result<(), Job
             (Some(json!({})), None)
         }
         Decision::Version(checked) => {
-            store::record_version(&mut tx, &audit, p.version_id, &checked).await?;
+            store::record_version(&mut tx, &audit, mode, p.version_id, &checked).await?;
             match checked {
                 Checked::Invalid { code, reason, .. }
                     if code == super::codes::OUTPUTS_BROKEN.to_string() =>
@@ -382,6 +389,7 @@ async fn save(svc: &Datasets, p: &Pending, decision: Decision) -> Result<(), Job
                 store::record_version(
                     &mut tx,
                     &audit,
+                    mode,
                     p.version_id,
                     &Checked::broken(&reason, None),
                 )
@@ -428,7 +436,7 @@ pub(super) async fn originals(
     Ok(())
 }
 
-pub(super) async fn check_pending(svc: &Datasets) -> Result<(), JobsError> {
+pub(super) async fn check_pending(svc: &Datasets, mode: Mode) -> Result<(), JobsError> {
     let pending: Vec<Pending> = sqlx::query_as(
         "SELECT w.job_id, j.org_id, j.project_id, w.version_id, v.schema_id, w.purpose,
                 j.state, j.state_version, j.state_reason, j.created_by
@@ -449,7 +457,7 @@ pub(super) async fn check_pending(svc: &Datasets) -> Result<(), JobsError> {
                 continue;
             }
         };
-        if let Err(error) = save(svc, &p, decision).await {
+        if let Err(error) = save(svc, mode, &p, decision).await {
             tracing::warn!(job = %p.job_id, %error, "dataset decision will be retried");
         }
     }

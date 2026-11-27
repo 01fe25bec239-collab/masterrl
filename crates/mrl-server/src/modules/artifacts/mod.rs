@@ -309,6 +309,9 @@ impl ArtifactStore {
     /// `self.add_download_guard(Arc::new(…));` line below its marker.
     fn with_download_guards(self) -> Self {
         // <mrl:download-guards P27> P27 guards go right below this line.
+        self.add_download_guard(Arc::new(
+            crate::modules::datasets::downloads::DatasetDownloadGuard::new(self.db.clone()),
+        ));
         self
     }
 

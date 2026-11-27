@@ -6,6 +6,7 @@
 //! it is.
 
 use super::codes;
+use crate::config::Mode;
 use crate::db::Tx;
 use crate::modules::events::{NewEvent, OutboxWriter};
 use crate::modules::jobs::JobsError;
@@ -646,11 +647,28 @@ async fn event(
     Ok(())
 }
 
+// Solo stores both legacy and personal-project graph edges under the local storage org.
+pub(super) async fn is_local_lineage_org<'e>(
+    db: impl sqlx::PgExecutor<'e>,
+    org: Uuid,
+) -> Result<bool, sqlx::Error> {
+    if org.is_nil() {
+        return Ok(true);
+    }
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM organizations WHERE id=$1 AND kind='personal')",
+    )
+    .bind(org)
+    .fetch_one(db)
+    .await
+}
+
 /// Writes the decision for version `id` (which must still be INGESTING or VALIDATING).
 /// Returns false, changing nothing, when it was already decided.
 pub async fn record_version(
     tx: &mut Tx,
     audit: &dyn AuditSink,
+    mode: Mode,
     id: Uuid,
     checked: &Checked,
 ) -> Result<bool, JobsError> {
@@ -722,9 +740,16 @@ pub async fn record_version(
                 .await?;
             }
             if let Some(p) = parent {
+                // P19 queries Solo graphs in the local namespace, even for personal projects.
+                let graph_org =
+                    if mode == Mode::Solo && is_local_lineage_org(&mut **tx, org).await? {
+                        Uuid::nil()
+                    } else {
+                        org
+                    };
                 LineageWriter::link(
                     tx,
-                    &crate::modules::checkpoints::service::storage_org(org),
+                    &crate::modules::checkpoints::service::storage_org(graph_org),
                     NodeRef::new("dsv", id),
                     Relation::DerivedFrom,
                     NodeRef::new("dsv", p),
