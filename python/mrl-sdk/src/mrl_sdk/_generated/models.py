@@ -467,6 +467,252 @@ class CreateToken(TypedDict):
     """`["*"]`, or areas like `["runs:write", "datasets:read"]`."""
 
 
+class DesktopActivity(TypedDict):
+    """Activity on this core."""
+
+    changes: list[DesktopJobChange]
+    """Changes from shortly before `since`, oldest first (at most 50)."""
+
+    cursor: str
+    """Pass as `since` next time."""
+
+    running: list[DesktopJob]
+    """Jobs on or getting a machine, oldest first (at most 50)."""
+
+    training_active: bool
+    """A job is training or saving right now."""
+
+
+class DesktopBackup(TypedDict):
+    """One backup file."""
+
+    created_at: NotRequired[str | None]
+    """When it was made."""
+
+    name: str
+    """File name, like `masterrl-20261127T093000123Z-daily.dump`."""
+
+    reason: str
+    """Why it was made: `daily`, `manual`, `before-update`, `before-restore`, a migration…"""
+
+    size_bytes: int
+    """Size in bytes."""
+
+
+class DesktopBackupList(TypedDict):
+    """The backups of the bundled database."""
+
+    available: bool
+    """False when the core uses another database (nothing to back up here)."""
+
+    folder: NotRequired[str | None]
+    """The folder they are kept in."""
+
+    items: list[DesktopBackup]
+    """Newest first."""
+
+
+class DesktopDoctorCheck(TypedDict):
+    """One check, like "NVIDIA driver"."""
+
+    check: str
+    """Check name, like `nvidia_driver`."""
+
+    code: NotRequired[str | None]
+    """Guidance code for a warning or failure."""
+
+    outcome: str
+    """`ok`, `warn`, `fail` or `not_applicable`."""
+
+    summary: str
+    """One plain line."""
+
+
+class DesktopDoctorInstall(TypedDict):
+    """Something to install to unlock more."""
+
+    download_gb_high: float
+    """Download size, high estimate in GB."""
+
+    download_gb_low: float
+    """Download size, low estimate in GB."""
+
+    id: str
+    """Component id, like `pytorch`."""
+
+    name: str
+    """Plain name."""
+
+    summary: str
+    """What it does."""
+
+
+class DesktopDoctorReport(TypedDict):
+    """What this computer has, can train, and could unlock."""
+
+    can: list[DesktopDoctorTask]
+    """"This computer can"."""
+
+    cannot: list[DesktopDoctorTask]
+    """"It can't"."""
+
+    checks: list[DesktopDoctorCheck]
+    """Check results."""
+
+    fits: NotRequired[str | None]
+    """What models fit here, in plain words."""
+
+    platform: str
+    """Platform id, like `macos-apple-silicon`."""
+
+    to_install: list[DesktopDoctorInstall]
+    """"To unlock more, install"."""
+
+
+class DesktopDoctorTask(TypedDict):
+    """A task this computer can or can't do."""
+
+    blocked_by: NotRequired[str | None]
+    """What stops it here ("can't" only)."""
+
+    download_first_gb_high: NotRequired[float | None]
+    """Download still needed first, high estimate in GB ("can" only)."""
+
+    download_first_gb_low: NotRequired[float | None]
+    """Download still needed first, low estimate in GB ("can" only)."""
+
+    name: str
+    """Plain name."""
+
+    note: NotRequired[str | None]
+    """A note from the catalog."""
+
+    task: str
+    """Task id, like `sft-lora`."""
+
+
+class DesktopJob(TypedDict):
+    """A job that holds or is getting a machine."""
+
+    job_id: str
+    """`job_…`."""
+
+    name: str
+    """The run's name, or the job kind."""
+
+    run_id: NotRequired[str | None]
+    """`run_…` for training and evaluation jobs."""
+
+    started_at: NotRequired[str | None]
+    """When it started on a machine."""
+
+    state: str
+    """Job state, like `RUNNING`."""
+
+
+class DesktopJobChange(TypedDict):
+    """A job that finished, failed, was cancelled or paused."""
+
+    at: str
+    """When it changed."""
+
+    job_id: str
+    """`job_…`."""
+
+    name: str
+    """The run's name, or the job kind."""
+
+    run_id: NotRequired[str | None]
+    """`run_…` for training and evaluation jobs."""
+
+    state: str
+    """`COMPLETED`, `FAILED`, `CANCELLED` or `PAUSED`."""
+
+    state_version: int
+    """Grows with every state change of the job; show each `(job_id, state_version)` once."""
+
+
+class DesktopOnboarding(TypedDict):
+    """Where first-run onboarding stands."""
+
+    completed_at: NotRequired[str | None]
+    """When onboarding was first finished; absent until then."""
+
+    step: str
+    """The step to show next: `welcome`, `sign_in`, `restore`, `check` or `done`."""
+
+
+class DesktopOnboardingUpdate(TypedDict):
+    """Move onboarding to a step."""
+
+    step: str
+    """`welcome`, `sign_in`, `restore`, `check` or `done`. `done` finishes onboarding."""
+
+
+class DesktopRestored(TypedDict):
+    """A finished restore."""
+
+    restart_required: bool
+    """Always true: restart the core so it updates the restored data."""
+
+    restored: str
+    """The backup now in use."""
+
+    safety_backup: str
+    """The backup of the data from just before, to undo the restore."""
+
+
+class DesktopState(TypedDict):
+    """The desktop app's view of this core."""
+
+    bundled_database: bool
+    """True when this core runs its own PostgreSQL (backups work)."""
+
+    data_dir: NotRequired[str | None]
+    """The folder the app's own database lives in; absent when the core uses another database."""
+
+    onboarding: DesktopOnboarding
+    """First-run onboarding."""
+
+    version: str
+    """The core's version."""
+
+
+class DesktopUpdateCheckpoint(TypedDict):
+    """How one job's emergency checkpoint went."""
+
+    checkpoint_id: NotRequired[str | None]
+    """`ckpt_…` when committed."""
+
+    detail: NotRequired[str | None]
+    """Why, in plain words, when not committed."""
+
+    job_id: str
+    """`job_…`."""
+
+    name: str
+    """The run's name, or the job kind."""
+
+    outcome: str
+    """`committed`, `refused`, `timed_out` or `failed`."""
+
+
+class DesktopUpdateReadiness(TypedDict):
+    """Whether the app may install the update now."""
+
+    backup: NotRequired[str | None]
+    """The backup's file name."""
+
+    backup_error: NotRequired[str | None]
+    """Why the backup failed."""
+
+    checkpoints: list[DesktopUpdateCheckpoint]
+    """One entry per running job."""
+
+    ready: bool
+    """The backup is made (or there is no bundled database): go ahead."""
+
+
 class DownloadRequest(TypedDict):
     """`POST /artifacts/{art}:download` body."""
 
@@ -2199,6 +2445,21 @@ __all__ = [
     "CreateEnrollmentToken",
     "CreatePool",
     "CreateToken",
+    "DesktopActivity",
+    "DesktopBackup",
+    "DesktopBackupList",
+    "DesktopDoctorCheck",
+    "DesktopDoctorInstall",
+    "DesktopDoctorReport",
+    "DesktopDoctorTask",
+    "DesktopJob",
+    "DesktopJobChange",
+    "DesktopOnboarding",
+    "DesktopOnboardingUpdate",
+    "DesktopRestored",
+    "DesktopState",
+    "DesktopUpdateCheckpoint",
+    "DesktopUpdateReadiness",
     "DownloadRequest",
     "Edge",
     "Endpoint",

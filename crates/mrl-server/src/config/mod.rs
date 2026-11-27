@@ -101,6 +101,8 @@ pub struct Config {
     // <mrl:config P28> P28 settings fields go right below this line.
     // <mrl:config P29> P29 settings fields go right below this line.
     // <mrl:config P30> P30 settings fields go right below this line.
+    /// The desktop app's endpoints: the Environment Doctor and updates.
+    pub desktop: crate::modules::desktop::DesktopConfig,
 }
 
 /// `[server]`.

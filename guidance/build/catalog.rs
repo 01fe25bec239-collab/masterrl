@@ -2426,6 +2426,16 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-CONFLICT-300")),
+            ("title", Value::Str("Another backup, restore or update check is running.")),
+            ("why", Value::Str("The app does one of these at a time, so they don't get in each other's way.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Wait until the other one finishes, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-DATA-001")),
             ("title", Value::Str("Your dataset did not pass its checks.")),
             ("why", Value::Str("Some rows are empty, are missing fields, or don't match the chosen format.")),
@@ -2812,6 +2822,38 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-ENV-300")),
+            ("title", Value::Str("Backups need the database the app runs itself.")),
+            ("why", Value::Str("This app uses a database it doesn't run itself, like a development database. It can't back that one up here.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Back up that database with its own tools."),
+                    Value::Str("Remove `database.url` from the settings file to let the app run its own database."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-ENV-301")),
+            ("title", Value::Str("The computer check couldn't read the agent's settings.")),
+            ("why", Value::Str("The settings file of this computer's agent can't be read or has a mistake in it.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Open the file named in the message and fix the line it points to."),
+                    Value::Str("Or remove the file to use the defaults."),
+                    Value::Str("Then run the check again."),
+                ])),
+                ("macos", Value::List(&[
+                    Value::Str("The file is usually `~/Library/Application Support/MasterRL/agent.toml`."),
+                ])),
+                ("linux", Value::List(&[
+                    Value::Str("The file is usually `~/.config/masterrl/agent.toml`."),
+                ])),
+                ("windows", Value::List(&[
+                    Value::Str("The file is usually `%APPDATA%\\MasterRL\\agent.toml`."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-IDEM-001")),
             ("title", Value::Str("This request is already running.")),
             ("why", Value::Str("A request with the same request key started earlier and has not finished.")),
@@ -3039,6 +3081,18 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Start the run again. It resumes from the last saved checkpoint."),
                     Value::Str("If it happens again, send the run's log to your admin."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-INTERNAL-300")),
+            ("title", Value::Str("The backup or restore didn't finish.")),
+            ("why", Value::Str("The database tools stopped with an error, or the disk is full or can't be written. Your current data is unchanged unless the message says the restore failed part way.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check that the disk with the app's data has free space."),
+                    Value::Str("Try again."),
+                    Value::Str("If a restore failed part way, restore the \"before-restore\" backup the app made just before."),
                 ])),
             ])),
         ]),
@@ -3568,6 +3622,17 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-RES-300")),
+            ("title", Value::Str("There is no backup with this name.")),
+            ("why", Value::Str("The backup was removed, or the list was out of date. The app keeps only the newest backups and removes older ones.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Refresh the list of backups."),
+                    Value::Str("Pick one of the backups shown, then try again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-RWD-140")),
             ("title", Value::Str("The reward policy has a problem.")),
             ("why", Value::Str("A field in the policy is missing, has a value the app doesn't accept, or clashes with another field. Details names the field.")),
@@ -3753,6 +3818,17 @@ pub static CATALOG: Value = Value::Map(&[
                     Value::Str("Refresh to see the checkpoint's state."),
                     Value::Str("If it is still being saved, wait a moment and try again."),
                     Value::Str("If it is damaged, use an earlier checkpoint of the same run."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STATE-300")),
+            ("title", Value::Str("These settings belong to the desktop app, not a team server.")),
+            ("why", Value::Str("First-run steps, backups, the computer check and app updates are part of the desktop app on your own computer. A team server keeps its own settings.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Open the MasterRL desktop app on your computer to change these."),
+                    Value::Str("Ask whoever runs the team server about its backups and updates."),
                 ])),
             ])),
         ]),

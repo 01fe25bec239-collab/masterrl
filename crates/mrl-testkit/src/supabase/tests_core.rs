@@ -1121,6 +1121,55 @@ async fn every_route_answers_by_role_in_team_mode() {
         // <mrl:roles-routes P28> P28 role-table rows go right below this line.
         // <mrl:roles-routes P29> P29 role-table rows go right below this line.
         // <mrl:roles-routes P30> P30 role-table rows go right below this line.
+        // P30 routes: the desktop app's own settings (admin.manage; a team core answers 409).
+        row(
+            Method::GET,
+            "/api/v1/desktop/state".into(),
+            Action::AdminManage,
+            None,
+        ),
+        row(
+            Method::PUT,
+            "/api/v1/desktop/onboarding".into(),
+            Action::AdminManage,
+            Some(json!({"step": "check"})),
+        ),
+        row(
+            Method::POST,
+            "/api/v1/desktop/doctor".into(),
+            Action::AdminManage,
+            None,
+        ),
+        row(
+            Method::GET,
+            "/api/v1/desktop/activity".into(),
+            Action::AdminManage,
+            None,
+        ),
+        row(
+            Method::GET,
+            "/api/v1/desktop/backups".into(),
+            Action::AdminManage,
+            None,
+        ),
+        row(
+            Method::POST,
+            "/api/v1/desktop/backups".into(),
+            Action::AdminManage,
+            None,
+        ),
+        row(
+            Method::POST,
+            "/api/v1/desktop/backups/masterrl-20261127T093000123Z-daily.dump/restore".into(),
+            Action::AdminManage,
+            None,
+        ),
+        row(
+            Method::POST,
+            "/api/v1/desktop/update/prepare".into(),
+            Action::AdminManage,
+            None,
+        ),
     ]);
     // A run submission needs an Idempotency-Key (keys are per person).
     let key_for = |method: &Method, path: &str| -> &'static [(&'static str, &'static str)] {
@@ -1171,6 +1220,8 @@ async fn every_route_answers_by_role_in_team_mode() {
             // <mrl:roles-expected P28> P28 expected-status arms go right below this line.
             // <mrl:roles-expected P29> P29 expected-status arms go right below this line.
             // <mrl:roles-expected P30> P30 expected-status arms go right below this line.
+            // P30 routes: desktop settings belong to the desktop app (MRL-STATE-300).
+            (_, p) if p.starts_with("/api/v1/desktop/") => &[409],
             (_, p) if p.starts_with("/api/v1/sync/") => &[409],
             ("POST", "/api/v1/auth/session") | ("POST", "/api/v1/auth/tokens") => &[201],
             ("DELETE", "/api/v1/auth/session") => &[204],
