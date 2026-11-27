@@ -102,6 +102,19 @@ pub enum ResolveError {
     Seam(#[from] SeamError),
 }
 
+/// What a submission is for, so a resolver can pick defaults for its method.
+#[derive(Debug, Clone)]
+pub struct SubmitScope {
+    /// The org.
+    pub org_id: Uuid,
+    /// The project.
+    pub project_id: Uuid,
+    /// The job kind (`TRAIN`, `EVAL`, …).
+    pub kind: String,
+    /// The method, like `sft`.
+    pub algorithm_id: String,
+}
+
 /// Turns the submitted config into the resolved one.
 #[async_trait]
 pub trait SubmissionResolver: Send + Sync {
@@ -110,6 +123,7 @@ pub trait SubmissionResolver: Send + Sync {
     /// Returns the config after this step; `resolved` is the output of the previous member.
     async fn resolve(
         &self,
+        scope: &SubmitScope,
         submitted: &serde_json::Value,
         resolved: serde_json::Value,
     ) -> Result<serde_json::Value, ResolveError>;
@@ -314,11 +328,12 @@ impl Chains {
     /// Runs every resolver in order, starting from the submitted config.
     pub async fn resolve(
         &self,
+        scope: &SubmitScope,
         submitted: &serde_json::Value,
     ) -> Result<serde_json::Value, ResolveError> {
         let mut resolved = submitted.clone();
         for r in self.resolvers.iter() {
-            resolved = r.resolve(submitted, resolved).await?;
+            resolved = r.resolve(scope, submitted, resolved).await?;
         }
         Ok(resolved)
     }
@@ -513,10 +528,12 @@ mod tests {
         }
         async fn resolve(
             &self,
+            scope: &SubmitScope,
             _: &serde_json::Value,
             mut resolved: serde_json::Value,
         ) -> Result<serde_json::Value, ResolveError> {
             resolved["lr"] = serde_json::json!(0.1);
+            resolved["method"] = serde_json::json!(scope.algorithm_id);
             Ok(resolved)
         }
     }
@@ -524,12 +541,18 @@ mod tests {
     #[tokio::test]
     async fn resolvers_fold_in_order_and_default_keeps_config() {
         let submitted = serde_json::json!({"epochs": 1});
+        let scope = SubmitScope {
+            org_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            kind: "TRAIN".into(),
+            algorithm_id: "sft".into(),
+        };
         let none = Chains::new(vec![], vec![], vec![]);
-        assert_eq!(none.resolve(&submitted).await.unwrap(), submitted);
+        assert_eq!(none.resolve(&scope, &submitted).await.unwrap(), submitted);
         let one = Chains::new(vec![], vec![], vec![Arc::new(AddKey)]);
         assert_eq!(
-            one.resolve(&submitted).await.unwrap(),
-            serde_json::json!({"epochs": 1, "lr": 0.1})
+            one.resolve(&scope, &submitted).await.unwrap(),
+            serde_json::json!({"epochs": 1, "lr": 0.1, "method": "sft"})
         );
     }
 }

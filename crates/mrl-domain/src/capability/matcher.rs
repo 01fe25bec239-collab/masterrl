@@ -650,7 +650,8 @@ pub fn check(engine: Engine<'_>, req: &Request) -> Vec<Problem> {
                 format!("{name} lists QLoRA but not 4-bit quantized training (bnb-4bit), which QLoRA needs."),
             ));
         }
-        if let Some(p) = settings.precision {
+        // `auto` lets the engine choose from its own list.
+        if let Some(p) = settings.precision.filter(|p| *p != "auto") {
             if !caps.precision.iter().any(|x| x == p) {
                 out.push(Problem::new(
                     codes::SETTING_UNSUPPORTED,
