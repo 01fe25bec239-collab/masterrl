@@ -34,6 +34,9 @@ pub fn pipeline(db: &Db, cfg: &SchedulerConfig) -> Pipeline {
             Arc::new(crate::modules::checkpoints::resume::ResumeInputs::new(
                 db.clone(),
             )),
+            Arc::new(crate::modules::builtin::launch::BuiltinLaunch::new(
+                db.clone(),
+            )),
             // <mrl:launch-contributors P26> P26 launch contributors go right below this line.
             Arc::new(crate::modules::models::launch::ModelInputs::new(db.clone())),
             // <mrl:launch-contributors P27> P27 launch contributors go right below this line.
