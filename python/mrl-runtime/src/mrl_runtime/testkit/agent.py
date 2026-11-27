@@ -45,6 +45,8 @@ class AgentScript:
     commit_state: pb.CommitState = pb.COMMIT_STATE_COMMITTED
     answer_commits: bool = True  # False: commit requests are never answered (commit timeout)
     grant_prefix: str = ""  # non-empty: the grant moves each staged file under this prefix
+    outputs_reason: str = ""  # non-empty: the outputs upload fails with this reason
+    answer_outputs: bool = True  # False: OutputsStaged is never answered (outputs timeout)
 
 
 async def _read(context: _Context) -> object:
@@ -71,6 +73,7 @@ class FakeAgent:
         self._start_sent = False
         self._staged: dict[str, pb.CheckpointStaged] = {}
         self._grants: dict[str, dict[str, str]] = {}
+        self.outputs_manifest: dict[str, Any] | None = None  # the last OutputsStaged manifest
         self.accepted: int = 0  # highest contiguous seq received this agent lifetime
         self.durable: int = 0  # highest seq acked: survives restart()
         self.hold_acks = False  # True: receive but do not ack (messages stay non-durable)
@@ -265,6 +268,12 @@ class FakeAgent:
             self._grants[staged.checkpoint_id] = targets
             grant = pb.UploadGrant(checkpoint_id=staged.checkpoint_id, targets=targets)
             await self._queue(pb.AgentMessage(upload_grant=grant))
+        elif kind == "outputs_staged":
+            self.outputs_manifest = json.loads(msg.outputs_staged.manifest_json)
+            if self.script.answer_outputs:
+                reason = self.script.outputs_reason
+                done = pb.OutputsUploaded(ok=not reason, reason=reason)
+                await self._queue(pb.AgentMessage(outputs_uploaded=done))
         elif kind == "checkpoint_commit":
             req = msg.checkpoint_commit
             state, reason = self._verify(req)

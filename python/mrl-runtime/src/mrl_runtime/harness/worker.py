@@ -7,7 +7,10 @@ only when max_pending_checkpoints commits are still waiting for an ack.
 
 Job spec keys the harness reads (Prepare.job_spec_json): run_id, job_kind, algorithm, common,
 engine, switch, base_model_sha256, export {format}, harness {stall_timeout_s,
-max_pending_checkpoints, nan_patience, commit_timeout_s, cancel_grace_s}.
+max_pending_checkpoints, nan_patience, commit_timeout_s, cancel_grace_s, outputs_timeout_s}.
+
+A job that leaves outputs/artifact-manifest.json (built-in tasks, exports) sends
+OutputsStaged after the engine and waits for OutputsUploaded before it exits.
 """
 
 import asyncio
@@ -58,12 +61,12 @@ from mrl_runtime.adapter.types import (
     ResourceEstimate,
     ValidationRequest,
 )
-from mrl_runtime.checkpoint.files import write_artifact_manifest
+from mrl_runtime.checkpoint.files import ARTIFACT_MANIFEST, write_artifact_manifest
 from mrl_runtime.checkpoint.provider import CheckpointProvider, CheckpointSettings
 from mrl_runtime.errors import FIELD_INVALID, FIELD_MISSING, METHOD_UNSUPPORTED
 from mrl_runtime.harness.classify import ExitState, Phase, classify, decide_exit, failure
 from mrl_runtime.logs import FdCapture, LogStream
-from mrl_runtime.metrics import MetricsMapper, SampleEmitter
+from mrl_runtime.metrics import MetricsMapper, SampleEmitter, add_resource_peaks
 from mrl_runtime.protocol.session import WorkerSession
 from mrl_runtime.protocol.spool import Spool
 from mrl_runtime.redact import Redactor
@@ -107,6 +110,8 @@ class Settings:
     nan_patience: int = 3
     commit_timeout_s: float = 600.0
     cancel_grace_s: float = 30.0
+    # Waiting for the agent to upload a job's outputs (a large model takes a while).
+    outputs_timeout_s: float = 21600.0
 
     @classmethod
     def from_spec(cls, raw: object) -> tuple["Settings", list[Issue]]:
@@ -178,6 +183,7 @@ class Harness:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._prepare: asyncio.Future[pb.Prepare] | None = None
         self._start: asyncio.Future[pb.Start] | None = None
+        self._outputs: asyncio.Future[pb.OutputsUploaded] | None = None
         self._ctx: JobContext | None = None
         self._settings = Settings()
         self._logs: dict[int, LogStream] = {}
@@ -276,10 +282,14 @@ class Harness:
                 await self._cleanup(ctx)
                 return pb.EXIT_KIND_DRY_RUN_OK, None
             await self._await(self._start)
-            if str(spec.get("job_kind", "")).upper() in ("EXPORT", "CONVERT"):
+            # Built-in EXPORT/CONVERT tasks run like any built-in task; a training engine's
+            # export goes through its export().
+            builtin = self.manifest.name == "mrl-builtin"
+            if not builtin and str(spec.get("job_kind", "")).upper() in ("EXPORT", "CONVERT"):
                 await self._export(ctx, spec)
             else:
                 engine_stopped = await self._run_engine(ctx, spec)
+            await self._upload_outputs(ctx)
         except _EndAttemptError as stop:
             if self._ctx is not None:
                 await self._cleanup(self._ctx)
@@ -577,6 +587,7 @@ class Harness:
                 for point in batch.points:
                     self._metrics[point.name] = point.value
                 self._watch_divergence(batch)
+                add_resource_peaks(batch, event.step)
                 if primary:
                     self.session.send(batch)
             case Samples():
@@ -664,6 +675,27 @@ class Harness:
             source={"run_id": ctx.run_id, "attempt_id": ctx.attempt_id, "format": result.format},
         )
 
+    async def _upload_outputs(self, ctx: JobContext) -> None:
+        """Hands a finished job's outputs to the agent and waits until they are uploaded."""
+        manifest = ctx.staging_dir / "outputs" / ARTIFACT_MANIFEST
+        failed = self._harness_failure or self._engine_failure or self._cancel_request
+        if failed or not manifest.is_file() or self.session is None:
+            return
+        assert self._loop is not None
+        self._outputs = self._loop.create_future()
+        _send(self.session, pb.OutputsStaged(manifest_json=manifest.read_text(encoding="utf-8")))
+        try:
+            done = await asyncio.wait_for(self._outputs, self._settings.outputs_timeout_s)
+        except TimeoutError:
+            done = pb.OutputsUploaded(ok=False, reason="the upload did not finish in time")
+        if not done.ok:
+            self._harness_failure = failure(
+                common.FAILURE_CLASS_INFRA_TRANSIENT,
+                "OUTPUTS_NOT_UPLOADED",
+                f"The job's results could not be saved: {done.reason or 'unknown reason'}.",
+                retryable=True,
+            )
+
     async def _cleanup(self, ctx: JobContext) -> None:
         try:
             await asyncio.wait_for(asyncio.to_thread(self.engine.cleanup, ctx), timeout=30)
@@ -702,6 +734,8 @@ class Harness:
                 self._start.set_result(msg.start)
             elif kind == "upload_grant" and self.provider:
                 self.provider.on_grant(msg.upload_grant)
+            elif kind == "outputs_uploaded" and self._outputs and not self._outputs.done():
+                self._outputs.set_result(msg.outputs_uploaded)
             elif kind == "checkpoint_commit_ack" and self.provider:
                 self.provider.on_ack(msg.checkpoint_commit_ack)
             elif kind == "pause":

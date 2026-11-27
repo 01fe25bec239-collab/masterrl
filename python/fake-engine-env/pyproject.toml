@@ -1,7 +1,7 @@
 # The FakeEngine's runtime project (testkit, dev only): what an agent installs for a FakeEngine
 # run. Separate uv project with its own lock (not a workspace member), like the adapters.
 # The lock's sha256 is the `lockSha256` in mrl_runtime/testkit/fake_engine/mrl-engine.yaml;
-# python/mrl-runtime/tests checks they match.
+# `just gen` keeps it current and python/mrl-runtime/tests checks they match.
 [project]
 name = "mrl-fake-engine-env"
 version = "0.1.0"

@@ -66,12 +66,16 @@ impl ArtifactsModule {
     /// The module for this database and these settings. Connects to storage on first use.
     pub fn new(db: Db, config: &Config) -> Self {
         Self {
-            store: Arc::new(ArtifactStore::new(
-                db,
-                backend_config(config),
-                config.server.mode,
-                scratch::default_root(),
-            )),
+            store: Arc::new(
+                ArtifactStore::new(
+                    db,
+                    backend_config(config),
+                    config.server.mode,
+                    scratch::default_root(),
+                )
+                .with_module_lookups()
+                .with_download_guards(),
+            ),
         }
     }
 
@@ -84,7 +88,11 @@ impl ArtifactsModule {
         scratch_root: std::path::PathBuf,
     ) -> Self {
         Self {
-            store: Arc::new(ArtifactStore::new(db, Ok(backend), mode, scratch_root)),
+            store: Arc::new(
+                ArtifactStore::new(db, Ok(backend), mode, scratch_root)
+                    .with_module_lookups()
+                    .with_download_guards(),
+            ),
         }
     }
 
@@ -231,6 +239,7 @@ pub struct ArtifactStore {
     plain: OnceCell<Backend>,
     signing: OnceCell<(Backend, TicketKey)>,
     lookups: std::sync::RwLock<HashMap<String, Arc<dyn NodeLookup>>>,
+    guards: std::sync::RwLock<Vec<Arc<dyn DownloadGuard>>>,
 }
 
 impl ArtifactStore {
@@ -248,7 +257,18 @@ impl ArtifactStore {
             plain: OnceCell::new(),
             signing: OnceCell::new(),
             lookups: std::sync::RwLock::new(HashMap::new()),
+            guards: std::sync::RwLock::new(Vec::new()),
         }
+    }
+
+    /// Adds the lineage lookups other modules own, so every store (the one P19 serves and
+    /// the ones other modules build) resolves their kinds. Each part adds one
+    /// `self.add_lineage_lookup(kind, Arc::new(…))` line below its marker.
+    fn with_module_lookups(self) -> Self {
+        // <mrl:lineage-lookups P26> P26 lookups go right below this line.
+        // <mrl:lineage-lookups P27> P27 lookups go right below this line.
+        // <mrl:lineage-lookups P29> P29 lookups go right below this line.
+        self
     }
 
     /// A new private scratch folder (see [`scratch`]).
@@ -277,6 +297,24 @@ impl ArtifactStore {
 
     pub(crate) fn lookup(&self, kind: &str) -> Option<Arc<dyn NodeLookup>> {
         self.lookups.read().ok().and_then(|l| l.get(kind).cloned())
+    }
+
+    /// Adds the download guards other modules own, on every store. Each part adds one
+    /// `self.add_download_guard(Arc::new(…));` line below its marker.
+    fn with_download_guards(self) -> Self {
+        // <mrl:download-guards P27> P27 guards go right below this line.
+        self
+    }
+
+    /// Adds a check that runs before any artifact download, after the read check passed.
+    pub fn add_download_guard(&self, guard: Arc<dyn DownloadGuard>) {
+        if let Ok(mut g) = self.guards.write() {
+            g.push(guard);
+        }
+    }
+
+    fn download_guards(&self) -> Vec<Arc<dyn DownloadGuard>> {
+        self.guards.read().map(|g| g.clone()).unwrap_or_default()
     }
 
     /// The storage backend, without a signing key. A failure is not kept: the next call
@@ -924,6 +962,21 @@ pub trait NodeLookup: Send + Sync {
     async fn find(&self, org: &str, id: Uuid) -> Result<Option<(&'static str, Resource)>, Error>;
 }
 
+/// A module's extra say on downloading artifacts it owns (like a dataset export's
+/// permission and PII policy). Registered with [`ArtifactStore::add_download_guard`].
+#[async_trait::async_trait]
+pub trait DownloadGuard: Send + Sync {
+    /// Runs after the caller passed the artifact read check. `Err` refuses the download;
+    /// return `Ok` for artifacts the module does not own.
+    async fn check(
+        &self,
+        state: &AppState,
+        ctx: &RequestContext,
+        org: &str,
+        artifact: &Artifact,
+    ) -> Result<(), Error>;
+}
+
 /// The stored file of a finished upload, as its row records it.
 pub(crate) struct UploadBlob {
     /// Its key, under `blobs/sha256/`.
@@ -1084,7 +1137,7 @@ pub(crate) fn destination(kind: &str, org: &str, project: Option<String>) -> Res
     Resource {
         kind: kind.to_owned(),
         id: None,
-        org: Some(org.to_owned()),
+        org: rbac_org(org),
         project,
     }
 }
@@ -1243,9 +1296,15 @@ pub(crate) fn owned(kind: &str, org: &str, id: String, project: Option<String>) 
     Resource {
         kind: kind.to_owned(),
         id: Some(id),
-        org: Some(org.to_owned()),
+        org: rbac_org(org),
         project,
     }
+}
+
+/// The org a [`Resource`] names for storage org `org`. [`LOCAL_ORG`] is the solo owner's
+/// storage name, not an org id, so it names none (RBAC hides resources whose org is not an id).
+pub fn rbac_org(org: &str) -> Option<String> {
+    (org != LOCAL_ORG).then(|| org.to_owned())
 }
 
 /// The action that reads artifacts (and the lineage graph).
@@ -1640,6 +1699,9 @@ async fn action(
         .filter(|a| a.state == "COMMITTED")
         .ok_or_else(|| not_found("artifact"))?;
     s.authorize(&ctx, READ, &found.resource(&org)).await?;
+    for guard in store.download_guards() {
+        guard.check(&s, &ctx, &org, &found).await?;
+    }
     let (key, file) = store.download_source(&org, &found, &body.path).await?;
     Ok(Json(
         store
@@ -1658,7 +1720,13 @@ struct Doc;
 
 #[cfg(test)]
 mod tests {
-    use super::{is_staging, total_size, ArtifactManifest};
+    use super::{is_staging, rbac_org, total_size, ArtifactManifest, LOCAL_ORG};
+
+    #[test]
+    fn the_solo_storage_org_names_no_rbac_org() {
+        assert_eq!(rbac_org(LOCAL_ORG), None);
+        assert_eq!(rbac_org("org_x").as_deref(), Some("org_x"));
+    }
 
     fn manifest(sizes: &[u64]) -> ArtifactManifest {
         let files: Vec<serde_json::Value> = sizes

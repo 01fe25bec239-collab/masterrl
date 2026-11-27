@@ -44,6 +44,10 @@ pub fn modules(db: &Db, config: &crate::Config) -> Vec<Box<dyn ServerModule>> {
     vec![
         // <mrl:register>
         Box::new(EventsModule::new(db.clone(), consumers(db))),
+        Box::new(crate::modules::builtin::BuiltinModule::new(
+            db.clone(),
+            config,
+        )),
         // <mrl:register P16> P16 modules go right below this line.
         Box::new(crate::modules::tenancy::TenancyModule::new(
             db.clone(),
