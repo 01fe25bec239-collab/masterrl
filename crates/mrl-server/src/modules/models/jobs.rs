@@ -938,12 +938,18 @@ pub async fn promote(
     } else {
         model
     };
-    // The run's starting version: the base of an adapter, the parent of full weights.
-    let base = match base {
-        Some(b) => super::gates::ready_in(service.db(), org, project, b)
-            .await?
-            .map(|v| v.id),
+    // Continuing a registered adapter still produces weights relative to its full base.
+    let starting = match base {
+        Some(id) => super::gates::ready_in(service.db(), org, project, id).await?,
         None => None,
+    };
+    let base = match starting {
+        Some(v) if v.kind.as_deref() == Some("adapter") => {
+            super::gates::adapter_base(service.db(), &v)
+                .await?
+                .map(|v| v.id)
+        }
+        other => other.map(|v| v.id),
     };
     start(
         state,

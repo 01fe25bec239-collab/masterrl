@@ -1172,6 +1172,38 @@ async fn promote_merge_and_export_round_trip() {
         .iter()
         .any(|f| f["local_path"] == "checkpoint/model.safetensors"));
 
+    // A READY adapter on the base merges into a new full-weights version.
+    let lora = env.model("lora").await;
+    let (adapter, job) = env.version(&lora, Some(base)).await;
+    let mut adapter_outputs = Outputs::tiny(|r| r["kind"] = json!("adapter"));
+    adapter_outputs
+        .files
+        .iter_mut()
+        .find(|(path, _)| path == "model/model.safetensors")
+        .unwrap()
+        .1 = b"adapter weights".to_vec();
+    let produced = env.produce(&adapter_outputs).await;
+    assert_eq!(
+        outputs::record(&env.models, job, Some(&produced))
+            .await
+            .unwrap(),
+        Verification::Verified
+    );
+
+    sqlx::query("UPDATE runs SET base_model_version_id = $1 WHERE id = $2")
+        .bind(adapter)
+        .bind(run)
+        .execute(env.db.pool())
+        .await
+        .unwrap();
+    let continued = env
+        .started(&format!("/checkpoints/{ckpt_id}:promote"), json!({}))
+        .await;
+    assert_eq!(
+        continued["base_model_version_id"],
+        ModelVersionId::from_uuid(base).to_string()
+    );
+
     // A checkpoint whose stored bytes changed since commit is not promoted.
     st.put(
         &format!("{prefix}model.safetensors"),
@@ -1193,18 +1225,6 @@ async fn promote_merge_and_export_round_trip() {
         .await;
     assert!(r.status >= 400, "{}", r.text());
 
-    // A READY adapter on the base merges into a new full-weights version.
-    let lora = env.model("lora").await;
-    let (adapter, job) = env.version(&lora, Some(base)).await;
-    let produced = env
-        .produce(&Outputs::tiny(|r| r["kind"] = json!("adapter")))
-        .await;
-    assert_eq!(
-        outputs::record(&env.models, job, Some(&produced))
-            .await
-            .unwrap(),
-        Verification::Verified
-    );
     let plan = env.launch(Uuid::nil(), adapter).await.unwrap();
     assert!(plan
         .inputs
