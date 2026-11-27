@@ -37,6 +37,9 @@ pub fn pipeline(db: &Db, cfg: &SchedulerConfig) -> Pipeline {
             // <mrl:launch-contributors P26> P26 launch contributors go right below this line.
             // <mrl:launch-contributors P27> P27 launch contributors go right below this line.
             // <mrl:launch-contributors P28> P28 launch contributors go right below this line.
+            Arc::new(crate::modules::submission::probe::ProbeLaunch::new(
+                db.clone(),
+            )),
             // <mrl:launch-contributors P29> P29 launch contributors go right below this line.
         ],
         vec![

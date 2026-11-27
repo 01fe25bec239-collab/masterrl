@@ -685,6 +685,9 @@ async fn every_route_answers_by_role_in_team_mode() {
     // <mrl:roles-seed P26> P26 seed data for the role table goes right below this line.
     // <mrl:roles-seed P27> P27 seed data for the role table goes right below this line.
     // <mrl:roles-seed P28> P28 seed data for the role table goes right below this line.
+    // P28 routes: validate and preflight take the P17 submission (no machine is connected,
+    // so nothing is probed); the resources of the P17 run.
+    let p28_submission = submission.clone();
     // <mrl:roles-seed P29> P29 seed data for the role table goes right below this line.
     // <mrl:roles-seed P30> P30 seed data for the role table goes right below this line.
     // Compute (P18): a pool made over the API and one machine in it (no agent connected).
@@ -1119,6 +1122,24 @@ async fn every_route_answers_by_role_in_team_mode() {
         // <mrl:roles-routes P26> P26 role-table rows go right below this line.
         // <mrl:roles-routes P27> P27 role-table rows go right below this line.
         // <mrl:roles-routes P28> P28 role-table rows go right below this line.
+        row(
+            Method::POST,
+            format!("/api/v1/projects/{prj}/runs:validate"),
+            Action::RunsSubmit,
+            Some(p28_submission.clone()),
+        ),
+        row(
+            Method::POST,
+            "/api/v1/runs:preflight".into(),
+            Action::RunsSubmit,
+            Some(json!({"project_id": prj.to_string(), "run": p28_submission})),
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/runs/{run}/resources"),
+            Action::RunsRead,
+            None,
+        ),
         // <mrl:roles-routes P29> P29 role-table rows go right below this line.
         // <mrl:roles-routes P30> P30 role-table rows go right below this line.
     ]);
@@ -1169,6 +1190,10 @@ async fn every_route_answers_by_role_in_team_mode() {
             // <mrl:roles-expected P26> P26 expected-status arms go right below this line.
             // <mrl:roles-expected P27> P27 expected-status arms go right below this line.
             // <mrl:roles-expected P28> P28 expected-status arms go right below this line.
+            // P28 routes: validate always answers 200 (problems are issues); preflight answers 422
+            // while the run's settings have errors.
+            ("POST", p) if p.ends_with("/runs:validate") => &[200],
+            ("POST", "/api/v1/runs:preflight") => &[200, 422],
             // <mrl:roles-expected P29> P29 expected-status arms go right below this line.
             // <mrl:roles-expected P30> P30 expected-status arms go right below this line.
             (_, p) if p.starts_with("/api/v1/sync/") => &[409],

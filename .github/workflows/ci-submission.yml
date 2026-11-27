@@ -1,0 +1,46 @@
+name: ci-submission
+
+# P28 run submission against PostgreSQL: runs:validate with and without machines (scripted
+# agents answering the dry run over the real gateway), a probe timeout, replayed and foreign
+# answers, the TRL SFT LoRA preset fitting a fake 24 GB GPU and not a 4 GB one, submit-time
+# preflight, estimate vs injected actuals with calibration, resume and experimental checks.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-submission-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  submission:
+    name: submission (postgres)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      DATABASE_URL: postgres://mrl:mrl-dev-only@127.0.0.1:55432/masterrl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+
+      - name: start PostgreSQL
+        run: docker compose -f deploy/local/compose.yaml up -d --wait postgres
+
+      - name: P28 integration tests
+        run: cargo test -p mrl-testkit --locked p28_submission -- --ignored --test-threads 4
+
+      - name: role table (every route, team mode)
+        run: cargo test -p mrl-testkit --locked --lib every_route_answers_by_role_in_team_mode -- --ignored
+
+      - name: service logs
+        if: failure()
+        run: docker compose -f deploy/local/compose.yaml logs postgres

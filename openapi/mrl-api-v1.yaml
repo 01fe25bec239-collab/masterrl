@@ -1328,6 +1328,44 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /api/v1/projects/{prj}/runs:validate:
+    post:
+      tags:
+      - runs
+      summary: '`POST /projects/{prj}/runs:validate`.'
+      operationId: validate_run
+      parameters:
+      - name: prj
+        in: path
+        description: Project id, `prj_…`.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RunSubmission'
+        required: true
+      responses:
+        '200':
+          description: Every finding, the resolved config, the estimate and the preflight.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ValidateResponse'
+        '400':
+          description: An unreadable body.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '404':
+          description: No such project, or hidden from you.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/queue:
     get:
       tags:
@@ -1698,6 +1736,32 @@ paths:
           description: No such run
         '422':
           description: A parameter is out of range
+  /api/v1/runs/{run}/resources:
+    get:
+      tags:
+      - runs
+      summary: '`GET /runs/{run}/resources`: the estimate next to the measured peaks, per phase.'
+      operationId: get_run_resources
+      parameters:
+      - name: run
+        in: path
+        description: Run id, `run_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Estimate vs actual.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunResources'
+        '404':
+          description: No such run, or hidden from you.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/runs/{run}/samples:
     get:
       tags:
@@ -1851,6 +1915,37 @@ paths:
           description: A run doesn't exist or is hidden
         '422':
           description: Fewer than 2 or more than 10 runs, or a repeated run
+  /api/v1/runs:preflight:
+    post:
+      tags:
+      - runs
+      summary: '`POST /runs:preflight`: will this run fit the connected machines?'
+      operationId: preflight_run
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PreflightRequest'
+        required: true
+      responses:
+        '200':
+          description: The verdict per machine, safety settings or alternatives.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunPreflight'
+        '404':
+          description: No such project, or hidden from you.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: The run's settings have problems (see `runs:validate`).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/secrets:
     get:
       tags:
@@ -2790,6 +2885,31 @@ components:
         trace_id:
           type: string
           description: Trace id.
+    CalibrationView:
+      type: object
+      description: How the estimate was corrected.
+      required:
+      - key
+      - n
+      - factor
+      - spread
+      properties:
+        factor:
+          type: number
+          format: double
+          description: Correction applied to the expected value (`e^μ`; 1 = none).
+        key:
+          type: string
+          description: 'Configuration class: engine|method|PEFT|GPU.'
+        n:
+          type: integer
+          format: int32
+          description: Finished runs of this class.
+          minimum: 0
+        spread:
+          type: number
+          format: double
+          description: Spread of the measurements (standard deviation of the log ratio).
     CallbackRequest:
       type: object
       description: Finish a sign-in with the code from the callback.
@@ -3037,6 +3157,34 @@ components:
           - 'null'
           format: date-time
           description: Last verified.
+    Confidence:
+      type: string
+      description: How far an estimate can be trusted (Doc 07 §6.11).
+      enum:
+      - high
+      - medium
+      - low
+    ConfigChange:
+      type: object
+      description: One setting the preflight changed, and why.
+      required:
+      - path
+      - from
+      - to
+      - why
+      properties:
+        from:
+          type: object
+          description: The value before (null when unset).
+        path:
+          type: string
+          description: JSON Pointer into the config, like `/engine/gradient_checkpointing`.
+        to:
+          type: object
+          description: The value after.
+        why:
+          type: string
+          description: Why, in plain words.
     CopyInfo:
       type: object
       description: A saved copy (metadata only).
@@ -3377,6 +3525,26 @@ components:
         version:
           type: string
           description: Adapter version.
+    EstimateRange:
+      type: object
+      description: A low–expected–high range.
+      required:
+      - lo
+      - expected
+      - hi
+      properties:
+        expected:
+          type: number
+          format: double
+          description: Most likely value.
+        hi:
+          type: number
+          format: double
+          description: High end.
+        lo:
+          type: number
+          format: double
+          description: Low end.
     Experiment:
       type: object
       description: An experiment, as the API shows it.
@@ -3569,6 +3737,13 @@ components:
         status:
           type: string
           description: '`ok`.'
+    IssueSeverity:
+      type: string
+      description: How serious an issue is.
+      enum:
+      - error
+      - warning
+      - info
     Job:
       type: object
       description: A job, as the API shows it.
@@ -3835,6 +4010,13 @@ components:
           - $ref: '#/components/schemas/UserInfo'
             description: The person (absent for an unknown principal).
           - type: 'null'
+    MemoryKind:
+      type: string
+      description: Which memory a machine check is about.
+      enum:
+      - gpu
+      - unified
+      - system
     MetricPointView:
       type: object
       description: One point of a query answer.
@@ -5205,6 +5387,32 @@ components:
             The ticket: `PUT` its `url` (the server's `/api/v1/transfer/{ticket}`, so
             `presigned` is false on every backend) with exactly the part's bytes. It expires after
             10 minutes and allows this one part's key and size.
+    PhaseComparison:
+      type: object
+      description: Estimated vs measured for one phase.
+      required:
+      - phase
+      properties:
+        actual_peak_gib:
+          type:
+          - number
+          - 'null'
+          format: double
+          description: Highest per-GPU peak measured in this phase (process peak, else reserved), GiB.
+        estimate_gib:
+          oneOf:
+          - $ref: '#/components/schemas/EstimateRange'
+            description: Estimated GPU memory per GPU, GiB (the run-wide estimate).
+          - type: 'null'
+        phase:
+          type: string
+          description: Phase.
+        ratio:
+          type:
+          - number
+          - 'null'
+          format: double
+          description: '`actual / expected`.'
     PoolView:
       type: object
       description: A pool.
@@ -5239,6 +5447,69 @@ components:
         provider_kind:
           type: string
           description: '`agent`, `kubernetes`, `slurm` or `cloud_vm`.'
+    PreflightAlternative:
+      type: object
+      description: A configuration that may fit instead.
+      required:
+      - kind
+      - message
+      properties:
+        kind:
+          type: string
+          description: '`qlora`, `smaller_model` or `machine`.'
+        message:
+          type: string
+          description: What to do, in plain words.
+        node_id:
+          type:
+          - string
+          - 'null'
+          description: The machine, for `machine`.
+    PreflightMachine:
+      type: object
+      description: One machine's answer.
+      required:
+      - node_id
+      - hostname
+      - memory
+      - capacity_gib
+      - usable_gib
+      - verdict
+      properties:
+        capacity_gib:
+          type: number
+          format: double
+          description: Memory per GPU (or all of it), GiB.
+        hostname:
+          type: string
+          description: Host name.
+        memory:
+          $ref: '#/components/schemas/MemoryKind'
+          description: Which memory was compared.
+        node_id:
+          type: string
+          description: '`node_…`.'
+        usable_gib:
+          type: number
+          format: double
+          description: What the run may use after the headroom, GiB.
+        verdict:
+          $ref: '#/components/schemas/Verdict'
+          description: This machine's verdict.
+    PreflightRequest:
+      type: object
+      description: '`POST /runs:preflight` body.'
+      required:
+      - project_id
+      - run
+      properties:
+        project_id:
+          type: string
+          description: Project, `prj_…`.
+        run:
+          type: object
+          description: The run, as for submit.
+      additionalProperties: false
     PresignRequest:
       type: object
       description: '`POST /uploads/{up}:presign` body.'
@@ -5416,6 +5687,34 @@ components:
       - exported_as
       - labelled_from
       - generated_by
+    ResourceActual:
+      type: object
+      description: One measured peak.
+      required:
+      - attempt_id
+      - device
+      - phase
+      - signal
+      - peak_gib
+      properties:
+        attempt_id:
+          type: string
+          description: '`att_…`.'
+        device:
+          type: string
+          description: GPU UUID, or empty for the whole host.
+        peak_gib:
+          type: number
+          format: double
+          description: Peak, GiB.
+        phase:
+          type: string
+          description: Phase, like `update`.
+        signal:
+          type: string
+          description: |-
+            `process_peak`, `torch_reserved_peak`, `torch_allocated_peak`, `host_rss_peak` or
+            `scratch_peak`.
     ResourceActualView:
       type: object
       description: Peak resource use of one attempt, device and phase.
@@ -5754,6 +6053,56 @@ components:
         submitted:
           type: object
           description: What was submitted (the whole request body).
+    RunEstimate:
+      type: object
+      description: An estimate as the API shows it (Doc 09 §6.5 `Estimate`).
+      required:
+      - verdict
+      - confidence
+      - assumptions
+      properties:
+        analytic_gpu_memory_gib:
+          oneOf:
+          - $ref: '#/components/schemas/EstimateRange'
+            description: The engine's own range before calibration, GiB.
+          - type: 'null'
+        assumptions:
+          type: array
+          items:
+            type: string
+          description: What the range assumes, in plain words.
+        calibration:
+          oneOf:
+          - $ref: '#/components/schemas/CalibrationView'
+            description: The correction from finished runs of the same kind.
+          - type: 'null'
+        confidence:
+          $ref: '#/components/schemas/Confidence'
+          description: '`high`, `medium` or `low`.'
+        estimate_id:
+          type:
+          - string
+          - 'null'
+          description: Id of the stored estimate (a UUID), when there is one.
+        per_gpu_memory_gib:
+          oneOf:
+          - $ref: '#/components/schemas/EstimateRange'
+            description: GPU memory per GPU, GiB, after calibration.
+          - type: 'null'
+        total_steps:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Planned optimizer steps.
+        verdict:
+          $ref: '#/components/schemas/Verdict'
+          description: '`fits`, `tight`, `does_not_fit` or `unknown`.'
+        wall_seconds:
+          oneOf:
+          - $ref: '#/components/schemas/EstimateRange'
+            description: Wall time, seconds.
+          - type: 'null'
     RunKind:
       type: string
       description: Run kinds (other job kinds have no run).
@@ -5786,6 +6135,44 @@ components:
           items:
             $ref: '#/components/schemas/MetricSeriesView'
           description: Every series, oldest first.
+    RunPreflight:
+      type: object
+      description: The preflight answer.
+      required:
+      - verdict
+      - message
+      - machines
+      - changes
+      - alternatives
+      properties:
+        alternatives:
+          type: array
+          items:
+            $ref: '#/components/schemas/PreflightAlternative'
+          description: 'For `does_not_fit`: what may fit instead.'
+        changes:
+          type: array
+          items:
+            $ref: '#/components/schemas/ConfigChange'
+          description: 'For `tight`: the safety settings applied (already in the returned config).'
+        machines:
+          type: array
+          items:
+            $ref: '#/components/schemas/PreflightMachine'
+          description: Every connected machine that could run this, with its own verdict.
+        message:
+          type: string
+          description: What happens next, in plain words.
+        probe_steps:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: 'For `unknown`: the run''s first steps are measured, then the app decides.'
+          minimum: 0
+        verdict:
+          $ref: '#/components/schemas/Verdict'
+          description: '`fits`, `tight`, `does_not_fit` or `unknown`.'
     RunProgressView:
       type: object
       description: The run's latest progress report.
@@ -5829,6 +6216,32 @@ components:
           type: string
           format: date-time
           description: When it arrived.
+    RunResources:
+      type: object
+      description: '`GET /runs/{run}/resources`.'
+      required:
+      - run_id
+      - phases
+      - actual
+      properties:
+        actual:
+          type: array
+          items:
+            $ref: '#/components/schemas/ResourceActual'
+          description: Every measured peak of every attempt.
+        estimate:
+          oneOf:
+          - $ref: '#/components/schemas/RunEstimate'
+            description: The estimate of the run's config, if one was made (`runs:validate`).
+          - type: 'null'
+        phases:
+          type: array
+          items:
+            $ref: '#/components/schemas/PhaseComparison'
+          description: 'Per phase: the estimate next to the measured peak.'
+        run_id:
+          type: string
+          description: '`run_…`.'
     RunSubmission:
       type: object
       description: '`POST /projects/{prj}/runs` body.'
@@ -6469,6 +6882,84 @@ components:
         id:
           type: string
           description: '`usr_…`.'
+    ValidateIssue:
+      type: object
+      description: One finding (Doc 09 §6.5).
+      required:
+      - severity
+      - code
+      - message
+      - hint
+      properties:
+        code:
+          type: string
+          description: Guidance code, like `MRL-CAP-250`.
+        hint:
+          type: string
+          description: What to do.
+        message:
+          type: string
+          description: What was found, in plain words.
+        path:
+          type:
+          - string
+          - 'null'
+          description: JSON Pointer into the submission, like `/config/engine/optim`.
+        severity:
+          $ref: '#/components/schemas/IssueSeverity'
+          description: '`error`, `warning` or `info`.'
+    ValidateResponse:
+      type: object
+      description: '`POST /projects/{prj}/runs:validate` answer (Doc 09 §6.5).'
+      required:
+      - ok
+      - issues
+      - resolved_config
+      - estimate
+      - checked
+      properties:
+        checked:
+          type: string
+          description: 'How far the checks went: `l0` (the app''s) or `l1` (also on a machine).'
+        engine_version_id:
+          type:
+          - string
+          - 'null'
+          description: The engine version the run would use (`engine_versions.id`).
+        estimate:
+          $ref: '#/components/schemas/RunEstimate'
+          description: Memory estimate with its verdict and confidence.
+        issues:
+          type: array
+          items:
+            $ref: '#/components/schemas/ValidateIssue'
+          description: 'Every finding: the app''s checks (L0), the machine''s (L1) and the preflight.'
+        ok:
+          type: boolean
+          description: 'True when no issue is an error: submitting this would queue the run.'
+        preflight:
+          oneOf:
+          - $ref: '#/components/schemas/RunPreflight'
+            description: The Guardian preflight; absent when the settings have errors.
+          - type: 'null'
+        preset:
+          type:
+          - string
+          - 'null'
+          description: The preset applied, if any.
+        resolved_config:
+          type: object
+          description: |-
+            The config the run would get (preset, settings, defaults, and any safety settings
+            the preflight applied). Submit this to get the same run.
+    Verdict:
+      type: string
+      description: The four preflight verdicts (Doc 24 §3).
+      enum:
+      - fits
+      - tight
+      - does_not_fit
+      - unknown
     Workspace:
       type: object
       description: A workspace.

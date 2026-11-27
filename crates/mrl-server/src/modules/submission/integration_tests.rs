@@ -1,0 +1,1021 @@
+//! P28 end-to-end tests: a real server (gateway, scheduler, runs, submission) on a test
+//! database with the TRL engine registered, and in-process agents with fake GPUs whose
+//! dry runs are scripted (they answer `Prepared` like the worker would, over the real
+//! protocol). Compiled by mrl-testkit under its P28 marker; they need PostgreSQL
+//! (`just test-integration`).
+
+use crate::agent::gateway::{fast_config, server_config, TestAgent};
+use crate::engines::TinyFixture;
+use crate::pg::TestDb;
+use crate::seams::InMemorySecretStore;
+use crate::server::{TestResponse, TestServer, TEST_SECRET};
+use axum::body::Body;
+use axum::http::Method;
+use mrl_agent::hw::{GpuDevice, GpuVendor};
+use mrl_agent::session::{CommandHandler, Link};
+use mrl_domain::capability::manifest::Bundle;
+use mrl_domain::ids::{AttemptId, NodeId, PoolId, ProjectId, RunId};
+use mrl_proto::agent::v1::agent_message::Body as Msg;
+use mrl_proto::agent::v1::command::Kind;
+use mrl_proto::agent::v1::{AgentMessage, AttemptPhase, AttemptStatus, Command, WorkerRelay};
+use mrl_proto::common::v1::{AttemptRef, Failure};
+use mrl_proto::worker::v1::worker_message::Body as WorkerBody;
+use mrl_proto::worker::v1::{ExitKind, Prepared, ResourceEstimate, WorkerMessage};
+use mrl_server::config::Mode;
+use mrl_server::modules::artifacts::ArtifactsModule;
+use mrl_server::modules::compute::LocalAgentPool;
+use mrl_server::modules::engines::launch::EngineRuntime;
+use mrl_server::modules::engines::CapabilityValidator;
+use mrl_server::modules::estimates::Calibrate;
+use mrl_server::modules::events::EventConsumer;
+use mrl_server::modules::jobs::{Chains, Projects, SchemaChecks};
+use mrl_server::modules::nodes::lanes::{LaneItem, LaneKind, LaneRouter};
+use mrl_server::modules::nodes::NodesModule;
+use mrl_server::modules::scheduler::admission::{MaxQueuedPerProject, PoolFlags, PoolMembership};
+use mrl_server::modules::scheduler::launch::{RunConfigSpec, Transfer};
+use mrl_server::modules::scheduler::pipeline::Pipeline;
+use mrl_server::modules::scheduler::placement::SingleNodePacking;
+use mrl_server::modules::scheduler::{SchedulerConfig, SchedulerModule};
+use mrl_server::modules::submission::policy::{Guardian, MethodPolicy};
+use mrl_server::modules::submission::probe::{self, PreparedSink, ProbeLaunch, ProbeVerifier};
+use mrl_server::modules::submission::resolve::Presets;
+use mrl_server::modules::submission::{SubmissionConfig, SubmissionModule};
+use mrl_server::modules::telemetry::MetricObservers;
+use mrl_server::seams::{SecretStore, LAUNCH_SECRET_HEADER};
+use serde_json::{json, Value};
+use std::str::FromStr;
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+use uuid::Uuid;
+
+const WAIT: Duration = Duration::from_secs(60);
+const TRL: &str = include_str!("../../../engines/first_party/trl.json");
+
+/// How a scripted machine answers a dry-run launch.
+#[derive(Clone)]
+enum Answer {
+    /// `Prepared{ok, estimate lo..hi GiB}`, then `DRY_RUN_OK`.
+    Estimate(f64, f64),
+    /// Takes the launch and never answers.
+    Silent,
+}
+
+struct Script {
+    link: Arc<Link>,
+    answer: Mutex<Answer>,
+    running: Mutex<Vec<AttemptRef>>,
+}
+
+fn status(r: &AttemptRef, phase: AttemptPhase, exit: ExitKind) -> AttemptStatus {
+    AttemptStatus {
+        attempt: Some(r.clone()),
+        phase: phase as i32,
+        exit_kind: exit as i32,
+        time: Some(prost_types::Timestamp::default()),
+        ..AttemptStatus::default()
+    }
+}
+
+fn prepared(r: &AttemptRef, lo: f64, hi: f64) -> Msg {
+    Msg::Worker(WorkerRelay {
+        attempt: Some(r.clone()),
+        role_id: "trainer".into(),
+        message: Some(WorkerMessage {
+            seq: 1,
+            sent_at: None,
+            body: Some(WorkerBody::Prepared(Prepared {
+                ok: true,
+                issues: vec![],
+                estimate: Some(ResourceEstimate {
+                    gpu_mem_gib_lo: lo,
+                    gpu_mem_gib_hi: hi,
+                    total_steps: 120,
+                    wall_seconds_lo: 300.0,
+                    wall_seconds_hi: 600.0,
+                    assumptions: vec!["sequence length 1024, micro-batch 4".into()],
+                }),
+                effective_config_sha256: String::new(),
+            })),
+        }),
+    })
+}
+
+impl Script {
+    fn send(&self, m: Msg) {
+        self.link.send_control(m).unwrap();
+    }
+
+    fn publish(&self) {
+        self.link.set_running(self.running.lock().unwrap().clone());
+    }
+}
+
+struct Handler(Arc<Script>);
+
+#[async_trait::async_trait]
+impl CommandHandler for Handler {
+    async fn handle(&self, c: Command) -> Result<(), Failure> {
+        let s = &self.0;
+        match c.kind {
+            Some(Kind::LaunchAttempt(l)) => {
+                let r = l.attempt.clone().unwrap_or_default();
+                let answer = s.answer.lock().unwrap().clone();
+                if !l.dry_run {
+                    // A real run: it starts and keeps running.
+                    s.running.lock().unwrap().push(r.clone());
+                    s.publish();
+                    s.send(Msg::AttemptStatus(status(
+                        &r,
+                        AttemptPhase::Staging,
+                        ExitKind::Unspecified,
+                    )));
+                    s.send(Msg::AttemptStatus(status(
+                        &r,
+                        AttemptPhase::Running,
+                        ExitKind::Unspecified,
+                    )));
+                    return Ok(());
+                }
+                assert!(
+                    l.job_spec_json.contains("\"algorithm\":\"sft\""),
+                    "the probe carries the resolved config: {}",
+                    l.job_spec_json
+                );
+                if let Answer::Estimate(lo, hi) = answer {
+                    s.send(Msg::AttemptStatus(status(
+                        &r,
+                        AttemptPhase::Staging,
+                        ExitKind::Unspecified,
+                    )));
+                    s.send(prepared(&r, lo, hi));
+                    s.send(Msg::AttemptStatus(status(
+                        &r,
+                        AttemptPhase::Exited,
+                        ExitKind::DryRunOk,
+                    )));
+                } else {
+                    s.running.lock().unwrap().push(r.clone());
+                    s.publish();
+                }
+                Ok(())
+            }
+            Some(Kind::CancelAttempt(x)) => {
+                let r = x.attempt.unwrap_or_default();
+                let known = {
+                    let mut running = s.running.lock().unwrap();
+                    let before = running.len();
+                    running.retain(|a| a.attempt_id != r.attempt_id);
+                    running.len() != before
+                };
+                if known {
+                    s.publish();
+                    s.send(Msg::AttemptStatus(status(
+                        &r,
+                        AttemptPhase::Exited,
+                        ExitKind::Cancelled,
+                    )));
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+}
+
+struct Machine {
+    _agent: TestAgent,
+    _running: crate::agent::gateway::Running,
+    node: Uuid,
+    _script: Arc<Script>,
+}
+
+struct World {
+    server: TestServer,
+    db: TestDb,
+    pool: Uuid,
+    project: ProjectId,
+    fixture: TinyFixture,
+    lanes: Arc<LaneRouter>,
+    _objects: tempfile::TempDir,
+}
+
+fn sched_config() -> SchedulerConfig {
+    SchedulerConfig {
+        tick_seconds: 1,
+        lease_grace_seconds: 1,
+        outage_threshold_seconds: 5,
+        launch_deadline_seconds: 60,
+        ..SchedulerConfig::default()
+    }
+}
+
+impl World {
+    async fn start(probe_timeout_seconds: u64) -> Self {
+        let db = TestDb::new().await;
+        let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
+        let objects = tempfile::tempdir().unwrap();
+        let mut gateway = fast_config();
+        gateway.min_disk_free_bytes = 0;
+        let mut cfg = server_config(gateway, Mode::Solo, 0);
+        cfg.object_store.url = Some(
+            reqwest::Url::from_directory_path(objects.path().join("objects"))
+                .unwrap()
+                .into(),
+        );
+        let trl = Bundle::parse(TRL).unwrap();
+        mrl_server::modules::engines::store::register(db.db(), &[&trl], false)
+            .await
+            .unwrap();
+        // Probes passed on CPU and NVIDIA (P24 checks them before a run may queue).
+        db.seed(
+            "UPDATE engine_versions SET status = 'ENABLED',
+               probe_results = '{\"cpu\": {\"status\": \"ENABLED\"}, \"nvidia\": {\"status\": \"ENABLED\"}}'",
+        )
+        .await;
+        let lanes = LaneRouter::new();
+        let artifacts = ArtifactsModule::with_backend(
+            db.db().clone(),
+            mrl_storage::BackendConfig::Local {
+                root: objects.path().join("objects"),
+            },
+            Mode::Solo,
+            objects.path().join("scratch"),
+        );
+        let transfer = Transfer::new(artifacts.store(), artifacts.secrets(), secrets.clone());
+        let nodes = NodesModule::new(db.db().clone(), &cfg, secrets.clone(), lanes.clone());
+        let gw = nodes.gateway();
+        let d = db.db().clone();
+        let fixture = TinyFixture::default();
+        let chains = Chains::new(
+            vec![
+                Arc::new(SchemaChecks),
+                Arc::new(CapabilityValidator::with_records(
+                    d.clone(),
+                    fixture.records(),
+                )),
+                Arc::new(MethodPolicy::new(d.clone())),
+                Arc::new(Guardian::new(d.clone())),
+            ],
+            vec![Arc::new(ProbeVerifier)],
+            vec![Arc::new(Presets::new(d.clone()))],
+        );
+        let pipeline = Pipeline::new(
+            vec![
+                Arc::new(PoolMembership),
+                Arc::new(PoolFlags),
+                Arc::new(MaxQueuedPerProject { max: 100 }),
+            ],
+            vec![Arc::new(SingleNodePacking)],
+            vec![
+                Arc::new(RunConfigSpec::new(d.clone())),
+                Arc::new(EngineRuntime::new(d.clone())),
+                Arc::new(ProbeLaunch::new(d.clone())),
+            ],
+            vec![],
+            vec![Arc::new(LocalAgentPool::new(d.clone()))],
+        );
+        let sched = SchedulerModule::with_parts(
+            d.clone(),
+            sched_config(),
+            &gw,
+            &lanes,
+            chains.clone(),
+            pipeline,
+            transfer,
+        );
+        let submission = SubmissionModule::with(
+            d.clone(),
+            SubmissionConfig {
+                probe_timeout_seconds,
+                ..SubmissionConfig::default()
+            },
+            chains.clone(),
+            Projects::default(),
+            &lanes,
+            &MetricObservers::new(),
+        );
+        let modules: Vec<Box<dyn mrl_server::app::ServerModule>> = vec![
+            Box::new(nodes),
+            Box::new(artifacts),
+            Box::new(sched),
+            Box::new(mrl_server::modules::runs::RunsModule::with_chains(
+                d, chains,
+            )),
+            Box::new(submission),
+        ];
+        let seams = crate::seams::build(
+            crate::seams::solo(TEST_SECRET).secrets_arc(secrets),
+            Mode::Solo,
+        );
+        let server = match TestServer::start(cfg, seams, modules).await {
+            Ok(s) => s,
+            Err(e) => panic!("server did not start: {}", e.explain()),
+        };
+        let mut w = Self {
+            server,
+            db,
+            pool: Uuid::nil(),
+            project: ProjectId::new(),
+            fixture,
+            lanes,
+            _objects: objects,
+        };
+        let r = w
+            .call(
+                Method::POST,
+                "/api/v1/pools",
+                json!({"name": "gpus", "attempt_lease_ttl_seconds": 10}),
+            )
+            .await;
+        assert_eq!(r.status, 201, "pool: {}", r.text());
+        w.pool = PoolId::from_str(r.json()["id"].as_str().unwrap())
+            .unwrap()
+            .as_uuid();
+        w
+    }
+
+    async fn call(&self, method: Method, path: &str, body: Value) -> TestResponse {
+        self.call_with(method, path, body, &[]).await
+    }
+
+    async fn call_with(
+        &self,
+        method: Method,
+        path: &str,
+        body: Value,
+        extra: &[(&str, &str)],
+    ) -> TestResponse {
+        let mut headers = vec![
+            (LAUNCH_SECRET_HEADER, TEST_SECRET),
+            ("content-type", "application/json"),
+        ];
+        headers.extend_from_slice(extra);
+        let body = if body.is_null() {
+            Body::empty()
+        } else {
+            Body::from(body.to_string())
+        };
+        self.server.request(method, path, &headers, body).await
+    }
+
+    fn pool(&self) -> &sqlx::PgPool {
+        self.db.pool()
+    }
+
+    /// A machine with one fake NVIDIA GPU of `gib` GiB that answers dry runs with `answer`.
+    /// Its platform reads as Linux (the TRL CUDA runtime is Linux-only) on every host.
+    async fn machine(&self, gib: u64, answer: Answer) -> Machine {
+        let agent = TestAgent::new(0, |_| {});
+        agent.hw.add_device(GpuDevice {
+            index: 0,
+            backend: "fake".into(),
+            vendor: GpuVendor::Nvidia,
+            uuid: format!("GPU-fake-{gib}g-{}", Uuid::now_v7()),
+            model: format!("Fake {gib} GB"),
+            compute_capability: Some("8.6".into()),
+            memory_total_bytes: gib << 30,
+            memory_free_bytes: gib << 30,
+            driver_version: Some("fake-1.0".into()),
+            cuda_version: Some("13.0".into()),
+            ecc_enabled: None,
+            pci_bus_id: Some("00000000:01:00.0".into()),
+            nvlink_peers: vec![],
+            mig: None,
+            experimental: false,
+        });
+        let r = self
+            .call(
+                Method::POST,
+                &format!(
+                    "/api/v1/pools/{}/enrollment-tokens",
+                    PoolId::from_uuid(self.pool)
+                ),
+                json!({}),
+            )
+            .await;
+        assert_eq!(r.status, 201, "token: {}", r.text());
+        let token = r.json()["token"].as_str().unwrap().to_owned();
+        let grpc = self.server.running().grpc_addr().expect("grpc listener");
+        let node = mrl_agent::enroll::enroll_dial(
+            &agent.ctx,
+            &grpc.to_string(),
+            &token,
+            mrl_agent::transports::TransportKind::Direct,
+            false,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("enroll: {}", e.explain()))
+        .link
+        .node_id;
+        let node = NodeId::from_str(&node).unwrap().as_uuid();
+        let link = Link::of(&agent.ctx).unwrap();
+        let script = Arc::new(Script {
+            link: link.clone(),
+            answer: Mutex::new(answer),
+            running: Mutex::default(),
+        });
+        for kind in [
+            "LaunchAttempt",
+            "CancelAttempt",
+            "StageArtifacts",
+            "UpdateCredentials",
+        ] {
+            link.register(kind, Arc::new(Handler(script.clone())));
+        }
+        let running = agent.run();
+        until("the machine is online with its GPU", || async {
+            sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS (SELECT 1 FROM compute_nodes n JOIN gpu_devices g ON g.node_id = n.id
+                  WHERE n.id = $1 AND n.status = 'ONLINE')",
+            )
+            .bind(node)
+            .fetch_one(self.pool())
+            .await
+            .unwrap()
+        })
+        .await;
+        // The inventory is sent once per connection, so this stays.
+        sqlx::query(
+            "UPDATE compute_nodes SET inventory = jsonb_set(jsonb_set(inventory, '{platform}',
+               '\"PLATFORM_LINUX\"'), '{arch}', '\"x86_64\"') WHERE id = $1",
+        )
+        .bind(node)
+        .execute(self.pool())
+        .await
+        .unwrap();
+        Machine {
+            _agent: agent,
+            _running: running,
+            node,
+            _script: script,
+        }
+    }
+
+    async fn validate(&self, body: Value) -> Value {
+        let r = self
+            .call(
+                Method::POST,
+                &format!("/api/v1/projects/{}/runs:validate", self.project),
+                body,
+            )
+            .await;
+        assert_eq!(r.status, 200, "validate: {}", r.text());
+        r.json()
+    }
+
+    async fn count(&self, sql: &str) -> i64 {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(sql.to_owned()))
+            .fetch_one(self.pool())
+            .await
+            .unwrap()
+    }
+}
+
+async fn until<F, Fut>(what: &str, f: F)
+where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + WAIT;
+    while !f().await {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// The TRL SFT LoRA preset on the tiny fixture, on one NVIDIA GPU.
+fn sft(f: &TinyFixture, nodes: &[Uuid]) -> Value {
+    let nodes: Vec<String> = nodes
+        .iter()
+        .map(|n| NodeId::from_uuid(*n).to_string())
+        .collect();
+    json!({
+        "name": "sft-lora",
+        "algorithm_id": "sft",
+        "base_model_version_id": f.model.to_string(),
+        "dataset_version_ids": [f.dataset.to_string()],
+        "config": {"preset": "sft-lora-beginner"},
+        "resources": {"roles": [{"role": "trainer", "replicas": 1, "gpu_count": 1,
+            "gpu": {"vendor": "nvidia"}, "node_ids": nodes,
+            "cpu_millis": 1000, "mem_bytes": 1u64 << 30}]}
+    })
+}
+
+fn codes(v: &Value) -> Vec<String> {
+    v["issues"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["code"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn validate_without_machines_answers_from_the_app_alone() {
+    let w = World::start(60).await;
+    let f = w.fixture;
+    let v = w.validate(sft(&f, &[])).await;
+    assert_eq!(v["ok"], false, "{v}");
+    assert_eq!(v["checked"], "l0");
+    assert!(
+        codes(&v).contains(&"MRL-CAP-245".to_owned()),
+        "no machine of this kind: {v}"
+    );
+    assert_eq!(v["estimate"]["verdict"], "unknown");
+    // The preset, the schema's defaults, and the engine pinned.
+    let cfg = &v["resolved_config"];
+    assert_eq!(cfg["common"]["update"]["lora"]["r"], 8, "{cfg}");
+    assert_eq!(cfg["engine"]["learning_rate"], 0.0002);
+    assert_eq!(cfg["engine"]["logging_steps"], 10, "a default");
+    assert!(cfg["common"]["engine"]
+        .as_str()
+        .unwrap()
+        .starts_with("trl@"));
+    assert!(cfg.get("preset").is_none());
+    assert_eq!(v["preset"], "sft-lora-beginner");
+    // No side effects: no run, no job.
+    assert_eq!(w.count("SELECT count(*) FROM runs").await, 0);
+    assert_eq!(w.count("SELECT count(*) FROM jobs").await, 0);
+    // An unknown preset is a field problem, not a server error.
+    let mut bad = sft(&f, &[]);
+    bad["config"]["preset"] = json!("no-such-preset");
+    let v = w.validate(bad).await;
+    assert_eq!(codes(&v), ["MRL-VAL-280"], "{v}");
+    // A malformed or missing project answers 404 before anything runs.
+    let r = w
+        .call(
+            Method::POST,
+            "/api/v1/projects/prj_bad/runs:validate",
+            sft(&f, &[]),
+        )
+        .await;
+    assert_eq!(r.status, 404, "{}", r.text());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn dry_run_fits_24_gb_and_not_4_gb_and_submit_agrees() {
+    let w = World::start(60).await;
+    let f = w.fixture;
+    let big = w.machine(24, Answer::Estimate(6.0, 9.0)).await;
+    let small = w.machine(4, Answer::Estimate(6.0, 9.0)).await;
+    let v = w.validate(sft(&f, &[big.node])).await;
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["checked"], "l1");
+    assert_eq!(v["estimate"]["verdict"], "fits");
+    assert_eq!(v["estimate"]["confidence"], "low");
+    assert_eq!(
+        v["estimate"]["per_gpu_memory_gib"],
+        json!({"lo": 6.0, "expected": 7.5, "hi": 9.0})
+    );
+    assert_eq!(v["estimate"]["total_steps"], 120);
+    assert_eq!(v["preflight"]["machines"][0]["usable_gib"], 21.6);
+    let v4 = w.validate(sft(&f, &[small.node])).await;
+    assert_eq!(v4["ok"], false, "{v4}");
+    assert_eq!(v4["estimate"]["verdict"], "does_not_fit");
+    assert!(codes(&v4).contains(&"MRL-CAP-280".to_owned()), "{v4}");
+    let kinds: Vec<&str> = v4["preflight"]["alternatives"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["qlora", "smaller_model", "machine"], "{v4}");
+    assert_eq!(
+        v4["preflight"]["alternatives"][2]["node_id"],
+        NodeId::from_uuid(big.node).to_string()
+    );
+    // The probe jobs are internal: no run, and they complete.
+    assert_eq!(w.count("SELECT count(*) FROM runs").await, 0);
+    until("both probes completed", || async {
+        w.count("SELECT count(*) FROM jobs WHERE state = 'COMPLETED' AND run_id IS NULL")
+            .await
+            == 2
+    })
+    .await;
+    // Submit with the resolved config: the same estimate is found. On the small machine
+    // the Guardian refuses it; on the big one it queues.
+    let mut on_small = sft(&f, &[small.node]);
+    on_small["config"] = v["resolved_config"].clone();
+    let r = w
+        .call_with(
+            Method::POST,
+            &format!("/api/v1/projects/{}/runs", w.project),
+            on_small,
+            &[("idempotency-key", "small")],
+        )
+        .await;
+    assert_eq!(r.status, 201, "{}", r.text());
+    assert_eq!(r.json()["state"], "REJECTED", "{}", r.text());
+    assert_eq!(
+        r.json()["state_reason"]["problems"][0]["code"],
+        "MRL-CAP-280"
+    );
+    let mut on_big = sft(&f, &[big.node]);
+    on_big["config"] = v["resolved_config"].clone();
+    let r = w
+        .call_with(
+            Method::POST,
+            &format!("/api/v1/projects/{}/runs", w.project),
+            on_big,
+            &[("idempotency-key", "big")],
+        )
+        .await;
+    assert_eq!(r.status, 201, "{}", r.text());
+    assert_ne!(r.json()["state"], "REJECTED", "{}", r.text());
+    let run = RunId::from_str(r.json()["id"].as_str().unwrap()).unwrap();
+    // It runs on the big machine; inject the measured peaks of its attempt.
+    until("the run is running", || async {
+        w.count(&format!(
+            "SELECT count(*) FROM jobs WHERE run_id = '{}' AND state = 'RUNNING'",
+            run.as_uuid()
+        ))
+        .await
+            == 1
+    })
+    .await;
+    let (job, attempt): (Uuid, Uuid) =
+        sqlx::query_as("SELECT id, current_attempt_id FROM jobs WHERE run_id = $1")
+            .bind(run.as_uuid())
+            .fetch_one(w.pool())
+            .await
+            .unwrap();
+    let device: String =
+        sqlx::query_scalar("SELECT device_uuid FROM gpu_devices WHERE node_id = $1")
+            .bind(big.node)
+            .fetch_one(w.pool())
+            .await
+            .unwrap();
+    for (phase, signal, gib) in [
+        ("update", "process_peak", 9.0),
+        ("update", "torch_reserved_peak", 8.0),
+        ("eval", "process_peak", 5.0),
+    ] {
+        sqlx::query(
+            "INSERT INTO resource_actuals (attempt_id, org_id, run_id, device, phase, signal, peak)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(attempt)
+        .bind(Uuid::nil())
+        .bind(run.as_uuid())
+        .bind(&device)
+        .bind(phase)
+        .bind(signal)
+        .bind(gib * f64::from(1u32 << 30))
+        .execute(w.pool())
+        .await
+        .unwrap();
+    }
+    let r = w
+        .call(
+            Method::GET,
+            &format!("/api/v1/runs/{run}/resources"),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(r.status, 200, "{}", r.text());
+    let res = r.json();
+    assert_eq!(res["estimate"]["verdict"], "fits", "{res}");
+    let update = res["phases"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["phase"] == "update")
+        .unwrap();
+    assert_eq!(update["actual_peak_gib"], 9.0);
+    assert_eq!(update["ratio"], 1.2);
+    assert_eq!(res["actual"].as_array().unwrap().len(), 3);
+    // Completing the run adds one calibration sample, once.
+    let event = mrl_server::modules::events::Event {
+        id: 0,
+        event_id: Uuid::now_v7(),
+        org_id: None,
+        aggregate_kind: "job".into(),
+        aggregate_id: job,
+        aggregate_seq: 9,
+        event_type: "job.completed".into(),
+        schema_version: 1,
+        payload: json!({}),
+        trace_context: None,
+        created_at: time::OffsetDateTime::now_utc(),
+        xid: 0,
+    };
+    for _ in 0..2 {
+        let mut tx = w.db.db().begin().await.unwrap();
+        Calibrate.handle(&mut tx, &event).await.unwrap();
+        tx.commit().await.unwrap();
+    }
+    let (n, sum): (i32, f64) = sqlx::query_as("SELECT n, sum_ln FROM estimator_calibration")
+        .fetch_one(w.pool())
+        .await
+        .unwrap();
+    assert_eq!(n, 1, "one sample per attempt");
+    assert!((sum - 1.2f64.ln()).abs() < 1e-9, "{sum}");
+    // The resume check: a checkpoint of another method can't be resumed.
+    sqlx::query("UPDATE runs SET algorithm_id = 'cpt' WHERE id = $1")
+        .bind(run.as_uuid())
+        .execute(w.pool())
+        .await
+        .unwrap();
+    let ckpt = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO checkpoints (id, org_id, storage_org, run_id, job_id, attempt_id,
+           attempt_epoch, global_step, kind, layout, state)
+         VALUES ($1, $2, 'local', $3, $4, $5, 1, 10, 'adapter_only', 'hf-trainer-v1', 'COMMITTED')",
+    )
+    .bind(ckpt)
+    .bind(Uuid::nil())
+    .bind(run.as_uuid())
+    .bind(job)
+    .bind(attempt)
+    .execute(w.pool())
+    .await
+    .unwrap();
+    let mut branch = sft(&f, &[big.node]);
+    branch["parent_checkpoint_id"] =
+        json!(mrl_domain::ids::CheckpointId::from_uuid(ckpt).to_string());
+    let v = w.validate(branch).await;
+    assert!(codes(&v).contains(&"MRL-CAP-281".to_owned()), "{v}");
+    // Probe mode: a run with no estimate of its config starts; once its first steps measure
+    // a peak above the GPU's usable memory it is cancelled. Below it, it goes on.
+    let mut unmeasured = sft(&f, &[small.node]);
+    unmeasured["config"] = v["resolved_config"].clone();
+    unmeasured["config"]["engine"]["num_train_epochs"] = json!(3);
+    let r = w
+        .call_with(
+            Method::POST,
+            &format!("/api/v1/projects/{}/runs", w.project),
+            unmeasured,
+            &[("idempotency-key", "unmeasured")],
+        )
+        .await;
+    assert_eq!(r.status, 201, "{}", r.text());
+    assert_ne!(
+        r.json()["state"],
+        "REJECTED",
+        "no estimate: unknown, not refused"
+    );
+    let probe_run = RunId::from_str(r.json()["id"].as_str().unwrap()).unwrap();
+    until("the unmeasured run is running", || async {
+        w.count(&format!(
+            "SELECT count(*) FROM jobs WHERE run_id = '{}' AND state = 'RUNNING'",
+            probe_run.as_uuid()
+        ))
+        .await
+            == 1
+    })
+    .await;
+    let attempt: Uuid = sqlx::query_scalar("SELECT current_attempt_id FROM jobs WHERE run_id = $1")
+        .bind(probe_run.as_uuid())
+        .fetch_one(w.pool())
+        .await
+        .unwrap();
+    let device: String =
+        sqlx::query_scalar("SELECT device_uuid FROM gpu_devices WHERE node_id = $1")
+            .bind(small.node)
+            .fetch_one(w.pool())
+            .await
+            .unwrap();
+    let guard = mrl_server::modules::preflight::ProbeModeGuard::new(
+        w.db.db().clone(),
+        mrl_server::modules::preflight::Headroom::default(),
+        5,
+    );
+    let peak = |gib: f64| {
+        sqlx::query(
+            "INSERT INTO resource_actuals (attempt_id, org_id, run_id, device, phase, signal, peak)
+             VALUES ($1, $2, $3, $4, 'update', 'process_peak', $5)
+             ON CONFLICT (attempt_id, device, phase, signal) DO UPDATE SET peak = EXCLUDED.peak",
+        )
+        .bind(attempt)
+        .bind(Uuid::nil())
+        .bind(probe_run.as_uuid())
+        .bind(device.clone())
+        .bind(gib * f64::from(1u32 << 30))
+        .execute(w.pool())
+    };
+    peak(3.0).await.unwrap();
+    assert!(
+        !guard.decide(probe_run.as_uuid(), attempt).await.unwrap(),
+        "3 of 3.6 GiB usable"
+    );
+    peak(3.9).await.unwrap();
+    assert!(
+        guard.decide(probe_run.as_uuid(), attempt).await.unwrap(),
+        "over the usable memory"
+    );
+    assert!(
+        !guard.decide(probe_run.as_uuid(), attempt).await.unwrap(),
+        "decided once"
+    );
+    assert_eq!(
+        w.count(&format!(
+            "SELECT count(*) FROM jobs WHERE run_id = '{}' AND state IN ('CANCELLING', 'CANCELLED')",
+            probe_run.as_uuid()
+        ))
+        .await,
+        1
+    );
+    // The measured run (with an estimate) is left alone even when it is close.
+    assert!(!guard
+        .decide(run.as_uuid(), job_attempt(&w, run).await)
+        .await
+        .unwrap());
+}
+
+async fn job_attempt(w: &World, run: RunId) -> Uuid {
+    sqlx::query_scalar("SELECT current_attempt_id FROM jobs WHERE run_id = $1")
+        .bind(run.as_uuid())
+        .fetch_one(w.pool())
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn a_probe_timeout_falls_back_to_l0_and_cancels_the_probe() {
+    let w = World::start(5).await;
+    let f = w.fixture;
+    let m = w.machine(24, Answer::Silent).await;
+    let started = tokio::time::Instant::now();
+    let v = w.validate(sft(&f, &[])).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(20),
+        "the budget holds"
+    );
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["checked"], "l0");
+    assert_eq!(codes(&v), ["MRL-CAP-282"], "{v}");
+    assert_eq!(v["issues"][0]["severity"], "info");
+    assert_eq!(v["estimate"]["verdict"], "unknown");
+    assert_eq!(v["preflight"]["probe_steps"], 5);
+    until("the probe is cancelled", || async {
+        w.count("SELECT count(*) FROM jobs WHERE state IN ('CANCELLING', 'CANCELLED')")
+            .await
+            == 1
+    })
+    .await;
+    assert_eq!(
+        w.count("SELECT count(*) FROM resource_estimates WHERE state = 'PENDING'")
+            .await,
+        1,
+        "nothing answered"
+    );
+    drop(m);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn replayed_or_foreign_answers_change_nothing() {
+    let w = World::start(60).await;
+    let m = w.machine(24, Answer::Silent).await;
+    let other = w.machine(24, Answer::Silent).await;
+    // A probe the silent machines take but never answer.
+    let engine: Uuid = sqlx::query_scalar("SELECT id FROM engine_versions LIMIT 1")
+        .fetch_one(w.pool())
+        .await
+        .unwrap();
+    let spec = probe::ProbeSpec {
+        algorithm: "sft".into(),
+        base_model_version_id: "mv_x".into(),
+        dataset_version_ids: vec![],
+        reward_version_id: None,
+        seeds: json!({}),
+        resolved: json!({"common": {}, "engine": {}}),
+    };
+    let (estimate, job) = probe::start(
+        w.db.db(),
+        &probe::NewProbe {
+            org: Uuid::nil(),
+            project: w.project.as_uuid(),
+            created_by: "test",
+            spec: &spec,
+            engine_version_id: engine,
+            estimator_version: "trl@x".into(),
+            calibration_key: "k".into(),
+            inputs_sha256: vec![0; 32],
+            max_runtime_seconds: 600,
+        },
+    )
+    .await
+    .unwrap();
+    let placed = || async {
+        sqlx::query_as::<_, (Uuid, i64, Uuid)>(
+            "SELECT a.id, a.epoch, p.node_id FROM job_attempts a
+               JOIN attempt_placements p ON p.attempt_id = a.id WHERE a.job_id = $1",
+        )
+        .bind(job)
+        .fetch_optional(w.pool())
+        .await
+        .unwrap()
+    };
+    until("the probe is placed", || async { placed().await.is_some() }).await;
+    let (attempt, epoch, node) = placed().await.unwrap();
+    let wrong = if node == m.node { other.node } else { m.node };
+    let sink = w
+        .lanes
+        .control_sink("worker.prepared")
+        .expect("the P28 sink");
+    let r = AttemptRef {
+        attempt_id: AttemptId::from_uuid(attempt).to_string(),
+        fencing_epoch: u64::try_from(epoch).unwrap(),
+        ..AttemptRef::default()
+    };
+    let item = |node: Uuid, r: &AttemptRef, lo: f64| LaneItem {
+        node_id: node,
+        session_epoch: 1,
+        lane: LaneKind::Control,
+        stream: mrl_proto::agent::v1::Lane::Control,
+        seq: 1,
+        dropped_before: 0,
+        message: AgentMessage {
+            body: Some(prepared(r, lo, lo + 1.0)),
+            ..AgentMessage::default()
+        },
+    };
+    let state = || async {
+        sqlx::query_as::<_, (String, Option<f64>)>(
+            "SELECT state, gpu_mem_lo_gib FROM resource_estimates WHERE id = $1",
+        )
+        .bind(estimate)
+        .fetch_one(w.pool())
+        .await
+        .unwrap()
+    };
+    sink.deliver(item(wrong, &r, 1.0)).await.unwrap();
+    assert_eq!(state().await, ("PENDING".into(), None), "another machine");
+    let stale = AttemptRef {
+        fencing_epoch: r.fencing_epoch + 1,
+        ..r.clone()
+    };
+    sink.deliver(item(node, &stale, 2.0)).await.unwrap();
+    assert_eq!(state().await, ("PENDING".into(), None), "another epoch");
+    sink.deliver(item(node, &r, 3.0)).await.unwrap();
+    assert_eq!(
+        state().await,
+        ("READY".into(), Some(3.0)),
+        "the right machine"
+    );
+    sink.deliver(item(node, &r, 4.0)).await.unwrap();
+    assert_eq!(
+        state().await,
+        ("READY".into(), Some(3.0)),
+        "a replay changes nothing"
+    );
+    assert!(PreparedSink::new(w.db.db().clone())
+        .store(node, attempt, epoch, &Prepared::default())
+        .await
+        .map(|changed| !changed)
+        .unwrap());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn unsupported_combinations_and_experimental_methods_are_refused() {
+    let w = World::start(60).await;
+    let f = w.fixture;
+    let _m = w.machine(24, Answer::Estimate(1.0, 2.0)).await;
+    // QLoRA on a processor-only run: P24's checks name it, nothing is probed.
+    let mut cpu = sft(&f, &[]);
+    cpu["config"] = json!({"preset": "sft-qlora-24gb"});
+    cpu["resources"]["roles"][0]["gpu_count"] = json!(0);
+    cpu["resources"]["roles"][0]["gpu"] = json!({});
+    let v = w.validate(cpu).await;
+    assert_eq!(v["ok"], false, "{v}");
+    let cap: Vec<String> = codes(&v)
+        .into_iter()
+        .filter(|c| c.starts_with("MRL-CAP-"))
+        .collect();
+    assert!(
+        !cap.is_empty() && !cap.contains(&"MRL-CAP-282".to_owned()),
+        "{v}"
+    );
+    assert_eq!(
+        w.count("SELECT count(*) FROM jobs").await,
+        0,
+        "no probe for a refused run"
+    );
+    // An experimental method needs the workspace toggle.
+    sqlx::query(
+        "UPDATE algorithm_definitions SET maturity = 'experimental' WHERE algorithm_id = 'sft'",
+    )
+    .execute(w.pool())
+    .await
+    .unwrap();
+    let v = w.validate(sft(&f, &[])).await;
+    assert!(codes(&v).contains(&"MRL-CAP-022".to_owned()), "{v}");
+    sqlx::query(
+        "INSERT INTO organizations (id, slug, name, kind, settings)
+         VALUES ($1, 'p28', 'P28', 'team', '{\"experimental_methods\": true}')",
+    )
+    .bind(Uuid::nil())
+    .execute(w.pool())
+    .await
+    .unwrap();
+    let v = w.validate(sft(&f, &[])).await;
+    assert!(!codes(&v).contains(&"MRL-CAP-022".to_owned()), "{v}");
+}

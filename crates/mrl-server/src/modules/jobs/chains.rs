@@ -216,6 +216,12 @@ impl Chains {
                 )),
                 // <mrl:job-validators P26> P26 validators go right below this line.
                 // <mrl:job-validators P28> P28 validators go right below this line.
+                Arc::new(crate::modules::submission::policy::MethodPolicy::new(
+                    db.clone(),
+                )),
+                Arc::new(crate::modules::submission::policy::Guardian::new(
+                    db.clone(),
+                )),
             ],
             vec![
                 // <mrl:completion-verifiers> Verifiers go right below this line.
@@ -225,10 +231,14 @@ impl Chains {
                 // <mrl:completion-verifiers P26> P26 verifiers go right below this line.
                 // <mrl:completion-verifiers P27> P27 verifiers go right below this line.
                 // <mrl:completion-verifiers P28> P28 verifiers go right below this line.
+                Arc::new(crate::modules::submission::probe::ProbeVerifier),
                 // <mrl:completion-verifiers P29> P29 verifiers go right below this line.
             ],
             vec![
                 // <mrl:submission-resolvers> Resolvers go right below this line.
+                Arc::new(crate::modules::submission::resolve::Presets::new(
+                    db.clone(),
+                )),
             ],
         )
     }

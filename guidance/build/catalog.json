@@ -2249,6 +2249,61 @@
       }
     },
     {
+      "code": "MRL-CAP-280",
+      "title": "This run is estimated not to fit in memory.",
+      "why": "The app compared the run's estimated memory with every connected machine that can run it. None has enough left after the memory it keeps free.",
+      "what_to_do": {
+        "steps": [
+          "Try the alternatives in Details, like QLoRA, a smaller model or another machine.",
+          "Or lower the batch size or sequence length and check again."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CAP-281",
+      "title": "This run can't resume from that checkpoint.",
+      "why": "Only the same method on the same major engine version can resume a checkpoint. Its training state would not load correctly otherwise.",
+      "what_to_do": {
+        "steps": [
+          "Resume with the engine version and method named in Details.",
+          "Or start a new run that uses the checkpoint's weights as its starting model."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CAP-282",
+      "title": "No machine checked these settings.",
+      "why": "The app checks a run's settings on a connected machine and estimates its memory there. No machine was connected, or none answered in time, so only the app's own checks ran.",
+      "what_to_do": {
+        "steps": [
+          "Connect a machine in Machines, or wait until one is online, and check again.",
+          "You can still submit; the run starts in probe mode and is measured first."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CAP-283",
+      "title": "This engine checks its settings only when the run starts.",
+      "why": "This engine has no settings check before the run, so the app checked what it could alone. Problems the engine finds show up at the start.",
+      "what_to_do": {
+        "steps": [
+          "Submit the run and watch its first minutes.",
+          "Or choose an engine that checks settings ahead of time."
+        ]
+      }
+    },
+    {
+      "code": "MRL-CAP-284",
+      "title": "The run starts with safety settings to fit in memory.",
+      "why": "The estimated memory is close to what the machine can give. The app turned on settings that use less memory; Details list each change and why.",
+      "what_to_do": {
+        "steps": [
+          "Review the changes in Details; they are already in the settings.",
+          "Or pick a bigger machine to run without them."
+        ]
+      }
+    },
+    {
       "code": "MRL-CONFLICT-001",
       "title": "Someone changed this item after you opened it.",
       "why": "The version you edited is older than the saved one.",
@@ -4084,6 +4139,17 @@
         "steps": [
           "Use a path inside the attempt folder, like `data/train.jsonl`.",
           "If the app sent the path, report it as a problem with the app."
+        ]
+      }
+    },
+    {
+      "code": "MRL-VAL-280",
+      "title": "No engine here offers this preset.",
+      "why": "A preset is a ready-made set of settings for one method of one engine. None of the engines here offers a preset with this name for this method, or several do.",
+      "what_to_do": {
+        "steps": [
+          "Pick a preset listed in the method's settings form.",
+          "If several engines offer it, name the engine in common.engine."
         ]
       }
     },

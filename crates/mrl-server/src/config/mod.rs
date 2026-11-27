@@ -99,6 +99,8 @@ pub struct Config {
     // <mrl:config P26> P26 settings fields go right below this line.
     // <mrl:config P27> P27 settings fields go right below this line.
     // <mrl:config P28> P28 settings fields go right below this line.
+    /// Run submission: the settings check on a machine, probe mode and memory headroom.
+    pub submission: crate::modules::submission::SubmissionConfig,
     // <mrl:config P29> P29 settings fields go right below this line.
     // <mrl:config P30> P30 settings fields go right below this line.
 }
