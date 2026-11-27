@@ -30,7 +30,8 @@ pub fn lane_for(msg: &WorkerMessage) -> Option<Lane> {
         | Body::Exit(_)
         | Body::PolicyVersion(_)
         | Body::RolloutBatch(_)
-        | Body::RewardBatchStats(_) => Lane::Control,
+        | Body::RewardBatchStats(_)
+        | Body::OutputsStaged(_) => Lane::Control,
     })
 }
 

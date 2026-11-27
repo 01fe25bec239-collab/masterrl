@@ -1,8 +1,9 @@
 """`mrl-builtin`: the utility engine for non-training jobs (DATA_PREP first).
 
-Job spec: {"job_kind": "DATA_PREP", "task": "<name>", "inputs": {...}}. The task runs with
-progress events; its outputs plus outputs/artifact-manifest.json (artifact-manifest/v1) stay
-in the staging directory for the agent to upload after the ExitReport.
+Job spec: {"job_kind": "DATA_PREP", "task": "<name>", "inputs": {...}, "sandbox": ...}. The
+task runs with progress events; its outputs plus outputs/artifact-manifest.json
+(artifact-manifest/v1) are handed to the agent (OutputsStaged), and the worker exits once they
+are uploaded.
 """
 
 from collections.abc import Iterator, Mapping

@@ -37,6 +37,7 @@ ADAPTERS = ROOT / "python/adapters"
 RUNTIME = ROOT / "python/mrl-runtime/src/mrl_runtime"
 FAKE = RUNTIME / "testkit/fake_engine"
 BUILTIN = RUNTIME / "builtin/mrl-builtin.yaml"
+BUILTIN_ENV = ROOT / "python/builtin-env"
 MANIFEST_FILE = "mrl-engine.yaml"
 FRAGMENT_DIR = "mrl-engine.d"
 # Platform metric names (resource peaks per phase); an engine may not emit into this prefix.
@@ -189,6 +190,11 @@ def load_builtin() -> tuple[str, dict[str, Any]]:
         raise ManifestError(
             f"{where}: the built-in bundle needs adapter metadata and the DATA_PREP sandbox"
         )
+    # The runtime's pin goes in the bundle only (lanes that change dependencies change the lock).
+    for env in doc["spec"].get("runtime", {}).get("environments", []):
+        if env.get("kind") == "uv":
+            lock = (BUILTIN_ENV / env["lockfile"]).read_bytes()
+            env["lockSha256"] = hashlib.sha256(lock).hexdigest()
     bundle = {"kind": "builtin", "source": where, "dev_only": False, "manifest": doc, "schemas": {}}
     return meta["name"], bundle
 

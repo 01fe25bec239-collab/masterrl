@@ -196,6 +196,103 @@ async fn upload_sink() -> (String, Uploads) {
 
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "needs uv; runs in ci-attempts"]
+async fn a_builtin_job_uploads_its_outputs_before_it_exits() {
+    if !ready("a_builtin_job_uploads_its_outputs_before_it_exits") {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx(dir.path(), None);
+    let (attempts, seen) = manager(&ctx);
+    let data = dir.path().join("train.jsonl");
+    std::fs::write(&data, b"{\"x\": 1}\n").unwrap();
+    let mut spec = spec(
+        "att_builtin",
+        serde_json::json!({}),
+        serde_json::json!({
+            "engine": "builtin",
+            "inputs": [{
+                "name": "dataset.train", "local_path": "data/train.jsonl",
+                "sha256": mrl_storage::sha256_hex(b"{\"x\": 1}\n"), "size": 9, "file": data
+            }]
+        }),
+    );
+    // What the core's built-in launch step sends (INT-6).
+    spec.job_spec = serde_json::json!({
+        "job_id": "job_t", "job_kind": "DATA_PREP", "task": "hash_files",
+        "inputs": {"roles": ["dataset.train"]}, "sandbox": "data_prep"
+    });
+    attempts.launch(spec).unwrap();
+    let (base, got) = upload_sink().await;
+
+    // The worker hands over its outputs; the core answers with tickets (no checkpoint id).
+    let s = seen.clone();
+    seen.until("outputs staged", move |_| {
+        s.bodies()
+            .iter()
+            .any(|(_, b)| matches!(b, Body::OutputsStaged(_)))
+    })
+    .await;
+    let manifest = seen
+        .bodies()
+        .into_iter()
+        .find_map(|(lane, b)| match b {
+            Body::OutputsStaged(o) => Some((lane, o.manifest_json)),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(manifest.0, Lane::Control);
+    let manifest: serde_json::Value = serde_json::from_str(&manifest.1).unwrap();
+    let expires = prost_types::Timestamp {
+        seconds: time::OffsetDateTime::now_utc().unix_timestamp() + 600,
+        nanos: 0,
+    };
+    let items = manifest["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| UploadItem {
+            local_path: format!("outputs/{}", f["path"].as_str().unwrap()),
+            url: format!("{base}/{}", f["path"].as_str().unwrap()),
+            sha256: f["sha256"].as_str().unwrap().to_owned(),
+            size: f["size"].as_u64().unwrap(),
+            expires_at: Some(expires),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(items.len(), 1);
+    let cmd = Command {
+        command_id: "up-outputs".into(),
+        kind: Some(Kind::UploadArtifacts(UploadArtifacts {
+            attempt: Some(mrl_proto::common::v1::AttemptRef {
+                job_id: "job_t".into(),
+                attempt_id: "att_builtin".into(),
+                fencing_epoch: 1,
+            }),
+            checkpoint_id: String::new(),
+            items,
+        })),
+    };
+    assert!(attempts.handle(&cmd).await.unwrap().accepted);
+
+    // The worker exits only after the upload, and completes.
+    let decision = tokio::time::timeout(WAIT, attempts.wait("att_builtin"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        decision.exit_kind,
+        ExitKind::Completed as i32,
+        "{decision:?}"
+    );
+    let got = got.lock().unwrap();
+    let hashes = &got["hashes.json"];
+    assert_eq!(
+        mrl_storage::sha256_hex(hashes),
+        manifest["files"][0]["sha256"]
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs uv; runs in ci-attempts"]
 async fn fake_engine_full_lifecycle_with_ticket_uploads() {
     if !ready("fake_engine_full_lifecycle_with_ticket_uploads") {
         return;
