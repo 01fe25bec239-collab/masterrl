@@ -504,7 +504,8 @@ pub(crate) fn install(models: std::sync::Arc<Models>) {
 }
 
 /// Completion chain: vouches for model jobs (`import_model`, `merge_adapter`,
-/// `export_model`): waits for their registered outputs, records the version (see the module
+/// `export_model`): waits for their registered outputs (answering an error, never
+/// `RetryLater`, which would retry the whole job), records the version (see the module
 /// docs) or the export's lineage. Abstains for every other job.
 pub struct ModelOutputs {
     db: Db,
@@ -546,18 +547,15 @@ impl CompletionVerifier for ModelOutputs {
             return Ok(Verification::Abstain);
         };
         let Some(models) = self.models.as_ref().or_else(|| MODELS.get()) else {
-            return Ok(Verification::RetryLater(
-                "the models module has not started".into(),
-            ));
+            return Err(seam("the models module has not started"));
         };
         let Some(out) = crate::modules::builtin::outputs(&self.db, job.org_id, job.id)
             .await
             .map_err(seam)?
         else {
-            // INT-6's own verifier fails jobs whose outputs can't be saved.
-            return Ok(Verification::RetryLater(
-                "the job's results are still being saved".into(),
-            ));
+            // Wait (an error keeps the job FINALIZING; finalize tries again next pass). INT-6's
+            // own verifier fails jobs whose outputs can't be saved.
+            return Err(seam("the job's results are still being saved"));
         };
         let org = storage_org(job.org_id);
         let Some(artifact) = models
@@ -566,9 +564,7 @@ impl CompletionVerifier for ModelOutputs {
             .await
             .map_err(seam)?
         else {
-            return Ok(Verification::RetryLater(
-                "the job's results are not readable yet".into(),
-            ));
+            return Err(seam("the job's results are not readable yet"));
         };
         if task == "export_model" {
             return exported(&self.db, job, out.artifact_id).await;

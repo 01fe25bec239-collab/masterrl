@@ -839,10 +839,14 @@ impl Env {
     }
 
     async fn verify(&self, job: Uuid) -> Verification {
+        self.try_verify(job).await.unwrap()
+    }
+
+    /// The verifier's answer; `Err` means "wait" (the job stays FINALIZING).
+    async fn try_verify(&self, job: Uuid) -> Result<Verification, SeamError> {
         ModelOutputs::with(self.models.clone())
             .verify(&self.job_row(job).await)
             .await
-            .unwrap()
     }
 
     /// POSTs `body` to `path` and expects 202: the new version (or export job).
@@ -913,7 +917,10 @@ async fn imports_run_as_builtin_jobs_and_their_outputs_make_the_version_ready() 
     assert_eq!(env.job_row(job).await.state, "QUEUED");
 
     // Not registered yet: wait. Registered: READY, files from the job's own outputs.
-    assert!(matches!(env.verify(job).await, Verification::RetryLater(_)));
+    assert!(
+        env.try_verify(job).await.is_err(),
+        "waits, never RetryLater"
+    );
     env.register_outputs(job, &out).await;
     assert_eq!(env.verify(job).await, Verification::Verified);
     assert_eq!(env.verify(job).await, Verification::Verified, "replayed");
@@ -1220,7 +1227,10 @@ async fn promote_merge_and_export_round_trip() {
     assert_eq!(inputs["target"], json!({"kind": "artifact"}));
     assert_eq!(inputs["card"]["name"], "merged");
     assert_eq!(staged.as_array().unwrap().len(), 5);
-    assert!(matches!(env.verify(job).await, Verification::RetryLater(_)));
+    assert!(
+        env.try_verify(job).await.is_err(),
+        "waits, never RetryLater"
+    );
     let bundle = Outputs {
         files: vec![
             ("export/model.safetensors".into(), b"w".to_vec()),
