@@ -2,6 +2,7 @@
 //! and registers its module in `registry.rs`.
 
 // <mrl:modules>
+pub mod builtin;
 pub mod events;
 
 // <mrl:modules P16> P16 `pub mod` lines go right below this line.

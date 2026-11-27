@@ -66,12 +66,15 @@ impl ArtifactsModule {
     /// The module for this database and these settings. Connects to storage on first use.
     pub fn new(db: Db, config: &Config) -> Self {
         Self {
-            store: Arc::new(ArtifactStore::new(
-                db,
-                backend_config(config),
-                config.server.mode,
-                scratch::default_root(),
-            )),
+            store: Arc::new(
+                ArtifactStore::new(
+                    db,
+                    backend_config(config),
+                    config.server.mode,
+                    scratch::default_root(),
+                )
+                .with_module_lookups(),
+            ),
         }
     }
 
@@ -84,7 +87,9 @@ impl ArtifactsModule {
         scratch_root: std::path::PathBuf,
     ) -> Self {
         Self {
-            store: Arc::new(ArtifactStore::new(db, Ok(backend), mode, scratch_root)),
+            store: Arc::new(
+                ArtifactStore::new(db, Ok(backend), mode, scratch_root).with_module_lookups(),
+            ),
         }
     }
 
@@ -249,6 +254,16 @@ impl ArtifactStore {
             signing: OnceCell::new(),
             lookups: std::sync::RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Adds the lineage lookups other modules own, so every store (the one P19 serves and
+    /// the ones other modules build) resolves their kinds. Each part adds one
+    /// `self.add_lineage_lookup(kind, Arc::new(…))` line below its marker.
+    fn with_module_lookups(self) -> Self {
+        // <mrl:lineage-lookups P26> P26 lookups go right below this line.
+        // <mrl:lineage-lookups P27> P27 lookups go right below this line.
+        // <mrl:lineage-lookups P29> P29 lookups go right below this line.
+        self
     }
 
     /// A new private scratch folder (see [`scratch`]).

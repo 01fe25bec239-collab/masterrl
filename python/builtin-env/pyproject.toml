@@ -1,0 +1,18 @@
+# The built-in engine's runtime project: what an agent installs for a built-in job (IMPORT,
+# DATA_PREP, EXPORT, …). Separate uv project with its own lock (not a workspace member), like
+# the adapters. The lock's sha256 is the `lockSha256` in mrl_runtime/builtin/mrl-builtin.yaml;
+# `just gen` keeps it current.
+[project]
+name = "mrl-builtin-env"
+version = "0.1.0"
+description = "Runtime environment for MasterRL built-in jobs"
+license = "Apache-2.0"
+requires-python = ">=3.12,<3.13"
+dependencies = ["mrl-runtime"]
+
+[tool.uv]
+required-version = "==0.11.28"
+package = false
+
+[tool.uv.sources]
+mrl-runtime = { path = "../mrl-runtime", editable = true }

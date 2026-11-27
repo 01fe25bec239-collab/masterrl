@@ -14,6 +14,16 @@ spec:
     entrypoint: mrl_runtime.builtin.engine:BuiltinEngine
     adapterApi: ">=1.0,<2"
     workerProtocol: ">=1.0,<2"
+  # The agent builds it from python/builtin-env's uv.lock, checked by hash. `just gen` adds the
+  # lockSha256 to the generated bundle only, so a dependency change never edits this file.
+  runtime:
+    environments:
+      - id: cpu-uv
+        kind: uv
+        lockfile: uv.lock
+        python: "3.12"
+        accelerator: { vendor: cpu }
+        mrlRuntime: 0.1.0
   jobKinds:
     - kind: DATA_PREP
       sandbox: data_prep   # no network, no secrets, no GPU
