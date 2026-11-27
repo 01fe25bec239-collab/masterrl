@@ -163,7 +163,8 @@ def pins_only(diff: str) -> bool:
     """True if a `git diff -U0` changes only `lockSha256:` lines (`just gen` writes those)."""
     lines = [ln for ln in diff.splitlines() if ln[:1] in "+-" and ln[:3] not in ("+++", "---")]
     return bool(lines) and all(
-        re.match(r"^[+-]\s*lockSha256:\s*[0-9a-f]{64}\s*$", ln) for ln in lines
+        re.match(r"""^[+-][ \t]*lockSha256:[ \t]*(["']?)[0-9a-f]{64}\1[ \t]*(?:#.*)?$""", ln)
+        for ln in lines
     )
 
 

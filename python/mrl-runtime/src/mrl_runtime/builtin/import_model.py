@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from huggingface_hub import HfApi, hf_hub_download  # pyright: ignore[reportUnknownVariableType]
+from packaging.licenses import InvalidLicenseExpression, canonicalize_license_expression
 
 from mrl_runtime.adapter.events import Progress
 from mrl_runtime.adapter.types import Issue
@@ -38,10 +39,12 @@ MODEL_DIR = "model"
 PICKLE_REFUSED = "MRL-MODEL-001"
 CONVERSION_UNAVAILABLE = "MRL-MODEL-260"
 UNREADABLE = "MRL-MODEL-150"
-WEIGHT_SUFFIXES = (".safetensors", ".gguf")
-# Files a model folder may bring; anything else (ONNX, TF/Flax weights, images) is left out.
+WEIGHT_SUFFIXES = (".safetensors", ".gguf", ".onnx")
+# Files a model folder may bring; TF/Flax weights and images are left out.
 KEPT_SUFFIXES = (
     *WEIGHT_SUFFIXES,
+    ".onnx_data",
+    ".onnx.data",
     ".json",
     ".txt",
     ".model",
@@ -129,9 +132,19 @@ def license_of(folder: Path, spdx: str | None = None) -> dict[str, Any]:
         if head.startswith("---"):
             found = FRONT_LICENSE.search(head.split("---", 2)[1] if head.count("---") >= 2 else "")
             spdx = found.group(1).lower() if found else None
-    kind = "unknown" if spdx is None else ("custom" if spdx in ("other", "custom") else "spdx")
     body = text if text is not None else f"license:{spdx or 'unknown'}".encode()
-    return {"spdx": spdx, "kind": kind, "sha256": hashlib.sha256(body).hexdigest()}
+    kind = "custom" if text is not None or spdx else "unknown"
+    try:
+        canonical = canonicalize_license_expression(spdx or "")
+    except InvalidLicenseExpression:
+        canonical = ""
+    if canonical and "licenseref-" not in canonical.lower():
+        kind = "spdx"
+    return {
+        "spdx": canonical.lower() if kind == "spdx" else None,
+        "kind": kind,
+        "sha256": hashlib.sha256(body).hexdigest(),
+    }
 
 
 def report(folder: Path, *, license: dict[str, Any], source: dict[str, Any]) -> dict[str, Any]:
@@ -220,7 +233,10 @@ def _hub(ctx: TaskContext, src: Mapping[str, Any], convert: bool) -> Iterator[Ta
 
 
 def _node_path(ctx: TaskContext, src: Mapping[str, Any], convert: bool) -> Iterator[TaskEvent]:
-    root = Path(str(src["path"])).resolve()
+    root = Path(str(src["path"]))
+    if root.is_symlink() or any(parent.is_symlink() for parent in root.parents):
+        raise MrlError(UNREADABLE, "Choose a model folder without symbolic links.")
+    root = root.resolve()
     paths: list[str] = []
     for p in sorted(root.rglob("*")):
         # A link could point anywhere on the machine: only real files inside the folder.

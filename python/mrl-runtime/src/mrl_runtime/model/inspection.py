@@ -12,7 +12,7 @@ import re
 from collections import Counter
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Literal
 
 from mrl_runtime.model._json import Json, arr, integer, number, obj, text
@@ -450,17 +450,44 @@ def _gguf_facts(header: GgufHeader) -> tuple[Json, str | None]:
     )
 
 
-def _safetensors_weights(folder: Path, files: list[Path], adapter: bool) -> list[Path]:
+def confined_model_file(folder: Path, name: str) -> Path:
+    """Resolve a model file without accepting traversal or symlink components."""
+    parts = name.split("/")
+    if (
+        "\\" in name
+        or PureWindowsPath(name).drive
+        or any(part in ("", ".", "..") for part in parts)
+    ):
+        raise _bad(folder, "a model file path leaves its folder")
+    path = folder
+    for part in parts:
+        path = path / part
+        if path.is_symlink():
+            raise _bad(path, "model files cannot be symbolic links")
+    if not path.is_file():
+        raise _bad(path, "model file is missing")
+    return path
+
+
+def indexed_safetensors(folder: Path) -> list[Path] | None:
+    """Read the shared Hugging Face shard list, confined to the model directory."""
     index = folder / "model.safetensors.index.json"
-    if not adapter and index.is_file():
-        weight_map = obj(read_json(index).get("weight_map"))
-        if weight_map is None:
-            raise _bad(index, "weight_map is missing")
-        shards = sorted({str(v) for v in weight_map.values()})
-        missing = [s for s in shards if not (folder / s).is_file()]
-        if missing:
-            raise _bad(index, f"missing shard {missing[0]}")
-        return [folder / s for s in shards]
+    if not index.exists() and not index.is_symlink():
+        return None
+    weight_map = obj(read_json(confined_model_file(folder, index.name)).get("weight_map"))
+    if not weight_map:
+        raise _bad(index, "weight_map is missing")
+    names: set[str] = set()
+    for name in weight_map.values():
+        if not isinstance(name, str) or not name.endswith(".safetensors"):
+            raise _bad(index, "weight_map must name safetensors shards")
+        names.add(name)
+    return [confined_model_file(folder, name) for name in sorted(names)]
+
+
+def _safetensors_weights(folder: Path, files: list[Path], adapter: bool) -> list[Path]:
+    if not adapter and (indexed := indexed_safetensors(folder)) is not None:
+        return indexed
     top = [f for f in files if f.parent == folder and f.suffix == ".safetensors"]
     if adapter:
         return [f for f in top if f.name.startswith("adapter_model")]

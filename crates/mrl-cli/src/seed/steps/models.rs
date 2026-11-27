@@ -53,7 +53,7 @@ fn segment(id: &str) -> Result<&str, String> {
 /// older server answers its routes with MRL-RES-002).
 pub fn ensure_model(
     mut get: impl FnMut(&str) -> Result<Value, Failure>,
-    mut post: impl FnMut(&str, &Value) -> Result<Value, Failure>,
+    mut post: impl FnMut(&str, &Value, &str) -> Result<Value, Failure>,
     prj: &str,
     dir: impl FnOnce() -> Result<String, String>,
 ) -> Result<Option<(Value, bool)>, String> {
@@ -65,6 +65,7 @@ pub fn ensure_model(
         Ok(_) => {}
     }
     let models = all_items(|p| get(p).map_err(String::from), &list)?;
+    let mut previous = "initial".to_owned();
     if let Some(m) = models.iter().find(|m| m["name"] == MODEL) {
         let id = segment(m["id"].as_str().unwrap_or_default())?;
         let versions = all_items(
@@ -72,14 +73,18 @@ pub fn ensure_model(
             &format!("/models/{id}/versions"),
         )?;
         if let Some(v) = versions
-            .into_iter()
+            .iter()
             .find(|v| v["state"] == "READY" || v["state"] == "IMPORTING")
         {
-            return Ok(Some((v, false)));
+            return Ok(Some((v.clone(), false)));
+        }
+        if let Some(id) = versions.first().and_then(|v| v["id"].as_str()) {
+            previous = segment(id)?.to_owned();
         }
     }
     let body = json!({"name": MODEL, "source": {"kind": "node_path", "path": dir()?}});
-    let v = post(&format!("/projects/{prj}/models:import"), &body).map_err(String::from)?;
+    let key = format!("seed-model-{prj}-{previous}");
+    let v = post(&format!("/projects/{prj}/models:import"), &body, &key).map_err(String::from)?;
     Ok(Some((v, true)))
 }
 
@@ -117,7 +122,7 @@ impl SeedStep for Model {
             .ok_or_else(|| "the project step did not run first".to_owned())?;
         let Some((mut v, created)) = ensure_model(
             |p| api.get(p),
-            |p, b| api.post(p, Some(b), None),
+            |p, b, key| api.post(p, Some(b), Some(key)),
             &prj,
             fixture_dir,
         )?
@@ -167,8 +172,10 @@ mod tests {
                 other => panic!("unexpected {other}"),
             })
         };
-        let post = |p: &str, b: &Value| -> Result<Value, Failure> {
-            posts.borrow_mut().push((p.to_owned(), b.clone()));
+        let post = |p: &str, b: &Value, key: &str| -> Result<Value, Failure> {
+            posts
+                .borrow_mut()
+                .push((p.to_owned(), b.clone(), key.to_owned()));
             Ok(json!({"id": "mv_3", "state": "IMPORTING"}))
         };
         let (v, created) = ensure_model(get, post, "prj_1", || Ok("/fx".into()))
@@ -187,7 +194,8 @@ mod tests {
             posts.borrow()[0],
             (
                 "/projects/prj_1/models:import".to_owned(),
-                json!({"name": MODEL, "source": {"kind": "node_path", "path": "/fx"}})
+                json!({"name": MODEL, "source": {"kind": "node_path", "path": "/fx"}}),
+                "seed-model-prj_1-initial".to_owned()
             )
         );
         assert!(ensure_model(empty, post, "../x", || Ok("/fx".into())).is_err());

@@ -289,7 +289,8 @@ class Harness:
                 await self._export(ctx, spec)
             else:
                 engine_stopped = await self._run_engine(ctx, spec)
-            await self._upload_outputs(ctx)
+            if spec.get("managed_outputs") is True:
+                await self._upload_outputs(ctx)
         except _EndAttemptError as stop:
             if self._ctx is not None:
                 await self._cleanup(self._ctx)

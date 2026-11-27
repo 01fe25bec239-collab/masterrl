@@ -12,6 +12,7 @@
 
 use super::api::{authorized_version, version_view, ModelVersionInfo};
 use super::store::{self, hex, NewVersion, VersionRow};
+use super::submission::Submission;
 use super::{codes, Models};
 use crate::app::AppState;
 use crate::error::{ApiError, ErrorCode, FieldError};
@@ -23,7 +24,7 @@ use crate::modules::jobs::{scope, JobsError};
 use crate::modules::runs::experiments::project_scope;
 use crate::seams::RequestContext;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use mrl_domain::ids::{JobId, ModelVersionId, NodeId, SecretId};
@@ -41,7 +42,7 @@ const PICKLE: [&str; 6] = [".bin", ".pt", ".pth", ".ckpt", ".pkl", ".pickle"];
 const EXPORT_FORMAT: &str = "hf-safetensors";
 
 /// Where an import's files come from.
-#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ImportSource {
     /// A Hugging Face Hub repository at a branch, tag or commit.
@@ -71,7 +72,7 @@ pub enum ImportSource {
 }
 
 /// `POST /projects/{prj}/models:import` body.
-#[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ImportModel {
     /// The model (created when missing).
@@ -87,7 +88,7 @@ pub struct ImportModel {
 }
 
 /// `POST /model-versions/{mv}:merge-adapter` body.
-#[derive(Debug, Clone, Default, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct MergeAdapter {
     /// The model to add the merged version to (default: the adapter's model).
@@ -99,7 +100,7 @@ pub struct MergeAdapter {
 }
 
 /// Where an export goes.
-#[derive(Debug, Clone, Default, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExportTarget {
     /// `artifact` (default: download it from the app), `s3` or `hf_hub`.
@@ -126,7 +127,7 @@ pub struct ExportTarget {
 }
 
 /// `POST /model-versions/{mv}:export` body.
-#[derive(Debug, Clone, Default, Deserialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExportModel {
     /// `hf-safetensors` (the default; others answer MRL-MODEL-261 in this release).
@@ -200,11 +201,30 @@ fn repo_ok(repo: &str) -> bool {
         })
 }
 
-fn secret(id: &str, path: &str, allowed_use: &str, name: &str) -> Result<BuiltinGrant, JobsError> {
+async fn secret(
+    state: &AppState,
+    models: &Models,
+    ctx: &RequestContext,
+    org: Uuid,
+    id: &str,
+    path: &str,
+    (allowed_use, name): (&str, &str),
+) -> Result<BuiltinGrant, JobsError> {
+    let secret = id
+        .parse::<SecretId>()
+        .map_err(|_| invalid(path, "This is not a secret id (`sec_…`)."))?;
+    crate::modules::secrets::SecretResolver::new(models.db.clone(), state.config.server.mode)
+        .prepare_grant(
+            &state.seams,
+            ctx,
+            &super::outputs::storage_org(org),
+            secret,
+            "env",
+        )
+        .await
+        .map_err(p19)?;
     Ok(BuiltinGrant {
-        secret: id
-            .parse::<SecretId>()
-            .map_err(|_| invalid(path, "This is not a secret id (`sec_…`)."))?,
+        secret,
         allowed_use: allowed_use.into(),
         name: name.into(),
     })
@@ -238,6 +258,7 @@ struct VersionJob {
     grants: Vec<BuiltinGrant>,
     node_id: Option<Uuid>,
     audit: &'static str,
+    checkpoint: Option<(Uuid, Uuid)>,
 }
 
 /// Creates the model (when missing), its IMPORTING version and the job, audited, in one
@@ -248,12 +269,27 @@ async fn start(
     ctx: &RequestContext,
     (org, project): (Uuid, Uuid),
     job: VersionJob,
+    submission: &Submission<'_>,
 ) -> Result<Response, JobsError> {
     super::api::check_name(&job.model)?;
     let mut tx = db.begin().await?;
+    if let Some(replay) = submission.claim(&mut tx).await? {
+        return Ok(replay);
+    }
+    if let Some((run, checkpoint)) = job.checkpoint {
+        use crate::modules::checkpoints::service::{lock_row, lock_run};
+        lock_run(&mut tx, run).await?;
+        let locked = lock_row(&mut tx, checkpoint).await?;
+        if !locked.is_some_and(|row| row.state == "COMMITTED") {
+            return Err(conflict(
+                codes::NOT_PROMOTABLE,
+                "The checkpoint is no longer committed.",
+            ));
+        }
+    }
     let model =
         store::get_or_create_model(&mut tx, org, project, &job.model, &ctx.principal.id).await?;
-    let v = store::insert_version(
+    let mut v = store::insert_version(
         &mut tx,
         &model,
         &NewVersion {
@@ -284,11 +320,11 @@ async fn start(
     .await?;
     store::set_job(&mut tx, v.id, row.id).await?;
     scope::audit(&mut tx, state, ctx, (org, project), job.audit, mv).await?;
+    v.job_id = Some(row.id);
+    let response = version_view(&v, &[], None);
+    submission.save(&mut tx, &response).await?;
     tx.commit().await.map_err(crate::db::DbError::from)?;
-    let v = store::version(db, v.id)
-        .await?
-        .ok_or_else(|| JobsError::not_found("model version"))?;
-    Ok((StatusCode::ACCEPTED, Json(version_view(&v, None, None))).into_response())
+    Ok((StatusCode::ACCEPTED, Json(response)).into_response())
 }
 
 /// `POST /projects/{prj}/models:import`: a new version of the model, IMPORTING until its job
@@ -304,11 +340,16 @@ pub async fn import(
     Extension(models): Extension<Arc<Models>>,
     ctx: RequestContext,
     Path(prj): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<ImportModel>,
 ) -> Result<Response, JobsError> {
     super::api::check_name(&body.name)?;
     let (org, project) =
         project_scope(&state, &ctx, &models.projects, &prj, "models.import").await?;
+    let submission = Submission::new((org, project), &ctx, &headers, "import", &prj, &body)?;
+    if let Some(replay) = submission.replay(&models.db).await? {
+        return Ok(replay);
+    }
     let base = match &body.base_model_version_id {
         Some(b) => {
             let id: ModelVersionId = scope::parse_id(b, "model version")?;
@@ -340,7 +381,18 @@ pub async fn import(
             }
             let mut src = json!({"kind": "hub", "repo": repo, "revision": revision});
             if let Some(s) = secret_id {
-                grants.push(secret(s, "/source/secret_id", "model_download", "hf")?);
+                grants.push(
+                    secret(
+                        &state,
+                        &models,
+                        &ctx,
+                        org,
+                        s,
+                        "/source/secret_id",
+                        ("model_download", "hf"),
+                    )
+                    .await?,
+                );
                 src["token_env"] = Value::from(mrl_proto::credential_env("hf"));
             }
             ("hub", json!({"repo": repo, "revision": revision}), src)
@@ -434,7 +486,9 @@ pub async fn import(
             grants,
             node_id,
             audit: "models.import",
+            checkpoint: None,
         },
+        &submission,
     )
     .await
 }
@@ -451,9 +505,21 @@ pub async fn merge(
     models: &Models,
     ctx: &RequestContext,
     mv: &str,
+    headers: &HeaderMap,
     body: MergeAdapter,
 ) -> Result<Response, JobsError> {
     let adapter = authorized_version(state, models, ctx, mv, &["models.import"]).await?;
+    let submission = Submission::new(
+        (adapter.org_id, adapter.project_id),
+        ctx,
+        headers,
+        "merge",
+        mv,
+        &body,
+    )?;
+    if let Some(replay) = submission.replay(&models.db).await? {
+        return Ok(replay);
+    }
     let base = match (
         adapter.state.as_str(),
         adapter.kind.as_deref(),
@@ -509,7 +575,9 @@ pub async fn merge(
             grants: vec![],
             node_id: None,
             audit: "models.merge_adapter",
+            checkpoint: None,
         },
+        &submission,
     )
     .await
 }
@@ -527,15 +595,19 @@ pub async fn export(
     models: &Models,
     ctx: &RequestContext,
     mv: &str,
+    headers: &HeaderMap,
     body: ExportModel,
 ) -> Result<Response, JobsError> {
     let v = authorized_version(state, models, ctx, mv, &["models.export"]).await?;
+    let submission = Submission::new((v.org_id, v.project_id), ctx, headers, "export", mv, &body)?;
+    if let Some(replay) = submission.replay(&models.db).await? {
+        return Ok(replay);
+    }
     let format = body.format.unwrap_or_else(|| EXPORT_FORMAT.into());
-    let gguf = store::files(&models.db, v.id)
-        .await?
-        .iter()
-        .any(|f| f.format == "gguf");
-    if format != EXPORT_FORMAT || v.quantization.is_some() || gguf {
+    if format != EXPORT_FORMAT
+        || v.kind.as_deref() == Some("inference_only")
+        || v.quantization.is_some()
+    {
         return Err(JobsError::domain(
             codes::EXPORT_FORMAT_UNAVAILABLE,
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -564,7 +636,18 @@ pub async fn export(
             let s = t.secret_id.as_deref().ok_or_else(|| {
                 invalid("/target/secret_id", "Name the secret with the credentials.")
             })?;
-            grants.push(secret(s, "/target/secret_id", "model_export", "export")?);
+            grants.push(
+                secret(
+                    state,
+                    models,
+                    ctx,
+                    v.org_id,
+                    s,
+                    "/target/secret_id",
+                    ("model_export", "export"),
+                )
+                .await?,
+            );
             target["credential_env"] = Value::from(mrl_proto::credential_env("export"));
             if kind == "s3" {
                 let url = t.url.unwrap_or_default();
@@ -603,6 +686,9 @@ pub async fn export(
         json!({"model_version_id": id, "source_ref": v.source_ref, "base_model_version_id": base});
     let files = staged(models, &v, "model").await?;
     let mut tx = models.db.begin().await?;
+    if let Some(replay) = submission.claim(&mut tx).await? {
+        return Ok(replay);
+    }
     let row = builtin::submit(
         &mut tx,
         BuiltinJob {
@@ -628,15 +714,13 @@ pub async fn export(
         format!("{id}->{kind}"),
     )
     .await?;
+    let response = ModelExportJob {
+        job_id: JobId::from_uuid(row.id).to_string(),
+        model_version_id: id,
+    };
+    submission.save(&mut tx, &response).await?;
     tx.commit().await.map_err(crate::db::DbError::from)?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(ModelExportJob {
-            job_id: JobId::from_uuid(row.id).to_string(),
-            model_version_id: id,
-        }),
-    )
-        .into_response())
+    Ok((StatusCode::ACCEPTED, Json(response)).into_response())
 }
 
 #[utoipa::path(post, path = "/checkpoints/{ckpt}:promote", operation_id = "promote_checkpoint", tag = "models",
@@ -653,6 +737,7 @@ pub async fn promote(
     service: &CheckpointService,
     row: CheckpointRow,
     (org, project): (Uuid, Uuid),
+    headers: &HeaderMap,
 ) -> Result<Response, JobsError> {
     let res = scope::resource(
         "project",
@@ -661,6 +746,11 @@ pub async fn promote(
         project,
     );
     scope::authorize(state, ctx, "models.import", &res).await?;
+    let ckpt = mrl_domain::ids::CheckpointId::from_uuid(row.id).to_string();
+    let submission = Submission::new((org, project), ctx, headers, "promote", &ckpt, &())?;
+    if let Some(replay) = submission.replay(service.db()).await? {
+        return Ok(replay);
+    }
     let row = service.require_full_verification(row.id).await?;
     let files: Vec<InputFile> = service
         .files(row.id)
@@ -712,7 +802,6 @@ pub async fn promote(
             .map(|v| v.id),
         None => None,
     };
-    let ckpt = mrl_domain::ids::CheckpointId::from_uuid(row.id).to_string();
     start(
         state,
         service.db(),
@@ -735,7 +824,9 @@ pub async fn promote(
             grants: vec![],
             node_id: None,
             audit: "models.promote",
+            checkpoint: Some((row.run_id, row.id)),
         },
+        &submission,
     )
     .await
 }

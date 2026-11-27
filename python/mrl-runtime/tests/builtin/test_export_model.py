@@ -8,11 +8,12 @@ import urllib.request
 import uuid
 from collections.abc import Mapping
 from pathlib import Path
+from types import SimpleNamespace
 
 import make_fixtures
 import pytest
 
-from mrl_runtime.builtin import discover_tasks, load_builtin_manifest
+from mrl_runtime.builtin import discover_tasks, export_model, load_builtin_manifest
 from mrl_runtime.builtin.export_model import (
     EXPORT_MODEL,
     RESULT_FILE,
@@ -135,8 +136,10 @@ def test_s3_export_lands_in_the_bucket(
     }
     export(models / "tiny-llama", tmp_path / "out", target)
     result = json.loads((tmp_path / "out" / RESULT_FILE).read_text())
-    assert f"{prefix}/model.safetensors" in result["keys"]
-    get = s3_request(s3, "GET", bucket, f"{prefix}/model.safetensors")
+    key = next(k for k in result["keys"] if k.endswith("/model.safetensors"))
+    assert key.startswith(f"{prefix}/")
+    assert key.count("/") == prefix.count("/") + 2
+    get = s3_request(s3, "GET", bucket, key)
     with urllib.request.urlopen(get, timeout=30) as resp:
         assert resp.read() == (models / "tiny-llama/model.safetensors").read_bytes()
 
@@ -152,3 +155,24 @@ def test_export_loads_in_vanilla_transformers(models: Path, tmp_path: Path) -> N
     with torch.no_grad():
         out = model.generate(ids, max_new_tokens=4, do_sample=False)
     assert out.shape[1] == ids.shape[1] + 4
+
+
+def test_private_export_rejects_a_public_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class PublicHub:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+        def create_repo(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def model_info(self, _repo: str) -> SimpleNamespace:
+            return SimpleNamespace(private=False)
+
+    monkeypatch.setattr(export_model, "HfApi", PublicHub)
+    monkeypatch.setenv("MRL_CREDENTIAL_TEST", "fixture-token")
+    with pytest.raises(export_model.MrlError, match="repository is public"):
+        export_model._to_hub(
+            tmp_path, {"repo": "owner/model", "credential_env": "MRL_CREDENTIAL_TEST"}
+        )

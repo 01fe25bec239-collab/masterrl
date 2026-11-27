@@ -232,7 +232,12 @@ def lock_pins() -> dict[Path, str]:
             raise ManifestError(f"{manifest.relative_to(ROOT)}: environments name different locks")
         digest = hashlib.sha256((project / locks.pop()).read_bytes()).hexdigest()
         text = manifest.read_text(encoding="utf-8")
-        new = re.sub(r"(lockSha256:\s*)[0-9a-f]{64}", rf"\g<1>{digest}", text)
+        new = re.sub(
+            r"""(^[ \t]*lockSha256:[ \t]*)(["']?)[0-9a-f]{64}\2(?=[ \t]*(?:#|$))""",
+            rf"\g<1>\g<2>{digest}\g<2>",
+            text,
+            flags=re.MULTILINE,
+        )
         if new != text:
             out[manifest] = new
     return out

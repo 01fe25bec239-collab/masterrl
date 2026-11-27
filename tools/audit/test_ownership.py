@@ -114,6 +114,8 @@ class OwnershipTest(unittest.TestCase):
     def test_a_manifest_change_to_lock_pins_only_counts_as_generated(self):
         pin = "lockSha256: " + "a" * 64
         self.assertTrue(ownership.pins_only(f"--- a/m\n+++ b/m\n@@ -1 +1 @@\n-  {pin}\n+  {pin}\n"))
+        quoted = 'lockSha256: "' + "b" * 64 + '"'
+        self.assertTrue(ownership.pins_only(f"@@ -1 +1 @@\n-  {pin}\n+  {quoted}\n"))
         self.assertFalse(ownership.pins_only(f"@@ -1 +1 @@\n-  {pin}\n+  name: x\n"))
         self.assertFalse(ownership.pins_only(""))
 

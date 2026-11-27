@@ -33,6 +33,7 @@ def _run(
     engine: BuiltinEngine | None = None,
     **script: Any,
 ) -> AttemptResult:
+    spec = {"managed_outputs": True, **spec}
     s = AgentScript(job_spec=spec, staging_dir=tmp_path / "staging", staged_paths=staged, **script)
     return asyncio.run(run_in_process(engine or BuiltinEngine(), load_builtin_manifest().engine, s))
 

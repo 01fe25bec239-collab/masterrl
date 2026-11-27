@@ -73,6 +73,7 @@ impl LaunchContributor for BuiltinLaunch {
             Ok(Value::Object(m)) => m,
             _ => Map::new(),
         };
+        spec.insert("managed_outputs".into(), Value::Bool(true));
         spec.insert("task".into(), Value::String(task));
         spec.insert("inputs".into(), inputs);
         spec.insert("sandbox".into(), Value::String(sandbox.to_owned()));

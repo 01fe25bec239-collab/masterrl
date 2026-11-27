@@ -358,7 +358,7 @@ def test_export_job_writes_artifact_manifest(tmp_path: Path) -> None:
     doc = json.loads((tmp_path / "export" / "outputs" / "artifact-manifest.json").read_text())
     assert doc["kind"] == "export"
     assert [f["path"] for f in doc["files"]] == ["model.safetensors"]
-    assert r.agent.outputs_manifest == doc
+    assert r.agent.outputs_manifest is None
 
 
 def test_protocol_mismatch_exits_without_report(tmp_path: Path) -> None:

@@ -82,6 +82,16 @@ pub enum Verification {
     RetryLater(String),
 }
 
+/// A durable change that belongs in the transaction applying a verified outcome.
+#[async_trait]
+pub trait CompletionWrite: std::fmt::Debug + Send + Sync {
+    /// Applies the change after the job snapshot has been checked.
+    async fn commit(&self, tx: &mut crate::db::Tx) -> Result<(), SeamError>;
+}
+
+/// A decision and any durable write it needs.
+pub type PreparedVerification = (Verification, Option<Arc<dyn CompletionWrite>>);
+
 /// Decides whether a FINALIZING job may become COMPLETED.
 #[async_trait]
 pub trait CompletionVerifier: Send + Sync {
@@ -89,6 +99,11 @@ pub trait CompletionVerifier: Send + Sync {
     fn name(&self) -> &'static str;
     /// Checks the finished `job`.
     async fn verify(&self, job: &JobRow) -> Result<Verification, SeamError>;
+
+    /// Checks outputs before the guarded transaction, and prepares any write it needs.
+    async fn prepare(&self, job: &JobRow) -> Result<PreparedVerification, SeamError> {
+        Ok((self.verify(job).await?, None))
+    }
 }
 
 /// Why a resolver refused a submission.
@@ -169,6 +184,7 @@ pub enum Validation {
 pub struct Completion {
     snapshot: (Uuid, Uuid, i64, i64),
     outcome: CompletionOutcome,
+    writes: Vec<Arc<dyn CompletionWrite>>,
 }
 
 impl Completion {
@@ -176,12 +192,16 @@ impl Completion {
         Self {
             snapshot: (job.org_id, job.id, job.state_version, job.epoch),
             outcome,
+            writes: Vec::new(),
         }
     }
 
-    pub(super) fn for_job(self, job: &JobRow) -> Option<CompletionOutcome> {
+    pub(super) fn for_job(
+        self,
+        job: &JobRow,
+    ) -> Option<(CompletionOutcome, Vec<Arc<dyn CompletionWrite>>)> {
         (self.snapshot == (job.org_id, job.id, job.state_version, job.epoch))
-            .then_some(self.outcome)
+            .then_some((self.outcome, self.writes))
     }
 }
 
@@ -206,7 +226,15 @@ pub struct Chains {
 impl Chains {
     /// The members this build registers. Each part adds one line inside its block.
     pub fn registered(db: &Db) -> Self {
-        let _ = db;
+        Self::build(db, None)
+    }
+
+    /// Registered verifiers with this app's storage configuration.
+    pub(crate) fn configured(db: &Db, config: &crate::Config) -> Self {
+        Self::build(db, Some(config))
+    }
+
+    fn build(db: &Db, config: Option<&crate::Config>) -> Self {
         Self::new(
             vec![
                 Arc::new(SchemaChecks),
@@ -227,6 +255,7 @@ impl Chains {
                 // <mrl:completion-verifiers P26> P26 verifiers go right below this line.
                 Arc::new(crate::modules::models::outputs::ModelOutputs::new(
                     db.clone(),
+                    config,
                 )),
                 // <mrl:completion-verifiers P27> P27 verifiers go right below this line.
                 // <mrl:completion-verifiers P28> P28 verifiers go right below this line.
@@ -294,12 +323,19 @@ impl Chains {
     pub async fn verify(&self, job: &JobRow) -> Result<Completion, SeamError> {
         let mut retry = None;
         let mut verified = false;
+        let mut writes = Vec::new();
         for v in self.verifiers.iter() {
-            match v.verify(job).await? {
+            let (decision, write) = v.prepare(job).await?;
+            match decision {
                 Verification::Abstain => {}
-                Verification::Verified => verified = true,
+                Verification::Verified => {
+                    verified = true;
+                    writes.extend(write);
+                }
                 Verification::Failed(r) => {
-                    return Ok(Completion::new(job, CompletionOutcome::Failed(r)))
+                    let mut completion = Completion::new(job, CompletionOutcome::Failed(r));
+                    completion.writes.extend(write);
+                    return Ok(completion);
                 }
                 Verification::RetryLater(why) => retry = Some(why),
             }
@@ -312,7 +348,11 @@ impl Chains {
                 "No checker is registered to confirm this job's results, so it can't be marked complete.",
             )),
         };
-        Ok(Completion::new(job, outcome))
+        let mut completion = Completion::new(job, outcome);
+        if completion.outcome == CompletionOutcome::Verified {
+            completion.writes = writes;
+        }
+        Ok(completion)
     }
 
     /// Runs every resolver in order, starting from the submitted config.

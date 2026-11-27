@@ -351,10 +351,10 @@ impl JobTransitions {
         verdict: Completion,
     ) -> Result<JobRow, JobsError> {
         Job::can_transition(row.job_state()?, JobEvent::Complete)?;
-        match verdict
+        let (outcome, writes) = verdict
             .for_job(row)
-            .ok_or_else(|| JobsError::changed("job"))?
-        {
+            .ok_or_else(|| JobsError::changed("job"))?;
+        let done = match outcome {
             CompletionOutcome::Verified => {
                 let extra = Extra::keep(row);
                 let change = JobChange::default();
@@ -372,7 +372,11 @@ impl JobTransitions {
                 let failure = FailureCode::class_only(FailureClass::InfraTransient);
                 Self::fail_or_retry(tx, row, failure, &why).await
             }
+        }?;
+        for write in writes {
+            write.commit(tx).await?;
         }
+        Ok(done)
     }
 
     /// Cancel (Doc 09 §4.1): → CANCELLING, then → CANCELLED at once when no attempt is live.

@@ -200,6 +200,21 @@ impl Env {
             .await
     }
 
+    async fn post_with_key(&self, path: &str, body: &Value, key: &str) -> TestResponse {
+        self.server
+            .request(
+                Method::POST,
+                &format!("/api/v1{path}"),
+                &[
+                    (LAUNCH_SECRET_HEADER, TEST_SECRET),
+                    ("content-type", "application/json"),
+                    ("idempotency-key", key),
+                ],
+                Body::from(body.to_string()),
+            )
+            .await
+    }
+
     /// The model `name` of the test project, created through the API.
     async fn model(&self, name: &str) -> store::ModelRow {
         let r = self
@@ -252,15 +267,10 @@ impl Env {
     /// Stores `out` and returns what the verifier is handed.
     async fn produce(&self, out: &Outputs) -> Produced {
         let st = self.store.org_store("local").await.unwrap();
-        let prefix = format!(
-            "{}jobs/test-{}/outputs/",
-            st.keys().prefix(),
-            Uuid::now_v7()
-        );
         let mut entries = vec![];
         for (path, bytes) in &out.files {
             let sha = sha256_hex(bytes);
-            st.put(&format!("{prefix}{path}"), bytes.clone().into())
+            st.put(&st.keys().blob(&sha).unwrap(), bytes.clone().into())
                 .await
                 .unwrap();
             entries.push(json!({"path": path, "sha256": sha, "size": bytes.len()}));
@@ -268,7 +278,6 @@ impl Env {
         Produced {
             artifact_id: Uuid::now_v7(),
             manifest: json!({"files": entries}),
-            prefix,
         }
     }
 
@@ -587,11 +596,7 @@ async fn runs_need_the_license_accepted_and_custom_code_approved() {
         assert_eq!(input.name, MODEL_INPUT);
         let path = input.local_path.strip_prefix("model/").unwrap();
         assert_eq!(input.sha256, out.sha(&format!("model/{path}")), "{path}");
-        assert!(
-            input.key.ends_with(&format!("/outputs/model/{path}")),
-            "{}",
-            input.key
-        );
+        assert!(input.key.ends_with(&input.sha256), "{}", input.key);
     }
     let spec: Value = serde_json::from_str(&plan.launch.job_spec_json).unwrap();
     assert_eq!(
@@ -666,7 +671,9 @@ async fn refused_or_broken_outputs_make_the_version_invalid() {
     let produced = env.produce(&Outputs::tiny(|_| {})).await;
     let st = env.store.org_store("local").await.unwrap();
     st.put(
-        &format!("{}inspection.json", produced.prefix),
+        &st.keys()
+            .blob(produced.manifest["files"][0]["sha256"].as_str().unwrap())
+            .unwrap(),
         br#"{"kind": "full_weights"}"#.to_vec().into(),
     )
     .await
@@ -762,6 +769,22 @@ async fn bad_ids_actions_and_names_are_refused() {
 
 impl Env {
     /// A finished upload of `bytes`.
+    async fn secret(&self, use_: &str) -> String {
+        let id = mrl_domain::ids::SecretId::new();
+        sqlx::query(
+            "INSERT INTO secrets_metadata (id, org_id, project_id, name, backend, ref, kind, allowed_uses, created_by)
+             VALUES ($1, 'local', $2, $3, 'secret_store', 'test', 'hf_token', ARRAY[$4], 'test')",
+        )
+        .bind(id.as_uuid())
+        .bind(self.project.to_string())
+        .bind(use_)
+        .bind(use_)
+        .execute(self.db.pool())
+        .await
+        .unwrap();
+        id.to_string()
+    }
+
     async fn upload(&self, name: &str, bytes: &[u8]) -> String {
         let r = self
             .call(
@@ -824,7 +847,7 @@ impl Env {
         .bind(produced.artifact_id)
         .bind(self.project.to_string())
         .bind(format!("outputs-{job}"))
-        .bind(&produced.prefix)
+        .bind(format!("orgs/local/jobs/{job}/outputs/"))
         .bind(&produced.manifest)
         .bind(size as i64)
         .execute(self.db.pool())
@@ -844,9 +867,15 @@ impl Env {
 
     /// The verifier's answer; `Err` means "wait" (the job stays FINALIZING).
     async fn try_verify(&self, job: Uuid) -> Result<Verification, SeamError> {
-        ModelOutputs::with(self.models.clone())
-            .verify(&self.job_row(job).await)
-            .await
+        let (outcome, write) = ModelOutputs::with(self.models.clone())
+            .prepare(&self.job_row(job).await)
+            .await?;
+        if let Some(write) = write {
+            let mut tx = self.db.db().begin().await.unwrap();
+            write.commit(&mut tx).await?;
+            tx.commit().await.unwrap();
+        }
+        Ok(outcome)
     }
 
     /// POSTs `body` to `path` and expects 202: the new version (or export job).
@@ -933,7 +962,7 @@ async fn imports_run_as_builtin_jobs_and_their_outputs_make_the_version_ready() 
     )));
 
     // A Hub import with a token: the secret is a grant, its id is not in the inputs.
-    let secret = mrl_domain::ids::SecretId::new().to_string();
+    let secret = env.secret("model_download").await;
     let v = env
         .started(
             &prj,
@@ -1197,7 +1226,7 @@ async fn promote_merge_and_export_round_trip() {
         assert_eq!(r.status, 422, "{body}: {}", r.text());
         assert_eq!(r.json()["code"], code, "{body}");
     }
-    let secret = mrl_domain::ids::SecretId::new().to_string();
+    let secret = env.secret("model_export").await;
     let hub = env
         .started(
             &format!(
@@ -1282,4 +1311,43 @@ async fn promote_merge_and_export_round_trip() {
         )
         .await
         .is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn concurrent_import_and_export_replays_share_one_job() {
+    let env = Env::start().await;
+    let import = format!("/projects/{}/models:import", env.project);
+    let body = json!({"name": "replay", "source": {"kind": "hub", "repo": "org/model"}});
+    let (a, b) = tokio::join!(
+        env.post_with_key(&import, &body, "import-once"),
+        env.post_with_key(&import, &body, "import-once"),
+    );
+    assert_eq!(a.status, 202, "{}", a.text());
+    assert_eq!(b.status, 202, "{}", b.text());
+    assert_eq!(a.json(), b.json());
+    let mismatch = env
+        .post_with_key(
+            &import,
+            &json!({"name": "other", "source": body["source"]}),
+            "import-once",
+        )
+        .await;
+    assert_eq!(mismatch.status, 422, "{}", mismatch.text());
+
+    let (mv, _) = env.ready("export-replay", |_| {}).await;
+    let export = format!("/model-versions/{}:export", ModelVersionId::from_uuid(mv));
+    let body = json!({});
+    let (a, b) = tokio::join!(
+        env.post_with_key(&export, &body, "export-once"),
+        env.post_with_key(&export, &body, "export-once"),
+    );
+    assert_eq!(a.status, 202, "{}", a.text());
+    assert_eq!(b.status, 202, "{}", b.text());
+    assert_eq!(a.json(), b.json());
+    let exports: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'EXPORT'")
+        .fetch_one(env.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(exports, 1);
 }

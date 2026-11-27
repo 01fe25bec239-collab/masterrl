@@ -117,23 +117,6 @@ impl Outputs {
             AttemptId::from_uuid(attempt)
         );
         let manifest: Value = serde_json::from_str(&staged.manifest_json).unwrap_or(Value::Null);
-        // Claims the upload for this attempt (a replay whose command went out does nothing).
-        let claimed = sqlx::query(
-            "UPDATE builtin_jobs SET upload_attempt_id = $2, upload_prefix = $3,
-                    upload_manifest = $4, upload_command_id = NULL, artifact_id = NULL,
-                    failure = NULL, updated_at = now()
-             WHERE job_id = $1
-               AND (upload_attempt_id IS DISTINCT FROM $2 OR upload_command_id IS NULL)",
-        )
-        .bind(job)
-        .bind(attempt)
-        .bind(&prefix)
-        .bind(&manifest)
-        .execute(self.db.pool())
-        .await?;
-        if claimed.rows_affected() == 0 {
-            return Ok(());
-        }
         let org_text = scope::org_text(org).unwrap_or_else(|| LOCAL_ORG.to_owned());
         let (items, refused) = match self
             .items(&org_text, project, &prefix, &staged.manifest_json)
@@ -155,9 +138,36 @@ impl Outputs {
         if refused.is_some() {
             upload.items.clear();
         }
+        let mut tx = self.db.begin().await?;
+        let current = crate::modules::jobs::JobTransitions::lock(&mut tx, org, job).await?;
+        if !current.is_some_and(|j| {
+            j.current_attempt_id == Some(attempt)
+                && j.epoch == epoch
+                && matches!(j.state.as_str(), "PREPARING" | "RUNNING")
+        }) {
+            return Ok(());
+        }
+        // Claims the upload for this attempt (a replay whose command went out does nothing).
+        let claimed = sqlx::query(
+            "UPDATE builtin_jobs SET upload_attempt_id = $2, upload_prefix = $3,
+                    upload_manifest = $4, upload_command_id = NULL, artifact_id = NULL,
+                    failure = NULL, updated_at = now()
+             WHERE job_id = $1
+               AND (upload_attempt_id IS DISTINCT FROM $2 OR upload_command_id IS NULL)",
+        )
+        .bind(job)
+        .bind(attempt)
+        .bind(&prefix)
+        .bind(&manifest)
+        .execute(&mut *tx)
+        .await?;
+        if claimed.rows_affected() == 0 {
+            return Ok(());
+        }
         let sent = self
             .commands
-            .send(
+            .send_in(
+                &mut tx,
                 NodeId::from_uuid(node),
                 NewCommand::new(Kind::UploadArtifacts(upload))
                     .attempt(AttemptId::from_uuid(attempt), at.fencing_epoch)
@@ -173,8 +183,9 @@ impl Outputs {
         .bind(attempt)
         .bind(sent.id)
         .bind(refused)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await.map_err(crate::db::DbError::from)?;
         Ok(())
     }
 
@@ -294,6 +305,10 @@ impl Outputs {
         let Ok(seams) = self.seams().await else {
             return Ok(None);
         };
+        let idem = crate::modules::artifacts::Idempotency {
+            key: format!("builtin-output-{job}-{attempt}"),
+            request_sha256: mrl_storage::sha256_hex(manifest.to_string().as_bytes()),
+        };
         let new = NewArtifact {
             name: format!(
                 "{}-{}",
@@ -308,7 +323,7 @@ impl Outputs {
         };
         match self
             .store
-            .register(seams, &system_ctx(&org_text, project), new, None)
+            .register(seams, &system_ctx(&org_text, project), new, Some(&idem))
             .await
         {
             Ok(a) => Ok(Some(a.uuid())),

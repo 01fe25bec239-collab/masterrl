@@ -250,7 +250,10 @@ impl CompletionVerifier for OutputsVerifier {
             Some((_, Some(_), _)) => Verification::Abstain,
             Some((_, None, Some(why))) => failed(&why),
             Some((_, None, None)) => {
-                Verification::RetryLater("the job's results are still being saved".into())
+                return Err(SeamError::new(
+                    "builtin",
+                    "the job's results are still being saved",
+                ));
             }
         })
     }

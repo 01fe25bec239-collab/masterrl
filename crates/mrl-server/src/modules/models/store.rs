@@ -193,7 +193,7 @@ pub fn weights_hash(files: &[FileRow]) -> Option<Vec<u8>> {
     let weights: Vec<&FileRow> = files
         .iter()
         .filter(|f| matches!(f.role.as_str(), "weights" | "adapter"))
-        .filter(|f| matches!(f.format.as_str(), "safetensors" | "gguf"))
+        .filter(|f| matches!(f.format.as_str(), "safetensors" | "gguf" | "onnx"))
         .collect();
     match weights.as_slice() {
         [] => None,
@@ -365,15 +365,15 @@ pub async fn set_job(tx: &mut Tx, version: Uuid, job: Uuid) -> Result<(), DbErro
     Ok(())
 }
 
-/// The hash of the license text the project acknowledged for `model`, if any.
-pub async fn acknowledged(db: &Db, project: Uuid, model: Uuid) -> Result<Option<Vec<u8>>, DbError> {
+/// License hashes the project has acknowledged for this model.
+pub async fn acknowledged(db: &Db, project: Uuid, model: Uuid) -> Result<Vec<Vec<u8>>, DbError> {
     Ok(sqlx::query_scalar(
         "SELECT license_text_sha256 FROM license_acknowledgements
           WHERE project_id = $1 AND model_id = $2",
     )
     .bind(project)
     .bind(model)
-    .fetch_optional(db.pool())
+    .fetch_all(db.pool())
     .await?)
 }
 
@@ -384,6 +384,8 @@ pub fn classify(path: &str, role: Option<&str>) -> (String, String) {
         "safetensors"
     } else if lower.ends_with(".gguf") {
         "gguf"
+    } else if lower.ends_with(".onnx") {
+        "onnx"
     } else if lower.ends_with(".json") {
         "json"
     } else if lower.ends_with(".txt") || lower.ends_with(".md") || lower.ends_with(".jinja") {

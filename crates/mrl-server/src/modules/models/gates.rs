@@ -170,7 +170,11 @@ impl ModelGates {
             ));
         }
         let acknowledged = store::acknowledged(&self.db, v.project_id, v.model_id).await?;
-        if acknowledged.is_none() || acknowledged != v.license_sha256 {
+        if !v
+            .license_sha256
+            .as_ref()
+            .is_some_and(|hash| acknowledged.contains(hash))
+        {
             out.push(Rejection::new(
                 codes::LICENSE_NOT_ACKNOWLEDGED,
                 Some(path),
@@ -221,7 +225,8 @@ impl JobValidator for ModelGates {
 /// Per live engine version (`name@version`) and method: whether the version's facts fit,
 /// and the model problems when they don't (`{"trl@1.0.0": {"sft": {"ok": true, "problems": []}}}`).
 /// Hardware, datasets and settings are left out: this is about the model alone.
-pub async fn compatibility(db: &Db, facts: &ModelFacts) -> Result<Value, SeamError> {
+pub async fn compatibility(db: &Db, version: &VersionRow) -> Result<Value, SeamError> {
+    let facts = facts(version);
     let candidates = crate::modules::engines::store::candidates(db, None)
         .await
         .map_err(SeamError::from)?;
@@ -248,7 +253,7 @@ pub async fn compatibility(db: &Db, facts: &ModelFacts) -> Result<Value, SeamErr
                 model_signals: BTreeMap::new(),
                 rollout: false,
             };
-            let problems: Vec<Value> = matcher::check(
+            let mut problems: Vec<Value> = matcher::check(
                 Engine {
                     manifest: &c.manifest,
                     schemas: &c.schemas,
@@ -260,6 +265,12 @@ pub async fn compatibility(db: &Db, facts: &ModelFacts) -> Result<Value, SeamErr
             .filter(|p| p.path.as_deref() == Some("/base_model_version_id"))
             .map(|p| json!({"code": p.code.to_string(), "message": p.message}))
             .collect();
+            if version.kind.as_deref() == Some("inference_only") {
+                problems.push(json!({
+                    "code": codes::INFERENCE_ONLY.to_string(),
+                    "message": "This model version can be used only for inference, not for training.",
+                }));
+            }
             methods.insert(
                 algo.id.clone(),
                 json!({"ok": problems.is_empty(), "problems": problems}),

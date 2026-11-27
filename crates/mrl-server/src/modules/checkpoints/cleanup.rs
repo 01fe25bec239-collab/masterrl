@@ -121,9 +121,16 @@ pub(crate) async fn in_use(
 async fn linked(tx: &mut Tx, id: Uuid) -> Result<bool, JobsError> {
     Ok(sqlx::query_scalar(
         "SELECT EXISTS (SELECT 1 FROM runs WHERE parent_checkpoint_id = $1)
-             OR EXISTS (SELECT 1 FROM job_attempts WHERE resume_from_checkpoint_id = $1)",
+             OR EXISTS (SELECT 1 FROM job_attempts WHERE resume_from_checkpoint_id = $1)
+             OR EXISTS (
+                 SELECT 1 FROM model_versions v JOIN jobs j ON j.id = v.job_id
+                 WHERE v.source_kind = 'checkpoint'
+                   AND v.source_ref ->> 'checkpoint_id' = $2
+                   AND j.state NOT IN ('COMPLETED', 'FAILED', 'CANCELLED', 'REJECTED')
+             )",
     )
     .bind(id)
+    .bind(mrl_domain::ids::CheckpointId::from_uuid(id).to_string())
     .fetch_one(&mut **tx)
     .await?)
 }

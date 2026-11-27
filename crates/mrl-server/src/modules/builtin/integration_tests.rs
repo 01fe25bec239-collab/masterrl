@@ -458,10 +458,7 @@ async fn a_builtin_job_runs_its_task_in_its_sandbox_and_registers_its_outputs() 
     assert_eq!(env.uploader.uploads.lock().unwrap().len(), 1);
     register_pass(&env.outputs).await;
     let row = env.job(job.id).await;
-    assert!(matches!(
-        verifier.verify(&row).await.unwrap(),
-        Verification::RetryLater(_)
-    ));
+    assert!(verifier.verify(&row).await.is_err());
     assert!(builtin::outputs(env.db.db(), Uuid::nil(), job.id)
         .await
         .unwrap()

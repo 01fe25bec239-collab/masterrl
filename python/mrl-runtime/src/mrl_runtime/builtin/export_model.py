@@ -31,13 +31,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, cast
 
-from huggingface_hub import HfApi
+from huggingface_hub import CommitOperationAdd, CommitOperationDelete, HfApi
 
 from mrl_runtime.adapter.events import Progress
 from mrl_runtime.adapter.types import Issue
 from mrl_runtime.builtin.import_model import REPO, safe_relative
 from mrl_runtime.builtin.tasks import BuiltinTask, TaskContext, TaskEvent, TaskOutput
 from mrl_runtime.errors import TASK_INPUT_INVALID, MrlError
+from mrl_runtime.model import inspect_model
 from mrl_runtime.model.inspection import PICKLE_SUFFIXES
 
 EXPORT_DIR = "export"
@@ -67,6 +68,14 @@ def _validate(inputs: Mapping[str, Any], staged: Mapping[str, Path]) -> list[Iss
         )
     if "model" not in staged:
         out.append(Issue(TASK_INPUT_INVALID, "No model folder was staged.", path="/inputs"))
+    else:
+        source = inspect_model(staged["model"])
+        if source.format != "safetensors" or source.quantization:
+            out.append(
+                Issue(
+                    FORMAT_UNAVAILABLE, "Export requires unquantized safetensors.", path="/inputs"
+                )
+            )
     target = _mapping(inputs.get("target"))
     kind = target.get("kind", "artifact")
     if kind == "s3" and not S3_URL.match(str(target.get("url", ""))):
@@ -239,6 +248,13 @@ def _to_s3(
     endpoint = str(
         target.get("endpoint") or creds.get("endpoint") or f"https://s3.{region}.amazonaws.com"
     )
+    revision_hash = hashlib.sha256()
+    for rel in paths:
+        with (folder / rel).open("rb") as source:
+            file_hash = hashlib.file_digest(source, "sha256").hexdigest()
+        revision_hash.update(json.dumps([rel, file_hash]).encode())
+    revision = revision_hash.hexdigest()
+    prefix = "/".join(part for part in (prefix, revision) if part)
     keys: list[str] = []
     for i, rel in enumerate(paths):
         if not safe_relative(rel):
@@ -259,20 +275,52 @@ def _to_s3(
                 raise MrlError(TARGET_FAILED, f"S3 refused {key}: {exc}") from exc
         keys.append(key)
         yield Progress(step=i + 1, total_steps=len(paths), phase="upload")
-    yield {"kind": "s3", "bucket": bucket, "keys": keys}
+    manifest = f"{prefix}/_mrl_export.json"
+    req = s3_request(S3(endpoint, region, creds), "PUT", bucket, manifest)
+    req.data = json.dumps({"files": keys}).encode()
+    try:
+        with urllib.request.urlopen(req, timeout=60):
+            pass
+    except OSError as exc:
+        raise MrlError(TARGET_FAILED, f"S3 could not publish the export: {exc}") from exc
+    yield {"kind": "s3", "bucket": bucket, "keys": keys, "manifest": manifest}
 
 
 def _to_hub(folder: Path, target: Mapping[str, Any]) -> dict[str, Any]:
     api = HfApi(token=os.environ[str(target["credential_env"])])
     repo = str(target["repo"])
-    api.create_repo(repo, private=bool(target.get("private", True)), exist_ok=True)
-    info = api.upload_folder(
-        folder_path=folder, repo_id=repo, commit_message="Export from MasterRL"
+    private = target.get("private", True)
+    api.create_repo(repo, private=bool(private), exist_ok=True)
+    current = api.model_info(repo)
+    if private and current.private is not True:
+        raise MrlError(
+            TARGET_FAILED,
+            "This Hub repository is public. Choose a private repo or allow public export.",
+        )
+    exports = {p.relative_to(folder).as_posix(): p for p in folder.rglob("*") if p.is_file()}
+    operations: list[CommitOperationAdd | CommitOperationDelete] = [
+        CommitOperationAdd(path_in_repo=rel, path_or_fileobj=p)
+        for rel, p in sorted(exports.items())
+    ]
+    if current.sha:
+        operations.extend(
+            CommitOperationDelete(path_in_repo=rel)
+            for rel in api.list_repo_files(repo, revision=current.sha)
+            if rel not in exports and rel != ".gitattributes"
+        )
+    info = api.create_commit(
+        repo,
+        operations=operations,
+        parent_commit=current.sha,
+        commit_message="Export from MasterRL",
     )
     return {"kind": "hf_hub", "repo": repo, "commit": info.oid}
 
 
 def _run(ctx: TaskContext) -> Iterator[TaskEvent]:
+    source = inspect_model(ctx.staged_paths["model"])
+    if source.format != "safetensors" or source.quantization:
+        raise MrlError(FORMAT_UNAVAILABLE, "Export requires unquantized safetensors.")
     folder, paths = _bundle(ctx)
     target = _mapping(ctx.inputs.get("target"))
     result: dict[str, Any] = {"kind": "artifact"}

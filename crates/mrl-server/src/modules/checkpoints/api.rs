@@ -238,11 +238,13 @@ pub async fn action(
     Extension(service): Extension<Arc<CheckpointService>>,
     ctx: RequestContext,
     Path(segment): Path<String>,
+    headers: axum::http::HeaderMap,
 ) -> Result<Response, JobsError> {
     // <mrl:checkpoint-actions P26> P26 actions (`:promote`) go right below this line.
     if let Some(ckpt) = segment.strip_suffix(":promote") {
         let (row, scope) = read(&state, &service, &ctx, ckpt, "checkpoints.read").await?;
-        return crate::modules::models::jobs::promote(&state, &ctx, &service, row, scope).await;
+        return crate::modules::models::jobs::promote(&state, &ctx, &service, row, scope, &headers)
+            .await;
     }
     let Some(ckpt) = segment.strip_suffix(":verify") else {
         return Err(ApiError::new(ErrorCode::RouteNotFound, "No endpoint has this path.").into());

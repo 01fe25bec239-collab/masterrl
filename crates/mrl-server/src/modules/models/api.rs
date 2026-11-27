@@ -15,7 +15,7 @@ use crate::modules::jobs::{scope, JobsError};
 use crate::modules::runs::experiments::project_scope;
 use crate::seams::RequestContext;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use mrl_domain::ids::{JobId, ModelId, ModelVersionId, ProjectId};
@@ -166,10 +166,10 @@ pub struct ModelVersionInfo {
     pub files: Option<Vec<ModelFileInfo>>,
 }
 
-/// The API view of `v`; `acknowledged` is the project's accepted license hash.
+/// The API view of `v`, including whether the project accepted this license.
 pub fn version_view(
     v: &VersionRow,
-    acknowledged: Option<&[u8]>,
+    acknowledged: &[Vec<u8>],
     files: Option<&[store::FileRow]>,
 ) -> ModelVersionInfo {
     ModelVersionInfo {
@@ -201,7 +201,10 @@ pub fn version_view(
             spdx: v.license_spdx.clone(),
             kind: v.license_kind.clone(),
             sha256: v.license_sha256.as_deref().map(hex),
-            acknowledged: v.license_sha256.is_some() && acknowledged == v.license_sha256.as_deref(),
+            acknowledged: v
+                .license_sha256
+                .as_ref()
+                .is_some_and(|hash| acknowledged.contains(hash)),
         },
         compatibility: v.compatibility.clone(),
         inspection: v.inspection.clone(),
@@ -399,7 +402,7 @@ pub async fn list_versions(
         "SELECT ",
         version_cols!(),
         " FROM model_versions WHERE model_id = $1
-           AND ($2::uuid IS NULL OR seq < (SELECT seq FROM model_versions WHERE id = $2))
+           AND ($2::uuid IS NULL OR seq < (SELECT seq FROM model_versions WHERE id = $2 AND model_id = $1))
          ORDER BY seq DESC LIMIT $3"
     ))
     .bind(m.id)
@@ -411,10 +414,7 @@ pub async fn list_versions(
     let ack = store::acknowledged(&models.db, m.project_id, m.id).await?;
     let (rows, next) = scope::cut(rows, &page, |v| ModelVersionId::from_uuid(v.id).to_string());
     Ok(Json(Page {
-        items: rows
-            .iter()
-            .map(|v| version_view(v, ack.as_deref(), None))
-            .collect(),
+        items: rows.iter().map(|v| version_view(v, &ack, None)).collect(),
         next_cursor: next,
     }))
 }
@@ -433,7 +433,7 @@ pub async fn get_version(
     let v = authorized_version(&state, &models, &ctx, &mv, &["models.read"]).await?;
     let files = store::files(&models.db, v.id).await?;
     let ack = store::acknowledged(&models.db, v.project_id, v.model_id).await?;
-    Ok(Json(version_view(&v, ack.as_deref(), Some(&files))))
+    Ok(Json(version_view(&v, &ack, Some(&files))))
 }
 
 /// Body of the `/model-versions/{mv}:…` actions.
@@ -474,6 +474,7 @@ pub async fn version_action(
     Extension(models): Extension<Arc<Models>>,
     ctx: RequestContext,
     Path(segment): Path<String>,
+    headers: HeaderMap,
     raw: Option<Json<serde_json::Value>>,
 ) -> Result<Response, JobsError> {
     let raw = raw.map(|Json(v)| v);
@@ -492,8 +493,10 @@ pub async fn version_action(
         "acknowledge-license" => acknowledge(&state, &models, &ctx, mv, &body(&raw)?)
             .await
             .map(IntoResponse::into_response),
-        "merge-adapter" => super::jobs::merge(&state, &models, &ctx, mv, body(&raw)?).await,
-        "export" => super::jobs::export(&state, &models, &ctx, mv, body(&raw)?).await,
+        "merge-adapter" => {
+            super::jobs::merge(&state, &models, &ctx, mv, &headers, body(&raw)?).await
+        }
+        "export" => super::jobs::export(&state, &models, &ctx, mv, &headers, body(&raw)?).await,
         _ => Err(ApiError::new(ErrorCode::RouteNotFound, "No endpoint has this path.").into()),
     }
 }
@@ -545,7 +548,7 @@ pub async fn approve(
     }
     let mut after = v.clone();
     after.remote_code_approved_for = Some(revision.clone());
-    let compatibility = gates::compatibility(&models.db, &gates::facts(&after)).await?;
+    let compatibility = gates::compatibility(&models.db, &after).await?;
     let mut tx = models.db.begin().await?;
     let v = store::lock_version(&mut tx, v.id)
         .await?
@@ -613,11 +616,10 @@ pub async fn acknowledge(
         ));
     }
     let mut tx = models.db.begin().await?;
-    sqlx::query(
+    let inserted = sqlx::query(
         "INSERT INTO license_acknowledgements (org_id, project_id, model_id, user_id, license_text_sha256)
          VALUES ($1, $2, $3, $4, $5)
-         ON CONFLICT (project_id, model_id) DO UPDATE
-            SET user_id = EXCLUDED.user_id, license_text_sha256 = EXCLUDED.license_text_sha256, at = now()",
+         ON CONFLICT (project_id, model_id, license_text_sha256) DO NOTHING",
     )
     .bind(v.org_id)
     .bind(v.project_id)
@@ -627,15 +629,17 @@ pub async fn acknowledge(
     .execute(&mut *tx)
     .await
     .map_err(crate::db::DbError::from)?;
-    scope::audit(
-        &mut tx,
-        state,
-        ctx,
-        (v.org_id, v.project_id),
-        "models.acknowledge_license",
-        format!("{}@{}", ModelVersionId::from_uuid(v.id), hex(&license)),
-    )
-    .await?;
+    if inserted.rows_affected() != 0 {
+        scope::audit(
+            &mut tx,
+            state,
+            ctx,
+            (v.org_id, v.project_id),
+            "models.acknowledge_license",
+            format!("{}@{}", ModelVersionId::from_uuid(v.id), hex(&license)),
+        )
+        .await?;
+    }
     tx.commit().await.map_err(crate::db::DbError::from)?;
     respond(models, v.id).await
 }
@@ -645,5 +649,5 @@ async fn respond(models: &Models, id: Uuid) -> Result<Json<ModelVersionInfo>, Jo
         .await?
         .ok_or_else(|| JobsError::not_found("model version"))?;
     let ack = store::acknowledged(&models.db, v.project_id, v.model_id).await?;
-    Ok(Json(version_view(&v, ack.as_deref(), None)))
+    Ok(Json(version_view(&v, &ack, None)))
 }
