@@ -750,18 +750,12 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         code(Model, 260),
         "Turning pickle weights into safetensors isn't available yet.",
     ),
-    (
-        code(Model, 261),
-        "This export format isn't available yet.",
-    ),
+    (code(Model, 261), "This export format isn't available yet."),
     (
         code(Model, 262),
         "This project hasn't accepted the model's license yet.",
     ),
-    (
-        code(Model, 263),
-        "This model version isn't ready.",
-    ),
+    (code(Model, 263), "This model version isn't ready."),
     (
         code(Model, 264),
         "This adapter needs a full-precision base model.",

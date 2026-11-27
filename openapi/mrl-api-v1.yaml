@@ -842,6 +842,162 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /api/v1/model-versions/{mv}:
+    get:
+      tags:
+      - models
+      summary: '`GET /model-versions/{mv}`: the version with its files and compatibility.'
+      operationId: get_model_version
+      parameters:
+      - name: mv
+        in: path
+        description: Model version id, `mv_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The version with its files.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelVersionInfo'
+        '404':
+          description: No such model version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/model-versions/{mv}:acknowledge-license:
+    post:
+      tags:
+      - models
+      summary: '`POST /model-versions/{mv}:acknowledge-license`: the project accepts this license text.'
+      operationId: acknowledge_model_license
+      parameters:
+      - name: mv
+        in: path
+        description: Model version id, `mv_…`.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModelVersionAction'
+        required: true
+      responses:
+        '200':
+          description: The version afterwards.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelVersionInfo'
+        '409':
+          description: Not READY (MRL-MODEL-263), or another license text (MRL-MODEL-266).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/model-versions/{mv}:approve-remote-code:
+    post:
+      tags:
+      - models
+      summary: |-
+        `POST /model-versions/{mv}:approve-remote-code`: the version's custom code may run, for
+        this exact revision.
+      operationId: approve_model_remote_code
+      parameters:
+      - name: mv
+        in: path
+        description: Model version id, `mv_…`.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ModelVersionAction'
+        required: true
+      responses:
+        '200':
+          description: The version afterwards.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelVersionInfo'
+        '409':
+          description: Not READY (MRL-MODEL-263), or another revision (MRL-MODEL-266).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/models/{mdl}:
+    get:
+      tags:
+      - models
+      summary: '`GET /models/{mdl}`.'
+      operationId: get_model
+      parameters:
+      - name: mdl
+        in: path
+        description: Model id, `mdl_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The model.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelInfo'
+        '404':
+          description: No such model.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/models/{mdl}/versions:
+    get:
+      tags:
+      - models
+      summary: '`GET /models/{mdl}/versions`.'
+      operationId: list_model_versions
+      parameters:
+      - name: mdl
+        in: path
+        description: Model id, `mdl_…`.
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The model's versions, newest first (no files).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_ModelVersionInfo'
+        '404':
+          description: No such model.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/nodes/{node}:
     get:
       tags:
@@ -1234,6 +1390,77 @@ paths:
                 $ref: '#/components/schemas/Experiment'
         '409':
           description: The name is taken.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/projects/{prj}/models:
+    get:
+      tags:
+      - models
+      summary: '`GET /projects/{prj}/models`.'
+      operationId: list_models
+      parameters:
+      - name: prj
+        in: path
+        description: Project id, `prj_…`.
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The project's models, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_ModelInfo'
+        '404':
+          description: No such project.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    post:
+      tags:
+      - models
+      summary: |-
+        `POST /projects/{prj}/models`: a model with no versions yet (or the existing one of that
+        name).
+      operationId: create_model
+      parameters:
+      - name: prj
+        in: path
+        description: Project id, `prj_…`.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/NewModel'
+        required: true
+      responses:
+        '201':
+          description: The model (also when it already existed).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelInfo'
+        '404':
+          description: No such project.
           content:
             application/json:
               schema:
@@ -3949,6 +4176,257 @@ components:
         split:
           type: string
           description: Split, like `train` or `eval` (may be empty).
+    ModelFileInfo:
+      type: object
+      description: One file of a version.
+      required:
+      - path
+      - role
+      - format
+      - size
+      - sha256
+      properties:
+        format:
+          type: string
+          description: '`safetensors`, `gguf`, `json`, `txt` or `other`.'
+        path:
+          type: string
+          description: Path inside the model folder.
+        role:
+          type: string
+          description: '`weights`, `config`, `tokenizer`, `adapter`, `code` or `other`.'
+        sha256:
+          type: string
+          description: sha256 (hex).
+        size:
+          type: integer
+          format: int64
+          description: Bytes.
+    ModelInfo:
+      type: object
+      description: A model as the API shows it.
+      required:
+      - id
+      - project_id
+      - name
+      - created_by
+      - created_at
+      properties:
+        created_at:
+          type: string
+          format: date-time
+          description: When.
+        created_by:
+          type: string
+          description: Who created it.
+        family:
+          type:
+          - string
+          - 'null'
+          description: Family of the newest READY version.
+        id:
+          type: string
+          description: '`mdl_…`.'
+        name:
+          type: string
+          description: Unique name in the project.
+        project_id:
+          type: string
+          description: '`prj_…`.'
+    ModelLicense:
+      type: object
+      description: A version's license and whether its project accepted it.
+      required:
+      - acknowledged
+      properties:
+        acknowledged:
+          type: boolean
+          description: The project accepted exactly this text.
+        kind:
+          type:
+          - string
+          - 'null'
+          description: '`spdx`, `custom` or `unknown`.'
+        sha256:
+          type:
+          - string
+          - 'null'
+          description: sha256 of the license text; `:acknowledge-license` names it.
+        spdx:
+          type:
+          - string
+          - 'null'
+          description: SPDX id, like `apache-2.0`.
+    ModelVersionAction:
+      type: object
+      description: Body of the `/model-versions/{mv}:…` actions.
+      properties:
+        license_sha256:
+          type:
+          - string
+          - 'null'
+          description: '`:acknowledge-license`: the license text hash being accepted (`license.sha256`).'
+        revision:
+          type:
+          - string
+          - 'null'
+          description: '`:approve-remote-code`: the revision being approved (the version''s `revision`).'
+      additionalProperties: false
+    ModelVersionInfo:
+      type: object
+      description: A model version as the API shows it.
+      required:
+      - id
+      - model_id
+      - seq
+      - state
+      - stage
+      - source_kind
+      - source_ref
+      - dtypes
+      - requires_remote_code
+      - remote_code_approved
+      - license
+      - compatibility
+      - created_by
+      - created_at
+      properties:
+        architecture:
+          type:
+          - string
+          - 'null'
+          description: '`architectures[0]`.'
+        base_model_version_id:
+          type:
+          - string
+          - 'null'
+          description: The base of an adapter or merge.
+        chat_template_sha256:
+          type:
+          - string
+          - 'null'
+          description: sha256 of the default chat template.
+        compatibility:
+          type: object
+          description: 'Per engine version and method: `{ok, problems[]}`.'
+        context_length:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Context length.
+        created_at:
+          type: string
+          format: date-time
+          description: When.
+        created_by:
+          type: string
+          description: Who created it.
+        dtypes:
+          type: array
+          items:
+            type: string
+          description: Weight dtypes.
+        family:
+          type:
+          - string
+          - 'null'
+          description: '`decoder`, `decoder-moe`, `encoder`, `encoder-decoder`, `vlm` or `unknown`.'
+        files:
+          type:
+          - array
+          - 'null'
+          items:
+            $ref: '#/components/schemas/ModelFileInfo'
+          description: Its files (only on `GET /model-versions/{mv}`).
+        id:
+          type: string
+          description: '`mv_…`.'
+        inspection:
+          type:
+          - object
+          - 'null'
+          description: The inspection report (P15), once inspected.
+        invalid_reason:
+          type:
+          - object
+          - 'null'
+          description: 'Why it is INVALID: `{code, message}`.'
+        job_id:
+          type:
+          - string
+          - 'null'
+          description: '`job_…` that inspects or builds it.'
+        kind:
+          type:
+          - string
+          - 'null'
+          description: '`full_weights`, `adapter` or `inference_only` (once inspected).'
+        license:
+          $ref: '#/components/schemas/ModelLicense'
+          description: License.
+        model_id:
+          type: string
+          description: '`mdl_…`.'
+        model_type:
+          type:
+          - string
+          - 'null'
+          description: '`model_type`.'
+        param_count:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Parameters.
+        quantization:
+          type:
+          - string
+          - 'null'
+          description: Quantization, if any.
+        ready_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When it became READY.
+        remote_code_approved:
+          type: boolean
+          description: The code is approved for this revision (or none is needed).
+        remote_code_approved_by:
+          type:
+          - string
+          - 'null'
+          description: Who approved it.
+        requires_remote_code:
+          type: boolean
+          description: Ships its own Python code.
+        revision:
+          type:
+          - string
+          - 'null'
+          description: The revision approvals name.
+        seq:
+          type: integer
+          format: int32
+          description: 1, 2, … within the model.
+        source_kind:
+          type: string
+          description: '`hub`, `upload`, `node_path`, `checkpoint` or `merge`.'
+        source_ref:
+          type: object
+          description: Where it came from (`commit` is the pinned Hub revision).
+        stage:
+          type: string
+          description: '`EXPERIMENTAL`, `CANDIDATE`, `APPROVED` or `ARCHIVED`.'
+        state:
+          type: string
+          description: '`IMPORTING`, `READY`, `INVALID` or `ARCHIVED`.'
+        weights_sha256:
+          type:
+          - string
+          - 'null'
+          description: The hash runs record as `base_model_sha256`.
     NewArtifact:
       type: object
       description: '`POST /artifacts` body.'
@@ -4046,6 +4524,16 @@ components:
           - string
           - 'null'
           description: The other entity, when this artifact points at it (like `derived_from` a checkpoint).
+      additionalProperties: false
+    NewModel:
+      type: object
+      description: '`POST /projects/{prj}/models` body.'
+      required:
+      - name
+      properties:
+        name:
+          type: string
+          description: 1–128 letters, digits, dots, dashes or underscores.
       additionalProperties: false
     NewSecret:
       type: object
@@ -4717,6 +5205,220 @@ components:
                 type: integer
                 format: int64
                 description: Bumped by every change; also the `ETag`.
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_ModelInfo:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: A model as the API shows it.
+            required:
+            - id
+            - project_id
+            - name
+            - created_by
+            - created_at
+            properties:
+              created_at:
+                type: string
+                format: date-time
+                description: When.
+              created_by:
+                type: string
+                description: Who created it.
+              family:
+                type:
+                - string
+                - 'null'
+                description: Family of the newest READY version.
+              id:
+                type: string
+                description: '`mdl_…`.'
+              name:
+                type: string
+                description: Unique name in the project.
+              project_id:
+                type: string
+                description: '`prj_…`.'
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_ModelVersionInfo:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: A model version as the API shows it.
+            required:
+            - id
+            - model_id
+            - seq
+            - state
+            - stage
+            - source_kind
+            - source_ref
+            - dtypes
+            - requires_remote_code
+            - remote_code_approved
+            - license
+            - compatibility
+            - created_by
+            - created_at
+            properties:
+              architecture:
+                type:
+                - string
+                - 'null'
+                description: '`architectures[0]`.'
+              base_model_version_id:
+                type:
+                - string
+                - 'null'
+                description: The base of an adapter or merge.
+              chat_template_sha256:
+                type:
+                - string
+                - 'null'
+                description: sha256 of the default chat template.
+              compatibility:
+                type: object
+                description: 'Per engine version and method: `{ok, problems[]}`.'
+              context_length:
+                type:
+                - integer
+                - 'null'
+                format: int32
+                description: Context length.
+              created_at:
+                type: string
+                format: date-time
+                description: When.
+              created_by:
+                type: string
+                description: Who created it.
+              dtypes:
+                type: array
+                items:
+                  type: string
+                description: Weight dtypes.
+              family:
+                type:
+                - string
+                - 'null'
+                description: '`decoder`, `decoder-moe`, `encoder`, `encoder-decoder`, `vlm` or `unknown`.'
+              files:
+                type:
+                - array
+                - 'null'
+                items:
+                  $ref: '#/components/schemas/ModelFileInfo'
+                description: Its files (only on `GET /model-versions/{mv}`).
+              id:
+                type: string
+                description: '`mv_…`.'
+              inspection:
+                type:
+                - object
+                - 'null'
+                description: The inspection report (P15), once inspected.
+              invalid_reason:
+                type:
+                - object
+                - 'null'
+                description: 'Why it is INVALID: `{code, message}`.'
+              job_id:
+                type:
+                - string
+                - 'null'
+                description: '`job_…` that inspects or builds it.'
+              kind:
+                type:
+                - string
+                - 'null'
+                description: '`full_weights`, `adapter` or `inference_only` (once inspected).'
+              license:
+                $ref: '#/components/schemas/ModelLicense'
+                description: License.
+              model_id:
+                type: string
+                description: '`mdl_…`.'
+              model_type:
+                type:
+                - string
+                - 'null'
+                description: '`model_type`.'
+              param_count:
+                type:
+                - integer
+                - 'null'
+                format: int64
+                description: Parameters.
+              quantization:
+                type:
+                - string
+                - 'null'
+                description: Quantization, if any.
+              ready_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+                description: When it became READY.
+              remote_code_approved:
+                type: boolean
+                description: The code is approved for this revision (or none is needed).
+              remote_code_approved_by:
+                type:
+                - string
+                - 'null'
+                description: Who approved it.
+              requires_remote_code:
+                type: boolean
+                description: Ships its own Python code.
+              revision:
+                type:
+                - string
+                - 'null'
+                description: The revision approvals name.
+              seq:
+                type: integer
+                format: int32
+                description: 1, 2, … within the model.
+              source_kind:
+                type: string
+                description: '`hub`, `upload`, `node_path`, `checkpoint` or `merge`.'
+              source_ref:
+                type: object
+                description: Where it came from (`commit` is the pinned Hub revision).
+              stage:
+                type: string
+                description: '`EXPERIMENTAL`, `CANDIDATE`, `APPROVED` or `ARCHIVED`.'
+              state:
+                type: string
+                description: '`IMPORTING`, `READY`, `INVALID` or `ARCHIVED`.'
+              weights_sha256:
+                type:
+                - string
+                - 'null'
+                description: The hash runs record as `base_model_sha256`.
           description: The items on this page.
         next_cursor:
           type:
@@ -6530,3 +7232,5 @@ tags:
   description: 'Checkpoints: listing, verification and deletion.'
 - name: engines
   description: Training engines, their methods and what can run where.
+- name: models
+  description: Models and immutable model versions.
