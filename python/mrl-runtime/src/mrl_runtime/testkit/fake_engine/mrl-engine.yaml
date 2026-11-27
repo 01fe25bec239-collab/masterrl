@@ -23,7 +23,7 @@ spec:
       - id: cpu-uv
         kind: uv
         lockfile: uv.lock
-        lockSha256: 0d36b23d60b87d989324100528d48e5950780aa16ceb13ffe5ce3c73220969cd
+        lockSha256: bbab9bda078259e76e445ccbdc59a66ef70b6e0663b75d4058ddf1d0fcf29249
         python: "3.12"
         platform: linux/amd64
         accelerator: { vendor: cpu }
