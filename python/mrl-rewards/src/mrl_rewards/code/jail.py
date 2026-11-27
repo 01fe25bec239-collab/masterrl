@@ -23,8 +23,10 @@ own result: Python has no isolation inside one process, which is why `code.*` is
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import hashlib
+import io
 import json
 import os
 import secrets
@@ -65,7 +67,7 @@ for target, fd in high.items():
 os.execv(sys.argv[2], sys.argv[2:])
 """
 
-HARNESS = r'''
+HARNESS = r"""
 import json, os, sys
 
 def _main():
@@ -113,7 +115,7 @@ def _main():
     done(compiled=True, loaded=True, results=results)
 
 _main()
-'''
+"""
 
 
 @dataclass(frozen=True)
@@ -130,7 +132,7 @@ class JailLimits:
     def checked(self) -> JailLimits:
         if not (0 < self.wall_s <= 10 and 0 < self.cpu_s <= 5):
             raise RewardError(
-                "MRL-RWD-143", "Code limits: wall time 0–10 s and CPU time 1–5 s at most."
+                "MRL-RWD-143", "Code limits: wall time up to 10 s and CPU time 1 to 5 s."
             )
         return self
 
@@ -267,7 +269,7 @@ class Jail:
             fd_map[SECCOMP_FD] = seccomp_fd
         cfg = json.dumps({"rlimits": self._rlimits(), "fds": fd_map})
         try:
-            proc = subprocess.Popen(  # noqa: S603 (fixed argv, no shell)
+            proc = subprocess.Popen(
                 [str(self.python), "-I", "-S", "-c", LAUNCHER, cfg, *self.argv(folder, mode)],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
@@ -299,8 +301,9 @@ class Jail:
         )
 
     def _watch(self, proc: subprocess.Popen[bytes]) -> tuple[str, bool, bool]:
-        stdout = proc.stdout
-        assert stdout is not None
+        if proc.stdout is None:
+            raise RewardError(JAIL_UNAVAILABLE, "The jail's output could not be read.")
+        stdout = cast("io.BufferedReader", proc.stdout)
         cap = self.limits.output_bytes
         buf = bytearray()
         flooded = False
@@ -334,10 +337,8 @@ class Jail:
 
 
 def _kill(proc: subprocess.Popen[bytes]) -> None:
-    try:
+    with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
 
 
 def _drain(fd: int, into: bytearray) -> None:

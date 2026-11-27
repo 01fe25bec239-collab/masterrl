@@ -18,6 +18,7 @@ dependencies = [
     # <mrl:deps P26> P26 dependencies go right below this line.
     # <mrl:deps P27> P27 dependencies go right below this line.
     # <mrl:deps P29> P29 dependencies go right below this line.
+    "mrl-rewards",
 ]
 
 [project.scripts]
@@ -36,6 +37,7 @@ hash_files = "mrl_runtime.builtin.tasks:HASH_FILES"
 # <mrl:builtin-tasks P26> P26 tasks go right below this line.
 # <mrl:builtin-tasks P27> P27 tasks go right below this line.
 # <mrl:builtin-tasks P29> P29 tasks go right below this line.
+reward_preview = "mrl_runtime.builtin.reward_preview:REWARD_PREVIEW"
 
 [dependency-groups]
 dev = ["hypothesis==6.170.14"]

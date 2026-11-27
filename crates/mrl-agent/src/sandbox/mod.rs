@@ -10,6 +10,7 @@
 //! and microVM backends). Each part adds one line inside its `// <mrl:register>` block.
 
 pub mod bwrap;
+pub mod profiles;
 
 use std::path::PathBuf;
 
@@ -74,6 +75,10 @@ pub fn profiles() -> Vec<SandboxProfile> {
         worker(),
         data_prep(),
         fetch(),
+        profiles::reward::profile(),
+        profiles::code_exec::profile(),
+        profiles::command::profile(),
+        profiles::command::profile_net(),
         // </mrl:register>
     ]
 }
@@ -167,7 +172,7 @@ mod tests {
     fn profiles_are_registered() {
         assert_eq!(profile("worker").unwrap(), worker());
         assert!(!profile("data_prep").unwrap().gpu_devices);
-        let e = profile("reward").unwrap_err();
+        let e = profile("no_such_profile").unwrap_err();
         assert_eq!(e.code(), "MRL-VAL-126");
         assert!(e.to_string().contains("worker, data_prep"));
     }

@@ -151,7 +151,7 @@ class CodeUnitTests(_CodeComponent):
         super().configure()
         self.scoring = self.p_str("scoring", "all_or_nothing")
 
-    def score_one(self, sample: RewardSample) -> RewardResult:
+    def score_one(self, sample: RewardSample) -> RewardResult:  # noqa: PLR0911
         verifier = reference_field(sample.reference, "verifier")
         tests = verifier.get("tests") if isinstance(verifier, dict) else None
         if not isinstance(tests, str) or not tests.strip():
@@ -169,18 +169,22 @@ class CodeUnitTests(_CodeComponent):
         if verdict.get("compiled") is not True or verdict.get("loaded") is not True:
             why = echo(str(verdict.get("error", "the code did not load")))
             return RewardResult.ok(0.0, {"code_found": True, "error": why}, *flags)
-        raw = verdict.get("results")
-        rows = cast("Sequence[JSONValue]", raw) if isinstance(raw, list) else []
-        passed = sum(1 for r in rows if isinstance(r, list) and len(r) == 3 and r[1] is True)
-        total = len(rows)
+        raw: JSONValue = verdict.get("results")
+        items: Sequence[JSONValue] = (
+            cast("Sequence[JSONValue]", raw) if isinstance(raw, list) else ()
+        )
+        rows: list[Sequence[JSONValue]] = []
+        for r in items:
+            if isinstance(r, list) and len(cast("Sequence[JSONValue]", r)) == 3:
+                rows.append(cast("Sequence[JSONValue]", r))
+        passed = sum(1 for r in rows if r[1] is True)
+        total = len(items)
         if total == 0:
             return RewardResult.ok(0.0, {"code_found": True, "tests": 0}, *flags)
         value = passed / total if self.scoring == "fraction" else float(passed == total)
-        first_fail = next(
-            (r for r in rows if isinstance(r, list) and len(r) == 3 and r[1] is not True), None
-        )
+        first_fail = next((r for r in rows if r[1] is not True), None)
         diag: dict[str, str | int | bool] = {"code_found": True, "passed": passed, "tests": total}
-        if isinstance(first_fail, list):
+        if first_fail is not None:
             diag["first_failure"] = echo(f"{first_fail[0]}: {first_fail[2]}")
         return RewardResult.ok(value, diag, *flags)
 

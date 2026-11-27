@@ -14,6 +14,7 @@ dependencies = [
 
 [project.scripts]
 mrl-reward-exec = "mrl_rewards.exec.main:main"
+mrl-reward-sandboxed = "mrl_rewards.server_bundle.serve:main"
 
 [dependency-groups]
 dev = ["hypothesis==6.170.14"]
