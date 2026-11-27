@@ -747,6 +747,24 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
     ),
     // <mrl:errors P26> rows for P26 go right below this line.
     // <mrl:errors P27> rows for P27 go right below this line.
+    (
+        code(Data, 270),
+        "This dataset has images, and the app can't train on images yet.",
+    ),
+    (code(Data, 271), "The app refused to unpack this archive."),
+    (code(Data, 272), "The app could not download this dataset."),
+    (
+        code(Data, 273),
+        "The dataset job finished, but its results are damaged.",
+    ),
+    (
+        code(Conflict, 270),
+        "This project already has a dataset with that name.",
+    ),
+    (
+        code(Perm, 270),
+        "This dataset holds personal data, so it can't leave the app.",
+    ),
     // <mrl:errors P28> rows for P28 go right below this line.
     // <mrl:errors P29> rows for P29 go right below this line.
     // <mrl:errors P30> rows for P30 go right below this line.

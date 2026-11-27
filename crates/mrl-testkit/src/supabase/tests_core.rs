@@ -684,6 +684,33 @@ async fn every_route_answers_by_role_in_team_mode() {
         .unwrap();
     // <mrl:roles-seed P26> P26 seed data for the role table goes right below this line.
     // <mrl:roles-seed P27> P27 seed data for the role table goes right below this line.
+    // P27 routes: a dataset with one READY version (no rows, an empty hash list), and a
+    // second dataset the allowed roles delete.
+    let (p27_ds, p27_dsv, p27_gone) = (
+        mrl_domain::ids::DatasetId::new(),
+        mrl_domain::ids::DatasetVersionId::new(),
+        mrl_domain::ids::DatasetId::new(),
+    );
+    core.db
+        .seed(&format!(
+            "INSERT INTO datasets (id, org_id, project_id, name, created_by)
+             VALUES ('{d}', '{o}', '{p}', 'rbac-data', 'seed'),
+                    ('{g}', '{o}', '{p}', 'rbac-gone', 'seed');
+             INSERT INTO dataset_versions (id, org_id, dataset_id, seq, schema_id, state,
+               source_kind, row_count, byte_size, content_sha256, summary, created_by, ready_at)
+             VALUES ('{v}', '{o}', '{d}', 1, 'sft.messages.v1', 'READY', 'upload', 0, 0,
+               decode(repeat('00', 32), 'hex'), '{{\"browse\": []}}', 'seed', now());
+             INSERT INTO dataset_files (dataset_version_id, org_id, path, role, object_key,
+               sha256, size_bytes)
+             VALUES ('{v}', '{o}', 'record_hashes.txt', 'derived', 'orgs/{o}/blobs/none',
+               decode(repeat('00', 32), 'hex'), 0);",
+            d = p27_ds.as_uuid(),
+            g = p27_gone.as_uuid(),
+            v = p27_dsv.as_uuid(),
+            o = org.as_uuid(),
+            p = prj.as_uuid()
+        ))
+        .await;
     // <mrl:roles-seed P28> P28 seed data for the role table goes right below this line.
     // <mrl:roles-seed P29> P29 seed data for the role table goes right below this line.
     // <mrl:roles-seed P30> P30 seed data for the role table goes right below this line.
@@ -1118,6 +1145,78 @@ async fn every_route_answers_by_role_in_team_mode() {
         ),
         // <mrl:roles-routes P26> P26 role-table rows go right below this line.
         // <mrl:roles-routes P27> P27 role-table rows go right below this line.
+        row(
+            Method::GET,
+            format!("/api/v1/projects/{prj}/datasets"),
+            Action::DatasetsRead,
+            None,
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/projects/{prj}/datasets"),
+            Action::DatasetsImport,
+            Some(json!({"name": "rbac-new", "license": "MIT"})),
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/datasets/{p27_ds}"),
+            Action::DatasetsRead,
+            None,
+        ),
+        row(
+            Method::PATCH,
+            format!("/api/v1/datasets/{p27_ds}"),
+            Action::DatasetsImport,
+            Some(json!({"description": "Checked by the role table."})),
+        ),
+        row(
+            Method::DELETE,
+            format!("/api/v1/datasets/{p27_gone}"),
+            Action::DatasetsImport,
+            None,
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/datasets/{p27_ds}/versions"),
+            Action::DatasetsRead,
+            None,
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/dataset-versions/{p27_dsv}"),
+            Action::DatasetsRead,
+            None,
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/dataset-versions/{p27_dsv}/validation"),
+            Action::DatasetsRead,
+            None,
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/dataset-versions/{p27_dsv}/stats"),
+            Action::DatasetsRead,
+            None,
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/dataset-versions/{p27_dsv}/records?filter=len(messages)%20%3E%200"),
+            Action::DatasetsRead,
+            None,
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/dataset-versions/{p27_dsv}:diff"),
+            Action::DatasetsRead,
+            Some(json!({"against": p27_dsv.to_string()})),
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/dataset-versions/{p27_dsv}:export"),
+            Action::DatasetsExport,
+            Some(json!({"format": "parquet"})),
+        ),
         // <mrl:roles-routes P28> P28 role-table rows go right below this line.
         // <mrl:roles-routes P29> P29 role-table rows go right below this line.
         // <mrl:roles-routes P30> P30 role-table rows go right below this line.
@@ -1168,6 +1267,12 @@ async fn every_route_answers_by_role_in_team_mode() {
             ("DELETE", p) if p.starts_with("/api/v1/checkpoints/") => &[204],
             // <mrl:roles-expected P26> P26 expected-status arms go right below this line.
             // <mrl:roles-expected P27> P27 expected-status arms go right below this line.
+            // P27 routes: the first allowed role makes the dataset, later ones meet its name
+            // (409 MRL-CONFLICT-270). Deleting is 204, also when already deleted.
+            ("POST", p) if p.ends_with("/datasets") => &[201, 409],
+            ("PATCH", p) if p.starts_with("/api/v1/datasets/") => &[200],
+            ("DELETE", p) if p.starts_with("/api/v1/datasets/") => &[204],
+            ("POST", p) if p.starts_with("/api/v1/dataset-versions/") => &[200],
             // <mrl:roles-expected P28> P28 expected-status arms go right below this line.
             // <mrl:roles-expected P29> P29 expected-status arms go right below this line.
             // <mrl:roles-expected P30> P30 expected-status arms go right below this line.

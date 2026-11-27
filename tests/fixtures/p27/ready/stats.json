@@ -1,0 +1,26 @@
+{
+  "records": 200,
+  "field_lengths": {
+    "messages.content": {
+      "count": 530,
+      "min": 16,
+      "max": 36,
+      "mean": 24.17,
+      "p50": 26.0,
+      "p95": 36.0
+    }
+  },
+  "roles": {
+    "user": 240,
+    "assistant": 240,
+    "system": 50
+  },
+  "turns": {
+    "count": 200,
+    "min": 2,
+    "max": 5,
+    "mean": 2.65,
+    "p50": 2.0,
+    "p95": 4.05
+  }
+}

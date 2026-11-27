@@ -467,6 +467,384 @@ class CreateToken(TypedDict):
     """`["*"]`, or areas like `["runs:write", "datasets:read"]`."""
 
 
+class DatasetContamination(TypedDict):
+    """Overlap of a version with an evaluation version."""
+
+    eval_dataset_version_id: str
+    """`dsv_…` of the evaluation set."""
+
+    method: str
+    """`exact`."""
+
+    overlap_ratio: float
+    """Share of this version's records that share a prompt with it (0-1)."""
+
+    overlapping_rows: int
+    """How many."""
+
+
+class DatasetCreate(TypedDict):
+    """`POST /projects/{prj}/datasets`."""
+
+    card_md: NotRequired[str | None]
+    """Dataset card (Markdown)."""
+
+    consent_basis: NotRequired[str | None]
+    """Why the data may be used."""
+
+    description: NotRequired[str | None]
+    """Short description."""
+
+    eval_set: NotRequired[bool | None]
+    """Check new versions of other datasets for overlap with this one."""
+
+    license: NotRequired[str | None]
+    """SPDX licence id, `custom` or `unknown` (default)."""
+
+    name: str
+    """Unique in the project (1-200 characters)."""
+
+    permitted_use: NotRequired[list[str] | None]
+    """`research`, `commercial`, `internal`."""
+
+    sensitivity: NotRequired[str | None]
+    """`public`, `internal` (default), `confidential` or `restricted-pii`."""
+
+    source_urls: NotRequired[list[str] | None]
+    """Where the data came from (http or https links)."""
+
+
+class DatasetDiff(TypedDict):
+    """How two versions differ (Doc 08 §2.6)."""
+
+    against: DatasetVersionInfo
+    """The other."""
+
+    against_sample: list[dict[str, Any]]
+    """The first records of `against`."""
+
+    base: DatasetVersionInfo
+    """This version."""
+
+    base_sample: list[dict[str, Any]]
+    """The first records of this version."""
+
+    records: DatasetRecordDiff
+    """Record changes, by exact record hash."""
+
+    row_delta: int
+    """`against` rows minus these rows."""
+
+    same_content: bool
+    """Same content hash: the same records."""
+
+    same_schema: bool
+    """Both use the same schema."""
+
+
+class DatasetDiffRequest(TypedDict):
+    """`POST /dataset-versions/{dsv}:diff`."""
+
+    against: str
+    """The version to compare with (`dsv_…`): "added" means in it but not in this one."""
+
+
+class DatasetExport(TypedDict):
+    """An export."""
+
+    files: list[DatasetExportFile]
+    """The files, with download links."""
+
+    format: str
+    """The format asked for."""
+
+
+class DatasetExportFile(TypedDict):
+    """A file to download."""
+
+    expires_at: str
+    """When the link stops working."""
+
+    path: str
+    """Path inside the export."""
+
+    sha256: str
+    """sha256 (hex): check the download against it."""
+
+    size: int
+    """Size in bytes."""
+
+    url: str
+    """Download link (relative to the server), valid until `expires_at`."""
+
+
+class DatasetExportRequest(TypedDict):
+    """`POST /dataset-versions/{dsv}:export`."""
+
+    format: str
+    """`parquet`: the version's shards."""
+
+
+class DatasetFileInfo(TypedDict):
+    """One stored file of a version."""
+
+    path: str
+    """Path inside the version."""
+
+    role: str
+    """`shard`, `original` or `derived`."""
+
+    rows: NotRequired[int | None]
+    """Rows (shards)."""
+
+    sha256: str
+    """sha256 (hex)."""
+
+    size: int
+    """Size in bytes."""
+
+    split: NotRequired[str | None]
+    """Split (shards)."""
+
+
+class DatasetInfo(TypedDict):
+    """A dataset."""
+
+    card_md: str
+    """Dataset card (Markdown, shown sanitized)."""
+
+    consent_basis: NotRequired[str | None]
+    """Why the data may be used."""
+
+    created_at: str
+    """Created."""
+
+    created_by: str
+    """Who made it."""
+
+    description: str
+    """Short description."""
+
+    eval_set: bool
+    """New versions of other datasets are checked for overlap with this one."""
+
+    id: str
+    """`ds_…`."""
+
+    license: str
+    """SPDX licence id, `custom` or `unknown`."""
+
+    name: str
+    """Unique in the project."""
+
+    permitted_use: list[str]
+    """`research`, `commercial`, `internal`."""
+
+    policy: DatasetPolicy
+    """What the sensitivity allows."""
+
+    project_id: str
+    """`prj_…`."""
+
+    sensitivity: str
+    """`public`, `internal`, `confidential` or `restricted-pii`."""
+
+    source_urls: list[str]
+    """Where the data came from."""
+
+    updated_at: str
+    """Last changed."""
+
+
+class DatasetInfoPage(TypedDict):
+    """One page of results."""
+
+    items: list[DatasetInfo]
+    """The items on this page."""
+
+    next_cursor: NotRequired[str | None]
+    """Pass as `cursor` for the next page; `null` on the last page."""
+
+
+class DatasetPatch(TypedDict):
+    """`PATCH /datasets/{ds}`: the fields to change (the name too)."""
+
+    card_md: NotRequired[str | None]
+    """New card."""
+
+    consent_basis: NotRequired[str | None]
+    """New consent basis."""
+
+    description: NotRequired[str | None]
+    """New description."""
+
+    eval_set: NotRequired[bool | None]
+    """Registered as an evaluation set."""
+
+    license: NotRequired[str | None]
+    """New licence."""
+
+    name: NotRequired[str | None]
+    """New name."""
+
+    permitted_use: NotRequired[list[str] | None]
+    """New permitted uses."""
+
+    sensitivity: NotRequired[str | None]
+    """New sensitivity."""
+
+    source_urls: NotRequired[list[str] | None]
+    """New source links."""
+
+
+class DatasetPolicy(TypedDict):
+    """What a dataset's sensitivity allows (P22/P23 read `sample_logging`)."""
+
+    export_allowed: bool
+    """Its files may be downloaded or exported."""
+
+    hub_push_allowed: bool
+    """It may be pushed to the Hugging Face Hub."""
+
+    sample_logging: bool
+    """Runs on it may log raw samples."""
+
+
+class DatasetRecord(TypedDict):
+    """One record."""
+
+    index: int
+    """Position in the version (0-based, in shard order)."""
+
+    record: dict[str, Any]
+    """The record. Show it as text only: it is untrusted."""
+
+
+class DatasetRecordDiff(TypedDict):
+    """Records that differ between two versions."""
+
+    added: int
+    """In `against` only."""
+
+    added_examples: list[str]
+    """Record hashes (sha256 of the record as canonical JSON) of some added records."""
+
+    removed: int
+    """In this version only."""
+
+    removed_examples: list[str]
+    """… of some removed records."""
+
+    unchanged: int
+    """In both."""
+
+
+class DatasetRecordsPage(TypedDict):
+    """A page of records."""
+
+    items: list[DatasetRecord]
+    """Records that match."""
+
+    next_cursor: NotRequired[str | None]
+    """Continue here; `null` at the end. A page may hold fewer than `limit` records when a"""
+
+    scanned: int
+    """Records looked at for this page."""
+
+
+class DatasetValidation(TypedDict):
+    """The validation report of a checked version."""
+
+    contamination: list[DatasetContamination]
+    """Overlap with registered evaluation sets."""
+
+    dataset_version_id: str
+    """`dsv_…`."""
+
+    report: NotRequired[dict[str, Any] | None]
+    """Counts, defect codes, invalid examples (record, code, field, message), duplicates,"""
+
+    state: str
+    """The version's state."""
+
+    state_reason: NotRequired[dict[str, Any] | None]
+    """Why it is INVALID."""
+
+    summary: NotRequired[dict[str, Any] | None]
+    """What the check wrote about the files (records per file, skipped files, images,"""
+
+
+class DatasetVersionInfo(TypedDict):
+    """A dataset version."""
+
+    byte_size: NotRequired[int | None]
+    """Bytes in its shards."""
+
+    content_sha256: NotRequired[str | None]
+    """sha256 over its sorted shard hashes (hex): the same records give the same value."""
+
+    created_at: str
+    """Created."""
+
+    created_by: str
+    """Who made it."""
+
+    dataset_id: str
+    """`ds_…`."""
+
+    files: NotRequired[list[DatasetFileInfo] | None]
+    """Its files (only on `GET /dataset-versions/{dsv}`)."""
+
+    id: str
+    """`dsv_…`."""
+
+    job_id: NotRequired[str | None]
+    """The job working on it (`job_…`), while it is being prepared."""
+
+    parent_version_id: NotRequired[str | None]
+    """The version it was made from."""
+
+    ready_at: NotRequired[str | None]
+    """Became READY."""
+
+    row_count: NotRequired[int | None]
+    """Rows."""
+
+    schema_id: str
+    """Canonical schema id, like `sft.messages.v1`."""
+
+    seq: int
+    """1, 2, … within the dataset."""
+
+    source_kind: str
+    """`upload`, `hub`, `remote_ref` or `transform`."""
+
+    source_ref: dict[str, Any]
+    """Where it came from (uploads, Hub repo with its commit SHA, link, parent)."""
+
+    splits: NotRequired[dict[str, Any] | None]
+    """Rows per split."""
+
+    state: str
+    """`INGESTING`, `VALIDATING`, `READY`, `INVALID` or `ARCHIVED`."""
+
+    state_reason: NotRequired[dict[str, Any] | None]
+    """Why it is INVALID: `{code, message}`."""
+
+    transform_spec: NotRequired[dict[str, Any] | None]
+    """The transform that made it."""
+
+
+class DatasetVersionInfoPage(TypedDict):
+    """One page of results."""
+
+    items: list[DatasetVersionInfo]
+    """The items on this page."""
+
+    next_cursor: NotRequired[str | None]
+    """Pass as `cursor` for the next page; `null` on the last page."""
+
+
 class DownloadRequest(TypedDict):
     """`POST /artifacts/{art}:download` body."""
 
@@ -2199,6 +2577,24 @@ __all__ = [
     "CreateEnrollmentToken",
     "CreatePool",
     "CreateToken",
+    "DatasetContamination",
+    "DatasetCreate",
+    "DatasetDiff",
+    "DatasetDiffRequest",
+    "DatasetExport",
+    "DatasetExportFile",
+    "DatasetExportRequest",
+    "DatasetFileInfo",
+    "DatasetInfo",
+    "DatasetInfoPage",
+    "DatasetPatch",
+    "DatasetPolicy",
+    "DatasetRecord",
+    "DatasetRecordDiff",
+    "DatasetRecordsPage",
+    "DatasetValidation",
+    "DatasetVersionInfo",
+    "DatasetVersionInfoPage",
     "DownloadRequest",
     "Edge",
     "Endpoint",

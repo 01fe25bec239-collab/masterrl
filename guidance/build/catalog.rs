@@ -2426,6 +2426,17 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-CONFLICT-270")),
+            ("title", Value::Str("This project already has a dataset with that name.")),
+            ("why", Value::Str("Dataset names are unique within a project, so you can tell them apart in runs and reports.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Pick another name."),
+                    Value::Str("Or add a new version to the dataset that already has this name."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-DATA-001")),
             ("title", Value::Str("Your dataset did not pass its checks.")),
             ("why", Value::Str("Some rows are empty, are missing fields, or don't match the chosen format.")),
@@ -2476,6 +2487,52 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Check the dataset version id in the run settings."),
                     Value::Str("Import the dataset first if it isn't in the app yet."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-DATA-270")),
+            ("title", Value::Str("This dataset has images, and the app can't train on images yet.")),
+            ("why", Value::Str("Records with images are a picture-and-text format. Training on pictures comes in a later version of the app, so the app doesn't keep these records now.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Remove the images from the records and add the dataset again as text only."),
+                    Value::Str("Or keep the file and add it again once picture training is available."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-DATA-271")),
+            ("title", Value::Str("The app refused to unpack this archive.")),
+            ("why", Value::Str("The archive writes outside its folder, holds links, has too many files, or unpacks to far more than its size. Details says which.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Unpack the archive on your computer and check what is inside."),
+                    Value::Str("Pack only the data files again, in plain folders, and add the new archive."),
+                    Value::Str("Or add the data files one by one without an archive."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-DATA-272")),
+            ("title", Value::Str("The app could not download this dataset.")),
+            ("why", Value::Str("The address isn't public `https://`, the server refused, the download is too big, or the connection broke. Details says which.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Check the address, the repository name and the revision."),
+                    Value::Str("For a private Hugging Face dataset, add an access token in Settings and pick it."),
+                    Value::Str("Try again. If the dataset is very large, raise the size limit or add the files yourself."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-DATA-273")),
+            ("title", Value::Str("The dataset job finished, but its results are damaged.")),
+            ("why", Value::Str("A file the job wrote is missing, cut short, or doesn't match its checksum. The version is marked as not usable.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Add the dataset version again."),
+                    Value::Str("If this keeps happening, check the storage settings and free space on the machine that ran the job."),
                 ])),
             ])),
         ]),
@@ -3446,6 +3503,17 @@ pub static CATALOG: Value = Value::Map(&[
             ("what_to_do", Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Create a pool and add a machine to it, or ask an admin to open a pool to your organization."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-PERM-270")),
+            ("title", Value::Str("This dataset holds personal data, so it can't leave the app.")),
+            ("why", Value::Str("Its sensitivity is set to restricted personal data. Exports and uploads to Hugging Face are turned off for it, and training doesn't log its records.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Use the dataset inside the app only."),
+                    Value::Str("If the data is not personal, an admin can change the dataset's sensitivity first."),
                 ])),
             ])),
         ]),

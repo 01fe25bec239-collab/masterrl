@@ -1,0 +1,49 @@
+{
+  "schema": "sft.messages.v1",
+  "source": "sft.messages.v1",
+  "format": "mixed",
+  "records": 200,
+  "valid": 200,
+  "invalid": 0,
+  "defect_counts": {},
+  "examples": [],
+  "duplicates": 0,
+  "duplicate_examples": [],
+  "leakage": {},
+  "stats": {
+    "records": 200,
+    "field_lengths": {
+      "messages.content": {
+        "count": 530,
+        "min": 16,
+        "max": 36,
+        "mean": 24.17,
+        "p50": 26.0,
+        "p95": 36.0
+      }
+    },
+    "roles": {
+      "user": 240,
+      "assistant": 240,
+      "system": 50
+    },
+    "turns": {
+      "count": 200,
+      "min": 2,
+      "max": 5,
+      "mean": 2.65,
+      "p50": 2.0,
+      "p95": 4.05
+    }
+  },
+  "checks": {
+    "parse": "full",
+    "schema": "full",
+    "rules": "full",
+    "duplicates": "full",
+    "stats": "full",
+    "leakage": "skipped"
+  },
+  "passed": true,
+  "error_code": null
+}

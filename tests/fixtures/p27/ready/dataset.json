@@ -1,0 +1,43 @@
+{
+  "browse": [
+    {
+      "first": 0,
+      "path": "browse/00000.jsonl",
+      "rows": 100
+    },
+    {
+      "first": 100,
+      "path": "browse/00001.jsonl",
+      "rows": 100
+    }
+  ],
+  "duplicates": 0,
+  "error_code": null,
+  "files": [
+    {
+      "first_record": 1,
+      "path": "data.jsonl",
+      "records": 200
+    }
+  ],
+  "ignored_files": [],
+  "images": 0,
+  "invalid": 0,
+  "leakage": {},
+  "passed": true,
+  "reason": "",
+  "records": 200,
+  "rows": 200,
+  "schema_id": "sft.messages.v1",
+  "shards": [
+    {
+      "path": "shards/train-00000.parquet",
+      "rows": 200,
+      "split": "train"
+    }
+  ],
+  "splits": {
+    "train": 200
+  },
+  "valid": 200
+}

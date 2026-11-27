@@ -1,0 +1,24 @@
+{
+  "browse": [],
+  "duplicates": 0,
+  "error_code": "MRL-DATA-001",
+  "files": [
+    {
+      "first_record": 1,
+      "path": "data.jsonl",
+      "records": 8
+    }
+  ],
+  "ignored_files": [],
+  "images": 0,
+  "invalid": 8,
+  "leakage": {},
+  "passed": false,
+  "reason": "8 of 8 record(s) do not match sft.messages.v1.",
+  "records": 8,
+  "rows": 0,
+  "schema_id": "sft.messages.v1",
+  "shards": [],
+  "splits": {},
+  "valid": 0
+}

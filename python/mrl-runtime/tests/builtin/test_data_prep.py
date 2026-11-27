@@ -5,6 +5,7 @@ import asyncio
 import hashlib
 import io
 import json
+import os
 import shutil
 import tarfile
 import zipfile
@@ -18,6 +19,7 @@ from mrl_runtime._generated.mrl.worker.v1 import worker_control_pb2 as pb
 from mrl_runtime.builtin import BuiltinEngine, discover_tasks, load_builtin_manifest
 from mrl_runtime.builtin.data_prep import DATA_PREP, MAX_RATIO, RATIO_FLOOR
 from mrl_runtime.builtin.tasks import TaskContext, TaskOutput
+from mrl_runtime.builtin.transform import TRANSFORM
 from mrl_runtime.data.adapter import DatasetAdapter
 from mrl_runtime.data.validate import DATASET_SCHEMAS, content_hashes
 from mrl_runtime.testkit.agent import AgentScript
@@ -224,3 +226,51 @@ def test_runs_in_the_builtin_engine(tmp_path: Path) -> None:
     assert {"dataset.json", "validation_report.json", "record_hashes.txt"} <= paths
     assert any(p.startswith("shards/") for p in paths)
     assert manifest["kind"] == "dataset"
+
+
+P27 = DATASETS.parent / "p27"
+
+
+def _version_folders(tmp: Path) -> dict[str, Path]:
+    """What the server tests read: a READY, an INVALID and a filtered (transform) version."""
+    out: dict[str, Path] = {}
+    for name, src in [
+        ("ready", "sft.messages.v1.jsonl"),
+        ("invalid", "sft.messages.v1-invalid.jsonl"),
+    ]:
+        _prep(tmp / name, {"data.jsonl": _fixture(src)}, {"schema_id": "sft.messages.v1"})
+        out[name] = tmp / name / "outputs"
+    spec = {
+        "schema_version": "transform/v1",
+        "name": "long-chats",
+        "to": "sft.messages.v1",
+        "steps": [{"op": "filter", "expr": "len(messages) > 2"}],
+    }
+    staged = {"parent": out["ready"]}
+    assert TRANSFORM.validate({"spec": spec}, staged) == []
+    out["filtered"] = tmp / "filtered"
+    list(TRANSFORM.run(TaskContext({"spec": spec}, staged, out["filtered"], lambda: False)))
+    return out
+
+
+def test_server_fixtures_are_what_the_tasks_write(tmp_path: Path) -> None:
+    """tests/fixtures/p27/ holds real task outputs. MRL_UPDATE_FIXTURES=1 rewrites them.
+    Parquet bytes carry the writer's version, so shards are compared by their records; JSON by
+    value (tied defect counts come in any order)."""
+    for name, made in _version_folders(tmp_path).items():
+        kept = P27 / name
+        if os.environ.get("MRL_UPDATE_FIXTURES") == "1":
+            shutil.rmtree(kept, ignore_errors=True)
+            shutil.copytree(made, kept)
+        files = sorted(p.relative_to(made).as_posix() for p in made.rglob("*") if p.is_file())
+        assert files == sorted(
+            p.relative_to(kept).as_posix() for p in kept.rglob("*") if p.is_file()
+        )
+        for f in files:
+            if f.endswith(".json"):
+                same = json.loads((made / f).read_bytes()) == json.loads((kept / f).read_bytes())
+                assert same, f"{name}/{f}"
+            elif not f.endswith(".parquet"):
+                assert (made / f).read_bytes() == (kept / f).read_bytes(), f"{name}/{f}"
+        if name != "invalid":
+            assert list(DatasetAdapter(kept).records()) == list(DatasetAdapter(made).records())
