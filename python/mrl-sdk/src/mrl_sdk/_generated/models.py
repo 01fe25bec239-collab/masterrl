@@ -654,7 +654,13 @@ class ExportTarget(TypedDict):
     """S3-compatible endpoint (s3; default AWS)."""
 
     kind: NotRequired[str | None]
-    """`artifact` (default: download it from the app), `s3` or `hf_hub`."""
+    """`artifact` (default), `node_path`, `s3` or `hf_hub`."""
+
+    node_id: NotRequired[str | None]
+    """Required machine id (`node_path`)."""
+
+    path: NotRequired[str | None]
+    """Absolute destination directory on the selected machine (`node_path`)."""
 
     private: NotRequired[bool | None]
     """Make the Hub repository private (hf_hub; default true)."""

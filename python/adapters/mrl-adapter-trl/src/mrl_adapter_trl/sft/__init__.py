@@ -817,7 +817,8 @@ class TrlSftEngine(BaseEngine):
             )
             if quantization is not None:
                 base = prepare_model_for_kbit_training(
-                    base, use_gradient_checkpointing=e.gradient_checkpointing,
+                    base,
+                    use_gradient_checkpointing=e.gradient_checkpointing,
                     gradient_checkpointing_kwargs={"use_reentrant": False},
                 )
             model = PeftModel.from_pretrained(

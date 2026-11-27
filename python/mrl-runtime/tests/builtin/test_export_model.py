@@ -23,6 +23,7 @@ from mrl_runtime.builtin.export_model import (
 )
 from mrl_runtime.builtin.import_model import IMPORT_MODEL, INSPECTION_FILE
 from mrl_runtime.builtin.tasks import TaskContext, TaskOutput
+from mrl_runtime.errors import MrlError
 
 CARD = {"name": "tiny", "version": "mv_x", "revision": "abc", "license": "apache-2.0"}
 
@@ -172,7 +173,7 @@ def test_private_export_rejects_a_public_repo(
 
     monkeypatch.setattr(export_model, "HfApi", PublicHub)
     monkeypatch.setenv("MRL_CREDENTIAL_TEST", "fixture-token")
-    with pytest.raises(export_model.MrlError, match="repository is public"):
+    with pytest.raises(MrlError, match="repository is public"):
         export_model._to_hub(
             tmp_path, {"repo": "owner/model", "credential_env": "MRL_CREDENTIAL_TEST"}
         )

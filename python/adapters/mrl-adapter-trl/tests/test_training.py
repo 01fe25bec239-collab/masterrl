@@ -166,6 +166,29 @@ def test_lora_checkpoints_and_both_exports(
     assert merged.exit_report.kind == pb.EXIT_KIND_COMPLETED
     _same_logits(model_dir, where, merged.agent.script.staging_dir / "outputs")
 
+    async def save_outputs(agent: FakeAgent, _process: object) -> None:
+        await agent.wait_for(lambda m: m.HasField("outputs_staged"), 60)
+        await agent.send(pb.AgentMessage(outputs_uploaded=pb.OutputsUploaded(ok=True)))
+
+    registry = attempt(
+        tmp_path,
+        "sft",
+        {},
+        {"checkpoint": where, "model": model_dir},
+        job_kind="EXPORT",
+        export={"format": "hf-safetensors"},
+        task="export_model",
+        managed_outputs=True,
+        inputs={"target": {"kind": "artifact"}, "card": {"name": "registered"}},
+        control=save_outputs,
+    )
+    assert registry.exit_report is not None
+    assert registry.exit_report.kind == pb.EXIT_KIND_COMPLETED
+    out = registry.agent.script.staging_dir / "outputs"
+    assert (out / "export" / "README.md").is_file()
+    assert (out / "export-result.json").is_file()
+    _same_logits(model_dir, where, out / "export")
+
 
 def _same_logits(base: Path, adapter: Path, merged: Path) -> None:
     ids = torch.tensor([[1, 5, 9, 33, 70]])

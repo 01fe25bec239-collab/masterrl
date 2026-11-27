@@ -26,6 +26,7 @@ prost-types = "=0.14.6"
 reqwest = { version = "=0.13.5", default-features = false, features = ["rustls", "stream", "http2"] }
 tokio-util = { version = "=0.7.20", features = ["io"] }
 toml = "=1.2.0"
+tempfile = "=3.27.0"
 # <mrl:deps P18> P18 dependencies go right below this line.
 keyring = { workspace = true }
 tonic = { workspace = true }
@@ -52,7 +53,6 @@ axum = { workspace = true }
 mrl-domain = { path = "../mrl-domain" }
 object_store = { workspace = true, features = ["aws"] }
 proptest = { workspace = true }
-tempfile = "=3.27.0"
 
 [lints]
 workspace = true

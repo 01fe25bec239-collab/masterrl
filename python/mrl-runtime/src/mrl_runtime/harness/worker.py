@@ -61,6 +61,8 @@ from mrl_runtime.adapter.types import (
     ResourceEstimate,
     ValidationRequest,
 )
+from mrl_runtime.builtin.export_model import EXPORT_MODEL
+from mrl_runtime.builtin.tasks import TaskContext, TaskOutput
 from mrl_runtime.checkpoint.files import ARTIFACT_MANIFEST, write_artifact_manifest
 from mrl_runtime.checkpoint.provider import CheckpointProvider, CheckpointSettings
 from mrl_runtime.errors import FIELD_INVALID, FIELD_MISSING, METHOD_UNSUPPORTED
@@ -665,12 +667,29 @@ class Harness:
                 ]
             )
         out = ctx.staging_dir / "outputs"
-        out.mkdir(parents=True, exist_ok=True)
-        export_ctx = ExportContext(checkpoint, fmt, out, ctx.config, ctx.logger)
+        publish = spec.get("managed_outputs") is True and spec.get("task") == "export_model"
+        destination = ctx.work_dir / "engine-export" if publish else out
+        destination.mkdir(parents=True, exist_ok=True)
+        export_ctx = ExportContext(checkpoint, fmt, destination, ctx.config, ctx.logger)
         result = await self._call("export", self.engine.export, export_ctx)
+        files = [(path, role, "") for path, role in result.files]
+        if publish:
+            task = TaskContext(
+                _mapping(spec.get("inputs")),
+                {"model": destination},
+                out,
+                lambda: bool(self._cancel_request),
+            )
+            issues = await self._call(
+                "export", lambda task: EXPORT_MODEL.validate(task.inputs, task.staged_paths), task
+            )
+            if issues:
+                raise self._reject(issues)
+            events = await self._call("export", lambda task: list(EXPORT_MODEL.run(task)), task)
+            files = [(e.path, e.role, e.format) for e in events if isinstance(e, TaskOutput)]
         write_artifact_manifest(
             out,
-            [(path, role, "") for path, role in result.files],
+            files,
             kind="export",
             source={"run_id": ctx.run_id, "attempt_id": ctx.attempt_id, "format": result.format},
         )

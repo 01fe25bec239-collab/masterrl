@@ -35,6 +35,7 @@ use mrl_server::seams::{AuditEvent, AuditSink, SeamError, StartupStep, LAUNCH_SE
 use mrl_storage::{sha256_hex, BackendConfig};
 use serde_json::{json, Value};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -45,7 +46,7 @@ const COMMIT: &str = "9fb191250dd56d0ba7ec9785a025ed29c03d5998";
 
 /// Keeps the events recorded inside transactions.
 #[derive(Default)]
-struct Audit(Mutex<Vec<AuditEvent>>);
+struct Audit(Mutex<Vec<AuditEvent>>, AtomicBool);
 
 impl Audit {
     fn actions(&self) -> Vec<(String, String)> {
@@ -69,6 +70,9 @@ impl AuditSink for Audit {
         _: &mut mrl_server::db::Tx,
         event: AuditEvent,
     ) -> Result<(), SeamError> {
+        if event.action == "models.import" && self.1.load(Ordering::Relaxed) {
+            return Err(SeamError::new("audit", "fixture refuses the import audit"));
+        }
         self.record(event).await
     }
 }
@@ -1148,6 +1152,26 @@ async fn promote_merge_and_export_round_trip() {
         env.edge(("ckpt", ckpt), "promoted_to", ("mv", promoted))
             .await
     );
+    sqlx::query(
+        "UPDATE runs SET engine_version_id = (
+            SELECT ev.id FROM engine_versions ev JOIN training_engines te ON te.id = ev.engine_id
+            WHERE te.name = 'trl' ORDER BY ev.created_at DESC LIMIT 1
+         ) WHERE id = $1",
+    )
+    .bind(run)
+    .execute(env.db.pool())
+    .await
+    .unwrap();
+    let native = env.action(promoted, "export", json!({})).await;
+    assert_eq!(native.status, 202, "{}", native.text());
+    let (_, native_inputs, native_files, _) = env.builtin(uuid_of(&native.json(), "job_id")).await;
+    assert_eq!(native_inputs["engine_export"]["algorithm"], "sft");
+    assert!(native_files
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f["local_path"] == "checkpoint/model.safetensors"));
+
     // A checkpoint whose stored bytes changed since commit is not promoted.
     st.put(
         &format!("{prefix}model.safetensors"),
@@ -1414,27 +1438,28 @@ impl ProjectDirectory for ModelProjectOwner {
 async fn rehome_moves_empty_models_and_verified_blobs_to_the_team_org() {
     let env = Env::start().await;
     let empty = env.model("empty").await;
-    let (ready, _) = env.ready("already-moved", |_| {}).await;
     let team = OrgId::new();
-    // An older startup moved this record, but left its object keys in solo storage.
-    sqlx::query("UPDATE model_versions SET org_id = $1 WHERE id = $2")
-        .bind(team.as_uuid())
-        .bind(ready)
-        .execute(env.db.pool())
-        .await
-        .unwrap();
     let step = RehomeLocalRows::new(
         env.models.db().clone(),
         Projects::with(Arc::new(ModelProjectOwner(env.project, team))),
     )
     .with_artifacts(Some(env.store.clone()));
     step.run().await.unwrap();
-    step.run().await.unwrap();
     let moved = store::model(env.models.db(), empty.id)
         .await
         .unwrap()
         .unwrap();
     assert_eq!(moved.org_id, team.as_uuid());
+    let (ready, _) = env.ready("already-moved", |_| {}).await;
+    // An older startup moved this version but left its object keys in solo storage.
+    sqlx::query("UPDATE model_versions SET org_id = $1 WHERE id = $2")
+        .bind(team.as_uuid())
+        .bind(ready)
+        .execute(env.db.pool())
+        .await
+        .unwrap();
+    step.run().await.unwrap();
+    step.run().await.unwrap();
     let st = env.store.org_store(&team.to_string()).await.unwrap();
     for file in store::files(env.models.db(), ready).await.unwrap() {
         assert_eq!(
@@ -1442,4 +1467,58 @@ async fn rehome_moves_empty_models_and_verified_blobs_to_the_team_org() {
             store::hex(&file.sha256)
         );
     }
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn a_failed_audit_rolls_back_the_job_and_its_replay_key() {
+    let env = Env::start().await;
+    let path = format!("/projects/{}/models:import", env.project);
+    let body = json!({"name": "audited", "source": {"kind": "hub", "repo": "org/model"}});
+    env.audit.1.store(true, Ordering::Relaxed);
+    let rejected = env.post_with_key(&path, &body, "audit-rollback").await;
+    assert_eq!(rejected.status, 503, "{}", rejected.text());
+    let empty: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS (SELECT FROM models)
+            AND NOT EXISTS (SELECT FROM model_versions)
+            AND NOT EXISTS (SELECT FROM builtin_jobs)
+            AND NOT EXISTS (SELECT FROM model_submission_keys)",
+    )
+    .fetch_one(env.db.pool())
+    .await
+    .unwrap();
+    assert!(empty);
+    env.audit.1.store(false, Ordering::Relaxed);
+    let allowed = env.post_with_key(&path, &body, "audit-rollback").await;
+    assert_eq!(allowed.status, 202, "{}", allowed.text());
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn a_node_export_targets_only_a_visible_machine() {
+    let env = Env::start().await;
+    let (mv, _) = env.ready("node-export", |_| {}).await;
+    let local = mrl_domain::ids::NodeId::new();
+    let foreign = mrl_domain::ids::NodeId::new();
+    env.db.seed(&format!(
+        "INSERT INTO compute_pools (id, org_id, name) VALUES ('{a}', NULL, 'local'), ('{b}', '{org}', 'foreign');
+         INSERT INTO compute_nodes (id, pool_id, hostname, lifecycle, status)
+         VALUES ('{local}', '{a}', 'local', 'STATIC', 'ONLINE'),
+                ('{foreign}', '{b}', 'foreign', 'STATIC', 'ONLINE');",
+        a = Uuid::now_v7(), b = Uuid::now_v7(), org = Uuid::now_v7(),
+        local = local.as_uuid(), foreign = foreign.as_uuid(),
+    )).await;
+    let target = |node| {
+        json!({"target": {
+            "kind": "node_path", "path": "/models/copied", "node_id": node,
+        }})
+    };
+    assert_eq!(env.action(mv, "export", target(foreign)).await.status, 404);
+    let accepted = env.action(mv, "export", target(local)).await;
+    assert_eq!(accepted.status, 202, "{}", accepted.text());
+    let job = env.job_row(uuid_of(&accepted.json(), "job_id")).await;
+    assert_eq!(
+        job.resource_request["roles"][0]["node_ids"][0],
+        local.to_string()
+    );
 }

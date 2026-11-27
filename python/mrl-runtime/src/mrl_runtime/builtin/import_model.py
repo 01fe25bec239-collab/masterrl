@@ -40,11 +40,11 @@ PICKLE_REFUSED = "MRL-MODEL-001"
 CONVERSION_UNAVAILABLE = "MRL-MODEL-260"
 UNREADABLE = "MRL-MODEL-150"
 WEIGHT_SUFFIXES = (".safetensors", ".gguf", ".onnx")
+ONNX_DATA_SUFFIXES = (".onnx_data", ".onnx.data")
 # Files a model folder may bring; TF/Flax weights and images are left out.
 KEPT_SUFFIXES = (
     *WEIGHT_SUFFIXES,
-    ".onnx_data",
-    ".onnx.data",
+    *ONNX_DATA_SUFFIXES,
     ".json",
     ".txt",
     ".model",
@@ -119,6 +119,23 @@ def _is_pickle(path: str) -> bool:
     return path.lower().endswith(PICKLE_SUFFIXES)
 
 
+def _selected(paths: list[str]) -> Iterator[str]:
+    preferred = next(
+        (suffix for suffix in WEIGHT_SUFFIXES if any(p.lower().endswith(suffix) for p in paths)),
+        None,
+    )
+    suffixes = (preferred,) if preferred else ()
+    if preferred == ".onnx":
+        suffixes += ONNX_DATA_SUFFIXES
+    for path in paths:
+        lower = path.lower()
+        if _is_pickle(path):
+            continue
+        if lower.endswith((*WEIGHT_SUFFIXES, *ONNX_DATA_SUFFIXES)) and not lower.endswith(suffixes):
+            continue
+        yield path
+
+
 def license_of(folder: Path, spdx: str | None = None) -> dict[str, Any]:
     """The license: its SPDX id (given, or from README front matter) and the hash of its text
     (the LICENSE file, else the id), which a project acknowledges."""
@@ -178,7 +195,7 @@ def _gate(paths: list[str], convert: bool) -> tuple[str, str] | None:
             "Only safetensors weights are accepted.",
         )
     if not has_weights:
-        return (UNREADABLE, "No safetensors or GGUF weights were found.")
+        return (UNREADABLE, "No safetensors, GGUF or ONNX weights were found.")
     return None
 
 
@@ -208,7 +225,7 @@ def _hub(ctx: TaskContext, src: Mapping[str, Any], convert: bool) -> Iterator[Ta
     if refused:
         yield from write_refusal(out, *refused)
         return
-    wanted = sorted(p for p in paths if _kept(p) and not _is_pickle(p))
+    wanted = sorted(p for p in _selected(paths) if _kept(p))
     folder = out / MODEL_DIR
     scratch = out.parent / "import-download"
     for i, rel in enumerate(wanted):
@@ -250,7 +267,7 @@ def _node_path(ctx: TaskContext, src: Mapping[str, Any], convert: bool) -> Itera
         yield from write_refusal(out, *refused)
         return
     folder = out / MODEL_DIR
-    wanted = [p for p in paths if _kept(p) and not _is_pickle(p)]
+    wanted = [p for p in _selected(paths) if _kept(p)]
     for i, rel in enumerate(wanted):
         if ctx.cancelled():
             return
@@ -275,7 +292,7 @@ def _staged(ctx: TaskContext, convert: bool) -> Iterator[TaskEvent]:
         yield from write_refusal(out, *refused)
         return
     folder = out / MODEL_DIR
-    wanted = [p for p in paths if not _is_pickle(p)]
+    wanted = list(_selected(paths))
     for i, rel in enumerate(wanted):
         (folder / rel).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(staged / rel, folder / rel)

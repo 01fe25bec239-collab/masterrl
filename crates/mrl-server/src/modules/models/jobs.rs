@@ -103,9 +103,15 @@ pub struct MergeAdapter {
 #[derive(Debug, Clone, Default, Deserialize, Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ExportTarget {
-    /// `artifact` (default: download it from the app), `s3` or `hf_hub`.
+    /// `artifact` (default), `node_path`, `s3` or `hf_hub`.
     #[serde(default)]
     pub kind: Option<String>,
+    /// Absolute destination directory on the selected machine (`node_path`).
+    #[serde(default)]
+    pub path: Option<String>,
+    /// Required machine id (`node_path`).
+    #[serde(default)]
+    pub node_id: Option<String>,
     /// `s3://bucket/prefix` (s3).
     #[serde(default)]
     pub url: Option<String>,
@@ -630,9 +636,45 @@ pub async fn export(
     let t = body.target;
     let kind = t.kind.clone().unwrap_or_else(|| "artifact".into());
     let mut grants = vec![];
+    let mut node_id = None;
     let mut target = json!({ "kind": kind });
     match kind.as_str() {
         "artifact" => {}
+        "node_path" => {
+            let resource = scope::resource(
+                "project",
+                Some(ProjectId::from_uuid(v.project_id).to_string()),
+                v.org_id,
+                v.project_id,
+            );
+            scope::authorize(state, ctx, "compute.manage", &resource).await?;
+            let path = t.path.as_deref().filter(|path| {
+                !path.contains('\0') && path.len() <= 4096 && (path.starts_with('/')
+                    || matches!(path.as_bytes(), [drive, b':', b'\\' | b'/', ..] if drive.is_ascii_alphabetic()))
+            }).ok_or_else(|| invalid("/target/path", "Give the destination as an absolute path."))?;
+            let node = t
+                .node_id
+                .as_deref()
+                .ok_or_else(|| invalid("/target/node_id", "Choose a machine."))?;
+            let node = node
+                .parse::<NodeId>()
+                .map_err(|_| invalid("/target/node_id", "This is not a machine id."))?;
+            let visible: bool = sqlx::query_scalar(
+                "SELECT EXISTS (SELECT FROM compute_nodes n JOIN compute_pools p ON p.id = n.pool_id
+                    WHERE n.id = $1 AND (p.org_id = $2 OR ($3 AND p.org_id IS NULL)))",
+            )
+            .bind(node.as_uuid())
+            .bind(v.org_id)
+            .bind(state.config.server.mode == crate::config::Mode::Solo)
+            .fetch_one(models.db.pool())
+            .await?;
+            if !visible {
+                return Err(JobsError::not_found("machine"));
+            }
+            node_id = Some(node.as_uuid());
+            target["path"] = path.into();
+            target["node_id"] = node.to_string().into();
+        }
         "s3" | "hf_hub" => {
             let s = t.secret_id.as_deref().ok_or_else(|| {
                 invalid("/target/secret_id", "Name the secret with the credentials.")
@@ -670,7 +712,12 @@ pub async fn export(
                 target["private"] = t.private.unwrap_or(true).into();
             }
         }
-        _ => return Err(invalid("/target/kind", "Export to artifact, s3 or hf_hub.")),
+        _ => {
+            return Err(invalid(
+                "/target/kind",
+                "Export to artifact, node_path, s3 or hf_hub.",
+            ))
+        }
     }
     let id = ModelVersionId::from_uuid(v.id).to_string();
     let model = store::model(&models.db, v.model_id)
@@ -685,7 +732,7 @@ pub async fn export(
     });
     let lineage =
         json!({"model_version_id": id, "source_ref": v.source_ref, "base_model_version_id": base});
-    let files = if v.kind.as_deref() == Some("adapter") {
+    let mut files = if v.kind.as_deref() == Some("adapter") {
         let base = super::gates::adapter_base(&models.db, &v)
             .await?
             .ok_or_else(|| {
@@ -706,6 +753,12 @@ pub async fn export(
     } else {
         staged(models, &v, "model").await?
     };
+    let mut inputs = json!({"format": format, "card": card, "lineage": lineage, "target": target});
+    if let Some((native, checkpoint_files)) = checkpoint_export(state, models, &v).await? {
+        inputs["engine_export"] = native;
+        files.retain(|f| f.name == "model");
+        files.extend(checkpoint_files);
+    }
     let mut tx = models.db.begin().await?;
     if let Some(replay) = submission.claim(&mut tx).await? {
         return Ok(replay);
@@ -717,12 +770,12 @@ pub async fn export(
             project_id: v.project_id,
             kind: "EXPORT".into(),
             task: "export_model".into(),
-            inputs: json!({"format": format, "card": card, "lineage": lineage, "target": target}),
+            inputs,
             files,
             subject: json!({ "model_version_id": id }),
             created_by: ctx.principal.id.clone(),
             grants,
-            node_id: None,
+            node_id,
         },
     )
     .await?;
@@ -742,6 +795,75 @@ pub async fn export(
     submission.save(&mut tx, &response).await?;
     tx.commit().await.map_err(crate::db::DbError::from)?;
     Ok((StatusCode::ACCEPTED, Json(response)).into_response())
+}
+
+async fn checkpoint_export(
+    state: &AppState,
+    models: &Models,
+    version: &VersionRow,
+) -> Result<Option<(Value, Vec<InputFile>)>, JobsError> {
+    use mrl_domain::ids::{CheckpointId, RunId};
+
+    if version.source_kind != "checkpoint" {
+        return Ok(None);
+    }
+    let ckpt = version.source_ref["checkpoint_id"]
+        .as_str()
+        .and_then(|id| id.parse::<CheckpointId>().ok())
+        .ok_or_else(|| JobsError::not_found("checkpoint"))?;
+    let run = version.source_ref["run_id"]
+        .as_str()
+        .and_then(|id| id.parse::<RunId>().ok())
+        .ok_or_else(|| JobsError::not_found("source run"))?;
+    let algorithm: Option<String> = sqlx::query_scalar(
+        "SELECT r.algorithm_id FROM runs r
+           JOIN engine_versions e ON e.id = r.engine_version_id
+           JOIN training_engines te ON te.id = e.engine_id
+          WHERE r.id = $1 AND r.org_id = $2 AND r.project_id = $3
+            AND te.name = 'trl' AND r.algorithm_id IN ('sft','cpt')",
+    )
+    .bind(run.as_uuid())
+    .bind(version.org_id)
+    .bind(version.project_id)
+    .fetch_optional(models.db.pool())
+    .await?;
+    let Some(algorithm) = algorithm else {
+        return Ok(None);
+    };
+
+    let nodes = crate::modules::nodes::NodesModule::from_config(models.db.clone(), &state.config);
+    let service = CheckpointService::new(
+        models.db.clone(),
+        models.store.clone(),
+        crate::modules::checkpoints::service::Secrets::keychain(&state.config),
+        &nodes.gateway(),
+        state.config.checkpoints.clone(),
+    );
+    let row = service.committed(ckpt.as_uuid()).await?;
+    if row.run_id != run.as_uuid()
+        || row.org_id != version.org_id
+        || row.storage_org != super::outputs::storage_org(version.org_id)
+    {
+        return Err(JobsError::not_found("checkpoint"));
+    }
+    service.require_full_verification(row.id).await?;
+    let files = service
+        .files(row.id)
+        .await?
+        .into_iter()
+        .filter(|f| safe_path(&f.path) && !pickle(&f.path))
+        .map(|f| InputFile {
+            name: "checkpoint".into(),
+            local_path: format!("checkpoint/{}", f.path),
+            key: f.object_key,
+            sha256: hex(&f.sha256),
+            size: u64::try_from(f.size_bytes).unwrap_or_default(),
+        })
+        .collect();
+    Ok(Some((
+        json!({"run_id": run, "algorithm": algorithm}),
+        files,
+    )))
 }
 
 #[utoipa::path(post, path = "/checkpoints/{ckpt}:promote", operation_id = "promote_checkpoint", tag = "models",

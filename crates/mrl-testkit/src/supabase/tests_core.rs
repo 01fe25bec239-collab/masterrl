@@ -696,9 +696,15 @@ async fn every_route_answers_by_role_in_team_mode() {
         mrl_domain::ids::ModelId::new(),
         mrl_domain::ids::ModelVersionId::new(),
     );
+    let (foreign_org, foreign_workspace, foreign_project) =
+        (OrgId::new(), WorkspaceId::new(), ProjectId::new());
     core.db
         .seed(&format!(
-            "INSERT INTO models (id, org_id, project_id, name, created_by)
+            "INSERT INTO organizations (id, slug, name, kind) VALUES ('{fo}', 'p26-other', 'Other', 'team');
+             INSERT INTO workspaces (id, org_id, slug, name) VALUES ('{fw}', '{fo}', 'other', 'Other');
+             INSERT INTO projects (id, org_id, workspace_id, slug, name)
+               VALUES ('{fp}', '{fo}', '{fw}', 'other', 'Other');
+             INSERT INTO models (id, org_id, project_id, name, created_by)
              VALUES ('{m}', '{o}', '{p}', 'rbac-model', 'seed'),
                     ('{fm}', '{fo}', '{fp}', 'theirs', 'seed');
              INSERT INTO model_versions (id, org_id, project_id, model_id, seq, kind, source_kind,
@@ -723,8 +729,9 @@ async fn every_route_answers_by_role_in_team_mode() {
             p = prj.as_uuid(),
             fm = p26_foreign.as_uuid(),
             fv = p26_foreign_mv.as_uuid(),
-            fo = uuid::Uuid::now_v7(),
-            fp = uuid::Uuid::now_v7(),
+            fo = foreign_org.as_uuid(),
+            fw = foreign_workspace.as_uuid(),
+            fp = foreign_project.as_uuid(),
         ))
         .await;
     for (method, path) in [

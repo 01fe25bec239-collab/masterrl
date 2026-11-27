@@ -836,6 +836,13 @@ impl Runner {
                 ));
             }
         }
+        let target = &self.rec.spec.job_spec["inputs"]["target"];
+        if self.rec.spec.job_spec["task"] == "export_model" && target["kind"] == "node_path" {
+            files::local_export_path(
+                cfg,
+                std::path::Path::new(target["path"].as_str().unwrap_or_default()),
+            )?;
+        }
         let (spec, container) = match &mat.worker {
             WorkerCommand::Process { program } => {
                 let program = program.display().to_string();
@@ -1671,13 +1678,19 @@ impl Runner {
         if let Some(command_id) = u.command_id.clone() {
             self.adhoc.remove(&command_id);
             let targets = self.rec.adhoc_uploads.remove(&command_id);
+            let expired = failure.as_deref().is_some_and(expired_upload);
             let ack = AgentBody::OutputsUploaded(OutputsUploaded {
                 ok: failure.is_none(),
                 reason: failure.clone().unwrap_or_default(),
             });
             // One save transfers the upload into both durable result queues.
             self.rec.results.insert(command_id.clone(), failure);
-            if self.remember(&ack).is_err() {
+            let saved = if expired {
+                self.save()
+            } else {
+                self.remember(&ack).is_ok()
+            };
+            if !saved {
                 self.rec.results.remove(&command_id);
                 if let Some(targets) = targets {
                     self.rec.adhoc_uploads.insert(command_id.clone(), targets);
@@ -1685,8 +1698,10 @@ impl Runner {
                 self.unsaved.insert(command_id, u);
                 return;
             }
-            if let Some(role) = self.primary_role() {
-                self.send(&role, ack).await;
+            if !expired {
+                if let Some(role) = self.primary_role() {
+                    self.send(&role, ack).await;
+                }
             }
             self.deliver_results().await;
         }
@@ -1723,6 +1738,10 @@ impl Runner {
         let staging = self.staging();
         let tx = self.uploads_tx.clone();
         let id = command_id.clone();
+        let target = &self.rec.spec.job_spec["inputs"]["target"];
+        let local = (self.rec.spec.job_spec["task"] == "export_model"
+            && target["kind"] == "node_path")
+            .then(|| target["path"].as_str().unwrap_or_default().to_owned());
         let task = tokio::spawn(async move {
             let mut result = Ok(());
             for t in targets {
@@ -1743,6 +1762,19 @@ impl Runner {
                 if let Err(e) = sent {
                     result = Err((CommitState::Rejected, e.explain()));
                     break;
+                }
+            }
+            if result.is_ok() {
+                if let Some(path) = local {
+                    let export = async {
+                        let dest =
+                            files::local_export_path(&ctx.config, std::path::Path::new(&path))?;
+                        files::publish_local_export(&staging, &dest).await
+                    }
+                    .await;
+                    if let Err(e) = export {
+                        result = Err((CommitState::Rejected, e.explain()));
+                    }
                 }
             }
             let _ = tx
@@ -2196,6 +2228,10 @@ fn request_id(body: &AgentBody) -> Option<&str> {
     }
 }
 
+fn expired_upload(reason: &str) -> bool {
+    reason.starts_with("MRL-STORE-008 ")
+}
+
 /// The `CommandResult` for a finished upload command (`failure`: why it failed).
 pub fn upload_result(command_id: String, failure: Option<String>) -> CommandResult {
     CommandResult {
@@ -2203,7 +2239,12 @@ pub fn upload_result(command_id: String, failure: Option<String>) -> CommandResu
         accepted: true,
         failure: failure.map(|reason| mrl_proto::common::v1::Failure {
             class: mrl_proto::common::v1::FailureClass::InfraTransient as i32,
-            sub_code: "UPLOAD_FAILED".into(),
+            sub_code: if expired_upload(&reason) {
+                "MRL-STORE-008"
+            } else {
+                "UPLOAD_FAILED"
+            }
+            .into(),
             message: reason,
             retryable_hint: true,
             classified_by: mrl_proto::common::v1::ClassifiedBy::Agent as i32,

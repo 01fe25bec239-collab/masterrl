@@ -83,7 +83,7 @@ def test_node_path_copies_kept_files_and_drops_pickles(models: Path, tmp_path: P
     outs = run({"source": {"kind": "node_path", "path": str(src)}}, {}, out)
     paths = sorted(o.path for o in outs)
     assert "model/pytorch_model.bin" not in paths
-    assert "model/onnx/model.onnx" in paths
+    assert "model/onnx/model.onnx" not in paths
     assert "model/model.safetensors" in paths
     assert "model/LICENSE" in paths
     roles = {o.path: o.role for o in outs}

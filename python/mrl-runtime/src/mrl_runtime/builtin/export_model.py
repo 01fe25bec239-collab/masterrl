@@ -92,13 +92,23 @@ def _validate(inputs: Mapping[str, Any], staged: Mapping[str, Path]) -> list[Iss
                 path="/inputs/target/repo",
             )
         )
-    elif kind not in ("artifact", "s3", "hf_hub"):
+    elif kind == "node_path" and not all(
+        isinstance(target.get(k), str) for k in ("path", "node_id")
+    ):
+        out.append(
+            Issue(
+                TASK_INPUT_INVALID,
+                "Choose a machine and destination folder.",
+                path="/inputs/target",
+            )
+        )
+    elif kind not in ("artifact", "node_path", "s3", "hf_hub"):
         out.append(
             Issue(
                 TASK_INPUT_INVALID,
                 "Say where to export to.",
                 path="/inputs/target/kind",
-                hint="Use artifact, s3 or hf_hub.",
+                hint="Use artifact, node_path, s3 or hf_hub.",
             )
         )
     if kind in ("s3", "hf_hub") and not os.environ.get(str(target.get("credential_env", ""))):
@@ -316,7 +326,9 @@ def _to_hub(folder: Path, target: Mapping[str, Any]) -> dict[str, Any]:
         existing = set(api.list_repo_files(repo, revision=current.sha))
         previous: set[str] = set()
         if LINEAGE_FILE in existing:
-            path = api.hf_hub_download(repo, LINEAGE_FILE, revision=current.sha)
+            path = api.hf_hub_download(  # pyright: ignore[reportUnknownMemberType]
+                repo, LINEAGE_FILE, revision=current.sha
+            )
             meta = _mapping(json.loads(Path(path).read_text(encoding="utf-8")))
             previous.update(
                 name
@@ -363,6 +375,8 @@ def _run(ctx: TaskContext) -> Iterator[TaskEvent]:
                 yield event
     elif target.get("kind") == "hf_hub":
         result = _to_hub(folder, target)
+    elif target.get("kind") == "node_path":
+        result = {k: target[k] for k in ("kind", "path", "node_id")}
     (ctx.output_dir / RESULT_FILE).write_text(json.dumps(result, sort_keys=True), encoding="utf-8")
     for rel in paths:
         yield TaskOutput(f"{EXPORT_DIR}/{rel}", role=_role(rel))

@@ -15,6 +15,8 @@
 //! removes unpinned ones, least recently used first, when the disk runs low. Downloads resume
 //! through uv's and Docker's own caches; their progress lines are passed to the caller.
 
+pub(crate) mod builtin;
+
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -251,6 +253,10 @@ impl Envs {
     /// The folder for a runtime.
     pub fn dir_for(&self, rt: &RuntimeSpec) -> PathBuf {
         let mut name = rt.dir_name();
+        if let Some(hash) = rt.project.as_deref().and_then(builtin::cache_suffix) {
+            name.push('-');
+            name.push_str(hash);
+        }
         if let Some(p) = &rt.package {
             name.push('-');
             name.extend(p.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-'));
@@ -1183,6 +1189,35 @@ mod tests {
         )
         .unwrap();
         Envs::open(dir, Arc::new(cache)).unwrap()
+    }
+
+    #[tokio::test]
+    #[ignore = "requires uv and the builtin dependency cache or network"]
+    async fn fresh_builtin_runtime_installs_a_working_worker() {
+        let state = tempfile::tempdir().unwrap();
+        let lock = include_bytes!("../../../../python/builtin-env/uv.lock");
+        let sha = mrl_storage::sha256_hex(lock);
+        let rt = RuntimeSpec {
+            runtime_ref: format!("uv:sha256:{sha}"),
+            project: builtin::project(state.path(), &sha).unwrap(),
+            package: None,
+        };
+        let envs = envs(state.path());
+        let fresh = envs.materialize(&rt, "att_one", &|_| {}).await.unwrap();
+        let WorkerCommand::Process { program } = fresh.worker else {
+            panic!("the builtin runtime must use a process");
+        };
+        assert!(std::process::Command::new(program)
+            .arg("--help")
+            .status()
+            .unwrap()
+            .success());
+        assert!(
+            envs.materialize(&rt, "att_two", &|_| {})
+                .await
+                .unwrap()
+                .cache_hit
+        );
     }
 
     #[tokio::test]
