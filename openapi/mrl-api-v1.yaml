@@ -1238,6 +1238,85 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /api/v1/projects/{prj}/rewards:
+    get:
+      tags:
+      - rewards
+      operationId: list_rewards
+      parameters:
+      - name: prj
+        in: path
+        description: Project id, `prj_…`.
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The project's rewards, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_RewardDefinition'
+        '404':
+          description: No such project.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    post:
+      tags:
+      - rewards
+      operationId: create_reward
+      parameters:
+      - name: prj
+        in: path
+        description: Project id, `prj_…`.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RewardCreateRequest'
+        required: true
+      responses:
+        '201':
+          description: The reward (with its first version when one was given).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RewardDefinition'
+        '404':
+          description: No such project.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: The name is taken (MRL-CONFLICT-290).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: The policy or test cases need a change (MRL-RWD-*, MRL-VAL-290).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/projects/{prj}/runs:
     get:
       tags:
@@ -1373,6 +1452,173 @@ paths:
                 $ref: '#/components/schemas/Problem'
         '422':
           description: Bad query.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/reward-components:
+    get:
+      tags:
+      - rewards
+      operationId: list_reward_components
+      responses:
+        '200':
+          description: Components the reward sandbox ships.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RewardComponentList'
+  /api/v1/reward-versions/{rwdv}:
+    get:
+      tags:
+      - rewards
+      operationId: get_reward_version
+      parameters:
+      - name: rwdv
+        in: path
+        description: Reward version id, `rwdv_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The version with its test cases and results.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RewardVersion'
+        '404':
+          description: No such reward version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/reward-versions/{rwdv}:deprecate:
+    post:
+      tags:
+      - rewards
+      operationId: deprecate_reward_version
+      parameters:
+      - name: rwdv
+        in: path
+        description: Reward version id, `rwdv_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: 'Deprecated (or already deprecated): new runs can''t use it.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RewardVersion'
+        '404':
+          description: No such reward version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Only a published version can be deprecated (MRL-STATE-290).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/reward-versions/{rwdv}:publish:
+    post:
+      tags:
+      - rewards
+      operationId: publish_reward_version
+      parameters:
+      - name: rwdv
+        in: path
+        description: Reward version id, `rwdv_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Published (or already published).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RewardVersion'
+        '404':
+          description: No such reward version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Its checks haven't passed (MRL-STATE-291) or its state doesn't allow it (MRL-STATE-290).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/rewards/{rwd}:
+    get:
+      tags:
+      - rewards
+      operationId: get_reward
+      parameters:
+      - name: rwd
+        in: path
+        description: Reward id, `rwd_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The reward and its versions.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RewardDefinition'
+        '404':
+          description: No such reward.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/rewards/{rwd}/versions:
+    post:
+      tags:
+      - rewards
+      operationId: create_reward_version
+      parameters:
+      - name: rwd
+        in: path
+        description: Reward id, `rwd_…`.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RewardVersionCreateRequest'
+        required: true
+      responses:
+        '200':
+          description: A version with the same content already exists; it is returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RewardVersion'
+        '201':
+          description: A new DRAFT version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RewardVersion'
+        '404':
+          description: No such reward.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: The policy or test cases need a change (MRL-RWD-*, MRL-VAL-290).
           content:
             application/json:
               schema:
@@ -4950,6 +5196,56 @@ components:
           - string
           - 'null'
           description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_RewardDefinition:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: A reward definition.
+            required:
+            - id
+            - project_id
+            - name
+            - description
+            - created_by
+            - created_at
+            - versions
+            properties:
+              created_at:
+                type: string
+                format: date-time
+                description: When.
+              created_by:
+                type: string
+                description: Who made it.
+              description:
+                type: string
+                description: Description.
+              id:
+                type: string
+                description: '`rwd_…`.'
+              name:
+                type: string
+                description: Name.
+              project_id:
+                type: string
+                description: '`prj_…`.'
+              versions:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RewardVersionSummary'
+                description: Versions, newest first.
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
     Page_Run:
       type: object
       description: One page of results.
@@ -5481,6 +5777,430 @@ components:
           type: integer
           format: int64
           description: The copy used.
+    RewardCaseExpect:
+      type: object
+      description: What a test case expects (Doc 06 §1.4.2).
+      properties:
+        absent_flags:
+          type: array
+          items:
+            type: string
+          description: Flags it must not carry.
+        components:
+          type: object
+          description: Per component id.
+        flags:
+          type: array
+          items:
+            type: string
+          description: Flags the sample must carry.
+        resolution:
+          type:
+          - string
+          - 'null'
+          description: '`SCORED`, `MASKED` or `FALLBACK_APPLIED`.'
+        total:
+          type:
+          - object
+          - 'null'
+          description: The sample's total; `null` expects no total (masked).
+      additionalProperties: false
+    RewardCaseSample:
+      type: object
+      description: The sample a test case scores.
+      required:
+      - prompt
+      - completion
+      properties:
+        completion:
+          type: string
+          description: The model's answer.
+        completion_token_count:
+          type: integer
+          format: int32
+          description: Tokens in the completion (length components read it).
+          minimum: 0
+        finish_reason:
+          type: string
+          description: '`stop`, `length`, `tool_calls` or `abort`.'
+        prompt:
+          type: string
+          description: The prompt as the model saw it.
+        reference:
+          type: object
+          description: 'What the answer is checked against (any JSON: a string, or `{answer, …}`).'
+      additionalProperties: false
+    RewardCodeBundle:
+      type: object
+      description: Code bundle of a version.
+      required:
+      - artifact_id
+      - bundle_sha256
+      - files
+      properties:
+        artifact_id:
+          type: string
+          description: '`art_…`.'
+        bundle_sha256:
+          type: string
+          description: sha256 over its `file <path> <sha256>` lines.
+        files:
+          type: array
+          items:
+            type: object
+          description: '`[{path, sha256, size}]`.'
+    RewardComponent:
+      type: object
+      description: One component the reward sandbox ships (a row of the generated list).
+      required:
+      - ref
+      - version
+      - kind
+      - tier
+      - shape
+      - deterministic
+      - stateful
+      - beta
+      - value_range
+      - needs
+      - description
+      - param_schema
+      - code_sha256
+      properties:
+        beta:
+          type: boolean
+          description: 'Beta: may change.'
+        code_sha256:
+          type: string
+          description: sha256 of its source file.
+        description:
+          type: string
+          description: What it does.
+        deterministic:
+          type: boolean
+          description: Same input gives the same value.
+        kind:
+          type: string
+          description: '`builtin` (Tier 1) or `code_exec` (Tier 2: runs model-written code).'
+        needs:
+          type: array
+          items:
+            type: string
+          description: Sample fields it reads, like `reference`.
+        param_schema:
+          type: object
+          description: JSON Schema of its `params`.
+        ref:
+          type: string
+          description: '`builtin/<name>@<major>`.'
+        shape:
+          type: string
+          description: '`scalar.sequence`.'
+        stateful:
+          type: boolean
+          description: Keeps state between batches.
+        tier:
+          type: integer
+          format: int32
+          description: 'Sandbox tier: 1 or 2.'
+          minimum: 0
+        value_range:
+          type: array
+          items:
+            type: number
+            format: double
+          description: Lowest and highest value.
+        version:
+          type: string
+          description: Semver.
+    RewardComponentInfo:
+      allOf:
+      - $ref: '#/components/schemas/RewardComponent'
+        description: The component.
+      - type: object
+        required:
+        - listed
+        properties:
+          listed:
+            type: boolean
+            description: True unless it is no longer shipped by this server.
+      description: A component with whether it can be used now.
+    RewardComponentList:
+      type: object
+      description: '`GET /reward-components`.'
+      required:
+      - sdk_contract
+      - executor_sha256
+      - items
+      properties:
+        executor_sha256:
+          type: string
+          description: Identity of the executor environment (part of every content hash).
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/RewardComponentInfo'
+          description: Components, by reference.
+        sdk_contract:
+          type: string
+          description: The reward SDK contract.
+    RewardCreateRequest:
+      type: object
+      description: '`POST /projects/{prj}/rewards`.'
+      required:
+      - name
+      properties:
+        description:
+          type: string
+          description: What it rewards.
+        name:
+          type: string
+          description: 'Unique in the project: lowercase letters, digits, `.`, `_`, `-` (1–100).'
+        version:
+          oneOf:
+          - $ref: '#/components/schemas/RewardVersionCreateRequest'
+            description: The first version, if any.
+          - type: 'null'
+      additionalProperties: false
+    RewardDefinition:
+      type: object
+      description: A reward definition.
+      required:
+      - id
+      - project_id
+      - name
+      - description
+      - created_by
+      - created_at
+      - versions
+      properties:
+        created_at:
+          type: string
+          format: date-time
+          description: When.
+        created_by:
+          type: string
+          description: Who made it.
+        description:
+          type: string
+          description: Description.
+        id:
+          type: string
+          description: '`rwd_…`.'
+        name:
+          type: string
+          description: Name.
+        project_id:
+          type: string
+          description: '`prj_…`.'
+        versions:
+          type: array
+          items:
+            $ref: '#/components/schemas/RewardVersionSummary'
+          description: Versions, newest first.
+    RewardPublishCheck:
+      type: object
+      description: Whether `:publish` would work, and why not.
+      required:
+      - ok
+      - reasons
+      properties:
+        ok:
+          type: boolean
+          description: True when nothing blocks it.
+        reasons:
+          type: array
+          items:
+            type: string
+          description: What blocks it.
+    RewardTestCase:
+      type: object
+      description: One test case.
+      required:
+      - position
+      - name
+      - sample
+      - expect
+      properties:
+        expect:
+          $ref: '#/components/schemas/RewardCaseExpect'
+          description: What must come out.
+        last_result:
+          type:
+          - object
+          - 'null'
+          description: The latest test run's outcome for it.
+        name:
+          type: string
+          description: Name.
+        position:
+          type: integer
+          format: int32
+          description: Order.
+        sample:
+          $ref: '#/components/schemas/RewardCaseSample'
+          description: The sample.
+    RewardVersion:
+      type: object
+      description: A reward version.
+      required:
+      - id
+      - reward_id
+      - project_id
+      - version_no
+      - state
+      - content_sha256
+      - hash_inputs
+      - sandbox_tier
+      - policy
+      - model_refs
+      - notes
+      - publishable
+      - test_cases
+      - created_by
+      - created_at
+      properties:
+        code:
+          oneOf:
+          - $ref: '#/components/schemas/RewardCodeBundle'
+            description: The code bundle, if any.
+          - type: 'null'
+        content_sha256:
+          type: string
+          description: sha256 of the canonical JSON of `hash_inputs`.
+        created_at:
+          type: string
+          format: date-time
+          description: When.
+        created_by:
+          type: string
+          description: Who made it.
+        deprecated_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When it was deprecated.
+        exec_sha256:
+          type:
+          - string
+          - 'null'
+          description: The bundle hash the sandbox reported in the passing test run.
+        hash_inputs:
+          type: object
+          description: Exactly what the hash covers.
+        id:
+          type: string
+          description: '`rwdv_…`.'
+        model_refs:
+          type: array
+          items:
+            type: string
+          description: Model versions the policy reads.
+        notes:
+          type: string
+          description: Notes.
+        policy:
+          type: object
+          description: The policy.
+        project_id:
+          type: string
+          description: '`prj_…`.'
+        publishable:
+          $ref: '#/components/schemas/RewardPublishCheck'
+          description: Whether it can be published now.
+        published_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When it was published.
+        regression:
+          type:
+          - object
+          - 'null'
+          description: Regression report against the previous published version.
+        reward_id:
+          type: string
+          description: '`rwd_…`.'
+        sandbox_tier:
+          type: string
+          description: '`standard` or `code_exec`.'
+        state:
+          type: string
+          description: State.
+        test_cases:
+          type: array
+          items:
+            $ref: '#/components/schemas/RewardTestCase'
+          description: Test cases.
+        test_summary:
+          type:
+          - object
+          - 'null'
+          description: Last test run's summary.
+        version_no:
+          type: integer
+          format: int32
+          description: 1, 2, …
+    RewardVersionCreateRequest:
+      type: object
+      description: '`POST /rewards/{rwd}/versions` (and `version` of a new reward).'
+      required:
+      - policy
+      properties:
+        code_artifact_id:
+          type:
+          - string
+          - 'null'
+          description: |-
+            `art_…`: a committed artifact with the code bundle (`components.yaml` and `.py`
+            files at its top level). Needed for `org/` and `hub/` components.
+        notes:
+          type: string
+          description: Notes shown with the version.
+        policy:
+          type: object
+          description: 'RewardPolicy v1 (`apiVersion: mrl.dev/reward/v1`).'
+        test_cases:
+          type: array
+          items:
+            type: object
+          description: |-
+            Test cases: `{name, sample: {prompt, completion, reference?, completion_token_count?,
+            finish_reason?}, expect: {total?, components?, flags?, absent_flags?, resolution?}}`.
+      additionalProperties: false
+    RewardVersionSummary:
+      type: object
+      description: A version in lists.
+      required:
+      - id
+      - version_no
+      - state
+      - content_sha256
+      - sandbox_tier
+      - created_at
+      properties:
+        content_sha256:
+          type: string
+          description: Content hash.
+        created_at:
+          type: string
+          format: date-time
+          description: When it was made.
+        id:
+          type: string
+          description: '`rwdv_…`.'
+        sandbox_tier:
+          type: string
+          description: '`standard` or `code_exec`.'
+        state:
+          type: string
+          description: DRAFT, TESTING, PUBLISHED, FAILED_TESTS or DEPRECATED.
+        version_no:
+          type: integer
+          format: int32
+          description: 1, 2, …
     RoleInfo:
       type: object
       description: One role a person holds.
@@ -6530,3 +7250,5 @@ tags:
   description: 'Checkpoints: listing, verification and deletion.'
 - name: engines
   description: Training engines, their methods and what can run where.
+- name: rewards
+  description: 'Reward Studio: reward definitions, versions, tests and publishing.'

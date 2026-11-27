@@ -24,6 +24,10 @@
         {
           "kind": "IMPORT",
           "sandbox": "fetch"
+        },
+        {
+          "kind": "REWARD_PREVIEW",
+          "sandbox": "code_exec"
         }
       ]
     }

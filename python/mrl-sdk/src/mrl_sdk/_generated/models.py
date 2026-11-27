@@ -1480,6 +1480,339 @@ class Restored(TypedDict):
     """The copy used."""
 
 
+class RewardCaseExpect(TypedDict):
+    """What a test case expects (Doc 06 §1.4.2)."""
+
+    absent_flags: NotRequired[list[str]]
+    """Flags it must not carry."""
+
+    components: NotRequired[dict[str, Any]]
+    """Per component id."""
+
+    flags: NotRequired[list[str]]
+    """Flags the sample must carry."""
+
+    resolution: NotRequired[str | None]
+    """`SCORED`, `MASKED` or `FALLBACK_APPLIED`."""
+
+    total: NotRequired[dict[str, Any] | None]
+    """The sample's total; `null` expects no total (masked)."""
+
+
+class RewardCaseSample(TypedDict):
+    """The sample a test case scores."""
+
+    completion: str
+    """The model's answer."""
+
+    completion_token_count: NotRequired[int]
+    """Tokens in the completion (length components read it)."""
+
+    finish_reason: NotRequired[str]
+    """`stop`, `length`, `tool_calls` or `abort`."""
+
+    prompt: str
+    """The prompt as the model saw it."""
+
+    reference: NotRequired[dict[str, Any]]
+    """What the answer is checked against (any JSON: a string, or `{answer, …}`)."""
+
+
+class RewardCodeBundle(TypedDict):
+    """Code bundle of a version."""
+
+    artifact_id: str
+    """`art_…`."""
+
+    bundle_sha256: str
+    """sha256 over its `file <path> <sha256>` lines."""
+
+    files: list[dict[str, Any]]
+    """`[{path, sha256, size}]`."""
+
+
+class RewardComponent(TypedDict):
+    """One component the reward sandbox ships (a row of the generated list)."""
+
+    beta: bool
+    """Beta: may change."""
+
+    code_sha256: str
+    """sha256 of its source file."""
+
+    description: str
+    """What it does."""
+
+    deterministic: bool
+    """Same input gives the same value."""
+
+    kind: str
+    """`builtin` (Tier 1) or `code_exec` (Tier 2: runs model-written code)."""
+
+    needs: list[str]
+    """Sample fields it reads, like `reference`."""
+
+    param_schema: dict[str, Any]
+    """JSON Schema of its `params`."""
+
+    ref: str
+    """`builtin/<name>@<major>`."""
+
+    shape: str
+    """`scalar.sequence`."""
+
+    stateful: bool
+    """Keeps state between batches."""
+
+    tier: int
+    """Sandbox tier: 1 or 2."""
+
+    value_range: list[float]
+    """Lowest and highest value."""
+
+    version: str
+    """Semver."""
+
+
+class RewardComponentInfo(TypedDict):
+    """A component with whether it can be used now."""
+
+    beta: bool
+    """Beta: may change."""
+
+    code_sha256: str
+    """sha256 of its source file."""
+
+    description: str
+    """What it does."""
+
+    deterministic: bool
+    """Same input gives the same value."""
+
+    kind: str
+    """`builtin` (Tier 1) or `code_exec` (Tier 2: runs model-written code)."""
+
+    listed: bool
+    """True unless it is no longer shipped by this server."""
+
+    needs: list[str]
+    """Sample fields it reads, like `reference`."""
+
+    param_schema: dict[str, Any]
+    """JSON Schema of its `params`."""
+
+    ref: str
+    """`builtin/<name>@<major>`."""
+
+    shape: str
+    """`scalar.sequence`."""
+
+    stateful: bool
+    """Keeps state between batches."""
+
+    tier: int
+    """Sandbox tier: 1 or 2."""
+
+    value_range: list[float]
+    """Lowest and highest value."""
+
+    version: str
+    """Semver."""
+
+
+class RewardComponentList(TypedDict):
+    """`GET /reward-components`."""
+
+    executor_sha256: str
+    """Identity of the executor environment (part of every content hash)."""
+
+    items: list[RewardComponentInfo]
+    """Components, by reference."""
+
+    sdk_contract: str
+    """The reward SDK contract."""
+
+
+class RewardCreateRequest(TypedDict):
+    """`POST /projects/{prj}/rewards`."""
+
+    description: NotRequired[str]
+    """What it rewards."""
+
+    name: str
+    """Unique in the project: lowercase letters, digits, `.`, `_`, `-` (1-100)."""
+
+    version: NotRequired[dict[str, Any]]
+
+
+class RewardDefinition(TypedDict):
+    """A reward definition."""
+
+    created_at: str
+    """When."""
+
+    created_by: str
+    """Who made it."""
+
+    description: str
+    """Description."""
+
+    id: str
+    """`rwd_…`."""
+
+    name: str
+    """Name."""
+
+    project_id: str
+    """`prj_…`."""
+
+    versions: list[RewardVersionSummary]
+    """Versions, newest first."""
+
+
+class RewardDefinitionPage(TypedDict):
+    """One page of results."""
+
+    items: list[RewardDefinition]
+    """The items on this page."""
+
+    next_cursor: NotRequired[str | None]
+    """Pass as `cursor` for the next page; `null` on the last page."""
+
+
+class RewardPublishCheck(TypedDict):
+    """Whether `:publish` would work, and why not."""
+
+    ok: bool
+    """True when nothing blocks it."""
+
+    reasons: list[str]
+    """What blocks it."""
+
+
+class RewardTestCase(TypedDict):
+    """One test case."""
+
+    expect: RewardCaseExpect
+    """What must come out."""
+
+    last_result: NotRequired[dict[str, Any] | None]
+    """The latest test run's outcome for it."""
+
+    name: str
+    """Name."""
+
+    position: int
+    """Order."""
+
+    sample: RewardCaseSample
+    """The sample."""
+
+
+class RewardVersion(TypedDict):
+    """A reward version."""
+
+    code: NotRequired[dict[str, Any]]
+
+    content_sha256: str
+    """sha256 of the canonical JSON of `hash_inputs`."""
+
+    created_at: str
+    """When."""
+
+    created_by: str
+    """Who made it."""
+
+    deprecated_at: NotRequired[str | None]
+    """When it was deprecated."""
+
+    exec_sha256: NotRequired[str | None]
+    """The bundle hash the sandbox reported in the passing test run."""
+
+    hash_inputs: dict[str, Any]
+    """Exactly what the hash covers."""
+
+    id: str
+    """`rwdv_…`."""
+
+    model_refs: list[str]
+    """Model versions the policy reads."""
+
+    notes: str
+    """Notes."""
+
+    policy: dict[str, Any]
+    """The policy."""
+
+    project_id: str
+    """`prj_…`."""
+
+    publishable: RewardPublishCheck
+    """Whether it can be published now."""
+
+    published_at: NotRequired[str | None]
+    """When it was published."""
+
+    regression: NotRequired[dict[str, Any] | None]
+    """Regression report against the previous published version."""
+
+    reward_id: str
+    """`rwd_…`."""
+
+    sandbox_tier: str
+    """`standard` or `code_exec`."""
+
+    state: str
+    """State."""
+
+    test_cases: list[RewardTestCase]
+    """Test cases."""
+
+    test_summary: NotRequired[dict[str, Any] | None]
+    """Last test run's summary."""
+
+    version_no: int
+    """1, 2, …"""
+
+
+class RewardVersionCreateRequest(TypedDict):
+    """`POST /rewards/{rwd}/versions` (and `version` of a new reward)."""
+
+    code_artifact_id: NotRequired[str | None]
+    """`art_…`: a committed artifact with the code bundle (`components.yaml` and `.py`"""
+
+    notes: NotRequired[str]
+    """Notes shown with the version."""
+
+    policy: dict[str, Any]
+    """RewardPolicy v1 (`apiVersion: mrl.dev/reward/v1`)."""
+
+    test_cases: NotRequired[list[dict[str, Any]]]
+    """Test cases: `{name, sample: {prompt, completion, reference?, completion_token_count?,"""
+
+
+class RewardVersionSummary(TypedDict):
+    """A version in lists."""
+
+    content_sha256: str
+    """Content hash."""
+
+    created_at: str
+    """When it was made."""
+
+    id: str
+    """`rwdv_…`."""
+
+    sandbox_tier: str
+    """`standard` or `code_exec`."""
+
+    state: str
+    """DRAFT, TESTING, PUBLISHED, FAILED_TESTS or DEPRECATED."""
+
+    version_no: int
+    """1, 2, …"""
+
+
 class RoleInfo(TypedDict):
     """One role a person holds."""
 
@@ -2257,6 +2590,20 @@ __all__ = [
     "ResourceActualView",
     "RestoreRequest",
     "Restored",
+    "RewardCaseExpect",
+    "RewardCaseSample",
+    "RewardCodeBundle",
+    "RewardComponent",
+    "RewardComponentInfo",
+    "RewardComponentList",
+    "RewardCreateRequest",
+    "RewardDefinition",
+    "RewardDefinitionPage",
+    "RewardPublishCheck",
+    "RewardTestCase",
+    "RewardVersion",
+    "RewardVersionCreateRequest",
+    "RewardVersionSummary",
     "RoleInfo",
     "Run",
     "RunArtifactInput",

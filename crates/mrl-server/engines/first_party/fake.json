@@ -117,7 +117,7 @@
             },
             "id": "cpu-uv",
             "kind": "uv",
-            "lockSha256": "0d36b23d60b87d989324100528d48e5950780aa16ceb13ffe5ce3c73220969cd",
+            "lockSha256": "29aa1e82fcf502f02d6f29daf4979e1ad1bd9094331c854f8e9887dc4dee6fa3",
             "lockfile": "uv.lock",
             "mrlRuntime": "0.1.0",
             "platform": "linux/amd64",
