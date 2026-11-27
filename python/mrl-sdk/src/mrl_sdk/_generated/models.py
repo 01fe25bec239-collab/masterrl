@@ -434,14 +434,12 @@ Confidence = Literal["high", "medium", "low"]
 class ConfigChange(TypedDict):
     """One setting the preflight changed, and why."""
 
-    from_: dict[str, Any]
-    """The value before (null when unset)."""
+    after: bool | float | str | None
+
+    before: bool | float | str | None
 
     path: str
     """JSON Pointer into the config, like `/engine/gradient_checkpointing`."""
-
-    to: dict[str, Any]
-    """The value after."""
 
     why: str
     """Why, in plain words."""

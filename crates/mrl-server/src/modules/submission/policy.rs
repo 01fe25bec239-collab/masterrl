@@ -10,8 +10,9 @@
 //!   launch for every resumed attempt ([`super::probe::ProbeLaunch`]).
 
 use super::codes;
-use super::resolve::{engine_choice, methods, sha256};
+use super::resolve::{engine_choice, methods};
 use crate::db::Db;
+use crate::modules::engines::validator::{CapabilityValidator, Pick};
 use crate::modules::estimates::{self, RunEstimate, Verdict};
 use crate::modules::jobs::{JobSpec, JobValidator, Rejection, Verdict as Check};
 use crate::modules::preflight::{self, Headroom, PreflightInput};
@@ -42,12 +43,19 @@ pub fn experimental_allowed(setting: &Value, workspace: Option<Uuid>) -> bool {
 /// The experimental-method policy.
 pub struct MethodPolicy {
     db: Db,
+    capability: CapabilityValidator,
 }
 
 impl MethodPolicy {
     /// Reads engines, orgs and projects from `db`.
     pub fn new(db: Db) -> Self {
-        Self { db }
+        let capability = CapabilityValidator::new(db.clone());
+        Self::with_capability(db, capability)
+    }
+
+    /// Uses the same registry lookups as the capability validator in a custom chain.
+    pub fn with_capability(db: Db, capability: CapabilityValidator) -> Self {
+        Self { db, capability }
     }
 }
 
@@ -62,13 +70,28 @@ impl JobValidator for MethodPolicy {
         let found = methods(&self.db, Some(&spec.algorithm_id), choice.as_ref(), None)
             .await
             .map_err(seam)?;
-        // ponytail: without a pinned engine (`common.engine`, set by resolution) the method
-        // is refused only when every engine offering it is blocked.
-        if found.is_empty()
-            || found
-                .iter()
-                .any(|m| m.dev_only || m.maturity != "experimental")
+        let mut experimental = found
+            .iter()
+            .filter(|m| !m.dev_only && m.maturity == "experimental");
+        let needs_policy = if found
+            .iter()
+            .all(|m| !m.dev_only && m.maturity == "experimental")
         {
+            !found.is_empty()
+        } else if experimental.clone().next().is_some() {
+            match self
+                .capability
+                .pick(spec)
+                .await
+                .map_err(|e| SeamError::new("engines", e.to_string()))?
+            {
+                Pick::Engine(selected) => experimental.any(|m| m.engine_version_id == selected),
+                Pick::Rejected(_) | Pick::NoEngine => false,
+            }
+        } else {
+            false
+        };
+        if !needs_policy {
             return Ok(Check::Abstain);
         }
         let row: Option<(Option<Value>, Option<Uuid>)> = sqlx::query_as(
@@ -121,7 +144,7 @@ impl JobValidator for Guardian {
     }
 
     async fn validate(&self, spec: &JobSpec) -> Result<Check, SeamError> {
-        let sha = sha256(&spec.resolved);
+        let sha = estimates::inputs_sha256(spec);
         let Some(row) = estimates::latest(&self.db, spec.org_id, spec.project_id, &sha)
             .await
             .map_err(seam)?

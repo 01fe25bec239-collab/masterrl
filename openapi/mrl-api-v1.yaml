@@ -3169,19 +3169,25 @@ components:
       description: One setting the preflight changed, and why.
       required:
       - path
-      - from
-      - to
+      - before
+      - after
       - why
       properties:
-        from:
-          type: object
-          description: The value before (null when unset).
+        after:
+          type:
+          - boolean
+          - number
+          - string
+          - 'null'
+        before:
+          type:
+          - boolean
+          - number
+          - string
+          - 'null'
         path:
           type: string
           description: JSON Pointer into the config, like `/engine/gradient_checkpointing`.
-        to:
-          type: object
-          description: The value after.
         why:
           type: string
           description: Why, in plain words.

@@ -18,7 +18,7 @@ use crate::seams::RequestContext;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
-use mrl_domain::ids::ProjectId;
+use mrl_domain::ids::{NodeId, ProjectId, RunId};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -122,12 +122,38 @@ fn ids<T: std::fmt::Display>(v: &[T]) -> Vec<String> {
 
 /// Runs every check for `sub` in `(org, project)` on behalf of `who`.
 pub async fn check(
+    state: &AppState,
     ctx: &Ctx,
+    req: &RequestContext,
     org: Uuid,
     project: Uuid,
-    who: &str,
     sub: &RunSubmission,
 ) -> Result<ValidateResponse, JobsError> {
+    if let Some(checkpoint) = sub.parent_checkpoint_id {
+        let source: Option<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT r.id, r.project_id FROM checkpoints c JOIN runs r ON r.id = c.run_id
+             WHERE c.id = $1 AND c.org_id = $2 AND r.org_id = $2",
+        )
+        .bind(checkpoint.as_uuid())
+        .bind(org)
+        .fetch_optional(ctx.db.pool())
+        .await?;
+        let (run, source_project) = source.ok_or_else(|| JobsError::not_found("checkpoint"))?;
+        let resource = scope::resource(
+            "run",
+            Some(RunId::from_uuid(run).to_string()),
+            org,
+            source_project,
+        );
+        scope::authorize(state, req, "checkpoints.read", &resource)
+            .await
+            .map_err(|err| match err {
+                JobsError::Api(a) if a.code == ErrorCode::NotFound => {
+                    JobsError::not_found("checkpoint")
+                }
+                other => other,
+            })?;
+    }
     let mut issues = Vec::new();
     let resources = sub.resources.clone().unwrap_or_else(default_resources);
     let unchecked = |issues: Vec<ValidateIssue>, config: Value, why: &str| ValidateResponse {
@@ -225,6 +251,16 @@ pub async fn check(
     let mut ok = true;
     let mut estimate = RunEstimate::unknown("No machine checked these settings.");
     let all = preflight::machines(&ctx.db, org, None).await?;
+    let eligible: Vec<NodeId> = all
+        .iter()
+        .map(|m| NodeId::from_uuid(m.node_id))
+        .filter(|node| {
+            resources
+                .roles
+                .iter()
+                .all(|r| r.node_ids.is_empty() || r.node_ids.contains(node))
+        })
+        .collect();
     match (&method, engine) {
         (Some(m), Some(_)) if !m.has_l1() => {
             issues.push(ValidateIssue::new(
@@ -237,7 +273,7 @@ pub async fn check(
                 ),
             ));
         }
-        (Some(_), Some(_)) if all.is_empty() => {
+        (Some(_), Some(_)) if eligible.is_empty() => {
             issues.push(ValidateIssue::new(
                 IssueSeverity::Info,
                 codes::CHECKED_WITHOUT_MACHINE,
@@ -246,11 +282,13 @@ pub async fn check(
             ));
         }
         (Some(m), Some(engine)) => {
+            let inputs_sha256 = estimates::inputs_sha256(&spec);
             let spec = ProbeSpec {
                 algorithm: sub.algorithm_id.clone(),
                 base_model_version_id: sub.base_model_version_id.to_string(),
                 dataset_version_ids: ids(&sub.dataset_version_ids),
                 reward_version_id: sub.reward_version_id.map(|r| r.to_string()),
+                target_resources: Some(resources.clone()),
                 seeds: sub.seeds.clone().unwrap_or_else(|| json!({"global": 0})),
                 resolved: config.clone(),
             };
@@ -260,17 +298,19 @@ pub async fn check(
                 &NewProbe {
                     org,
                     project,
-                    created_by: who,
+                    created_by: &req.principal.id,
                     spec: &spec,
                     engine_version_id: engine,
                     estimator_version: m.engine_ref(),
                     calibration_key: estimates::calibration_key(
-                        &m.engine,
+                        &m.engine_ref(),
                         &sub.algorithm_id,
                         &config,
-                        preflight::gpu_bucket(&resources),
+                        "unknown",
                     ),
-                    inputs_sha256: resolve::sha256(&config),
+                    inputs_sha256,
+                    node_ids: eligible,
+                    timeout_seconds: budget.as_secs(),
                     max_runtime_seconds: i64::try_from(budget.as_secs() * 2).unwrap_or(120),
                 },
             )
@@ -284,7 +324,16 @@ pub async fn check(
                             .into_iter()
                             .filter_map(|i| serde_json::from_value::<ValidateIssue>(i).ok()),
                     );
-                    if let Some(row) = estimates::ready(&ctx.db, id).await? {
+                    if !worker_ok && !issues.iter().any(|i| i.severity == IssueSeverity::Error) {
+                        issues.push(ValidateIssue::new(
+                            IssueSeverity::Error,
+                            crate::modules::jobs::codes::FIELD_VALUE,
+                            None,
+                            "The machine could not check these settings. Check the worker environment and try again.",
+                        ));
+                    }
+                    let row = if worker_ok { estimates::ready(&ctx.db, id).await? } else { None };
+                    if let Some(row) = row {
                         let cal = estimates::calibration(&ctx.db, &row.calibration_key).await?;
                         estimate = RunEstimate::of(&row, cal);
                     }
@@ -317,7 +366,19 @@ pub async fn check(
         supports_qlora: method.as_ref().is_some_and(resolve::Method::supports_qlora),
         probe_steps: ctx.config.probe_steps,
     };
-    let (pre, adjusted) = preflight::decide(&input, &all, &ctx.config.headroom);
+    let (mut pre, mut adjusted) = preflight::decide(&input, &all, &ctx.config.headroom);
+    if !pre.changes.is_empty() {
+        let mut adjusted_spec = spec;
+        adjusted_spec.resolved = adjusted.clone();
+        if matches!(
+            ctx.chains.validate(&adjusted_spec).await?,
+            Validation::Rejected(_)
+        ) {
+            adjusted = config;
+            pre.changes.clear();
+            pre.message = "The fit is tight. The automatic changes did not pass validation.".into();
+        }
+    }
     estimate.verdict = pre.verdict;
     match pre.verdict {
         Verdict::DoesNotFit => {
@@ -384,9 +445,7 @@ pub async fn validate(
     let v: Value = serde_json::from_slice(&body)
         .map_err(|e| bad_body(format!("The body is not JSON: {e}.")))?;
     let sub = read_submission(&v)?;
-    Ok(Json(
-        check(&ctx, org, project, &req.principal.id, &sub).await?,
-    ))
+    Ok(Json(check(&state, &ctx, &req, org, project, &sub).await?))
 }
 
 /// `POST /runs:preflight`: will this run fit the connected machines?
@@ -416,10 +475,20 @@ pub async fn preflight_route(
     )
     .await?;
     let sub = read_submission(&r.run)?;
-    let out = check(&ctx, org, project, &req.principal.id, &sub).await?;
+    let out = check(&state, &ctx, &req, org, project, &sub).await?;
     match out.preflight {
-        Some(p) => Ok(Json(p)),
-        None => Err(ApiError::validation(
+        Some(p)
+            if out.ok
+                || (p.verdict == Verdict::DoesNotFit
+                    && out
+                        .issues
+                        .iter()
+                        .filter(|i| i.severity == IssueSeverity::Error)
+                        .all(|i| i.code == codes::DOES_NOT_FIT.to_string())) =>
+        {
+            Ok(Json(p))
+        }
+        _ => Err(ApiError::validation(
             out.issues
                 .into_iter()
                 .filter(|i| i.severity == IssueSeverity::Error)

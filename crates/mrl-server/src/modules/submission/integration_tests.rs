@@ -20,7 +20,7 @@ use mrl_proto::agent::v1::command::Kind;
 use mrl_proto::agent::v1::{AgentMessage, AttemptPhase, AttemptStatus, Command, WorkerRelay};
 use mrl_proto::common::v1::{AttemptRef, Failure};
 use mrl_proto::worker::v1::worker_message::Body as WorkerBody;
-use mrl_proto::worker::v1::{ExitKind, Prepared, ResourceEstimate, WorkerMessage};
+use mrl_proto::worker::v1::{ExitKind, MetricPoint, Prepared, ResourceEstimate, WorkerMessage};
 use mrl_server::config::Mode;
 use mrl_server::modules::artifacts::ArtifactsModule;
 use mrl_server::modules::compute::LocalAgentPool;
@@ -40,8 +40,12 @@ use mrl_server::modules::submission::policy::{Guardian, MethodPolicy};
 use mrl_server::modules::submission::probe::{self, PreparedSink, ProbeLaunch, ProbeVerifier};
 use mrl_server::modules::submission::resolve::Presets;
 use mrl_server::modules::submission::{SubmissionConfig, SubmissionModule};
-use mrl_server::modules::telemetry::MetricObservers;
-use mrl_server::seams::{SecretStore, LAUNCH_SECRET_HEADER};
+use mrl_server::modules::telemetry::ingest::{Delivery, Owner};
+use mrl_server::modules::telemetry::{Ingest, MetricObservers};
+use mrl_server::seams::{
+    Authorizer, Decision, LocalOwnerAuthorizer, RequestContext, Resource, SeamError, SecretStore,
+    LAUNCH_SECRET_HEADER,
+};
 use serde_json::{json, Value};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
@@ -58,6 +62,8 @@ enum Answer {
     Estimate(f64, f64),
     /// Takes the launch and never answers.
     Silent,
+    /// The worker rejects validation without sending issues.
+    Reject,
 }
 
 struct Script {
@@ -141,6 +147,27 @@ impl CommandHandler for Handler {
                     "the probe carries the resolved config: {}",
                     l.job_spec_json
                 );
+                if let Answer::Reject = answer {
+                    s.send(Msg::AttemptStatus(status(
+                        &r,
+                        AttemptPhase::Staging,
+                        ExitKind::Unspecified,
+                    )));
+                    s.send(Msg::Worker(WorkerRelay {
+                        attempt: Some(r.clone()),
+                        role_id: "trainer".into(),
+                        message: Some(WorkerMessage {
+                            body: Some(WorkerBody::Prepared(Prepared::default())),
+                            ..WorkerMessage::default()
+                        }),
+                    }));
+                    s.send(Msg::AttemptStatus(status(
+                        &r,
+                        AttemptPhase::Exited,
+                        ExitKind::Failed,
+                    )));
+                    return Ok(());
+                }
                 if let Answer::Estimate(lo, hi) = answer {
                     s.send(Msg::AttemptStatus(status(
                         &r,
@@ -189,6 +216,28 @@ struct Machine {
     _script: Arc<Script>,
 }
 
+struct CheckpointAccess {
+    decision: Arc<Mutex<Decision>>,
+}
+
+#[async_trait::async_trait]
+impl Authorizer for CheckpointAccess {
+    async fn authorize(
+        &self,
+        ctx: &RequestContext,
+        action: &str,
+        resource: &Resource,
+    ) -> Result<Decision, SeamError> {
+        if action == "checkpoints.read" {
+            assert_eq!(resource.kind, "run");
+            assert!(resource.project.is_some());
+            Ok(*self.decision.lock().unwrap())
+        } else {
+            LocalOwnerAuthorizer.authorize(ctx, action, resource).await
+        }
+    }
+}
+
 struct World {
     server: TestServer,
     db: TestDb,
@@ -196,6 +245,8 @@ struct World {
     project: ProjectId,
     fixture: TinyFixture,
     lanes: Arc<LaneRouter>,
+    ingest: Ingest,
+    checkpoint_access: Arc<Mutex<Decision>>,
     _objects: tempfile::TempDir,
 }
 
@@ -242,6 +293,12 @@ impl World {
             objects.path().join("scratch"),
         );
         let transfer = Transfer::new(artifacts.store(), artifacts.secrets(), secrets.clone());
+        let ingest = Ingest::new(
+            db.db().clone(),
+            artifacts.store(),
+            MetricObservers::new(),
+            100,
+        );
         let nodes = NodesModule::new(db.db().clone(), &cfg, secrets.clone(), lanes.clone());
         let gw = nodes.gateway();
         let d = db.db().clone();
@@ -253,7 +310,10 @@ impl World {
                     d.clone(),
                     fixture.records(),
                 )),
-                Arc::new(MethodPolicy::new(d.clone())),
+                Arc::new(MethodPolicy::with_capability(
+                    d.clone(),
+                    CapabilityValidator::with_records(d.clone(), fixture.records()),
+                )),
                 Arc::new(Guardian::new(d.clone())),
             ],
             vec![Arc::new(ProbeVerifier)],
@@ -303,8 +363,13 @@ impl World {
             )),
             Box::new(submission),
         ];
+        let checkpoint_access = Arc::new(Mutex::new(Decision::Allow));
         let seams = crate::seams::build(
-            crate::seams::solo(TEST_SECRET).secrets_arc(secrets),
+            crate::seams::solo(TEST_SECRET)
+                .secrets_arc(secrets)
+                .authorizer(CheckpointAccess {
+                    decision: checkpoint_access.clone(),
+                }),
             Mode::Solo,
         );
         let server = match TestServer::start(cfg, seams, modules).await {
@@ -318,6 +383,8 @@ impl World {
             project: ProjectId::new(),
             fixture,
             lanes,
+            ingest,
+            checkpoint_access,
             _objects: objects,
         };
         let r = w
@@ -562,7 +629,7 @@ async fn dry_run_fits_24_gb_and_not_4_gb_and_submit_agrees() {
     let w = World::start(60).await;
     let f = w.fixture;
     let big = w.machine(24, Answer::Estimate(6.0, 9.0)).await;
-    let small = w.machine(4, Answer::Estimate(6.0, 9.0)).await;
+    let small = w.machine(4, Answer::Estimate(5.0, 7.0)).await;
     let v = w.validate(sft(&f, &[big.node])).await;
     assert_eq!(v["ok"], true, "{v}");
     assert_eq!(v["checked"], "l1");
@@ -577,6 +644,16 @@ async fn dry_run_fits_24_gb_and_not_4_gb_and_submit_agrees() {
     let v4 = w.validate(sft(&f, &[small.node])).await;
     assert_eq!(v4["ok"], false, "{v4}");
     assert_eq!(v4["estimate"]["verdict"], "does_not_fit");
+    assert_eq!(
+        v4["estimate"]["per_gpu_memory_gib"]["expected"], 6.0,
+        "used the pinned node"
+    );
+    let placements: Vec<Uuid> =
+        sqlx::query_scalar("SELECT node_id FROM resource_estimates ORDER BY created_at")
+            .fetch_all(w.pool())
+            .await
+            .unwrap();
+    assert_eq!(placements, [big.node, small.node]);
     assert!(codes(&v4).contains(&"MRL-CAP-280".to_owned()), "{v4}");
     let kinds: Vec<&str> = v4["preflight"]["alternatives"]
         .as_array()
@@ -680,6 +757,33 @@ async fn dry_run_fits_24_gb_and_not_4_gb_and_submit_agrees() {
     assert_eq!(r.status, 200, "{}", r.text());
     let res = r.json();
     assert_eq!(res["estimate"]["verdict"], "fits", "{res}");
+    let original_model: Uuid =
+        sqlx::query_scalar("SELECT base_model_version_id FROM runs WHERE id = $1")
+            .bind(run.as_uuid())
+            .fetch_one(w.pool())
+            .await
+            .unwrap();
+    sqlx::query("UPDATE runs SET base_model_version_id = $2 WHERE id = $1")
+        .bind(run.as_uuid())
+        .bind(Uuid::now_v7())
+        .execute(w.pool())
+        .await
+        .unwrap();
+    let changed = w
+        .call(
+            Method::GET,
+            &format!("/api/v1/runs/{run}/resources"),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(changed.status, 200, "{}", changed.text());
+    assert!(changed.json()["estimate"].is_null(), "{}", changed.text());
+    sqlx::query("UPDATE runs SET base_model_version_id = $2 WHERE id = $1")
+        .bind(run.as_uuid())
+        .bind(original_model)
+        .execute(w.pool())
+        .await
+        .unwrap();
     let update = res["phases"]
         .as_array()
         .unwrap()
@@ -704,11 +808,53 @@ async fn dry_run_fits_24_gb_and_not_4_gb_and_submit_agrees() {
         created_at: time::OffsetDateTime::now_utc(),
         xid: 0,
     };
+    sqlx::query("DELETE FROM resource_actuals WHERE attempt_id = $1")
+        .bind(attempt)
+        .execute(w.pool())
+        .await
+        .unwrap();
+    let cal = Calibrate::new(w.db.db().clone());
     for _ in 0..2 {
         let mut tx = w.db.db().begin().await.unwrap();
-        Calibrate.handle(&mut tx, &event).await.unwrap();
+        cal.handle(&mut tx, &event).await.unwrap();
         tx.commit().await.unwrap();
     }
+    assert_eq!(
+        w.count("SELECT count(*) FROM estimator_calibration_pending")
+            .await,
+        1
+    );
+    w.ingest
+        .metrics(
+            Owner {
+                org: Uuid::nil(),
+                run: run.as_uuid(),
+                attempt,
+                attempt_no: 1,
+            },
+            Delivery {
+                node: big.node,
+                stream: mrl_proto::agent::v1::Lane::Telemetry,
+                seq: 10,
+            },
+            None,
+            &[MetricPoint {
+                name: format!("resource/process_peak/{device}"),
+                split: "update".into(),
+                step: 5,
+                value: 9.0 * f64::from(1u32 << 30),
+                ..MetricPoint::default()
+            }],
+        )
+        .await
+        .unwrap();
+    cal.reconcile().await.unwrap();
+    cal.reconcile().await.unwrap();
+    assert_eq!(
+        w.count("SELECT count(*) FROM estimator_calibration_pending")
+            .await,
+        0
+    );
     let (n, sum): (i32, f64) = sqlx::query_as("SELECT n, sum_ln FROM estimator_calibration")
         .fetch_one(w.pool())
         .await
@@ -738,6 +884,27 @@ async fn dry_run_fits_24_gb_and_not_4_gb_and_submit_agrees() {
     let mut branch = sft(&f, &[big.node]);
     branch["parent_checkpoint_id"] =
         json!(mrl_domain::ids::CheckpointId::from_uuid(ckpt).to_string());
+    for (decision, expected) in [(Decision::Hide, 404), (Decision::Deny, 403)] {
+        *w.checkpoint_access.lock().unwrap() = decision;
+        let other_project = ProjectId::new();
+        let rejected = w
+            .call(
+                Method::POST,
+                &format!("/api/v1/projects/{other_project}/runs:validate"),
+                branch.clone(),
+            )
+            .await;
+        assert_eq!(rejected.status, expected, "{}", rejected.text());
+        let rejected = w
+            .call(
+                Method::POST,
+                "/api/v1/runs:preflight",
+                json!({"project_id": other_project.to_string(), "run": branch}),
+            )
+            .await;
+        assert_eq!(rejected.status, expected, "{}", rejected.text());
+    }
+    *w.checkpoint_access.lock().unwrap() = Decision::Allow;
     let v = w.validate(branch).await;
     assert!(codes(&v).contains(&"MRL-CAP-281".to_owned()), "{v}");
     // Probe mode: a run with no estimate of its config starts; once its first steps measure
@@ -785,32 +952,61 @@ async fn dry_run_fits_24_gb_and_not_4_gb_and_submit_agrees() {
         mrl_server::modules::preflight::Headroom::default(),
         5,
     );
-    let peak = |gib: f64| {
-        sqlx::query(
-            "INSERT INTO resource_actuals (attempt_id, org_id, run_id, device, phase, signal, peak)
-             VALUES ($1, $2, $3, $4, 'update', 'process_peak', $5)
-             ON CONFLICT (attempt_id, device, phase, signal) DO UPDATE SET peak = EXCLUDED.peak",
-        )
-        .bind(attempt)
-        .bind(Uuid::nil())
-        .bind(probe_run.as_uuid())
-        .bind(device.clone())
-        .bind(gib * f64::from(1u32 << 30))
-        .execute(w.pool())
+    let points: Vec<_> = (1..=5)
+        .map(|step| MetricPoint {
+            name: format!("resource/process_peak/{device}"),
+            split: "update".into(),
+            step,
+            value: 3.9 * f64::from(1u32 << 30),
+            ..MetricPoint::default()
+        })
+        .collect();
+    let owner = Owner {
+        org: Uuid::nil(),
+        run: probe_run.as_uuid(),
+        attempt,
+        attempt_no: 1,
     };
-    peak(3.0).await.unwrap();
-    assert!(
-        !guard.decide(probe_run.as_uuid(), attempt).await.unwrap(),
-        "3 of 3.6 GiB usable"
+    let delivery = Delivery {
+        node: small.node,
+        stream: mrl_proto::agent::v1::Lane::Telemetry,
+        seq: 11,
+    };
+    w.ingest
+        .metrics(owner, delivery, None, &points[..4])
+        .await
+        .unwrap();
+    guard.reconcile().await.unwrap();
+    assert_eq!(
+        w.count("SELECT count(*) FROM submission_probe_decisions")
+            .await,
+        0
     );
-    peak(3.9).await.unwrap();
-    assert!(
-        guard.decide(probe_run.as_uuid(), attempt).await.unwrap(),
-        "over the usable memory"
+
+    // The batch commits with no observer. A new guard recovers it from storage.
+    w.ingest
+        .metrics(
+            owner,
+            Delivery {
+                seq: 12,
+                ..delivery
+            },
+            None,
+            &points[4..],
+        )
+        .await
+        .unwrap();
+    let restarted = mrl_server::modules::preflight::ProbeModeGuard::new(
+        w.db.db().clone(),
+        mrl_server::modules::preflight::Headroom::default(),
+        5,
     );
-    assert!(
-        !guard.decide(probe_run.as_uuid(), attempt).await.unwrap(),
-        "decided once"
+    restarted.reconcile().await.unwrap();
+    restarted.reconcile().await.unwrap();
+    assert_eq!(
+        w.count("SELECT count(*) FROM submission_probe_decisions WHERE cancelled")
+            .await,
+        1
     );
     assert_eq!(
         w.count(&format!(
@@ -860,12 +1056,27 @@ async fn a_probe_timeout_falls_back_to_l0_and_cancels_the_probe() {
     })
     .await;
     assert_eq!(
-        w.count("SELECT count(*) FROM resource_estimates WHERE state = 'PENDING'")
+        w.count("SELECT count(*) FROM resource_estimates WHERE state = 'EXPIRED'")
             .await,
         1,
-        "nothing answered"
+        "the probe no longer accepts answers"
     );
-    drop(m);
+    let (attempt, epoch): (Uuid, i64) = sqlx::query_as("SELECT id, epoch FROM job_attempts")
+        .fetch_one(w.pool())
+        .await
+        .unwrap();
+    assert!(!PreparedSink::new(w.db.db().clone())
+        .store(
+            m.node,
+            attempt,
+            epoch,
+            &Prepared {
+                ok: true,
+                ..Prepared::default()
+            },
+        )
+        .await
+        .unwrap());
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -884,6 +1095,7 @@ async fn replayed_or_foreign_answers_change_nothing() {
         base_model_version_id: "mv_x".into(),
         dataset_version_ids: vec![],
         reward_version_id: None,
+        target_resources: None,
         seeds: json!({}),
         resolved: json!({"common": {}, "engine": {}}),
     };
@@ -898,6 +1110,8 @@ async fn replayed_or_foreign_answers_change_nothing() {
             estimator_version: "trl@x".into(),
             calibration_key: "k".into(),
             inputs_sha256: vec![0; 32],
+            node_ids: Vec::new(),
+            timeout_seconds: 60,
             max_runtime_seconds: 600,
         },
     )
@@ -954,6 +1168,23 @@ async fn replayed_or_foreign_answers_change_nothing() {
     };
     sink.deliver(item(node, &stale, 2.0)).await.unwrap();
     assert_eq!(state().await, ("PENDING".into(), None), "another epoch");
+    sqlx::query("UPDATE jobs SET epoch = epoch + 1 WHERE id = $1")
+        .bind(job)
+        .execute(w.pool())
+        .await
+        .unwrap();
+    sink.deliver(item(node, &r, 2.5)).await.unwrap();
+    assert_eq!(
+        state().await,
+        ("PENDING".into(), None),
+        "an attempt behind its job fence"
+    );
+    sqlx::query("UPDATE jobs SET epoch = $2 WHERE id = $1")
+        .bind(job)
+        .bind(epoch)
+        .execute(w.pool())
+        .await
+        .unwrap();
     sink.deliver(item(node, &r, 3.0)).await.unwrap();
     assert_eq!(
         state().await,
@@ -1018,4 +1249,107 @@ async fn unsupported_combinations_and_experimental_methods_are_refused() {
     .unwrap();
     let v = w.validate(sft(&f, &[])).await;
     assert!(!codes(&v).contains(&"MRL-CAP-022".to_owned()), "{v}");
+    let mut submission = sft(&f, &[]);
+    submission["config"] = v["resolved_config"].clone();
+    submission["config"]["common"]
+        .as_object_mut()
+        .unwrap()
+        .remove("engine");
+
+    let mut experimental: Value = serde_json::from_str(TRL).unwrap();
+    experimental["manifest"]["metadata"]["name"] = json!("zz-experimental");
+    experimental["manifest"]["spec"]["algorithms"][0]["maturity"] = json!("experimental");
+    let experimental = Bundle::parse(&experimental.to_string()).unwrap();
+    mrl_server::modules::engines::store::register(w.db.db(), &[&experimental], false)
+        .await
+        .unwrap();
+    w.db.seed(
+        r#"UPDATE organizations SET settings = '{}';
+         UPDATE algorithm_definitions ad SET maturity = 'stable'
+           FROM engine_versions ev JOIN training_engines e ON e.id = ev.engine_id
+          WHERE ad.engine_version_id = ev.id AND e.name = 'trl';
+         UPDATE engine_versions ev SET status = 'ENABLED', probe_results = CASE
+           WHEN e.name = 'trl' THEN '{"cpu": {"status": "ENABLED"}}'::jsonb
+           ELSE '{"nvidia": {"status": "ENABLED"}}'::jsonb END
+           FROM training_engines e WHERE e.id = ev.engine_id;"#,
+    )
+    .await;
+    let r = w
+        .call_with(
+            Method::POST,
+            &format!("/api/v1/projects/{}/runs", w.project),
+            submission,
+            &[("idempotency-key", "mixed-maturity")],
+        )
+        .await;
+    assert_eq!(r.status, 201, "{}", r.text());
+    let result = r.json();
+    assert_eq!(result["state"], "REJECTED", "{result}");
+    assert!(
+        result["state_reason"]["problems"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|issue| issue["code"] == "MRL-CAP-022"),
+        "{result}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn preflight_keeps_worker_rejections_and_validation_explains_empty_replies() {
+    let w = World::start(60).await;
+    let m = w.machine(24, Answer::Reject).await;
+    let body = sft(&w.fixture, &[m.node]);
+    let result = w.validate(body.clone()).await;
+    assert_eq!(result["ok"], false, "{result}");
+    assert_eq!(result["checked"], "l1", "{result}");
+    assert_eq!(result["issues"][0]["severity"], "error", "{result}");
+    let r = w
+        .call(
+            Method::POST,
+            "/api/v1/runs:preflight",
+            json!({"project_id": w.project.to_string(), "run": body}),
+        )
+        .await;
+    assert_eq!(r.status, 422, "{}", r.text());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn audit_failure_rolls_back_probe_creation_and_train_requires_a_run_or_probe() {
+    let w = World::start(60).await;
+    let m = w.machine(24, Answer::Estimate(6.0, 9.0)).await;
+    for subject in [None, Some(json!({})), Some(json!({"kind": null}))] {
+        let error = sqlx::query(
+            "INSERT INTO jobs (id, org_id, project_id, kind, subject_ref, state, resource_request,
+               retry_policy, created_by) VALUES ($1, $2, $3, 'TRAIN', $4, 'CREATED', '{}', '{}', 'test')"
+        )
+        .bind(Uuid::now_v7()).bind(Uuid::nil()).bind(w.project.as_uuid()).bind(subject)
+        .execute(w.pool()).await.unwrap_err();
+        assert_eq!(
+            error.as_database_error().and_then(|e| e.constraint()),
+            Some("jobs_check")
+        );
+    }
+    w.db.seed(
+        "CREATE FUNCTION fail_p28_audit() RETURNS trigger LANGUAGE plpgsql AS $$
+         BEGIN
+           IF NEW.action = 'submission.probe.create' THEN
+             RAISE EXCEPTION 'test audit failure';
+           END IF;
+           RETURN NEW;
+         END $$;
+         CREATE TRIGGER fail_p28_audit BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION fail_p28_audit();"
+    ).await;
+    let response = w
+        .call(
+            Method::POST,
+            &format!("/api/v1/projects/{}/runs:validate", w.project),
+            sft(&w.fixture, &[m.node]),
+        )
+        .await;
+    assert!((500..600).contains(&response.status), "{}", response.text());
+    assert_eq!(w.count("SELECT count(*) FROM jobs").await, 0);
+    assert_eq!(w.count("SELECT count(*) FROM resource_estimates").await, 0);
 }

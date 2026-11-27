@@ -31,6 +31,32 @@ use std::sync::Arc;
 use std::time::Duration;
 use utoipa::OpenApi;
 
+pub(crate) async fn audit(
+    db: &Db,
+    tx: &mut crate::db::Tx,
+    (org, project): (uuid::Uuid, uuid::Uuid),
+    actor: &str,
+    action: &str,
+    target: String,
+) -> Result<(), SeamError> {
+    use crate::seams::{AuditEvent, AuditOutcome, AuditSink};
+    crate::modules::audit::PgAuditSink::new(db.clone())
+        .record_in(
+            tx,
+            AuditEvent {
+                at: time::OffsetDateTime::now_utc(),
+                actor: actor.to_owned(),
+                org: crate::modules::jobs::scope::org_text(org),
+                project: Some(mrl_domain::ids::ProjectId::from_uuid(project).to_string()),
+                action: action.to_owned(),
+                target,
+                outcome: AuditOutcome::Success,
+                trace_id: uuid::Uuid::new_v4().simple().to_string(),
+            },
+        )
+        .await
+}
+
 /// Codes this part adds (guidance/fragments/errors/p28.yaml), plus the ones it reuses.
 pub mod codes {
     use mrl_domain::errors::{ErrorCode, ErrorFamily};
@@ -224,18 +250,33 @@ impl ServerModule for SubmissionModule {
 
     fn background_tasks(&self) -> Vec<Task> {
         let db = self.ctx.db.clone();
-        let stale = Duration::from_secs(self.ctx.config.probe_timeout_seconds * 2 + 60);
+        let calibration = Arc::new(crate::modules::estimates::Calibrate::new(db.clone()));
+        let guard = Arc::new(ProbeModeGuard::new(
+            db.clone(),
+            self.ctx.config.headroom,
+            self.ctx.config.probe_steps,
+        ));
         vec![Task::new(
             "submission.probe-sweep",
             Role::Background,
-            move |cancel| async move {
-                let mut tick = tokio::time::interval(Duration::from_secs(30));
-                loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => return Ok(()),
-                        _ = tick.tick() => {
-                            if let Err(e) = probe::sweep(&db, stale).await {
-                                tracing::warn!(error = %e, "could not cancel stale settings checks; retrying");
+            move |cancel| {
+                let calibration = calibration.clone();
+                let guard = guard.clone();
+                async move {
+                    let mut tick = tokio::time::interval(Duration::from_secs(30));
+                    loop {
+                        tokio::select! {
+                            _ = cancel.cancelled() => return Ok(()),
+                            _ = tick.tick() => {
+                                if let Err(e) = guard.reconcile().await {
+                                    tracing::warn!(error = %e, "could not recover pending Guardian checks");
+                                }
+                                if let Err(e) = calibration.reconcile().await {
+                                    tracing::warn!(error = %e, "could not reconcile late resource measurements");
+                                }
+                                if let Err(e) = probe::sweep(&db).await {
+                                    tracing::warn!(error = %e, "could not cancel stale settings checks; retrying");
+                                }
                             }
                         }
                     }
@@ -261,6 +302,15 @@ mod tests {
         }
         let schemas = doc.components.map(|c| c.schemas).unwrap_or_default();
         assert!(schemas.contains_key("ValidateResponse") && schemas.contains_key("RunPreflight"));
+        let change = serde_json::to_value(&schemas["ConfigChange"]).unwrap();
+        assert_eq!(
+            change["properties"]["before"]["type"],
+            serde_json::json!(["boolean", "number", "string", "null"])
+        );
+        assert_eq!(
+            change["properties"]["after"]["type"],
+            serde_json::json!(["boolean", "number", "string", "null"])
+        );
     }
 
     #[test]
