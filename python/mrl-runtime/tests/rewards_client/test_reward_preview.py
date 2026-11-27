@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sys
 import tempfile
 from collections.abc import Iterator
@@ -211,3 +212,15 @@ def test_custom_code_without_a_jail_is_refused_with_its_own_code(tmp: Path) -> N
         )
     assert e.value.code == "MRL-RWD-295", e.value
     assert not (tmp / "out" / REPORT).exists()
+
+
+@pytest.mark.skipif(
+    not (sys.platform.startswith("linux") and os.environ.get("MRL_JAIL_SECCOMP")),
+    reason="needs Linux, bubblewrap and an agent filter in MRL_JAIL_SECCOMP (ci-security-rewards)",
+)
+def test_with_a_jail_the_reward_service_runs_inside_it(tmp: Path) -> None:
+    report, _, _ = run(tmp, {"mode": "test", "reward": reward(), "cases": CASES})
+    log = report["sandbox"]["log_excerpt"]
+    assert "reward_exec.ready" in log, log
+    assert "jail_skipped" not in log, log
+    assert [c["total"] for c in sorted(report["cases"], key=lambda c: c["position"])] == [1.0, 0.0]

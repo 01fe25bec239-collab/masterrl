@@ -86,6 +86,9 @@ pub struct RewardExecLaunch {
     pub limits: Limits,
     /// The bundle has custom code.
     pub user_code: bool,
+    /// The reward has code-running (Tier-2) components: the service runs in the
+    /// [`code_exec`](super::code_exec) profile and may start one jail per execution.
+    pub tier2: bool,
 }
 
 impl RewardExecLaunch {
@@ -95,10 +98,10 @@ impl RewardExecLaunch {
     }
 }
 
-/// The sandboxed command for `l`. Custom code needs an isolating bubblewrap backend
-/// (MRL-RWD-295 otherwise).
+/// The sandboxed command for `l`. Custom code and Tier-2 rewards need an isolating
+/// bubblewrap backend (MRL-RWD-295 otherwise).
 pub fn spec(backend: &dyn SandboxBackend, l: &RewardExecLaunch) -> Result<ExecSpec, ProfileError> {
-    if l.user_code {
+    if l.user_code || l.tier2 {
         super::user_code_gate(backend)?;
     }
     let listen = format!("unix:{}", l.socket().display());
@@ -115,15 +118,21 @@ pub fn spec(backend: &dyn SandboxBackend, l: &RewardExecLaunch) -> Result<ExecSp
     if l.user_code {
         args.push("--user-code".into());
     }
+    if l.tier2 {
+        args.extend(["--tier".into(), "2".into()]);
+    }
     let program = l.program.display().to_string();
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut spec = ExecSpec::new(&l.name, &program, &arg_refs, &l.job_dir);
     spec.work_dir = l.bundle.clone();
     spec.staging_dir = l.socket_dir.clone();
     spec.log_dir = l.job_dir.join("logs").join(&l.name);
-    let h = hardening();
+    let (h, p) = if l.tier2 {
+        (super::code_exec::hardening(), super::code_exec::profile())
+    } else {
+        (hardening(), profile())
+    };
     spec.limits = effective_limits(&h, l.limits);
-    let p = profile();
     let isolating = backend.isolates() && backend.name() == "bubblewrap";
     if !isolating {
         // Built-ins only (the gate refused custom code): the nonce still goes through a file
@@ -143,14 +152,21 @@ pub fn spec(backend: &dyn SandboxBackend, l: &RewardExecLaunch) -> Result<ExecSp
         spec.args = sh;
         return Ok(spec);
     }
-    let env = sandbox_env(&p, &h, &spec);
+    let files = l.job_dir.join(super::SANDBOX_DIR).join(&l.name);
+    let mut env = sandbox_env(&p, &h, &spec);
+    let mut binds = Vec::new();
+    if l.tier2 {
+        let (vars, b) = super::code_exec::jail_files_in(&files.join("jail"))?;
+        env.extend(vars);
+        binds = b;
+    }
     let mut opts = env_options(&env);
     opts.extend([
         "--setenv".to_owned(),
         super::USER_CODE_ENV.to_owned(),
         "1".to_owned(),
     ]);
-    let files = l.job_dir.join(super::SANDBOX_DIR).join(&l.name);
+    opts.extend(binds);
     let wrapped = backend.wrap(&p, spec, &l.read_paths)?;
     Ok(harden_bwrap(wrapped, &h, &opts, &files, Some(&l.nonce))?)
 }
@@ -255,6 +271,7 @@ mod tests {
             nonce: "secret-nonce".into(),
             limits: Limits::default(),
             user_code,
+            tier2: false,
         }
     }
 
@@ -311,8 +328,46 @@ mod tests {
         let extra = std::fs::read(files.join("args")).unwrap();
         let extra: Vec<&[u8]> = extra.split(|b| *b == 0).collect();
         assert!(extra.contains(&&b"--clearenv"[..]) && extra.contains(&&b"ALL"[..]));
+        // No process inside keeps the outer environment (`/proc/1/environ` would show it).
+        assert!(extra.contains(&&b"--as-pid-1"[..]));
+        assert!(
+            s.env.is_empty(),
+            "the outer command gets no environment: {:?}",
+            s.env
+        );
         let filter = std::fs::metadata(files.join("seccomp.bpf")).unwrap();
         assert_eq!(filter.len() % 8, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_tier2_reward_runs_as_a_jail_supervisor_and_never_without_bubblewrap() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut l = launch(dir.path(), false);
+        l.tier2 = true;
+        assert_eq!(spec(&NoSandbox, &l).unwrap_err().code(), "MRL-RWD-295");
+        let backend = crate::sandbox::bwrap::Bubblewrap::new(Some("/usr/bin/bwrap".into()));
+        let r = spec(&backend, &l);
+        if !cfg!(target_os = "linux") {
+            assert_eq!(r.unwrap_err().code(), "MRL-RWD-295");
+            return;
+        }
+        let s = r.unwrap();
+        assert!(s.args.windows(2).any(|w| w[0] == "--tier" && w[1] == "2"));
+        let files = dir.path().join("sandbox").join("reward-1");
+        let extra =
+            String::from_utf8_lossy(&std::fs::read(files.join("args")).unwrap()).replace('\0', " ");
+        assert!(
+            extra.contains("MRL_JAIL_SECCOMP /run/mrl-jail/strict.bpf"),
+            "{extra}"
+        );
+        assert!(extra.contains("MRL_SANDBOX_PROFILE code_exec"), "{extra}");
+        let own = std::fs::read(files.join("seccomp.bpf")).unwrap();
+        let strict = std::fs::read(files.join("jail/strict.bpf")).unwrap();
+        assert_ne!(
+            own, strict,
+            "the service itself runs under the supervisor filter"
+        );
     }
 
     /// An executor that ends each run with the next scripted report.
@@ -437,5 +492,306 @@ mod tests {
         let task = async { supervise(&exec, &NoSandbox, &l, cancel, |_| {}).await };
         let (out, ()) = tokio::join!(task, async { stop.cancel() });
         assert_eq!(out.unwrap(), Outcome::Stopped);
+    }
+}
+
+/// SB-1 / SB-2: the reward escape corpus (`tests/security/reward_escape`) against the real
+/// `reward` and `code_exec` sandboxes with bubblewrap. Ignored; needs Linux, bubblewrap,
+/// unprivileged user namespaces and the workspace's Python environment (`.venv`, or
+/// `MRL_ESCAPE_PYTHON`). Without them it prints SKIPPED, unless `MRL_TEST_SANDBOX_REQUIRED=1`
+/// (CI: `.github/workflows/ci-security-rewards.yml`). `MRL_ESCAPE_KEEP=1` keeps the run
+/// folder (bundles, results, service logs) for a look afterwards.
+#[cfg(all(test, target_os = "linux"))]
+mod escape {
+    use super::*;
+    use crate::config::{ExecConfig, SandboxChoice, SandboxConfig};
+    use crate::exec::process::ProcessExecutor;
+    use std::io::Write as _;
+    use std::os::linux::net::SocketAddrExt as _;
+    use std::os::unix::net::{SocketAddr, UnixListener};
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    fn skip(why: &str) {
+        let required = std::env::var("MRL_TEST_SANDBOX_REQUIRED").as_deref() == Ok("1");
+        assert!(!required, "{why}");
+        eprintln!("SKIPPED: {why}");
+    }
+
+    fn secret() -> String {
+        let mut b = [0u8; 16];
+        getrandom::fill(&mut b).unwrap();
+        b.iter().map(|x| format!("{x:02x}")).collect()
+    }
+
+    /// Counts connections and answers each with `secret`.
+    fn tcp_canary(secret: &str, hits: Arc<AtomicUsize>) -> u16 {
+        let l = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        let s = secret.to_owned();
+        std::thread::spawn(move || {
+            for mut c in l.incoming().flatten() {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let _ = c.write_all(s.as_bytes());
+            }
+        });
+        port
+    }
+
+    fn unix_canary(l: UnixListener, secret: &str, hits: Arc<AtomicUsize>) {
+        let s = secret.to_owned();
+        std::thread::spawn(move || {
+            for mut c in l.incoming().flatten() {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let _ = c.write_all(s.as_bytes());
+            }
+        });
+    }
+
+    /// This machine's address on its default route (no packet is sent).
+    fn host_ip() -> Option<std::net::IpAddr> {
+        let s = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+        s.connect("192.0.2.1:9").ok()?;
+        Some(s.local_addr().ok()?.ip())
+    }
+
+    fn gone(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .map_or(true, |s| s.split_whitespace().nth(2) == Some("Z"))
+    }
+
+    fn python(root: &Path, args: &[&str]) -> std::process::Output {
+        let py = std::env::var_os("MRL_ESCAPE_PYTHON")
+            .map_or_else(|| root.join(".venv/bin/python"), PathBuf::from);
+        std::process::Command::new(py)
+            .arg(root.join("tests/security/reward_escape/runner.py"))
+            .args(args)
+            .output()
+            .unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "needs Linux, bubblewrap and the workspace Python environment"]
+    async fn reward_escape_corpus_is_blocked() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let root = std::fs::canonicalize(root).unwrap();
+        let py = std::env::var_os("MRL_ESCAPE_PYTHON")
+            .map_or_else(|| root.join(".venv/bin/python"), PathBuf::from);
+        if !py.exists() {
+            return skip(&format!("no Python environment at {}", py.display()));
+        }
+        let backend = match crate::sandbox::select(&SandboxConfig {
+            backend: SandboxChoice::Bubblewrap,
+            bwrap_path: None,
+        }) {
+            Ok(b) => b,
+            Err(e) => return skip(&e.to_string()),
+        };
+        let exec = ProcessExecutor::new(&ExecConfig::default()).unwrap();
+        let tmp = tempfile::Builder::new()
+            .prefix("rwe")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let (canary, run) = (tmp.path().join("canary"), tmp.path().join("run"));
+        std::fs::create_dir_all(canary.join("agent-state")).unwrap();
+        std::fs::create_dir_all(&run).unwrap();
+
+        // Canaries: secrets the sandbox must never see, listeners it must never reach.
+        let (file_secret, net_secret, env_secret) = (secret(), secret(), secret());
+        let mut files = vec![
+            canary.join("secret.txt"),
+            canary.join("agent-state/state.json"),
+        ];
+        let home_canary = std::env::var_os("HOME")
+            .filter(|_| std::env::var("MRL_ESCAPE_HOME_CANARY").as_deref() == Ok("1"))
+            .map(|h| PathBuf::from(h).join(format!(".mrl-escape-canary-{}", secret())));
+        files.extend(home_canary.clone());
+        for f in &files {
+            std::fs::write(f, &file_secret).unwrap();
+        }
+        let hits = Arc::new(AtomicUsize::new(0));
+        let port = tcp_canary(&net_secret, hits.clone());
+        let mut tcp = vec![format!("127.0.0.1:{port}")];
+        tcp.extend(host_ip().map(|ip| format!("{ip}:{port}")));
+        // The workflow's own canary server (ci-security-rewards.yml).
+        let extra = std::env::var("MRL_ESCAPE_EXTRA_TCP").unwrap_or_default();
+        tcp.extend(extra.split_whitespace().map(str::to_owned));
+        let abstract_name = format!("mrl-escape-{}", secret());
+        let addr = SocketAddr::from_abstract_name(abstract_name.as_bytes()).unwrap();
+        unix_canary(
+            UnixListener::bind_addr(&addr).unwrap(),
+            &net_secret,
+            hits.clone(),
+        );
+        let unix_path = canary.join("agent.sock");
+        unix_canary(
+            UnixListener::bind(&unix_path).unwrap(),
+            &net_secret,
+            hits.clone(),
+        );
+        let mut sentinel = std::process::Command::new("sleep")
+            .arg("777.25")
+            .spawn()
+            .unwrap();
+        let secrets = canary.join("secrets.json");
+        let workflow = std::env::var("MRL_ESCAPE_EXTRA_SECRET").unwrap_or_default();
+        let doc = serde_json::json!({
+            "file": file_secret, "net": net_secret, "env": env_secret, "workflow": workflow,
+        });
+        std::fs::write(&secrets, doc.to_string()).unwrap();
+
+        let mut plan_args = vec![
+            "plan".to_owned(),
+            "--out".into(),
+            run.display().to_string(),
+            "--abstract".into(),
+            abstract_name,
+            "--unix".into(),
+            unix_path.display().to_string(),
+            "--sentinel-pid".into(),
+            sentinel.id().to_string(),
+            "--sentinel-marker".into(),
+            "777.25".into(),
+            "--tcp".into(),
+        ];
+        plan_args.extend(tcp);
+        plan_args.push("--files".into());
+        plan_args.extend(files.iter().map(|f| f.display().to_string()));
+        let refs: Vec<&str> = plan_args.iter().map(String::as_str).collect();
+        let out = python(&root, &refs);
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let plan_path = run.join("plan.json");
+        let plan: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&plan_path).unwrap()).unwrap();
+        let read_paths: Vec<PathBuf> = plan["read_paths"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| PathBuf::from(p.as_str().unwrap()))
+            .collect();
+
+        for (i, case) in plan["cases"].as_array().unwrap().iter().enumerate() {
+            let id = case["id"].as_str().unwrap();
+            let launch = RewardExecLaunch {
+                name: format!("esc-{i}"),
+                job_dir: run.join("job"),
+                program: PathBuf::from(plan["program"].as_str().unwrap()),
+                read_paths: read_paths.clone(),
+                bundle: PathBuf::from(case["bundle"].as_str().unwrap()),
+                socket_dir: run.join("s").join(i.to_string()),
+                reward_version_id: case["version"].as_str().unwrap().to_owned(),
+                nonce: secret(),
+                limits: Limits::default(),
+                user_code: case["user_code"].as_bool().unwrap(),
+                tier2: case["tier"].as_u64() == Some(2),
+            };
+            std::fs::create_dir_all(&launch.socket_dir).unwrap();
+            let mut s = spec(backend.as_ref(), &launch).unwrap();
+            // As if the agent's own environment leaked into the launch: it must not get in.
+            for k in [
+                "MRL_CREDENTIAL_ESCAPE",
+                "MRL_ESCAPE_ENV_CANARY",
+                "AWS_SECRET_ACCESS_KEY",
+            ] {
+                s.env.insert(k.into(), env_secret.clone());
+            }
+            let logs = s.log_dir.clone();
+            let mut proc = exec.spawn(s).await.unwrap();
+            let pid = proc.pid().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            while !launch.socket().exists() && !gone(pid) && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            let sock = launch.socket().display().to_string();
+            let args = [
+                "score",
+                "--plan",
+                plan_path.to_str().unwrap(),
+                "--case",
+                id,
+                "--socket",
+                &sock,
+                "--nonce",
+                &launch.nonce,
+            ];
+            let root2 = root.clone();
+            let owned: Vec<String> = args.iter().map(|a| (*a).to_owned()).collect();
+            let scored = tokio::task::spawn_blocking(move || {
+                let refs: Vec<&str> = owned.iter().map(String::as_str).collect();
+                python(&root2, &refs)
+            })
+            .await
+            .unwrap();
+            assert!(
+                scored.status.success(),
+                "{id}: {}",
+                String::from_utf8_lossy(&scored.stderr)
+            );
+            let report = if gone(pid) {
+                proc.wait().await.unwrap()
+            } else {
+                proc.stop(Duration::from_secs(5)).await.unwrap()
+            };
+            let ending = match classify(&report) {
+                Ending::Ok => "ok".to_owned(),
+                Ending::Violation(_) => "violation".to_owned(),
+                Ending::OutOfMemory => "oom".to_owned(),
+                Ending::Failed(why) => format!("failed: {why}"),
+            };
+            let tail = |f: &str| {
+                let t = std::fs::read_to_string(logs.join(f)).unwrap_or_default();
+                let cut = t.len().saturating_sub(1500);
+                t.get(cut..).unwrap_or_default().to_owned()
+            };
+            let exit = serde_json::json!({
+                "ending": ending.split(':').next(), "detail": ending,
+                "log": format!("{}{}", tail("stdout.log"), tail("stderr.log")),
+            });
+            std::fs::write(
+                run.join("r").join(format!("{id}.exit.json")),
+                exit.to_string(),
+            )
+            .unwrap();
+        }
+
+        let judged = python(
+            &root,
+            &[
+                "judge",
+                "--plan",
+                plan_path.to_str().unwrap(),
+                "--secrets",
+                secrets.to_str().unwrap(),
+            ],
+        );
+        let alive = sentinel.try_wait().unwrap().is_none();
+        if std::env::var("MRL_ESCAPE_KEEP").as_deref() == Ok("1") {
+            eprintln!("kept the run folder: {}", tmp.keep().display());
+        }
+        let _ = sentinel.kill();
+        if let Some(h) = &home_canary {
+            let _ = std::fs::remove_file(h);
+        }
+        let report = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&judged.stdout),
+            String::from_utf8_lossy(&judged.stderr)
+        );
+        eprintln!("{report}");
+        assert!(
+            judged.status.success(),
+            "the corpus was not fully blocked:\n{report}"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "a canary listener got a connection"
+        );
+        assert!(alive, "the host sentinel process was killed from a sandbox");
     }
 }

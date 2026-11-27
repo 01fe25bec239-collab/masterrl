@@ -21,7 +21,7 @@ from mrl_rewards.builtin._base import (
     reference_field,
     schema,
 )
-from mrl_rewards.code.jail import Jail, JailLimits, JailResult
+from mrl_rewards.code.jail import SIGXCPU, Jail, JailLimits, JailResult
 from mrl_rewards.types import ComponentSpec, JSONValue, RewardResult, RewardSample, Status
 
 MAX_CODE_CHARS = 64 * 1024
@@ -74,20 +74,34 @@ class _CodeComponent(Component):
     @staticmethod
     def outcome(run: JailResult) -> RewardResult | None:
         """The failure result for a run that ended without a usable verdict, else None."""
-        if run.sandbox_violation:
-            return RewardResult.failed(
-                Status.ERROR, "the sandbox stopped the code", "sandbox_violation"
-            )
-        if run.timed_out:
-            return RewardResult.failed(Status.TIMEOUT, "the code ran past its time limit")
-        if run.output_flooded:
-            return RewardResult.failed(Status.ERROR, "the code printed too much", "output_flood")
-        if run.tests_changed:
-            return RewardResult.failed(Status.ERROR, "the test files changed", "tests_changed")
+        failures: list[tuple[bool, Status, str, tuple[str, ...]]] = [
+            (
+                run.sandbox_violation,
+                Status.ERROR,
+                "the sandbox stopped the code",
+                ("sandbox_violation",),
+            ),
+            (run.timed_out, Status.TIMEOUT, "the code ran past its time limit", ()),
+            (
+                (run.verdict or {}).get("child_signal") == SIGXCPU,
+                Status.TIMEOUT,
+                "the code used up its CPU time",
+                (),
+            ),
+            (run.output_flooded, Status.ERROR, "the code printed too much", ("output_flood",)),
+            (run.tests_changed, Status.ERROR, "the test files changed", ("tests_changed",)),
+        ]
+        for hit, status, reason, flags in failures:
+            if hit:
+                return RewardResult.failed(status, reason, *flags)
         if run.verdict is None:
-            return RewardResult.ok(
-                0.0, {"reason": "the code ended before the checks finished"}, "no_verdict"
-            )
+            ended = f"exit code {run.exit_code}" if run.signal is None else f"signal {run.signal}"
+            diag: dict[str, str] = {
+                "reason": "the code ended before the checks finished",
+                "ended": ended,
+                "output": echo(run.output[-300:]),
+            }
+            return RewardResult.ok(0.0, diag, "no_verdict")
         return None
 
 

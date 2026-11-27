@@ -14,11 +14,16 @@ generated code and a harness it authored into a private folder, and starts one j
 - limits: 5 s of CPU and 10 s wall clock at most (defaults 3 s / 4 s, inside the reward
   service's 5 s per-sample budget), 512 MiB of memory, 64 processes, 64 KiB of output.
 
-The verdict travels on a pipe only the harness holds: it reads a one-time token from
-another pipe before any generated code runs and writes `{"token": …, …}` at the end. Printed
-text never counts, an early exit leaves no verdict (a failure), and the test files are
-re-hashed after the run. Code that inspects the harness's own frames could still forge its
-own result: Python has no isolation inside one process, which is why `code.*` is beta.
+The verdict travels on a pipe only the harness holds. The harness makes itself
+non-dumpable (nothing else in the jail can read its memory or its `/proc` files), reads a
+one-time token, then forks: the child forgets the token, closes the verdict pipe and runs
+the code and the tests, reporting to the harness on a pipe of its own; the harness keeps
+only well-formed fields of that report and writes `{"token": …, …}`. So generated code can
+never reach the token or the verdict pipe. Printed text never counts, an early exit leaves
+no results (a failure), a seccomp kill of the child is reported (`child_signal`) and the
+test files are re-hashed after the run. Code that shares the interpreter with assert-style
+tests can still fake *their* outcomes (the tests aren't secret), which is why `code.*` is
+beta.
 """
 
 from __future__ import annotations
@@ -50,6 +55,8 @@ VERDICT_FD = 4
 TOKEN_FD = 5
 SECCOMP_FD = 3
 MAX_VERDICT_BYTES = 256 << 10
+SIGSYS = 31  # Linux (jails exist only there): what a seccomp kill sends
+SIGXCPU = 24  # Linux: what the CPU-time limit sends
 
 # Runs first in the new process (single-threaded, so it is safe where `preexec_fn` is not):
 # sets the limits, moves the pipes to their fixed numbers, then becomes bubblewrap.
@@ -57,7 +64,7 @@ LAUNCHER = r"""
 import fcntl, json, os, resource, sys
 cfg = json.loads(sys.argv[1])
 for name, value in cfg["rlimits"].items():
-    resource.setrlimit(getattr(resource, name), (value, value))
+    resource.setrlimit(getattr(resource, name), tuple(value))
 high = {int(t): fcntl.fcntl(s, fcntl.F_DUPFD, 100) for t, s in cfg["fds"].items()}
 for s in cfg["fds"].values():
     os.close(s)
@@ -68,40 +75,46 @@ os.execv(sys.argv[2], sys.argv[2:])
 """
 
 HARNESS = r"""
-import json, os, sys
+import ctypes, json, os, sys
 
-def _main():
-    token = os.read(5, 256).decode("ascii", "replace")
-    os.close(5)
-    out = os.fdopen(4, "w", encoding="utf-8")
-    mode = sys.argv[1]
-    with open("/jail/solution.py", encoding="utf-8", errors="replace") as f:
-        source = f.read()
-    def done(**fields):
-        fields["token"] = token
+MAX_REPORT = 200 << 10
+
+
+def _err(e):
+    return type(e).__name__ + ": " + str(e)[:300]
+
+
+def _child(mode, folder, w):
+    # Runs the generated code. This process never holds the token or the verdict pipe.
+    out = os.fdopen(w, "w", encoding="utf-8")
+
+    def report(**fields):
         out.write(json.dumps(fields))
         out.flush()
         os._exit(0)
+
+    with open(folder + "/solution.py", encoding="utf-8", errors="replace") as f:
+        source = f.read()
     try:
         code = compile(source, "solution.py", "exec")
     except BaseException as e:
-        done(compiled=False, error=type(e).__name__ + ": " + str(e)[:300])
+        report(compiled=False, error=_err(e))
     if mode == "compile":
-        done(compiled=True)
-    with open("/jail/tests.py", encoding="utf-8", errors="replace") as f:
+        report(compiled=True)
+    with open(folder + "/tests.py", encoding="utf-8", errors="replace") as f:
         tests_source = f.read()
     ns = {"__name__": "solution"}
     try:
         exec(code, ns)
     except BaseException as e:
-        done(compiled=True, loaded=False, error=type(e).__name__ + ": " + str(e)[:300])
+        report(compiled=True, loaded=False, error=_err(e))
     tests_ns = dict(ns)
     tests_ns["__name__"] = "tests"
     results = []
     try:
         exec(compile(tests_source, "tests.py", "exec"), tests_ns)
     except BaseException as e:
-        results.append(["<module>", False, type(e).__name__ + ": " + str(e)[:300]])
+        results.append(["<module>", False, _err(e)])
     else:
         names = sorted(n for n, v in tests_ns.items() if n.startswith("test_") and callable(v))
         if not names:
@@ -111,8 +124,66 @@ def _main():
                 tests_ns[name]()
                 results.append([name, True, ""])
             except BaseException as e:
-                results.append([name, False, type(e).__name__ + ": " + str(e)[:300]])
-    done(compiled=True, loaded=True, results=results)
+                results.append([name, False, _err(e)])
+    report(compiled=True, loaded=True, results=results)
+
+
+def _clean(raw):
+    # Only the expected fields and shapes pass from the child's report into the verdict.
+    try:
+        doc = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return {}
+    if not isinstance(doc, dict):
+        return {}
+    out = {k: doc[k] for k in ("compiled", "loaded") if isinstance(doc.get(k), bool)}
+    if isinstance(doc.get("error"), str):
+        out["error"] = doc["error"][:300]
+    rows = doc.get("results")
+    if isinstance(rows, list):
+        out["results"] = [
+            [r[0][:200], r[1], r[2][:300]]
+            for r in rows[:1000]
+            if isinstance(r, list) and len(r) == 3 and isinstance(r[0], str)
+            and isinstance(r[1], bool) and isinstance(r[2], str)
+        ]
+    return out
+
+
+def _main():
+    # Nothing in the jail (the child included) may read this process's memory or files.
+    # (Jails exist only on Linux; elsewhere the harness runs only in tests.)
+    linux = sys.platform.startswith("linux")
+    if linux and ctypes.CDLL(None).prctl(4, 0, 0, 0, 0) != 0:  # PR_SET_DUMPABLE = 0
+        os._exit(3)
+    token = bytearray(256)
+    n = os.readv(5, [token])
+    os.close(5)
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        token[:] = bytes(len(token))
+        os.close(4)
+        os.close(r)
+        try:
+            _child(sys.argv[1], sys.argv[2], w)
+        finally:
+            os._exit(0)
+    os.close(w)
+    raw = bytearray()
+    while len(raw) <= MAX_REPORT:
+        chunk = os.read(r, 65536)
+        if not chunk:
+            break
+        raw += chunk
+    _, status = os.waitpid(pid, 0)
+    verdict = _clean(bytes(raw)) if len(raw) <= MAX_REPORT else {}
+    if os.WIFSIGNALED(status):
+        verdict["child_signal"] = os.WTERMSIG(status)
+    verdict["token"] = bytes(token[:n]).decode("ascii", "replace")
+    with os.fdopen(4, "w", encoding="utf-8") as out:
+        out.write(json.dumps(verdict))
+
 
 _main()
 """
@@ -151,8 +222,10 @@ class JailResult:
 
     @property
     def sandbox_violation(self) -> bool:
-        """The seccomp filter killed the program (SIGSYS)."""
-        return self.signal == int(signal.SIGSYS)
+        """The seccomp filter killed the harness or the code it ran (SIGSYS; bubblewrap
+        passes on a signal death as exit code 128 + the signal)."""
+        child = (self.verdict or {}).get("child_signal")
+        return SIGSYS in (self.signal, child) or self.exit_code == 128 + SIGSYS
 
 
 def _sha(data: bytes) -> str:
@@ -230,18 +303,20 @@ class Jail:
         a += ["--ro-bind", str(folder), "/jail", "--chdir", "/work"]
         if self.seccomp is not None:
             a += ["--seccomp", str(SECCOMP_FD)]
-        a += ["--", str(self.python), "-I", "-S", "-B", "/jail/harness.py", mode]
+        a += ["--", str(self.python), "-I", "-S", "-B", "/jail/harness.py", mode, "/jail"]
         return a
 
-    def _rlimits(self) -> dict[str, int]:
+    def _rlimits(self) -> dict[str, tuple[int, int]]:
+        """(soft, hard) per limit. CPU time gets one more hard second, so running out of it
+        arrives as SIGXCPU (reported as a timeout) before the kernel's SIGKILL."""
         lim = self.limits
         return {
-            "RLIMIT_CPU": lim.cpu_s,
-            "RLIMIT_AS": lim.memory_bytes,
-            "RLIMIT_FSIZE": lim.tmpfs_bytes,
-            "RLIMIT_CORE": 0,
+            "RLIMIT_CPU": (lim.cpu_s, lim.cpu_s + 1),
+            "RLIMIT_AS": (lim.memory_bytes, lim.memory_bytes),
+            "RLIMIT_FSIZE": (lim.tmpfs_bytes, lim.tmpfs_bytes),
+            "RLIMIT_CORE": (0, 0),
             # Counted per user, so the processes this user already runs are added.
-            "RLIMIT_NPROC": _own_processes() + lim.pids,
+            "RLIMIT_NPROC": (_own_processes() + lim.pids, _own_processes() + lim.pids),
         }
 
     def run(self, mode: str, solution: str, tests: str = "") -> JailResult:

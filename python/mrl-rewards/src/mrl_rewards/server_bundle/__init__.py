@@ -19,10 +19,12 @@ else custom code is refused with MRL-RWD-295 (macOS and Windows always refuse it
 
 from __future__ import annotations
 
+import errno
 import importlib.util
 import json
 import os
 import shutil
+import socket
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -76,9 +78,50 @@ def sandbox_proof(  # noqa: PLR0911 (one answer per marker)
         return Proof(False, "no seccomp filter is active on this process")
     if fields.get("NoNewPrivs", "").strip() != "1":
         return Proof(False, "no_new_privs is not set on this process")
-    if extra := non_loopback_interfaces():
+    if extra := network_interfaces():
         return Proof(False, f"network interfaces are up ({', '.join(extra[:4])})")
     return Proof(True)
+
+
+def network_interfaces() -> list[str]:
+    """Network interfaces other than loopback this process could use. Inside the agent's
+    sandbox `/sys` isn't mounted and the seccomp filter refuses every socket but AF_UNIX
+    (EAFNOSUPPORT), which itself proves there is no network to use; elsewhere it is P14's
+    check (`/sys/class/net` flags, else the interface list)."""
+    if not Path("/sys/class/net").is_dir():
+        try:
+            socket.socket(socket.AF_INET, socket.SOCK_DGRAM).close()
+        except OSError as e:
+            if e.errno == errno.EAFNOSUPPORT:
+                return []
+    return non_loopback_interfaces()
+
+
+def symlinked_dirs(path: Path) -> set[Path]:
+    """Every symlinked folder on the way from `path` to the file it finally names (uv's
+    `cpython-3.12-…` links to `cpython-3.12.13-…`). A sandbox binds them too, or the link
+    dangles inside."""
+    out: set[Path] = set()
+    cur = path
+    for _ in range(40):
+        out |= {a for a in cur.parents if a.is_symlink() and a.is_dir()}
+        if not cur.is_symlink():
+            break
+        cur = cur.parent / cur.readlink()
+    return out
+
+
+def python_paths() -> list[Path]:
+    """The folders this Python needs read-only in a sandbox: its environment, its install,
+    the symlinked folders between them and every import path."""
+    paths = {
+        Path(sys.prefix),
+        Path(sys.base_prefix).resolve(),
+        Path(sys.executable).resolve().parent,
+    }
+    paths |= symlinked_dirs(Path(sys.executable))
+    paths |= {Path(p).resolve() for p in sys.path if p and Path(p).is_dir()}
+    return sorted(paths)
 
 
 def _safe_name(name: str) -> bool:
@@ -199,5 +242,8 @@ __all__ = [
     "Proof",
     "assemble",
     "load",
+    "network_interfaces",
+    "python_paths",
     "sandbox_proof",
+    "symlinked_dirs",
 ]

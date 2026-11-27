@@ -57,7 +57,7 @@ def main(argv: list[str]) -> int:
             return 1
         return 0
     OUT.write_text(text, encoding="utf-8")
-    print(f"wrote {OUT.relative_to(ROOT)} ({text.count('\"ref\"')} components)")
+    print(f"wrote {OUT.relative_to(ROOT)} ({text.count('"ref"')} components)")
     return 0
 
 

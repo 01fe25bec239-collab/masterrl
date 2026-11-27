@@ -31,7 +31,7 @@ import sys
 import threading
 from pathlib import Path
 
-from mrl_rewards.exec.main import non_loopback_interfaces, read_nonce
+from mrl_rewards.exec.main import read_nonce
 from mrl_rewards.exec.server import STARTUP_FAILED, Audit, ExecLimits, RewardExecService, serve
 from mrl_rewards.policy.runtime import PolicyRuntime
 from mrl_rewards.server_bundle import (
@@ -39,6 +39,8 @@ from mrl_rewards.server_bundle import (
     USER_CODE_ENV,
     USER_CODE_REFUSED,
     load,
+    network_interfaces,
+    python_paths,
     sandbox_proof,
 )
 from mrl_rewards.types import RewardError
@@ -84,7 +86,7 @@ def start(args: argparse.Namespace, audit: Audit) -> tuple[RewardExecService, ob
         )
     if args.allow_network:
         audit("network_check_skipped", reason="built-in components only")
-    elif extra := non_loopback_interfaces():
+    elif extra := network_interfaces():
         raise RewardError(
             STARTUP_FAILED,
             f"Network interfaces other than loopback are up ({', '.join(extra[:4])}); the "
@@ -166,13 +168,7 @@ def jail_argv(args: argparse.Namespace, raw: list[str]) -> list[str] | None:
         a += ["--setenv", k, v]
     for p in SYSTEM_PATHS:
         a += ["--ro-bind-try", p, p]
-    for p in sorted(
-        {
-            Path(sys.prefix).resolve(),
-            Path(sys.base_prefix).resolve(),
-            Path(sys.executable).resolve().parent,
-        }
-    ):
+    for p in python_paths():
         a += ["--ro-bind-try", str(p), str(p)]
     if args.tier == 2 and Path(JAIL_DIR).is_dir():
         a += ["--ro-bind", JAIL_DIR, JAIL_DIR]
@@ -184,11 +180,20 @@ def jail_argv(args: argparse.Namespace, raw: list[str]) -> list[str] | None:
     return [*a, sys.executable, "-I", "-m", "mrl_rewards.server_bundle.serve", *inner]
 
 
+def _nonce_fd_moved(argv: list[str], fd: int) -> list[str]:
+    """`argv` with its `--nonce-fd` set to `fd`."""
+    out = list(argv)
+    for i, a in enumerate(out):
+        if a == "--nonce-fd" and i + 1 < len(out):
+            out[i + 1] = str(fd)
+        elif a.startswith("--nonce-fd="):
+            out[i] = f"--nonce-fd={fd}"
+    return out
+
+
 def enter_jail(args: argparse.Namespace, raw: list[str], audit: Audit) -> None:
     """Replaces this process with the jailed service, or returns when no jail can be made
     (refusing custom code then)."""
-    if args.nonce_fd == SECCOMP_FD:
-        raise RewardError(STARTUP_FAILED, f"The nonce can't come on fd {SECCOMP_FD}; use fd 5.")
     argv = jail_argv(args, raw)
     if argv is None:
         if args.user_code:
@@ -199,12 +204,21 @@ def enter_jail(args: argparse.Namespace, raw: list[str], audit: Audit) -> None:
             )
         audit("jail_skipped", reason="no jail here; built-in components only")
         return
+    nonce_fd = int(args.nonce_fd)
+    if nonce_fd == SECCOMP_FD:
+        # bubblewrap reads the filter from fd 3: the nonce moves out of its way.
+        moved = os.dup(nonce_fd)
+        os.close(nonce_fd)
+        nonce_fd = moved
+        argv = _nonce_fd_moved(argv, nonce_fd)
     filt = os.environ[SUPERVISOR_ENV if args.tier == 2 else JAIL_ENV]
     fd = os.open(filt, os.O_RDONLY)
     if fd != SECCOMP_FD:
         os.dup2(fd, SECCOMP_FD, inheritable=True)
         os.close(fd)
-    os.set_inheritable(args.nonce_fd, True)
+    else:
+        os.set_inheritable(fd, True)
+    os.set_inheritable(nonce_fd, True)
     sys.stdout.flush()
     os.execv(argv[0], argv)
 

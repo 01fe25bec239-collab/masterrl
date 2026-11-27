@@ -99,7 +99,8 @@ pub enum Filter {
     Strict,
     /// `Strict`, but any socket family (commands the user allowed onto the network).
     StrictNetwork,
-    /// The Tier-2 supervisor: may start bubblewrap jails (namespace and mount calls).
+    /// The Tier-2 supervisor: may start bubblewrap jails (namespace and mount calls, and
+    /// NETLINK_ROUTE sockets, which bubblewrap uses to bring up a jail's loopback).
     Supervisor,
 }
 
@@ -201,8 +202,10 @@ pub enum Ending {
 pub const SIGSYS: i32 = 31;
 
 /// Classifies `report` (Doc 06 §1.8.3): SIGSYS is a violation; OOM and timeouts are not.
+/// bubblewrap passes on its program's death by a signal as exit code 128 + the signal, so
+/// code 159 counts as SIGSYS too (a program that exits 159 on purpose only fails itself).
 pub fn classify(report: &ExitReport) -> Ending {
-    if report.signal == Some(SIGSYS) {
+    if report.signal == Some(SIGSYS) || report.code == Some(128 + SIGSYS) {
         return Ending::Violation("the sandbox's system-call filter stopped the program".into());
     }
     if report.oom_killed {
@@ -232,6 +235,9 @@ const OFF_ARG0_LO: u32 = 16;
 const ENOSYS: u32 = 38;
 const EAFNOSUPPORT: u32 = 97;
 const AF_UNIX: u32 = 1;
+const AF_NETLINK: u32 = 16;
+const NETLINK_ROUTE: u32 = 0;
+const OFF_ARG2_LO: u32 = 32;
 /// Every `CLONE_NEW*` flag (NEWTIME, NEWNS, NEWCGROUP, NEWUTS, NEWIPC, NEWUSER, NEWPID, NEWNET).
 const CLONE_NS_FLAGS: u32 = 0x80
     | 0x2_0000
@@ -372,11 +378,19 @@ pub fn program(filter: Filter, arch: &Arch) -> Vec<Insn> {
         .into_iter()
         .filter(|_| filter != Filter::StrictNetwork)
     {
-        // socket(domain, …): only AF_UNIX.
-        p.push(insn(BPF_JEQ_K, 0, 4, nr));
+        // socket(domain, …, protocol): only AF_UNIX, and for the supervisor's
+        // `socket()` also AF_NETLINK with NETLINK_ROUTE.
+        let netlink = filter == Filter::Supervisor && nr == arch.socket;
+        p.push(insn(BPF_JEQ_K, 0, if netlink { 8 } else { 4 }, nr));
         p.push(insn(BPF_LD_W_ABS, 0, 0, OFF_ARG0_LO));
         p.push(insn(BPF_JEQ_K, 0, 1, AF_UNIX));
         p.push(insn(BPF_RET_K, 0, 0, RET_ALLOW));
+        if netlink {
+            p.push(insn(BPF_JEQ_K, 0, 3, AF_NETLINK));
+            p.push(insn(BPF_LD_W_ABS, 0, 0, OFF_ARG2_LO));
+            p.push(insn(BPF_JEQ_K, 0, 1, NETLINK_ROUTE));
+            p.push(insn(BPF_RET_K, 0, 0, RET_ALLOW));
+        }
         p.push(insn(BPF_RET_K, 0, 0, RET_ERRNO | EAFNOSUPPORT));
     }
     p.push(insn(BPF_RET_K, 0, 0, RET_ALLOW));
@@ -399,6 +413,11 @@ pub fn program_bytes(prog: &[Insn]) -> Vec<u8> {
 /// What the filter answers for system call `nr` with first argument `arg0` (a small BPF
 /// interpreter, used by the tests to check the program means what it says).
 pub fn evaluate(prog: &[Insn], arch: u32, nr: u32, arg0: u32) -> u32 {
+    evaluate_with(prog, arch, nr, arg0, 0)
+}
+
+/// [`evaluate`] with the third argument (the low 32 bits of each) too.
+pub fn evaluate_with(prog: &[Insn], arch: u32, nr: u32, arg0: u32, arg2: u32) -> u32 {
     let (mut acc, mut pc) = (0u32, 0usize);
     while let Some(i) = prog.get(pc) {
         match i.code {
@@ -407,6 +426,7 @@ pub fn evaluate(prog: &[Insn], arch: u32, nr: u32, arg0: u32) -> u32 {
                     OFF_NR => nr,
                     OFF_ARCH => arch,
                     OFF_ARG0_LO => arg0,
+                    OFF_ARG2_LO => arg2,
                     _ => 0,
                 };
             }
@@ -497,7 +517,8 @@ pub fn sandbox_env(
 /// Rewrites a bubblewrap-wrapped `spec` (the output of `Bubblewrap::wrap`) with `extra`
 /// bubblewrap options read from an args file, the seccomp filter on fd 3 and the tmpfs size.
 /// The program becomes `/bin/sh`, which opens both files, deletes the args file and runs
-/// bwrap.
+/// bwrap. The outer command gets no environment of its own (the sandbox's is in the args
+/// file), and the program runs as pid 1 of its namespace.
 pub fn harden_bwrap(
     mut spec: ExecSpec,
     h: &Hardening,
@@ -522,11 +543,14 @@ pub fn harden_bwrap(
         .ok_or_else(|| {
             AgentError::SandboxUnavailable("the bubblewrap command has no `--`".into())
         })?;
+    // `--as-pid-1`: the program is pid 1, so no bubblewrap init (which keeps the outer
+    // environment in `/proc/1/environ`) lives inside the sandbox.
     let mut opts: Vec<String> = vec![
         "--cap-drop".into(),
         "ALL".into(),
         "--hostname".into(),
         "mrl-sandbox".into(),
+        "--as-pid-1".into(),
     ];
     opts.extend(extra.iter().cloned());
     let filter_path = files.join("seccomp.bpf");
@@ -579,6 +603,8 @@ pub fn harden_bwrap(
     sh.extend(args);
     spec.program = "/bin/sh".into();
     spec.args = sh;
+    // Everything the sandbox gets is in the args file; the outer command needs none of it.
+    spec.env.clear();
     Ok(spec)
 }
 
@@ -692,6 +718,26 @@ mod tests {
                 evaluate(&p, arch.audit, arch.socket, 2),
                 RET_ERRNO | EAFNOSUPPORT
             );
+            // bubblewrap brings up a jail's loopback over NETLINK_ROUTE; nothing else.
+            let netlink = |filter, protocol| {
+                let p = program(filter, &arch);
+                evaluate_with(&p, arch.audit, arch.socket, AF_NETLINK, protocol)
+            };
+            assert_eq!(netlink(Filter::Supervisor, NETLINK_ROUTE), ALLOW);
+            assert_eq!(
+                netlink(Filter::Supervisor, 9),
+                RET_ERRNO | EAFNOSUPPORT,
+                "audit"
+            );
+            assert_eq!(
+                netlink(Filter::Strict, NETLINK_ROUTE),
+                RET_ERRNO | EAFNOSUPPORT
+            );
+            assert_eq!(
+                evaluate_with(&p, arch.audit, arch.socketpair, AF_NETLINK, NETLINK_ROUTE),
+                RET_ERRNO | EAFNOSUPPORT
+            );
+            assert_eq!(evaluate(&p, arch.audit, arch.socket, AF_UNIX), ALLOW);
         }
     }
 
@@ -747,6 +793,15 @@ mod tests {
         assert_eq!(classify(&r(Some(0), None, false)), Ending::Ok);
         assert!(matches!(
             classify(&r(Some(2), None, false)),
+            Ending::Failed(_)
+        ));
+        // Under bubblewrap the sandboxed program's signal death arrives as 128 + signal.
+        assert!(matches!(
+            classify(&r(Some(128 + SIGSYS), None, false)),
+            Ending::Violation(_)
+        ));
+        assert!(matches!(
+            classify(&r(Some(128 + 9), None, false)),
             Ending::Failed(_)
         ));
     }

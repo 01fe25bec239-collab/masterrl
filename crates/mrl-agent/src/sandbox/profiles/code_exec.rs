@@ -74,7 +74,12 @@ pub type JailFiles = (Vec<(String, String)>, Vec<String>);
 /// Writes the jail filters for `spec` and returns the environment and bind options that
 /// make them visible inside.
 pub fn jail_files(spec: &ExecSpec) -> Result<JailFiles> {
-    let dir = sandbox_dir(spec).join("jail");
+    jail_files_in(&sandbox_dir(spec).join("jail"))
+}
+
+/// [`jail_files`] with the filters written to `dir` (a private folder that is never mounted
+/// writable).
+pub fn jail_files_in(dir: &std::path::Path) -> Result<JailFiles> {
     write_filter(Filter::Strict, &dir.join("strict.bpf"))?;
     write_filter(Filter::Supervisor, &dir.join("supervisor.bpf"))?;
     let env = vec![
@@ -122,6 +127,9 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("MRL_WORKER_NONCE n"));
+        // Nothing of the outer environment is left where the sandbox could read it.
+        assert!(text.contains("--as-pid-1"), "{text}");
+        assert!(s.env.is_empty(), "{:?}", s.env);
         assert!(!text.contains("hf_x"), "no secrets: {text}");
         assert!(
             files.join("jail/strict.bpf").is_file() && files.join("jail/supervisor.bpf").is_file()

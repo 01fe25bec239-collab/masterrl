@@ -1,0 +1,113 @@
+name: ci-security-rewards
+
+# The reward sandboxes on real Linux (SB-1, SB-2): the escape corpus in
+# tests/security/reward_escape runs through the agent's real `reward` and `code_exec`
+# profiles with bubblewrap, as the runner user (unprivileged user namespaces, like a node).
+# Every escape, leaked secret or unexpected ending fails the job; so does a request to the
+# workflow's own canary server or its canary secret turning up in the suite's output.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-security-rewards-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  escape:
+    name: reward escape suite (linux, bubblewrap)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: 0.11.28
+
+      # Ubuntu 24.04 blocks unprivileged user namespaces through AppArmor; bubblewrap needs them.
+      - name: install bubblewrap and allow user namespaces
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends bubblewrap
+          if sysctl -n kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+            sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          fi
+
+      - name: Python environment
+        run: uv sync --locked
+
+      - name: build the sandbox tests
+        run: cargo test -p mrl-agent --lib --locked --no-run
+
+      # A canary the corpus also attacks: a server on every interface that must never be
+      # reached, and a secret in the agent's environment that must never come out.
+      - name: start the canary server
+        id: canary
+        run: |
+          set -euo pipefail
+          token="$(openssl rand -hex 16)"
+          echo "::add-mask::$token"
+          mkdir -p "$RUNNER_TEMP/canary"
+          echo "$token" > "$RUNNER_TEMP/canary/index.html"
+          nohup python3 -m http.server 8099 --bind 0.0.0.0 --directory "$RUNNER_TEMP/canary" \
+            > "$RUNNER_TEMP/canary.log" 2>&1 &
+          for _ in $(seq 50); do curl -fsS http://127.0.0.1:8099/ >/dev/null && break; sleep 0.1; done
+          : > "$RUNNER_TEMP/canary.log"
+          ip="$(hostname -I | awk '{print $1}')"
+          echo "tcp=127.0.0.1:8099 ${ip}:8099" >> "$GITHUB_OUTPUT"
+          echo "token=$token" >> "$GITHUB_OUTPUT"
+
+      - name: reward escape corpus (SB-1, SB-2)
+        env:
+          MRL_TEST_SANDBOX_REQUIRED: "1"
+          MRL_ESCAPE_HOME_CANARY: "1"
+          MRL_ESCAPE_KEEP: "1"
+          MRL_ESCAPE_PYTHON: ${{ github.workspace }}/.venv/bin/python
+          MRL_ESCAPE_EXTRA_TCP: ${{ steps.canary.outputs.tcp }}
+          MRL_ESCAPE_EXTRA_SECRET: ${{ steps.canary.outputs.token }}
+          MRL_CREDENTIAL_CI_CANARY: ${{ steps.canary.outputs.token }}
+        run: |
+          cargo test -p mrl-agent --lib --locked -- --ignored --exact --nocapture \
+            sandbox::profiles::reward::escape::reward_escape_corpus_is_blocked
+
+      - name: the canary server was never reached
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -s "$RUNNER_TEMP/canary.log" ]; then
+            echo "::error::the canary server got requests from a sandbox:"
+            cat "$RUNNER_TEMP/canary.log"
+            exit 1
+          fi
+          echo "canary unreachable"
+
+      # The REWARD_PREVIEW task jails its reward service itself, with the strict filter the
+      # agent wrote for the corpus's first service.
+      - name: the preview task's own jail
+        run: |
+          set -euo pipefail
+          filter="$(ls /tmp/rwe*/run/job/sandbox/esc-0/seccomp.bpf | head -1)"
+          MRL_JAIL_SECCOMP="$filter" uv run --locked pytest -q \
+            python/mrl-runtime/tests/rewards_client tests/security/reward_escape
+
+      - name: keep the run folder when the suite fails
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: reward-escape-run
+          path: /tmp/rwe*/run
+          retention-days: 7
+
+      - name: reward sandbox unit tests (bubblewrap present)
+        run: cargo test -p mrl-agent --lib --locked sandbox::profiles

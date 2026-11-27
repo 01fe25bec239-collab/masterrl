@@ -2,7 +2,7 @@
   "components": [
     {
       "beta": true,
-      "code_sha256": "f75d8aa2eee4f2829700e596c6c439231745c16a3b6298f052809ef600f7c5ff",
+      "code_sha256": "a5e5951caa4f6bd54ca46c13d6c0e0f324aa6bbc2405808246ecafcb66d6b1cb",
       "description": "1 when the extracted Python code compiles (it is never run), else 0.",
       "deterministic": true,
       "kind": "code_exec",
@@ -44,7 +44,7 @@
     },
     {
       "beta": true,
-      "code_sha256": "f75d8aa2eee4f2829700e596c6c439231745c16a3b6298f052809ef600f7c5ff",
+      "code_sha256": "a5e5951caa4f6bd54ca46c13d6c0e0f324aa6bbc2405808246ecafcb66d6b1cb",
       "description": "Runs the reference's Python tests against the extracted code. `scoring`:\n    `all_or_nothing` (default: 1 only when every test passes) or `fraction` (share passed).\n    Tests come from the sample's `reference.verifier.tests`; top-level asserts count as one\n    test, `test_*` functions as one each.",
       "deterministic": true,
       "kind": "code_exec",
@@ -683,7 +683,7 @@
     }
   ],
   "executor": {
-    "components_digest": "9800e2a7610224240782715d59fb1348d109c6f53bf33332ca0339c437726d7b",
+    "components_digest": "694902706e0dac005d94ecd404c3d04bb74209e4f76c7b979cbf6221ab4e7f8c",
     "dependencies": [
       "google-re2==1.1.20251105",
       "grpcio==1.85.1",
@@ -694,7 +694,7 @@
     "package": "mrl-rewards",
     "version": "0.1.0"
   },
-  "executor_sha256": "8386b760e563aab1b3a6cb18fce8f5ed489c8493bb7fae94ea23f8bb265f278d",
+  "executor_sha256": "a76e18e37f4f65e93a5060184fa6882b5be7e46c461480d5c54f65b02bd92182",
   "format": "mrl-reward-components/1",
   "sdk_contract": "mrl-rewards/1"
 }

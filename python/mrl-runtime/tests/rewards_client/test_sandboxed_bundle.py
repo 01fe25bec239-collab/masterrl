@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import sys
 from pathlib import Path
 from typing import Any
@@ -232,7 +231,10 @@ def test_unit_tests_score_from_the_verdict_never_from_printed_text() -> None:
 @pytest.mark.parametrize(
     ("ending", "status", "flag"),
     [
-        (result(None, signal=int(getattr(signal, "SIGSYS", 31))), "ERROR", "sandbox_violation"),
+        (result(None, signal=31), "ERROR", "sandbox_violation"),
+        (result(None, exit_code=128 + 31), "ERROR", "sandbox_violation"),
+        (result({"child_signal": 31}), "ERROR", "sandbox_violation"),
+        (result({"child_signal": 24}), "TIMEOUT", None),  # SIGXCPU: its CPU time ran out
         (result(None, timed_out=True), "TIMEOUT", None),
         (result(None, output_flooded=True), "ERROR", "output_flood"),
         (
@@ -303,3 +305,68 @@ def test_limits_are_capped_and_the_jail_refuses_machines_that_cannot_isolate(
             "/tmp/x",
             "/jail",
         ]
+
+
+class DirectJail(Jail):
+    """The real harness, launcher and verdict pipe, without bubblewrap (any Unix)."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            Path("/nonexistent/bwrap"), None, Path(sys.executable), (), JailLimits(wall_s=5)
+        )
+
+    def argv(self, folder: Path, mode: str) -> list[str]:
+        return [str(self.python), "-I", "-S", "-B", str(folder / "harness.py"), mode, str(folder)]
+
+    def _rlimits(self) -> dict[str, tuple[int, int]]:
+        return {}
+
+
+FORGE_FROM_FRAMES = """
+import json, os, sys
+found = []
+f = sys._getframe()
+while f is not None:
+    found += [v for k, v in f.f_locals.items() if k == "token"]
+    f = f.f_back
+forged = {"compiled": True, "loaded": True, "results": [["test_x", True, ""]]}
+forged["token"] = "".join(map(str, found))
+for fd in (4, 5):
+    try:
+        os.write(fd, json.dumps(forged).encode())
+    except OSError:
+        pass
+def solve():
+    return 0
+"""
+
+
+@pytest.mark.skipif(os.name != "posix", reason="the jail harness is Unix-only")
+@pytest.mark.parametrize(
+    ("solution", "passed", "loaded"),
+    [
+        ("def solve():\n    return 42\n", True, True),
+        ("def solve():\n    return 41\n", False, True),
+        (FORGE_FROM_FRAMES, False, "any"),
+        ("import os\nos._exit(0)\n", False, None),
+        ("print('ALL TESTS PASSED')\nraise SystemExit(0)\n", False, False),
+        ("import os, signal\nos.kill(os.getppid(), signal.SIGKILL)\n", False, None),
+    ],
+    ids=["correct", "wrong", "forge-from-frames", "early-exit", "print-pass", "kill-harness"],
+)
+def test_generated_code_never_reaches_the_token_or_the_verdict_pipe(
+    solution: str, passed: bool, loaded: bool | str | None
+) -> None:
+    run = DirectJail().run("tests", solution, "def test_x():\n    assert solve() == 42\n")
+    verdict = run.verdict or {}
+    rows = verdict.get("results")
+    ok = (
+        isinstance(rows, list)
+        and bool(rows)
+        and all(isinstance(r, list) and r[1] is True for r in rows)
+    )
+    assert ok is passed, (run, solution)
+    if loaded != "any":
+        assert verdict.get("loaded") is loaded
+    assert not run.tests_changed
+    assert set(verdict) <= {"compiled", "loaded", "error", "results", "child_signal", "token"}
