@@ -17,6 +17,7 @@ pub mod gates;
 pub mod jobs;
 pub mod launch;
 pub mod outputs;
+pub(crate) mod rehome;
 pub mod store;
 mod submission;
 

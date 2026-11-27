@@ -14,13 +14,14 @@ use crate::server::{TestResponse, TestServer, TEST_SECRET};
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::Method;
-use mrl_domain::ids::{ModelVersionId, ProjectId};
+use mrl_domain::ids::{ModelVersionId, OrgId, ProjectId};
 use mrl_server::config::Mode;
 use mrl_server::modules::artifacts::{ArtifactStore, ArtifactsModule};
 use mrl_server::modules::engines::{RecordScope, RegistryRecords};
 use mrl_server::modules::jobs::CompletionVerifier;
 use mrl_server::modules::jobs::{
-    AttemptRow, JobRow, JobSpec, JobValidator, Projects, Verdict, Verification,
+    AttemptRow, JobRow, JobSpec, JobValidator, ProjectDirectory, Projects, RehomeLocalRows,
+    Verdict, Verification,
 };
 use mrl_server::modules::models::gates::{ModelGates, ModelRecords};
 use mrl_server::modules::models::launch::{ModelInputs, MODEL_INPUT};
@@ -30,7 +31,7 @@ use mrl_server::modules::models::{Models, ModelsModule};
 use mrl_server::modules::scheduler::pipeline::{
     LaunchContributor, LaunchError, LaunchPlan, Placement,
 };
-use mrl_server::seams::{AuditEvent, AuditSink, SeamError, LAUNCH_SECRET_HEADER};
+use mrl_server::seams::{AuditEvent, AuditSink, SeamError, StartupStep, LAUNCH_SECRET_HEADER};
 use mrl_storage::{sha256_hex, BackendConfig};
 use serde_json::{json, Value};
 use std::str::FromStr;
@@ -362,6 +363,7 @@ impl Env {
     async fn launch(&self, org: Uuid, mv: Uuid) -> Result<LaunchPlan, LaunchError> {
         let (job, attempt) = self.run_job(org).await;
         let mut plan = LaunchPlan::default();
+        plan.launch.engine_name = "trl".to_owned();
         plan.launch.job_spec_json =
             json!({"base_model_version_id": ModelVersionId::from_uuid(mv).to_string()}).to_string();
         let placement = Placement {
@@ -1179,6 +1181,20 @@ async fn promote_merge_and_export_round_trip() {
             .unwrap(),
         Verification::Verified
     );
+    let plan = env.launch(Uuid::nil(), adapter).await.unwrap();
+    assert!(plan
+        .inputs
+        .iter()
+        .any(|f| f.local_path == "model/model.safetensors"));
+    assert!(plan
+        .inputs
+        .iter()
+        .any(|f| f.local_path == "model_adapter/model.safetensors"));
+    let spec: Value = serde_json::from_str(&plan.launch.job_spec_json).unwrap();
+    assert_eq!(
+        spec["base_model_sha256"],
+        env.get_version(base).await["weights_sha256"]
+    );
     let adapter_id = ModelVersionId::from_uuid(adapter);
     let refused = env.action(base, "merge-adapter", json!({})).await;
     assert_eq!(refused.status, 409);
@@ -1350,4 +1366,80 @@ async fn concurrent_import_and_export_replays_share_one_job() {
         .await
         .unwrap();
     assert_eq!(exports, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn model_credentials_must_belong_to_the_project_and_allow_the_use() {
+    let env = Env::start().await;
+    let foreign = env.secret("model_download").await;
+    sqlx::query("UPDATE secrets_metadata SET project_id = $1 WHERE id = $2")
+        .bind(ProjectId::new().to_string())
+        .bind(
+            foreign
+                .parse::<mrl_domain::ids::SecretId>()
+                .unwrap()
+                .as_uuid(),
+        )
+        .execute(env.db.pool())
+        .await
+        .unwrap();
+    let wrong_use = env.secret("model_export").await;
+    let path = format!("/projects/{}/models:import", env.project);
+    for (secret, status) in [(foreign, 404), (wrong_use, 403)] {
+        let body = json!({"name": "hidden", "source": {
+            "kind": "hub", "repo": "org/model", "secret_id": secret
+        }});
+        let res = env.call(Method::POST, &path, Some(body)).await;
+        assert_eq!(res.status, status, "{}", res.text());
+    }
+    let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM builtin_jobs")
+        .fetch_one(env.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(jobs, 0);
+}
+
+struct ModelProjectOwner(ProjectId, OrgId);
+
+#[async_trait]
+impl ProjectDirectory for ModelProjectOwner {
+    async fn owner(&self, project: ProjectId) -> Result<Option<OrgId>, SeamError> {
+        Ok((self.0 == project).then_some(self.1))
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn rehome_moves_empty_models_and_verified_blobs_to_the_team_org() {
+    let env = Env::start().await;
+    let empty = env.model("empty").await;
+    let (ready, _) = env.ready("already-moved", |_| {}).await;
+    let team = OrgId::new();
+    // An older startup moved this record, but left its object keys in solo storage.
+    sqlx::query("UPDATE model_versions SET org_id = $1 WHERE id = $2")
+        .bind(team.as_uuid())
+        .bind(ready)
+        .execute(env.db.pool())
+        .await
+        .unwrap();
+    let step = RehomeLocalRows::new(
+        env.models.db().clone(),
+        Projects::with(Arc::new(ModelProjectOwner(env.project, team))),
+    )
+    .with_artifacts(Some(env.store.clone()));
+    step.run().await.unwrap();
+    step.run().await.unwrap();
+    let moved = store::model(env.models.db(), empty.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(moved.org_id, team.as_uuid());
+    let st = env.store.org_store(&team.to_string()).await.unwrap();
+    for file in store::files(env.models.db(), ready).await.unwrap() {
+        assert_eq!(
+            st.sha256(&file.object_key).await.unwrap(),
+            store::hex(&file.sha256)
+        );
+    }
 }

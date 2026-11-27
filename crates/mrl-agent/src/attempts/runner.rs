@@ -1954,16 +1954,22 @@ impl Runner {
                     return true;
                 }
                 if checkpoint_id.is_empty() {
+                    if self.rec.results.contains_key(&command_id) {
+                        self.deliver_results().await;
+                        return true;
+                    }
                     if self.adhoc.contains_key(&command_id)
                         || self.unsaved.contains_key(&command_id)
                     {
-                        return true; // a replay of a running upload: answered when it ends
+                        return true;
                     }
-                    // Saved before it starts, so a restarted agent knows about it.
                     self.rec
                         .adhoc_uploads
                         .insert(command_id.clone(), targets.clone());
-                    self.save();
+                    if !self.save() {
+                        self.rec.adhoc_uploads.remove(&command_id);
+                        return false;
+                    }
                     self.start_adhoc(command_id, targets);
                 } else {
                     let active = self

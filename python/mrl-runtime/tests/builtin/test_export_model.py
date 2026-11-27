@@ -138,7 +138,7 @@ def test_s3_export_lands_in_the_bucket(
     result = json.loads((tmp_path / "out" / RESULT_FILE).read_text())
     key = next(k for k in result["keys"] if k.endswith("/model.safetensors"))
     assert key.startswith(f"{prefix}/")
-    assert key.count("/") == prefix.count("/") + 2
+    assert key.count("/") == prefix.count("/") + 3
     get = s3_request(s3, "GET", bucket, key)
     with urllib.request.urlopen(get, timeout=30) as resp:
         assert resp.read() == (models / "tiny-llama/model.safetensors").read_bytes()

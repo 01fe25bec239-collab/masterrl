@@ -261,10 +261,14 @@ async fn decide(
             .map_err(seam)?,
         None => None,
     };
-    if kind == "adapter" && base.is_none() {
+    if kind == "adapter"
+        && !base
+            .as_ref()
+            .is_some_and(|v| v.kind.as_deref() == Some("full_weights") && v.quantization.is_none())
+    {
         return Ok(Err(invalid(
             codes::ADAPTER_BASE,
-            "This is a LoRA adapter: import it with the READY base model version it was trained on.",
+            "This is a LoRA adapter: import it with the READY full-precision base model version it was trained on.",
         )));
     }
     let files = match files_of(models, version, produced, &report).await? {

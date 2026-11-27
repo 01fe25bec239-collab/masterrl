@@ -27,7 +27,7 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use mrl_domain::ids::{JobId, ModelVersionId, NodeId, SecretId};
+use mrl_domain::ids::{JobId, ModelVersionId, NodeId, ProjectId, SecretId};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -205,7 +205,7 @@ async fn secret(
     state: &AppState,
     models: &Models,
     ctx: &RequestContext,
-    org: Uuid,
+    (org, project): (Uuid, Uuid),
     id: &str,
     path: &str,
     (allowed_use, name): (&str, &str),
@@ -220,6 +220,7 @@ async fn secret(
             &super::outputs::storage_org(org),
             secret,
             "env",
+            Some((ProjectId::from_uuid(project), allowed_use)),
         )
         .await
         .map_err(p19)?;
@@ -386,7 +387,7 @@ pub async fn import(
                         &state,
                         &models,
                         &ctx,
-                        org,
+                        (org, project),
                         s,
                         "/source/secret_id",
                         ("model_download", "hf"),
@@ -641,7 +642,7 @@ pub async fn export(
                     state,
                     models,
                     ctx,
-                    v.org_id,
+                    (v.org_id, v.project_id),
                     s,
                     "/target/secret_id",
                     ("model_export", "export"),
@@ -684,7 +685,27 @@ pub async fn export(
     });
     let lineage =
         json!({"model_version_id": id, "source_ref": v.source_ref, "base_model_version_id": base});
-    let files = staged(models, &v, "model").await?;
+    let files = if v.kind.as_deref() == Some("adapter") {
+        let base = super::gates::adapter_base(&models.db, &v)
+            .await?
+            .ok_or_else(|| {
+                conflict(
+                    codes::ADAPTER_BASE,
+                    "The adapter's original base model is unavailable.",
+                )
+            })?;
+        if !base.code_approved() {
+            return Err(conflict(
+                codes::REMOTE_CODE,
+                "A maintainer must approve the base model's code before export.",
+            ));
+        }
+        let mut files = staged(models, &base, "model").await?;
+        files.extend(staged(models, &v, "model_adapter").await?);
+        files
+    } else {
+        staged(models, &v, "model").await?
+    };
     let mut tx = models.db.begin().await?;
     if let Some(replay) = submission.claim(&mut tx).await? {
         return Ok(replay);

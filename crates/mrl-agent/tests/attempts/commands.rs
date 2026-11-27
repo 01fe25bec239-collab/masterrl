@@ -1532,3 +1532,33 @@ async fn an_accepted_probe_survives_restart_before_receipt() {
     .await
     .unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn tampered_model_weights_fail_the_attempt_before_worker_launch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (ctx, attempts, _rx) = manager(dir.path());
+    let input = serde_json::json!({"inputs": [{
+        "name": "model", "local_path": "model/model.safetensors",
+        "sha256": mrl_storage::sha256_hex(b"original"), "size": 8,
+        "file": write_tmp(dir.path(), b"tampered")
+    }]});
+    attempts
+        .launch(bad_lock_spec(
+            dir.path(),
+            "att_model",
+            "job_model",
+            1,
+            input,
+        ))
+        .unwrap();
+    let ended = tokio::time::timeout(WAIT, attempts.wait("att_model"))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ended.failure.unwrap().sub_code, "MRL-STORE-010");
+    assert!(!ctx
+        .state
+        .job_dir("att_model")
+        .join("inputs/model/model.safetensors")
+        .exists());
+}

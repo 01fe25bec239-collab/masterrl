@@ -539,3 +539,21 @@ def test_long_chat_prompt_sample_keeps_the_assistant_turn(tmp_path: Path, model_
     full = tokenizer.apply_chat_template(turns[:1], tokenize=False, add_generation_prompt=True)
     assert sample.prompt != full
     assert sample.prompt.endswith(full[-24:])  # the assistant header survives truncation
+
+
+def test_continue_training_a_registered_adapter(
+    tmp_path: Path, model_dir: Path, train_file: Path
+) -> None:
+    staged = {"model": model_dir, "train": train_file}
+    engine = {**FAST, "max_steps": 2, "save_steps": 2}
+    first = attempt(tmp_path, "sft", engine, staged, common=LORA)
+    [(_, _, adapter)] = first.committed()
+    continued = attempt(tmp_path, "sft", engine, {**staged, "model_adapter": adapter}, common=LORA)
+    assert continued.exit_report is not None
+    assert continued.exit_report.kind == pb.EXIT_KIND_COMPLETED
+    [(_, step, checkpoint)] = continued.committed()
+    assert step == 2
+    before = load_file(adapter / "adapter_model.safetensors")
+    after = load_file(checkpoint / "adapter_model.safetensors")
+    assert before.keys() == after.keys()
+    assert any((before[key] != after[key]).any() for key in before)

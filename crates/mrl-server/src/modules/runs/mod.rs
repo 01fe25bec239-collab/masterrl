@@ -1,6 +1,6 @@
 //! Experiments, runs and their immutable config snapshots; serves the `/jobs` endpoints too.
 //!
-//! Register with `Box::new(crate::modules::runs::RunsModule::new(db.clone())),`.
+//! Register with `Box::new(crate::modules::runs::RunsModule::new(db.clone(), config)),`.
 
 pub mod api;
 pub mod experiments;
@@ -19,18 +19,21 @@ pub struct RunsModule {
     db: Db,
     chains: Chains,
     projects: Projects,
+    artifacts: Option<Arc<crate::modules::artifacts::ArtifactStore>>,
 }
 
 impl RunsModule {
     /// The module with every registered chain member and project directory
     /// ([`Chains::registered`], [`Projects::registered`]).
-    pub fn new(db: Db) -> Self {
+    pub fn new(db: Db, config: &crate::Config) -> Self {
         let chains = Chains::registered(&db);
         let projects = Projects::registered(&db);
+        let artifacts = crate::modules::artifacts::ArtifactsModule::new(db.clone(), config).store();
         Self {
             db,
             chains,
             projects,
+            artifacts: Some(artifacts),
         }
     }
 
@@ -40,6 +43,7 @@ impl RunsModule {
             db,
             chains,
             projects: Projects::default(),
+            artifacts: None,
         }
     }
 
@@ -107,10 +111,10 @@ impl ServerModule for RunsModule {
     }
 
     fn startup_steps(&self) -> Vec<Arc<dyn StartupStep>> {
-        vec![Arc::new(RehomeLocalRows::new(
-            self.db.clone(),
-            self.projects.clone(),
-        ))]
+        vec![Arc::new(
+            RehomeLocalRows::new(self.db.clone(), self.projects.clone())
+                .with_artifacts(self.artifacts.clone()),
+        )]
     }
 
     fn openapi(&self) -> utoipa::openapi::OpenApi {
