@@ -946,7 +946,7 @@ async fn the_registry_knows_only_ready_versions_of_the_asking_project() {
 
 #[tokio::test]
 #[ignore = "needs PostgreSQL (just dev)"]
-async fn a_run_stages_each_dataset_version_as_one_checked_folder() {
+async fn runs_and_probes_stage_each_dataset_version_as_one_checked_folder() {
     let env = Env::start().await;
     let ds = env.dataset("chats", json!({})).await;
     let first = env.ready(&ds, "ready", None).await;
@@ -1034,6 +1034,63 @@ async fn a_run_stages_each_dataset_version_as_one_checked_folder() {
             &std::fs::read(fixture("ready/shards/train-00000.parquet")).unwrap()
         )
     );
+
+    let mut probe = job.clone();
+    probe.run_id = None;
+    let mut probe_plan = LaunchPlan::default();
+    probe_plan.launch.job_spec_json =
+        json!({"dataset_version_ids": [dsv(first), dsv(second)]}).to_string();
+    inputs
+        .contribute(&probe, &attempt, &placement, &mut probe_plan)
+        .await
+        .unwrap();
+    assert!(probe_plan.inputs.is_empty());
+
+    probe.subject_ref = Some(json!({"kind": "run_probe"}));
+    inputs
+        .contribute(&probe, &attempt, &placement, &mut probe_plan)
+        .await
+        .unwrap();
+    assert_eq!(probe_plan.inputs, plan.inputs);
+
+    let mut empty = LaunchPlan::default();
+    empty.launch.job_spec_json = json!({"dataset_version_ids": []}).to_string();
+    inputs
+        .contribute(&probe, &attempt, &placement, &mut empty)
+        .await
+        .unwrap();
+    assert!(empty.inputs.is_empty());
+
+    let mut malformed = LaunchPlan::default();
+    malformed.launch.job_spec_json =
+        json!({"dataset_version_ids": ["not-a-dataset-id"]}).to_string();
+    let err = inputs
+        .contribute(&probe, &attempt, &placement, &mut malformed)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            LaunchError::Fail(mrl_domain::failure::FailureClass::HarnessError, _)
+        ),
+        "{err:?}"
+    );
+    assert!(malformed.inputs.is_empty());
+
+    probe.project_id = env.side.as_uuid();
+    probe_plan.inputs.clear();
+    let err = inputs
+        .contribute(&probe, &attempt, &placement, &mut probe_plan)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            LaunchError::Fail(mrl_domain::failure::FailureClass::UserConfig, _)
+        ),
+        "{err:?}"
+    );
+    assert!(probe_plan.inputs.is_empty());
 
     // A version that is no longer usable stops the launch with a plain reason.
     sqlx::query("UPDATE datasets SET deleted_at = now() WHERE id = $1")

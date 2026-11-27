@@ -1,5 +1,5 @@
-//! Launch contributor: each dataset version a run names is staged as the folder input
-//! `dataset_<n>` (n = its place in the run's `dataset_version_ids`): one input file per
+//! Launch contributor: each dataset version a run or settings check names is staged as the folder input
+//! `dataset_<n>` (n = its place in `dataset_version_ids`): one input file per
 //! shard at `dataset_<n>/shards/…` plus `dataset_<n>/dataset.json`. The agent checks every
 //! file's sha256; engines read the folder with `mrl_runtime.data.adapter.DatasetAdapter`.
 
@@ -37,6 +37,11 @@ struct Staged {
     size_bytes: i64,
 }
 
+#[derive(serde::Deserialize)]
+struct ProbeInputs {
+    dataset_version_ids: Vec<DatasetVersionId>,
+}
+
 #[async_trait::async_trait]
 impl LaunchContributor for DatasetInputs {
     fn name(&self) -> &'static str {
@@ -63,20 +68,40 @@ impl LaunchContributor for DatasetInputs {
                 ));
             }
         }
-        let Some(run) = job.run_id else {
-            return Ok(());
-        };
         let transient =
             |e: sqlx::Error| LaunchError::Transient(format!("the database did not answer: {e}"));
-        let ids: Option<Vec<Uuid>> = sqlx::query_scalar(
-            "SELECT dataset_version_ids FROM run_configs WHERE run_id = $1 AND org_id = $2",
-        )
-        .bind(run)
-        .bind(job.org_id)
-        .fetch_optional(self.db.pool())
-        .await
-        .map_err(transient)?;
-        for (n, id) in ids.unwrap_or_default().into_iter().enumerate() {
+        let ids = if let Some(run) = job.run_id {
+            sqlx::query_scalar::<_, Vec<Uuid>>(
+                "SELECT dataset_version_ids FROM run_configs WHERE run_id = $1 AND org_id = $2",
+            )
+            .bind(run)
+            .bind(job.org_id)
+            .fetch_optional(self.db.pool())
+            .await
+            .map_err(transient)?
+            .unwrap_or_default()
+        } else if job.kind == "TRAIN"
+            && job
+                .subject_ref
+                .as_ref()
+                .is_some_and(|subject| subject["kind"] == "run_probe")
+        {
+            let probe: ProbeInputs =
+                serde_json::from_str(&plan.launch.job_spec_json).map_err(|_| {
+                    LaunchError::Fail(
+                        FailureClass::HarnessError,
+                        "The settings check is missing a valid list of dataset versions.".into(),
+                    )
+                })?;
+            probe
+                .dataset_version_ids
+                .iter()
+                .map(DatasetVersionId::as_uuid)
+                .collect()
+        } else {
+            return Ok(());
+        };
+        for (n, id) in ids.into_iter().enumerate() {
             let ready: Option<bool> = sqlx::query_scalar(
                 "SELECT v.state = 'READY' FROM dataset_versions v JOIN datasets d ON d.id = v.dataset_id \
                   WHERE v.id = $1 AND v.org_id = $2 AND d.project_id = $3 AND d.deleted_at IS NULL",
@@ -91,7 +116,7 @@ impl LaunchContributor for DatasetInputs {
                 return Err(LaunchError::Fail(
                     FailureClass::UserConfig,
                     format!(
-                        "The dataset version {} is no longer ready in this project, so the run can't use it.",
+                        "The dataset version {} is no longer ready in this project, so the job can't use it.",
                         DatasetVersionId::from_uuid(id)
                     ),
                 ));
