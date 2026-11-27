@@ -65,14 +65,14 @@ pub struct ArtifactsModule {
 impl ArtifactsModule {
     /// The module for this database and these settings. Connects to storage on first use.
     pub fn new(db: Db, config: &Config) -> Self {
-        Self {
-            store: Arc::new(ArtifactStore::new(
-                db,
-                backend_config(config),
-                config.server.mode,
-                scratch::default_root(),
-            )),
-        }
+        let store = Arc::new(ArtifactStore::new(
+            db,
+            backend_config(config),
+            config.server.mode,
+            scratch::default_root(),
+        ));
+        crate::modules::datasets::records::register_lineage(&store);
+        Self { store }
     }
 
     /// The module with an explicit backend, for a server in `mode`, keeping request scratch
@@ -1640,6 +1640,9 @@ async fn action(
         .filter(|a| a.state == "COMMITTED")
         .ok_or_else(|| not_found("artifact"))?;
     s.authorize(&ctx, READ, &found.resource(&org)).await?;
+    if crate::modules::datasets::store::is_version_output(store.db(), id).await? {
+        return Err(not_found("artifact"));
+    }
     let (key, file) = store.download_source(&org, &found, &body.path).await?;
     Ok(Json(
         store

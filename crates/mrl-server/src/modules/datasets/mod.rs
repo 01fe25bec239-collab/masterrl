@@ -104,6 +104,10 @@ impl ServerModule for DatasetsModule {
         "datasets"
     }
 
+    fn handler_idempotency_paths(&self) -> &'static [&'static str] {
+        &["/projects/{prj}/datasets", "/dataset-versions/{dsv}"]
+    }
+
     fn routes(&self) -> Router<AppState> {
         Router::new()
             .route(

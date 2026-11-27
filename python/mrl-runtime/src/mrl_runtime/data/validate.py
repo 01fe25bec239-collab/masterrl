@@ -455,6 +455,7 @@ class CheckOptions:
     max_examples: int = 20
     max_invalid_fraction: float = 0.0
     schema_dir: Path | None = None
+    unique_stats: bool = False
 
 
 def validate_records(
@@ -493,18 +494,21 @@ def validate_records(
             continue
         valid += 1
         rec: Json = raw.value
-        stats.add(rec)
         digest = record_hash(rec)
         if digest in first_seen:
             duplicates.append((raw.number, first_seen[digest]))
+            if opts.unique_stats:
+                continue
         else:
             first_seen[digest] = raw.number
+        stats.add(rec)
         if protected:
             mine = content_hashes(schema_id, rec)
             for name, hashes in protected.items():
                 if mine & hashes:
                     leaks[name].append(raw.number)
     invalid = total - valid
+    measured = len(first_seen) if opts.unique_stats else valid
     passed = valid > 0 and invalid <= opts.max_invalid_fraction * total
     return ValidationReport(
         schema=schema_id,
@@ -519,7 +523,9 @@ def validate_records(
         duplicate_examples=tuple(duplicates[:max_examples]),
         leakage={
             name: Leak(
-                len(n), round(100 * len(n) / valid, 2) if valid else 0.0, tuple(n[:max_examples])
+                len(n),
+                round(100 * len(n) / measured, 2) if measured else 0.0,
+                tuple(n[:max_examples]),
             )
             for name, n in leaks.items()
         },

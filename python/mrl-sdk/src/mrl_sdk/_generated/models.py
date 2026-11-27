@@ -565,6 +565,9 @@ class DatasetExportFile(TypedDict):
     expires_at: str
     """When the link stops working."""
 
+    headers: dict[str, Any]
+    """Headers required by the download URL."""
+
     path: str
     """Path inside the export."""
 
@@ -575,7 +578,7 @@ class DatasetExportFile(TypedDict):
     """Size in bytes."""
 
     url: str
-    """Download link (relative to the server), valid until `expires_at`."""
+    """Download URL, valid until `expires_at`."""
 
 
 class DatasetExportRequest(TypedDict):

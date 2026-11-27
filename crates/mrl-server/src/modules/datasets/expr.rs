@@ -5,6 +5,7 @@
 //! small tree and evaluated against one JSON record.
 
 use serde_json::{Map, Value};
+use std::cmp::Ordering;
 
 /// Longest expression accepted, in characters.
 pub const MAX_CHARS: usize = 2000;
@@ -402,16 +403,31 @@ fn lookup<'a>(record: &'a Value, parts: &[Part]) -> Option<&'a Value> {
     })
 }
 
-fn num_eq(a: &serde_json::Number, b: &serde_json::Number) -> bool {
-    match (a.as_i64(), b.as_i64()) {
-        (Some(x), Some(y)) => x == y,
-        _ => a.as_f64() == b.as_f64(),
+fn number_order(a: &serde_json::Number, b: &serde_json::Number) -> Option<Ordering> {
+    let integer = |n: &serde_json::Number| {
+        n.as_i64()
+            .map(i128::from)
+            .or_else(|| n.as_u64().map(i128::from))
+    };
+    let compare_mixed = |i: i128, f: f64| {
+        i.cmp(&(f as i128)).then_with(|| {
+            f.fract()
+                .partial_cmp(&0.0)
+                .unwrap_or(Ordering::Equal)
+                .reverse()
+        })
+    };
+    match (integer(a), integer(b)) {
+        (Some(x), Some(y)) => Some(x.cmp(&y)),
+        (Some(x), None) => b.as_f64().map(|y| compare_mixed(x, y)),
+        (None, Some(y)) => a.as_f64().map(|x| compare_mixed(y, x).reverse()),
+        (None, None) => a.as_f64()?.partial_cmp(&b.as_f64()?),
     }
 }
 
 fn eq(a: &Value, b: &Value) -> bool {
     match (a, b) {
-        (Value::Number(x), Value::Number(y)) => num_eq(x, y),
+        (Value::Number(x), Value::Number(y)) => number_order(x, y) == Some(Ordering::Equal),
         (Value::Array(x), Value::Array(y)) => {
             x.len() == y.len() && x.iter().zip(y).all(|(p, q)| eq(p, q))
         }
@@ -426,13 +442,7 @@ fn obj_eq(x: &Map<String, Value>, y: &Map<String, Value>) -> bool {
 
 fn order(op: &str, a: &Value, b: &Value) -> bool {
     let ord = match (a, b) {
-        (Value::Number(x), Value::Number(y)) => match (x.as_i64(), y.as_i64()) {
-            (Some(p), Some(q)) => Some(p.cmp(&q)),
-            _ => x
-                .as_f64()
-                .zip(y.as_f64())
-                .and_then(|(p, q)| p.partial_cmp(&q)),
-        },
+        (Value::Number(x), Value::Number(y)) => number_order(x, y),
         (Value::String(x), Value::String(y)) => Some(x.cmp(y)),
         _ => None,
     };

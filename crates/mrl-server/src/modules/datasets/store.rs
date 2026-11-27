@@ -10,14 +10,14 @@ use crate::db::Tx;
 use crate::modules::events::{NewEvent, OutboxWriter};
 use crate::modules::jobs::JobsError;
 use crate::modules::lineage::{LineageWriter, NodeRef, Relation};
-use crate::seams::SeamError;
+use crate::seams::{AuditEvent, AuditOutcome, AuditSink, SeamError};
 use axum::http::StatusCode;
-use mrl_domain::ids::DatasetVersionId;
+use mrl_domain::ids::{DatasetVersionId, ProjectId};
 use mrl_storage::{ArtifactManifest, StorageError, Store};
 use serde::Deserialize;
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -214,6 +214,14 @@ pub async fn dataset(
     .await?)
 }
 
+/// True for internal version outputs, which have a dedicated export policy.
+pub async fn is_version_output(db: &crate::db::Db, artifact: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM dataset_versions WHERE artifact_id = $1)")
+        .bind(artifact)
+        .fetch_one(db.pool())
+        .await
+}
+
 /// The files of a version.
 pub async fn files(db: &crate::db::Db, version: Uuid) -> Result<Vec<FileRow>, JobsError> {
     Ok(sqlx::query_as::<_, FileRow>(
@@ -270,8 +278,7 @@ impl From<StorageError> for OutputsError {
 pub struct Outputs {
     /// The P19 artifact.
     pub artifact_id: Uuid,
-    /// Its files.
-    pub files: Vec<mrl_storage::ManifestFile>,
+    files: HashMap<String, mrl_storage::ManifestFile>,
 }
 
 impl Outputs {
@@ -283,13 +290,17 @@ impl Outputs {
             .map_err(|e| OutputsError::Broken(format!("the output list is malformed: {e}")))?;
         Ok(Self {
             artifact_id,
-            files: m.files,
+            files: m
+                .files
+                .into_iter()
+                .map(|file| (file.path.clone(), file))
+                .collect(),
         })
     }
 
     /// The listed file at `path`.
     pub fn get(&self, path: &str) -> Option<&mrl_storage::ManifestFile> {
-        self.files.iter().find(|f| f.path == path)
+        self.files.get(path)
     }
 
     /// The object key of the listed file at `path` (its checked blob).
@@ -313,7 +324,18 @@ impl Outputs {
                 "{path} is larger than {MAX_JSON_BYTES} bytes"
             )));
         }
-        let bytes = store.get(&self.key(store, path)?).await?;
+        let key = self.key(store, path)?;
+        let bytes = if f.size == 0 {
+            return Err(OutputsError::Broken(format!("{path} is empty")));
+        } else {
+            let size = store.head(&key).await?.size;
+            if size != f.size {
+                return Err(OutputsError::Broken(format!(
+                    "{path} does not match its size"
+                )));
+            }
+            store.get_range(&key, 0..size).await?
+        };
         if mrl_storage::sha256_hex(&bytes) != f.sha256 {
             return Err(OutputsError::Broken(format!(
                 "{path} does not match its hash"
@@ -335,6 +357,8 @@ struct ShardEntry {
 #[derive(Debug, Deserialize)]
 struct BrowseEntry {
     path: String,
+    first: u64,
+    rows: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -347,6 +371,8 @@ struct LeakEntry {
 struct Summary {
     schema_id: String,
     rows: u64,
+    #[serde(default)]
+    splits: BTreeMap<String, u64>,
     #[serde(default)]
     shards: Vec<ShardEntry>,
     passed: bool,
@@ -474,14 +500,33 @@ async fn check(store: &Store, outputs: &Outputs, schema_id: &str) -> Result<Chec
         validation.ok_or_else(|| OutputsError::Broken("the job wrote no report".into()))?;
     let stats = outputs.json(store, "stats.json").await?;
     let mut files = Vec::new();
+    let mut paths = HashSet::new();
+    let mut splits = BTreeMap::<String, u64>::new();
     let (mut rows, mut bytes) = (0u64, 0u64);
     let mut shard_hashes = Vec::new();
     for s in &summary.shards {
+        if !s.path.starts_with("shards/")
+            || !s.path.ends_with(".parquet")
+            || !matches!(s.split.as_str(), "train" | "test" | "validation")
+            || s.rows == 0
+            || !paths.insert(s.path.clone())
+        {
+            return Err(OutputsError::Broken(
+                "a shard is invalid or listed twice".into(),
+            ));
+        }
         let f = outputs
             .get(&s.path)
             .ok_or_else(|| OutputsError::Broken(format!("the shard {} is missing", s.path)))?;
-        rows += s.rows;
-        bytes = bytes.saturating_add(f.size);
+        rows = rows
+            .checked_add(s.rows)
+            .filter(|n| i64::try_from(*n).is_ok())
+            .ok_or_else(|| OutputsError::Broken("the shard row count is too large".into()))?;
+        *splits.entry(s.split.clone()).or_default() += s.rows;
+        bytes = bytes
+            .checked_add(f.size)
+            .filter(|n| i64::try_from(*n).is_ok())
+            .ok_or_else(|| OutputsError::Broken("the shard size is too large".into()))?;
         shard_hashes.push(f.sha256.clone());
         files.push(NewFile {
             path: s.path.clone(),
@@ -493,11 +538,29 @@ async fn check(store: &Store, outputs: &Outputs, schema_id: &str) -> Result<Chec
             rows: Some(s.rows),
         });
     }
-    if rows != summary.rows || summary.shards.is_empty() {
+    if rows != summary.rows || splits != summary.splits || summary.shards.is_empty() {
         return Err(OutputsError::Broken(format!(
             "{SUMMARY} lists {} rows but its shards hold {rows}",
             summary.rows
         )));
+    }
+    let mut browsed = 0u64;
+    for page in &summary.browse {
+        if !page.path.starts_with("browse/")
+            || !page.path.ends_with(".jsonl")
+            || page.first != browsed
+            || !(1..=100).contains(&page.rows)
+        {
+            return Err(OutputsError::Broken(
+                "the browse pages are inconsistent".into(),
+            ));
+        }
+        browsed += page.rows;
+    }
+    if browsed != rows {
+        return Err(OutputsError::Broken(
+            "the browse row count does not match the shards".into(),
+        ));
     }
     let derived = [
         SUMMARY,
@@ -510,6 +573,9 @@ async fn check(store: &Store, outputs: &Outputs, schema_id: &str) -> Result<Chec
     .map(str::to_owned)
     .chain(summary.browse.iter().map(|b| b.path.clone()));
     for path in derived {
+        if !paths.insert(path.clone()) {
+            return Err(OutputsError::Broken(format!("{path} is listed twice")));
+        }
         let f = outputs
             .get(&path)
             .ok_or_else(|| OutputsError::Broken(format!("the job wrote no {path}")))?;
@@ -557,7 +623,7 @@ async fn insert_files(
         sqlx::query(
             "INSERT INTO dataset_files (dataset_version_id, org_id, path, split, role, object_key, \
                sha256, size_bytes, row_count) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9) \
-             ON CONFLICT (dataset_version_id, path) DO NOTHING",
+",
         )
         .bind(version)
         .bind(org)
@@ -590,21 +656,28 @@ async fn event(
 
 /// Writes the decision for version `id` (which must still be INGESTING or VALIDATING).
 /// Returns false, changing nothing, when it was already decided.
-pub async fn record_version(tx: &mut Tx, id: Uuid, checked: &Checked) -> Result<bool, JobsError> {
-    let row: Option<(Uuid, String, Option<Uuid>)> = sqlx::query_as(
-        "SELECT org_id, state, parent_version_id FROM dataset_versions WHERE id = $1 FOR UPDATE",
+pub async fn record_version(
+    tx: &mut Tx,
+    audit: &dyn AuditSink,
+    id: Uuid,
+    checked: &Checked,
+) -> Result<bool, JobsError> {
+    let row: Option<(Uuid, Uuid, String, Option<Uuid>)> = sqlx::query_as(
+        "SELECT v.org_id, d.project_id, v.state, v.parent_version_id FROM dataset_versions v
+         JOIN datasets d ON d.id = v.dataset_id AND d.org_id = v.org_id
+         WHERE v.id = $1 FOR UPDATE OF v",
     )
     .bind(id)
     .fetch_optional(&mut **tx)
     .await?;
-    let Some((org, state, parent)) = row else {
+    let Some((org, project, state, parent)) = row else {
         return Ok(false);
     };
     if !matches!(state.as_str(), "INGESTING" | "VALIDATING") {
         return Ok(false);
     }
     let dsv = DatasetVersionId::from_uuid(id).to_string();
-    match checked {
+    let action = match checked {
         Checked::Ready {
             summary,
             validation,
@@ -641,8 +714,10 @@ pub async fn record_version(tx: &mut Tx, id: Uuid, checked: &Checked) -> Result<
                 sqlx::query(
                     "INSERT INTO eval_contamination (dataset_version_id, eval_dataset_version_id, \
                        org_id, overlap_ratio, overlapping_rows, method) \
-                     SELECT $1, e.id, $2, $3::float8::numeric, $4, 'exact' FROM dataset_versions e \
-                      WHERE e.id = $5 AND e.org_id = $2 \
+                     SELECT $1, e.id, $2, $3::float8::numeric, $4, 'exact' FROM dataset_versions e
+                      JOIN datasets d ON d.id = e.dataset_id AND d.org_id = e.org_id
+                      WHERE e.id = $5 AND e.org_id = $2 AND d.project_id = $6
+                        AND d.deleted_at IS NULL AND d.eval_set AND e.state = 'READY' \
                      ON CONFLICT DO NOTHING",
                 )
                 .bind(id)
@@ -650,6 +725,7 @@ pub async fn record_version(tx: &mut Tx, id: Uuid, checked: &Checked) -> Result<
                 .bind(*ratio)
                 .bind(i64::try_from(*records).unwrap_or(i64::MAX))
                 .bind(eval)
+                .bind(project)
                 .execute(&mut **tx)
                 .await?;
             }
@@ -671,6 +747,7 @@ pub async fn record_version(tx: &mut Tx, id: Uuid, checked: &Checked) -> Result<
                 json!({"dataset_version_id": dsv, "rows": rows}),
             )
             .await?;
+            "dataset_version.ready"
         }
         Checked::Invalid {
             code,
@@ -698,8 +775,24 @@ pub async fn record_version(tx: &mut Tx, id: Uuid, checked: &Checked) -> Result<
                 json!({"dataset_version_id": dsv, "code": code}),
             )
             .await?;
+            "dataset_version.invalid"
         }
-    }
+    };
+    audit
+        .record_in(
+            tx,
+            AuditEvent {
+                at: OffsetDateTime::now_utc(),
+                actor: "system:datasets".into(),
+                org: crate::modules::jobs::scope::org_text(org),
+                project: Some(ProjectId::from_uuid(project).to_string()),
+                action: action.into(),
+                target: dsv,
+                outcome: AuditOutcome::Success,
+                trace_id: id.simple().to_string(),
+            },
+        )
+        .await?;
     Ok(true)
 }
 

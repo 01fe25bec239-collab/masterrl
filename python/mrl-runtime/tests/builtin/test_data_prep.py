@@ -16,7 +16,7 @@ import make_fixtures
 import pytest
 
 from mrl_runtime._generated.mrl.worker.v1 import worker_control_pb2 as pb
-from mrl_runtime.builtin import BuiltinEngine, discover_tasks, load_builtin_manifest
+from mrl_runtime.builtin import BuiltinEngine, data_prep, discover_tasks, load_builtin_manifest
 from mrl_runtime.builtin.data_prep import DATA_PREP, MAX_RATIO, RATIO_FLOOR
 from mrl_runtime.builtin.tasks import TaskContext, TaskOutput
 from mrl_runtime.builtin.transform import TRANSFORM
@@ -26,8 +26,6 @@ from mrl_runtime.testkit.agent import AgentScript
 from mrl_runtime.testkit.runner import run_in_process
 
 DATASETS = Path(__file__).resolve().parents[4] / "tests/fixtures/datasets"
-# rl.rollout.v1 is written by rollouts, never uploaded, so it has no fixture file.
-UPLOADABLE = [s for s in DATASET_SCHEMAS if (DATASETS / f"{s}.jsonl").exists()]
 
 
 def _prep(tmp: Path, files: dict[str, bytes], inputs: dict[str, Any]) -> dict[str, Any]:
@@ -48,12 +46,25 @@ def _fixture(name: str) -> bytes:
     return (DATASETS / name).read_bytes()
 
 
-@pytest.mark.parametrize("schema", UPLOADABLE)
+@pytest.mark.parametrize("schema", DATASET_SCHEMAS)
 def test_every_canonical_schema(tmp_path: Path, schema: str) -> None:
-    ok = _prep(tmp_path / "ok", {"data.jsonl": _fixture(f"{schema}.jsonl")}, {"schema_id": schema})
-    bad = _prep(
-        tmp_path / "bad", {"data.jsonl": _fixture(f"{schema}-invalid.jsonl")}, {"schema_id": schema}
-    )
+    if schema == "rl.rollout.v1":
+        rollout = {
+            "sample_id": "one",
+            "group_id": "batch",
+            "batch_no": 0,
+            "prompt": "Question",
+            "completion": "Answer",
+            "status": "ok",
+            "resolution": "scored",
+            "reward_total": 1,
+            "policy_version": 1,
+        }
+        good, invalid = json.dumps(rollout).encode(), b'{"sample_id":"one"}'
+    else:
+        good, invalid = _fixture(f"{schema}.jsonl"), _fixture(f"{schema}-invalid.jsonl")
+    ok = _prep(tmp_path / "ok", {"data.jsonl": good}, {"schema_id": schema})
+    bad = _prep(tmp_path / "bad", {"data.jsonl": invalid}, {"schema_id": schema})
     if schema == "mm.messages.v1":  # images wait for multimodal training (P47)
         assert ok["passed"] is False
         assert ok["error_code"] == "MRL-DATA-270"
@@ -274,3 +285,36 @@ def test_server_fixtures_are_what_the_tasks_write(tmp_path: Path) -> None:
                 assert (made / f).read_bytes() == (kept / f).read_bytes(), f"{name}/{f}"
         if name != "invalid":
             assert list(DatasetAdapter(kept).records()) == list(DatasetAdapter(made).records())
+
+
+def test_parquet_reimport_and_eval_stats_use_the_stored_rows(tmp_path: Path) -> None:
+    schema = "pretrain.text.v1"
+    src = b'{"text":"shared"}\n' * 9 + b'{"text":"clean"}\n'
+    eval_dir = tmp_path / "eval"
+    eval_dir.mkdir()
+    hashes = content_hashes(schema, {"text": "shared"})
+    (eval_dir / "content_hashes.txt").write_text("\n".join(hashes) + "\n", "utf-8")
+    first = _prep(
+        tmp_path, {"test.jsonl": src}, {"schema_id": schema, "against": {"eval": "benchmark"}}
+    )
+    assert first["rows"] == 2
+    assert first["duplicates"] == 8
+    assert first["leakage"]["benchmark"] == {"percent": 50.0, "records": 1}
+    assert first["splits"] == {"test": 2}
+    shard = tmp_path / "outputs/shards/test-00000.parquet"
+    again = _prep(tmp_path / "again", {shard.name: shard.read_bytes()}, {"schema_id": schema})
+    assert again["passed"]
+    assert again["splits"] == {"test": 2}
+
+
+def test_tar_ratio_applies_to_the_archive(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(data_prep, "RATIO_FLOOR", 256 * 1024)
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w:gz") as archive:
+        for i in range(3):
+            body = b" " * (128 * 1024)
+            member = tarfile.TarInfo(f"{i}.jsonl")
+            member.size = len(body)
+            archive.addfile(member, io.BytesIO(body))
+    result = _prep(tmp_path, {"dataset.tar.gz": buf.getvalue()}, {"schema_id": "pretrain.text.v1"})
+    assert result["error_code"] == "MRL-DATA-271"

@@ -12,12 +12,18 @@ from typing import Any
 
 import pytest
 
+from mrl_runtime.builtin import import_dataset
 from mrl_runtime.builtin.import_dataset import IMPORT_DATASET, Fetcher, Policy, safe_name
 from mrl_runtime.builtin.tasks import TaskContext
 from mrl_runtime.errors import MrlError
 
 SHA = "a" * 40
-FILES = {"data/train.jsonl": b'{"text": "hello"}\n', "README.md": b"# card"}
+FILES = {
+    "data/train.jsonl": b'{"text": "hello"}\n',
+    "data/test.jsonl": b'{"text": "held out"}\n',
+    "dataset_infos.json": b"{}",
+    "README.md": b"# card",
+}
 
 
 class _Hub(http.server.BaseHTTPRequestHandler):
@@ -30,9 +36,15 @@ class _Hub(http.server.BaseHTTPRequestHandler):
         _Hub.seen_auth.append(self.headers.get("Authorization"))
         if self.path.startswith("/api/datasets/acme/qa/revision/"):
             sib = [{"rfilename": n} for n in [*FILES, "../evil.jsonl"]][
-                : 2 if "main" in self.path else 3
+                : len(FILES) if "main" in self.path else len(FILES) + 1
             ]
             return self._send(json.dumps({"sha": SHA, "siblings": sib}).encode())
+        if self.path == "/short.jsonl":
+            self.send_response(200)
+            self.send_header("Content-Length", "100")
+            self.end_headers()
+            self.wfile.write(b'{"text":"first"}\n')
+            return None
         if self.path.startswith("/redirect"):
             self.send_response(302)
             self.send_header("Location", "http://169.254.169.254/latest/meta-data")
@@ -58,6 +70,13 @@ def hub() -> Iterator[str]:
     _Hub.seen_auth.clear()
     yield f"http://127.0.0.1:{srv.server_address[1]}"
     srv.shutdown()
+    srv.server_close()
+
+
+@pytest.fixture
+def mirror(hub: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(import_dataset, "HUB", hub)
+    monkeypatch.setattr(import_dataset, "Policy", lambda: Policy(allow_private=True))
 
 
 def _run(tmp: Path, inputs: dict[str, Any]) -> dict[str, Any]:
@@ -67,9 +86,8 @@ def _run(tmp: Path, inputs: dict[str, Any]) -> dict[str, Any]:
     return json.loads((out / "import.json").read_text("utf-8"))
 
 
-def test_hub_import_pins_the_commit(
-    tmp_path: Path, hub: str, monkeypatch: pytest.MonkeyPatch
-) -> None:
+@pytest.mark.usefixtures("mirror")
+def test_hub_import_pins_the_commit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MRL_CREDENTIAL_HF", "hf_secret")
     doc = _run(
         tmp_path,
@@ -77,8 +95,8 @@ def test_hub_import_pins_the_commit(
             "source": "hub",
             "repo": "acme/qa",
             "revision": "main",
-            "endpoint": hub,
-            "allow_private_hosts": True,
+            "config": "data",
+            "split": "train",
             "token_env": "MRL_CREDENTIAL_HF",
         },
     )
@@ -89,32 +107,39 @@ def test_hub_import_pins_the_commit(
     ]
     assert (tmp_path / "outputs/files/data/train.jsonl").read_bytes() == body
     assert not (tmp_path / "outputs/files/README.md").exists()
+    assert not (tmp_path / "outputs/files/dataset_infos.json").exists()
     assert set(_Hub.seen_auth) == {"Bearer hf_secret"}
 
 
-def test_hub_file_names_outside_the_folder_are_refused(tmp_path: Path, hub: str) -> None:
+@pytest.mark.usefixtures("mirror")
+def test_hub_file_names_outside_the_folder_are_refused(tmp_path: Path) -> None:
     inputs = {
         "source": "hub",
         "repo": "acme/qa",
         "revision": "v2",
-        "endpoint": hub,
-        "allow_private_hosts": True,
     }
     with pytest.raises(MrlError) as err:
         _run(tmp_path, inputs)
     assert err.value.code == "MRL-DATA-272"
 
 
-def test_size_limit_counts_real_bytes(tmp_path: Path, hub: str) -> None:
+@pytest.mark.usefixtures("mirror")
+def test_size_limit_counts_real_bytes(tmp_path: Path) -> None:
     inputs = {
         "source": "hub",
         "repo": "acme/qa",
-        "endpoint": hub,
-        "allow_private_hosts": True,
         "max_bytes": 5,
     }
     with pytest.raises(MrlError, match="larger than 5 bytes"):
         _run(tmp_path, inputs)
+
+
+@pytest.mark.usefixtures("mirror")
+def test_interrupted_response_never_publishes_partial_file(tmp_path: Path, hub: str) -> None:
+    with pytest.raises(MrlError, match="ended after"):
+        _run(tmp_path, {"source": "remote", "url": f"{hub}/short.jsonl"})
+    assert not (tmp_path / "outputs/import.json").exists()
+    assert not (tmp_path / "outputs/files/short.jsonl").exists()
 
 
 def test_private_addresses_and_plain_http_are_refused(tmp_path: Path, hub: str) -> None:

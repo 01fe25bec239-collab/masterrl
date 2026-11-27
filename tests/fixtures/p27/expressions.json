@@ -1,6 +1,7 @@
 {
   "about": "Filter-language cases. Python (mrl_runtime.builtin.transform.Expr) and the server (modules::datasets::expr) must give the same answer for each. `result` is the evaluated value; `error: true` means the expression is refused.",
   "record": {
+    "large": 9007199254740993,
     "lang": "en",
     "completion": "Paris",
     "prompt": "Capital of France?",
@@ -14,6 +15,9 @@
     "word": "Straße"
   },
   "cases": [
+    {"expr": "large > 9007199254740992.0", "result": true},
+    {"expr": "large == 9007199254740992.0", "result": false},
+    {"expr": "9007199254740992.0 < large", "result": true},
     {"expr": "len(completion) > 0 and lang == 'en'", "result": true},
     {"expr": "lang == \"en\"", "result": true},
     {"expr": "lang != 'en'", "result": false},

@@ -13,16 +13,16 @@ Rules: only `https://` to public addresses (every redirect is checked again, and
 is never sent to another host); at most `max_files` files and `max_bytes` bytes, counted as
 they arrive; file names must stay inside the folder. Output: `files/<path>` and
 `import.json` (what was fetched, with each file's size and sha256 and the Hub commit SHA).
-`allow_private_hosts: true` lifts the address rule for tests on this machine; the server
-never sets it.
 """
 
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
 import re
 import socket
+import ssl
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -33,8 +33,9 @@ from typing import IO, Any, cast, override
 
 from mrl_runtime.adapter.events import Progress
 from mrl_runtime.adapter.types import Issue
-from mrl_runtime.builtin.data_prep import ARCHIVE_SUFFIXES
+from mrl_runtime.builtin.data_prep import ARCHIVE_SUFFIXES, source_split
 from mrl_runtime.builtin.tasks import BuiltinTask, TaskContext, TaskEvent, TaskOutput
+from mrl_runtime.data.adapter import SPLITS
 from mrl_runtime.data.readers import SUFFIXES
 from mrl_runtime.errors import TASK_INPUT_INVALID, MrlError
 from mrl_runtime.model._json import arr, integer, obj, text
@@ -65,22 +66,63 @@ class Policy:
 
     allow_private: bool = False
 
-    def check(self, url: str) -> None:
-        parts = urllib.parse.urlsplit(url)
+    def addresses(self, url: str) -> list[str]:
+        try:
+            parts = urllib.parse.urlsplit(url)
+            port = parts.port or 443
+        except ValueError as exc:
+            raise _refused("the download URL is malformed") from exc
         if parts.scheme != "https" and not (self.allow_private and parts.scheme == "http"):
             raise _refused(f"only https:// links are allowed, not {parts.scheme or 'none'}://")
         if not parts.hostname or parts.username or parts.password:
             raise _refused("the link needs a host name and no user name or password")
-        if self.allow_private:
-            return
         try:
-            infos = socket.getaddrinfo(parts.hostname, parts.port or 443, type=socket.SOCK_STREAM)
+            infos = socket.getaddrinfo(parts.hostname, port, type=socket.SOCK_STREAM)
         except OSError as exc:
             raise _refused(f"{parts.hostname} could not be found: {exc}") from exc
-        for info in infos:
-            ip = ipaddress.ip_address(info[4][0])
-            if not ip.is_global or ip.is_multicast:
+        addresses = list(dict.fromkeys(str(info[4][0]) for info in infos))
+        if not addresses:
+            raise _refused(f"{parts.hostname} has no addresses")
+        for address in addresses:
+            ip = ipaddress.ip_address(address)
+            if not self.allow_private and (not ip.is_global or ip.is_multicast):
                 raise _refused(f"{parts.hostname} is a private or local address ({ip})")
+        return addresses
+
+    def check(self, url: str) -> None:
+        self.addresses(url)
+
+
+class _PinnedHTTPS(urllib.request.HTTPSHandler):
+    """Use the validated addresses for TCP and the original hostname for TLS."""
+
+    def __init__(self, policy: Policy) -> None:
+        super().__init__()
+        self.policy = policy
+
+    @override
+    def https_open(self, req: urllib.request.Request) -> Any:
+        addresses = self.policy.addresses(req.full_url)
+        context = ssl.create_default_context()
+
+        class Connection(http.client.HTTPSConnection):
+            @override
+            def connect(self) -> None:
+                err = OSError("no vetted address connected")
+                for ip in addresses:
+                    try:
+                        with_socket = socket.create_connection((ip, self.port), self.timeout)
+                        try:
+                            self.sock = context.wrap_socket(with_socket, server_hostname=self.host)
+                        except OSError:
+                            with_socket.close()
+                            raise
+                        return
+                    except OSError as exc:
+                        err = exc
+                raise err
+
+        return self.do_open(Connection, req)
 
 
 class _Redirects(urllib.request.HTTPRedirectHandler):
@@ -114,9 +156,11 @@ class Fetcher:
     def _open(self, url: str) -> Any:
         self.policy.check(url)
         req = urllib.request.Request(url, headers={"User-Agent": "masterrl-import/1"})
-        if self.token:
+        if self.token and urllib.parse.urlsplit(url).netloc == urllib.parse.urlsplit(HUB).netloc:
             req.add_unredirected_header("Authorization", f"Bearer {self.token}")
-        opener = urllib.request.build_opener(_Redirects(self.policy))
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({}), _Redirects(self.policy), _PinnedHTTPS(self.policy)
+        )
         try:
             return opener.open(req, timeout=TIMEOUT_S)
         except urllib.error.HTTPError as exc:
@@ -139,16 +183,31 @@ class Fetcher:
         dest.parent.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256()
         size = 0
-        with self._open(url) as resp, dest.open("xb") as f:
-            while chunk := resp.read(_CHUNK):
-                if self.cancelled():
-                    raise _refused("the import was cancelled")
-                size += len(chunk)
-                self.fetched += len(chunk)
-                if self.fetched > self.max_bytes:
-                    raise _refused(f"the dataset is larger than {self.max_bytes} bytes")
-                digest.update(chunk)
-                f.write(chunk)
+        with self._open(url) as resp:
+            f = dest.open("xb")
+            try:
+                expected: int | None = resp.length
+                with f:
+                    while chunk := resp.read(_CHUNK):
+                        if self.cancelled():
+                            raise _refused("the import was cancelled")
+                        size += len(chunk)
+                        self.fetched += len(chunk)
+                        if self.fetched > self.max_bytes:
+                            raise _refused(f"the dataset is larger than {self.max_bytes} bytes")
+                        digest.update(chunk)
+                        f.write(chunk)
+                if expected is not None and size != expected:
+                    raise ConnectionError(f"the download ended after {size} of {expected} bytes")
+            except Exception as exc:
+                dest.unlink()
+                if isinstance(exc, http.client.IncompleteRead):
+                    raise _refused("the download stopped before it finished") from ConnectionError(
+                        str(exc)
+                    )
+                if isinstance(exc, (OSError, http.client.HTTPException)):
+                    raise _refused(str(exc)) from exc
+                raise
         return size, digest.hexdigest()
 
 
@@ -158,6 +217,7 @@ def safe_name(path: str) -> str:
     if (
         not path
         or "\\" in path
+        or ":" in path
         or p.is_absolute()
         or any(part in ("", ".", "..") or part.startswith(".") for part in p.parts)
     ):
@@ -194,14 +254,24 @@ def _validate(inputs: Mapping[str, Any], staged: Mapping[str, Path]) -> list[Iss
             bad("url", "Give an https:// link to the dataset file.")
     else:
         bad("source", "`source` must be hub or remote.")
+    config = inputs.get("config")
+    if config is not None and (
+        source != "hub" or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", text(config) or "")
+    ):
+        bad("config", "Name a Hub dataset configuration.")
+    if inputs.get("split") is not None and (source != "hub" or inputs["split"] not in SPLITS):
+        bad("split", "Choose train, validation or test for a Hub dataset.")
+    for name in ("endpoint", "allow_private_hosts"):
+        if name in inputs:
+            bad(name, "The download policy is set by the runtime.")
     token_env = inputs.get("token_env")
-    if token_env is not None and not _TOKEN_ENV.match(text(token_env) or ""):
+    if token_env is not None and (source != "hub" or not _TOKEN_ENV.match(text(token_env) or "")):
         bad("token_env", "`token_env` must name a granted credential (MRL_CREDENTIAL_…).")
     return issues
 
 
 def _hub(ctx: TaskContext, fetch: Fetcher, out: Path) -> Iterator[TaskEvent]:
-    endpoint = (text(ctx.inputs.get("endpoint")) or HUB).rstrip("/")
+    endpoint = HUB.rstrip("/")
     repo = str(ctx.inputs["repo"])
     revision = str(ctx.inputs.get("revision", "main"))
     quoted = urllib.parse.quote(revision, safe="")
@@ -210,10 +280,19 @@ def _hub(ctx: TaskContext, fetch: Fetcher, out: Path) -> Iterator[TaskEvent]:
     if not _SHA.match(sha):
         raise _refused(f"the Hub did not give a commit for {repo}@{revision}")
     names = [text((obj(s) or {}).get("rfilename")) or "" for s in arr(info.get("siblings")) or []]
-    chosen = sorted(n for n in names if n and wanted(n))
+    metadata = {"dataset_infos.json", "dataset_info.json", "state.json"}
+    chosen = sorted(safe_name(n) for n in names if n and wanted(n) and Path(n).name not in metadata)
+    config = ctx.inputs.get("config")
+    if config:
+        scoped = [n for n in chosen if PurePosixPath(n).parts[0] == config]
+        if scoped or config != "default":
+            chosen = scoped
+    split = ctx.inputs.get("split")
+    if split:
+        chosen = [n for n in chosen if source_split(n) == split]
     if not chosen:
         raise _refused(f"{repo}@{sha} has no data files")
-    limit = _int(ctx.inputs, "max_files", MAX_FILES)
+    limit = min(_int(ctx.inputs, "max_files", MAX_FILES), MAX_FILES)
     if len(chosen) > limit:
         raise _refused(f"{repo} has {len(chosen)} data files; the limit is {limit}")
     files: list[dict[str, Any]] = []
@@ -245,9 +324,9 @@ def _write(out: Path, doc: dict[str, Any]) -> None:
 def _run(ctx: TaskContext) -> Iterator[TaskEvent]:
     token_env = text(ctx.inputs.get("token_env"))
     fetch = Fetcher(
-        Policy(allow_private=ctx.inputs.get("allow_private_hosts") is True),
-        os.environ.get(token_env) if token_env else None,
-        _int(ctx.inputs, "max_bytes", MAX_BYTES),
+        Policy(),
+        os.environ.get(token_env) if token_env and ctx.inputs.get("source") == "hub" else None,
+        min(_int(ctx.inputs, "max_bytes", MAX_BYTES), MAX_BYTES),
         ctx.cancelled,
     )
     out = ctx.output_dir

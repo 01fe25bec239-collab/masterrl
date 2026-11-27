@@ -56,3 +56,56 @@ impl RegistryRecords for DatasetRecords {
         }))
     }
 }
+
+/// Registers dataset version visibility with the served lineage graph.
+pub fn register_lineage(store: &crate::modules::artifacts::ArtifactStore) {
+    store.add_lineage_lookup(
+        "dsv",
+        std::sync::Arc::new(DatasetRecords::new(store.db().clone())),
+    );
+}
+
+#[async_trait]
+impl crate::modules::artifacts::NodeLookup for DatasetRecords {
+    async fn find(
+        &self,
+        org: &str,
+        id: uuid::Uuid,
+    ) -> Result<Option<(&'static str, crate::seams::Resource)>, crate::modules::artifacts::Error>
+    {
+        let Some(row) = lineage_version(&self.db, id).await? else {
+            return Ok(None);
+        };
+        if crate::modules::checkpoints::service::storage_org(row.org_id) != org {
+            return Ok(None);
+        }
+        Ok(Some((
+            "datasets.read",
+            crate::modules::jobs::scope::resource(
+                "dataset",
+                Some(mrl_domain::ids::DatasetId::from_uuid(row.dataset_id).to_string()),
+                row.org_id,
+                row.project_id,
+            ),
+        )))
+    }
+}
+
+/// Storage org that contains the dataset version's lineage edges.
+pub(crate) async fn lineage_org(
+    store: &crate::modules::artifacts::ArtifactStore,
+    id: uuid::Uuid,
+) -> Result<Option<String>, crate::modules::artifacts::Error> {
+    Ok(lineage_version(store.db(), id)
+        .await?
+        .map(|row| crate::modules::checkpoints::service::storage_org(row.org_id)))
+}
+
+async fn lineage_version(
+    db: &Db,
+    id: uuid::Uuid,
+) -> Result<Option<super::store::VersionRow>, crate::modules::artifacts::Error> {
+    super::store::version(db, id).await.map_err(|error| {
+        crate::modules::artifacts::Error::from(SeamError::new("datasets", error.to_string()))
+    })
+}

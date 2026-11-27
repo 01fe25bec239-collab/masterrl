@@ -3690,12 +3690,20 @@ components:
       - size
       - sha256
       - url
+      - headers
       - expires_at
       properties:
         expires_at:
           type: string
           format: date-time
           description: When the link stops working.
+        headers:
+          type: object
+          description: Headers required by the download URL.
+          additionalProperties:
+            type: string
+          propertyNames:
+            type: string
         path:
           type: string
           description: Path inside the export.
@@ -3709,7 +3717,7 @@ components:
           minimum: 0
         url:
           type: string
-          description: Download link (relative to the server), valid until `expires_at`.
+          description: Download URL, valid until `expires_at`.
     DatasetExportRequest:
       type: object
       description: '`POST /dataset-versions/{dsv}:export`.'

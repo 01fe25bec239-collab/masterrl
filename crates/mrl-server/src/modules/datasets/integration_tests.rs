@@ -9,10 +9,13 @@ use crate::pg::TestDb;
 use crate::supabase::core::{config, Auth, CoreServer};
 use crate::supabase::{MockSupabase, MockUser};
 use axum::http::Method;
-use mrl_domain::ids::{DatasetId, DatasetVersionId, OrgId, ProjectId, UserId, WorkspaceId};
+use mrl_domain::ids::{
+    ArtifactId, DatasetId, DatasetVersionId, OrgId, ProjectId, UserId, WorkspaceId,
+};
 use mrl_domain::rbac::Role;
 use mrl_server::config::Mode;
 use mrl_server::modules::artifacts::{ArtifactStore, ArtifactsModule};
+use mrl_server::modules::audit::PgAuditSink;
 use mrl_server::modules::checkpoints::service::storage_org;
 use mrl_server::modules::datasets::launch::DatasetInputs;
 use mrl_server::modules::datasets::records::DatasetRecords;
@@ -235,9 +238,14 @@ impl Env {
             .await
             .unwrap();
         let mut tx = self.core.db.db().begin().await.unwrap();
-        let changed = store::record_version(&mut tx, version, &checked)
-            .await
-            .unwrap();
+        let changed = store::record_version(
+            &mut tx,
+            &PgAuditSink::new(self.core.db.db().clone()),
+            version,
+            &checked,
+        )
+        .await
+        .unwrap();
         tx.commit().await.unwrap();
         (checked, changed)
     }
@@ -416,7 +424,14 @@ async fn job_outputs_make_a_ready_version_once_and_the_same_bytes_the_same_hash(
     assert!(changed);
     // A replayed decision changes nothing.
     let mut tx = env.core.db.db().begin().await.unwrap();
-    assert!(!store::record_version(&mut tx, v, &checked).await.unwrap());
+    assert!(!store::record_version(
+        &mut tx,
+        &PgAuditSink::new(env.core.db.db().clone()),
+        v,
+        &checked
+    )
+    .await
+    .unwrap());
     tx.commit().await.unwrap();
 
     let (s, got) = env
@@ -550,6 +565,32 @@ async fn invalid_or_broken_outputs_record_a_reason() {
         );
     }
 
+    let mut duplicated = env.publish("ready").await;
+    let mut summary: Value =
+        serde_json::from_slice(&std::fs::read(fixture("ready/dataset.json")).unwrap()).unwrap();
+    let shard = summary["shards"][0].clone();
+    summary["shards"].as_array_mut().unwrap().push(shard);
+    let body = serde_json::to_vec(&summary).unwrap();
+    let hash = mrl_storage::sha256_hex(&body);
+    let storage = env.store.org_store(&env.org.to_string()).await.unwrap();
+    let bytes = body.len();
+    storage
+        .put(&storage.keys().blob(&hash).unwrap(), body.into())
+        .await
+        .unwrap();
+    let entry = duplicated["files"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|f| f["path"] == "dataset.json")
+        .unwrap();
+    entry["sha256"] = json!(hash);
+    entry["size"] = json!(bytes);
+    let pending = env.pending(&ds, None).await;
+    let (checked, _) = env.decide(pending, &duplicated).await;
+    assert!(matches!(checked, Checked::Invalid {code, reason, ..}
+        if code == "MRL-DATA-273" && reason.contains("listed twice")));
+
     // Outputs whose files don't match their list are MRL-DATA-273, not READY.
     let mut tampered = env.publish("ready").await;
     for f in tampered["files"].as_array_mut().unwrap() {
@@ -673,6 +714,20 @@ async fn records_page_and_filter_and_a_transform_diffs_against_its_parent() {
     .await
     .unwrap();
     assert_eq!(edge, 1);
+    let (status, graph) = env
+        .call(
+            &env.owner,
+            Method::GET,
+            &format!("/lineage/{}", dsv(child)),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{graph}");
+    assert!(graph["edges"].as_array().unwrap().contains(&json!({
+        "from": dsv(child),
+        "to": dsv(parent),
+        "relation": "derived_from"
+    })));
 
     let (s, diff) = env
         .call(
@@ -776,6 +831,37 @@ async fn exports_hand_out_shard_links_unless_the_data_is_restricted() {
         )
         .await;
     assert_eq!(s, 403);
+    let artifact: Uuid =
+        sqlx::query_scalar("SELECT artifact_id FROM dataset_versions WHERE id = $1")
+            .bind(v)
+            .fetch_one(env.core.db.pool())
+            .await
+            .unwrap();
+    let manifest = env.publish("ready").await;
+    sqlx::query(
+        "INSERT INTO artifacts (id, org_id, project_id, name, kind, prefix, manifest, size_bytes,
+                                state, created_by, committed_at)
+         VALUES ($1, $2, $3, 'internal-dataset-output', 'dataset', $4, $5, 0,
+                 'COMMITTED', 'system', now())",
+    )
+    .bind(artifact)
+    .bind(env.org.to_string())
+    .bind(env.prj.to_string())
+    .bind(format!("orgs/{}/artifacts/{artifact}/", env.org))
+    .bind(manifest)
+    .execute(env.core.db.pool())
+    .await
+    .unwrap();
+    let (status, _) = env
+        .call(
+            &env.viewer,
+            Method::POST,
+            &format!("/artifacts/{}:download", ArtifactId::from_uuid(artifact)),
+            Some(json!({"path": "shards/train-00000.parquet"})),
+        )
+        .await;
+    assert_eq!(status, 404);
+
     // Restricted personal data never leaves: MRL-PERM-270.
     let (s, _) = env
         .call(
@@ -959,4 +1045,80 @@ async fn a_run_stages_each_dataset_version_as_one_checked_folder() {
         matches!(err, LaunchError::Fail(_, ref m) if m.contains("no longer ready")),
         "{err:?}"
     );
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn dataset_posts_apply_current_permissions_and_create_replays_durably() {
+    let env = Env::start().await;
+    let path = format!("/api/v1/projects/{}/datasets", env.prj);
+    let headers = &[("Idempotency-Key", "dataset-post-test")];
+    let post = |path: String, body: Value| {
+        let core = &env.core;
+        let owner = &env.owner;
+        async move {
+            core.call_with(Method::POST, &path, owner, Some(body), headers)
+                .await
+        }
+    };
+    let meta = json!({"name": "replayed"});
+    let r = post(path.clone(), meta.clone()).await;
+    assert_eq!(r.status, 201, "{}", r.text());
+    let ds = r.json()["id"].as_str().unwrap().to_owned();
+    let replay = post(path.clone(), meta.clone()).await;
+    assert_eq!(replay.status, 201, "{}", replay.text());
+    assert_eq!(r.json(), replay.json());
+    assert_eq!(
+        post(path.clone(), json!({"name": "different"}))
+            .await
+            .status,
+        422
+    );
+
+    let version = dsv(env.ready(&ds, "ready", None).await);
+    let diff_path = format!("/api/v1/dataset-versions/{version}:diff");
+    let diff = json!({"against": version});
+    let get_diff = || {
+        env.core.call_with(
+            Method::POST,
+            &diff_path,
+            &env.owner,
+            Some(diff.clone()),
+            &[("Idempotency-Key", "diff-test")],
+        )
+    };
+    assert_eq!(get_diff().await.status, 200);
+    let export_path = format!("/api/v1/dataset-versions/{version}:export");
+    let export = || {
+        env.core.call_with(
+            Method::POST,
+            &export_path,
+            &env.owner,
+            Some(json!({"format":"parquet"})),
+            &[("Idempotency-Key", "export-test")],
+        )
+    };
+    assert_eq!(export().await.status, 200);
+
+    let user: Uuid = sqlx::query_scalar(
+        "DELETE FROM role_bindings WHERE org_id = $1 AND role = 'owner' RETURNING principal_id",
+    )
+    .bind(env.org.as_uuid())
+    .fetch_one(env.core.db.pool())
+    .await
+    .unwrap();
+    let mut tx = env.core.db.db().begin().await.unwrap();
+    bind_role(
+        &mut tx,
+        env.org,
+        UserId::from_uuid(user),
+        Role::Viewer,
+        Scope::Project(env.side),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(get_diff().await.status, 404);
+    assert_eq!(export().await.status, 404);
+    assert_eq!(post(path, meta).await.status, 404);
 }
