@@ -35,9 +35,11 @@ class _Hub(http.server.BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         _Hub.seen_auth.append(self.headers.get("Authorization"))
         if self.path.startswith("/api/datasets/acme/qa/revision/"):
-            sib = [{"rfilename": n} for n in [*FILES, "../evil.jsonl"]][
-                : len(FILES) if "main" in self.path else len(FILES) + 1
+            sib: list[dict[str, Any]] = [{"rfilename": n} for n in [*FILES, "../evil.jsonl"]][
+                : len(FILES) if "v2" not in self.path else len(FILES) + 1
             ]
+            if "bad-sha" in self.path:
+                sib[0]["lfs"] = {"sha256": "0" * 64}
             return self._send(json.dumps({"sha": SHA, "siblings": sib}).encode())
         if self.path == "/short.jsonl":
             self.send_response(200)
@@ -140,6 +142,13 @@ def test_interrupted_response_never_publishes_partial_file(tmp_path: Path, hub: 
         _run(tmp_path, {"source": "remote", "url": f"{hub}/short.jsonl"})
     assert not (tmp_path / "outputs/import.json").exists()
     assert not (tmp_path / "outputs/files/short.jsonl").exists()
+
+
+@pytest.mark.usefixtures("mirror")
+def test_hub_files_must_match_the_upstream_digest(tmp_path: Path) -> None:
+    with pytest.raises(MrlError, match="does not match"):
+        _run(tmp_path, {"source": "hub", "repo": "acme/qa", "revision": "bad-sha"})
+    assert not (tmp_path / "outputs/import.json").exists()
 
 
 def test_private_addresses_and_plain_http_are_refused(tmp_path: Path, hub: str) -> None:

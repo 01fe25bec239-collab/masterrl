@@ -54,6 +54,7 @@ _REPO = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$")
 _REVISION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$")
 _TOKEN_ENV = re.compile(r"^MRL_CREDENTIAL_[A-Z0-9_]{1,64}$")
 _SHA = re.compile(r"^[0-9a-f]{40}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
 def _refused(why: str) -> MrlError:
@@ -171,15 +172,18 @@ class Fetcher:
 
     def json(self, url: str) -> object:
         with self._open(url) as resp:
+            expected: int | None = resp.length
             body = resp.read(16 * 1024 * 1024 + 1)
         if len(body) > 16 * 1024 * 1024:
             raise _refused(f"{url} answered with too much data")
+        if expected is not None and len(body) != expected:
+            raise _refused("the Hub metadata download ended early") from ConnectionError()
         try:
             return json.loads(body)
         except ValueError as exc:
             raise _refused(f"{url} did not answer with JSON") from exc
 
-    def download(self, url: str, dest: Path) -> tuple[int, str]:
+    def download(self, url: str, dest: Path, expected_sha256: str | None = None) -> tuple[int, str]:
         dest.parent.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256()
         size = 0
@@ -199,6 +203,8 @@ class Fetcher:
                         f.write(chunk)
                 if expected is not None and size != expected:
                     raise ConnectionError(f"the download ended after {size} of {expected} bytes")
+                if expected_sha256 is not None and digest.hexdigest() != expected_sha256:
+                    raise ConnectionError(f"{dest.name} does not match the Hub's file hash")
             except Exception as exc:
                 dest.unlink()
                 if isinstance(exc, http.client.IncompleteRead):
@@ -275,13 +281,20 @@ def _hub(ctx: TaskContext, fetch: Fetcher, out: Path) -> Iterator[TaskEvent]:
     repo = str(ctx.inputs["repo"])
     revision = str(ctx.inputs.get("revision", "main"))
     quoted = urllib.parse.quote(revision, safe="")
-    info = obj(fetch.json(f"{endpoint}/api/datasets/{repo}/revision/{quoted}")) or {}
+    info = obj(fetch.json(f"{endpoint}/api/datasets/{repo}/revision/{quoted}?blobs=true")) or {}
     sha = text(info.get("sha")) or ""
     if not _SHA.match(sha):
         raise _refused(f"the Hub did not give a commit for {repo}@{revision}")
-    names = [text((obj(s) or {}).get("rfilename")) or "" for s in arr(info.get("siblings")) or []]
     metadata = {"dataset_infos.json", "dataset_info.json", "state.json"}
-    chosen = sorted(safe_name(n) for n in names if n and wanted(n) and Path(n).name not in metadata)
+    hashes: dict[str, str | None] = {}
+    for raw in arr(info.get("siblings")) or []:
+        sibling = obj(raw) or {}
+        name = text(sibling.get("rfilename"))
+        if name and wanted(name) and PurePosixPath(name).name not in metadata:
+            lfs = obj(sibling.get("lfs")) or {}
+            sha256 = text(lfs.get("sha256"))
+            hashes[safe_name(name)] = sha256 if sha256 and _SHA256.fullmatch(sha256) else None
+    chosen = sorted(hashes)
     config = ctx.inputs.get("config")
     if config:
         scoped = [n for n in chosen if PurePosixPath(n).parts[0] == config]
@@ -299,7 +312,7 @@ def _hub(ctx: TaskContext, fetch: Fetcher, out: Path) -> Iterator[TaskEvent]:
     for i, name in enumerate(chosen, 1):
         rel = safe_name(name)
         url = f"{endpoint}/datasets/{repo}/resolve/{sha}/{urllib.parse.quote(rel)}"
-        size, digest = fetch.download(url, out / FILES_DIR / rel)
+        size, digest = fetch.download(url, out / FILES_DIR / rel, hashes[name])
         files.append({"path": rel, "size": size, "sha256": digest})
         yield Progress(step=i, total_steps=len(chosen), phase="download")
     _write(out, {"source": "hub", "repo": repo, "revision": revision, "sha": sha, "files": files})
