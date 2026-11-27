@@ -166,11 +166,31 @@ pub async fn check(
         preset: None,
         checked: "l0".into(),
     };
+    let mut spec = JobSpec {
+        org_id: org,
+        project_id: project,
+        kind: serde_json::to_value(sub.kind)
+            .ok()
+            .and_then(|k| k.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "TRAIN".into()),
+        algorithm_id: sub.algorithm_id.clone(),
+        base_model_version_id: sub.base_model_version_id.as_uuid(),
+        reward_version_id: sub.reward_version_id.map(|r| r.as_uuid()),
+        dataset_version_ids: sub
+            .dataset_version_ids
+            .iter()
+            .map(|d| d.as_uuid())
+            .collect(),
+        resolved: sub.config.clone(),
+        resources: resources.clone(),
+        max_runtime_seconds: sub.max_runtime_seconds,
+    };
+    let picker = Some((ctx.capability.as_ref(), &spec));
     let Resolved {
         config,
         method,
         preset,
-    } = match resolve::resolve(&ctx.db, Some(&sub.algorithm_id), &sub.config).await {
+    } = match resolve::resolve(&ctx.db, Some(&sub.algorithm_id), &sub.config, picker).await {
         Ok(r) => r,
         Err(ResolveError::Invalid(fields)) => {
             let issues = fields
@@ -191,25 +211,7 @@ pub async fn check(
         }
         Err(ResolveError::Seam(s)) => return Err(JobsError::Seam(s)),
     };
-    let spec = JobSpec {
-        org_id: org,
-        project_id: project,
-        kind: serde_json::to_value(sub.kind)
-            .ok()
-            .and_then(|k| k.as_str().map(str::to_owned))
-            .unwrap_or_else(|| "TRAIN".into()),
-        algorithm_id: sub.algorithm_id.clone(),
-        base_model_version_id: sub.base_model_version_id.as_uuid(),
-        reward_version_id: sub.reward_version_id.map(|r| r.as_uuid()),
-        dataset_version_ids: sub
-            .dataset_version_ids
-            .iter()
-            .map(|d| d.as_uuid())
-            .collect(),
-        resolved: config.clone(),
-        resources: resources.clone(),
-        max_runtime_seconds: sub.max_runtime_seconds,
-    };
+    spec.resolved = config.clone();
     let engine = match ctx.chains.validate(&spec).await? {
         Validation::Accepted(engine) => engine,
         Validation::Rejected(problems) => {
@@ -250,6 +252,7 @@ pub async fn check(
     let mut checked = "l0";
     let mut ok = true;
     let mut estimate = RunEstimate::unknown("No machine checked these settings.");
+    let mut estimate_id = None;
     let all = preflight::machines(&ctx.db, org, None).await?;
     let eligible: Vec<NodeId> = all
         .iter()
@@ -334,6 +337,7 @@ pub async fn check(
                     }
                     let row = if worker_ok { estimates::ready(&ctx.db, id).await? } else { None };
                     if let Some(row) = row {
+                        estimate_id = Some(row.id);
                         let cal = estimates::calibration(&ctx.db, &row.calibration_key).await?;
                         estimate = RunEstimate::of(&row, cal);
                     }
@@ -377,6 +381,10 @@ pub async fn check(
             adjusted = config;
             pre.changes.clear();
             pre.message = "The fit is tight. The automatic changes did not pass validation.".into();
+        } else if let Some(id) = estimate_id {
+            // Submitting `resolved_config` as is finds this estimate.
+            estimates::mark_adjusted(&ctx.db, id, &estimates::inputs_sha256(&adjusted_spec))
+                .await?;
         }
     }
     estimate.verdict = pre.verdict;

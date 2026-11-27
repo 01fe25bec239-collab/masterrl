@@ -124,6 +124,16 @@ impl SubmissionConfig {
     }
 }
 
+// ponytail: one copy per process, set by the last module built. The submit chains are built
+// from the database alone (P17), so the resolver and the Guardian read `[submission]` here;
+// production runs one server per process.
+static SETTINGS: std::sync::RwLock<Option<SubmissionConfig>> = std::sync::RwLock::new(None);
+
+/// This process's `[submission]` settings (the defaults until the module is built).
+pub fn settings() -> SubmissionConfig {
+    SETTINGS.read().ok().and_then(|s| *s).unwrap_or_default()
+}
+
 /// What the handlers share.
 #[derive(Clone)]
 pub struct Ctx {
@@ -131,6 +141,8 @@ pub struct Ctx {
     pub db: Db,
     /// The validator chain (the same one submit uses).
     pub chains: Chains,
+    /// P24's engine pick, for resolving a config that names no engine.
+    pub capability: Arc<crate::modules::engines::CapabilityValidator>,
     /// Which org owns a project.
     pub projects: Projects,
     /// Settings.
@@ -167,6 +179,9 @@ impl SubmissionModule {
         lanes: &LaneRouter,
         observers: &MetricObservers,
     ) -> Self {
+        if let Ok(mut s) = SETTINGS.write() {
+            *s = Some(config);
+        }
         lanes.register(Arc::new(probe::PreparedSink::new(db.clone())));
         observers.register(Arc::new(ProbeModeGuard::new(
             db.clone(),
@@ -175,6 +190,9 @@ impl SubmissionModule {
         )));
         Self {
             ctx: Ctx {
+                capability: Arc::new(crate::modules::engines::CapabilityValidator::new(
+                    db.clone(),
+                )),
                 db,
                 chains,
                 projects,

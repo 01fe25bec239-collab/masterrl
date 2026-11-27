@@ -159,6 +159,8 @@ pub struct EstimateRow {
     pub wall: Option<(f64, f64)>,
     /// What the range assumes.
     pub assumptions: Vec<String>,
+    /// Found through the fingerprint of its adjusted config: the safety settings are in.
+    pub adjusted: bool,
 }
 
 fn row_to_estimate(r: &sqlx::postgres::PgRow) -> Result<EstimateRow, sqlx::Error> {
@@ -180,6 +182,7 @@ fn row_to_estimate(r: &sqlx::postgres::PgRow) -> Result<EstimateRow, sqlx::Error
             .flatten()
             .filter_map(|a| a.as_str().map(str::to_owned))
             .collect(),
+        adjusted: r.try_get("via_adjusted")?,
     })
 }
 
@@ -250,7 +253,8 @@ async fn saved_inputs(
     .map(JobSpec::from))
 }
 
-/// Looks up the current matching estimate for a saved run.
+/// The newest estimate matching a saved run's inputs (its config as saved, safety settings
+/// included: see [`mark_adjusted`]).
 pub(crate) async fn estimate_for_run(
     conn: &mut sqlx::PgConnection,
     run: Uuid,
@@ -261,7 +265,8 @@ pub(crate) async fn estimate_for_run(
     latest_on(conn, spec.org_id, spec.project_id, &inputs_sha256(&spec)).await
 }
 
-/// The newest answered estimate of this exact resolved config in the project.
+/// The newest answered estimate of these exact inputs in the project, also found through the
+/// fingerprint of its adjusted config ([`mark_adjusted`]).
 pub async fn latest(
     db: &Db,
     org: Uuid,
@@ -280,8 +285,9 @@ async fn latest_on<'a>(
     let row = sqlx::query(concat!(
         "SELECT ",
         estimate_cols!(),
-        " FROM resource_estimates
-         WHERE org_id = $1 AND project_id = $2 AND inputs_sha256 = $3 AND state = 'READY'
+        ", inputs_sha256 <> $3 AS via_adjusted FROM resource_estimates
+         WHERE org_id = $1 AND project_id = $2 AND state = 'READY'
+           AND (inputs_sha256 = $3 OR adjusted_sha256 = $3)
            AND ok IS TRUE AND gpu_mem_hi_gib > 0
          ORDER BY decided_at DESC, id DESC LIMIT 1"
     ))
@@ -298,12 +304,24 @@ pub async fn ready(db: &Db, id: Uuid) -> Result<Option<EstimateRow>, sqlx::Error
     let row = sqlx::query(concat!(
         "SELECT ",
         estimate_cols!(),
-        " FROM resource_estimates WHERE id = $1 AND state = 'READY'"
+        ", false AS via_adjusted FROM resource_estimates WHERE id = $1 AND state = 'READY'"
     ))
     .bind(id)
     .fetch_optional(db.pool())
     .await?;
     row.as_ref().map(row_to_estimate).transpose()
+}
+
+/// Lets `sha` (the inputs with estimate `id`'s safety settings applied) find that estimate.
+pub async fn mark_adjusted(db: &Db, id: Uuid, sha: &[u8]) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE resource_estimates SET adjusted_sha256 = $2 WHERE id = $1 AND state = 'READY'",
+    )
+    .bind(id)
+    .bind(sha)
+    .execute(db.pool())
+    .await?;
+    Ok(())
 }
 
 /// The calibration of `key` (empty when none).

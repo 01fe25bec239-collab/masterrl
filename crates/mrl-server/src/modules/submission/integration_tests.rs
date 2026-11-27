@@ -317,7 +317,10 @@ impl World {
                 Arc::new(Guardian::new(d.clone())),
             ],
             vec![Arc::new(ProbeVerifier)],
-            vec![Arc::new(Presets::new(d.clone()))],
+            vec![Arc::new(Presets::with_capability(
+                d.clone(),
+                CapabilityValidator::with_records(d.clone(), fixture.records()),
+            ))],
         );
         let pipeline = Pipeline::new(
             vec![
@@ -1352,4 +1355,103 @@ async fn audit_failure_rolls_back_probe_creation_and_train_requires_a_run_or_pro
     assert!((500..600).contains(&response.status), "{}", response.text());
     assert_eq!(w.count("SELECT count(*) FROM jobs").await, 0);
     assert_eq!(w.count("SELECT count(*) FROM resource_estimates").await, 0);
+}
+
+async fn submit(w: &World, body: Value, key: &str) -> (Value, Value, Option<Uuid>) {
+    let r = w
+        .call_with(
+            Method::POST,
+            &format!("/api/v1/projects/{}/runs", w.project),
+            body,
+            &[("idempotency-key", key)],
+        )
+        .await;
+    assert_eq!(r.status, 201, "{}", r.text());
+    let run = RunId::from_str(r.json()["id"].as_str().unwrap()).unwrap();
+    let (resolved, estimate): (Value, Option<Uuid>) =
+        sqlx::query_as("SELECT resolved, estimate_id FROM run_configs WHERE run_id = $1")
+            .bind(run.as_uuid())
+            .fetch_one(w.pool())
+            .await
+            .unwrap();
+    (r.json(), resolved, estimate)
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn submit_applies_method_defaults_and_tight_safety_settings() {
+    let w = World::start(60).await;
+    let f = w.fixture;
+    // 9 GiB, 10 % kept free: 8.1 usable. 6–9 GiB expected 7.5: tight.
+    let m = w.machine(9, Answer::Estimate(6.0, 9.0)).await;
+    let v = w.validate(sft(&f, &[m.node])).await;
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["estimate"]["verdict"], "tight", "{v}");
+    assert!(codes(&v).contains(&"MRL-CAP-284".to_owned()), "{v}");
+    assert_eq!(
+        v["resolved_config"]["engine"]["gradient_checkpointing"],
+        true
+    );
+    assert_eq!(
+        v["resolved_config"]["common"]["precision"], "auto",
+        "common defaults"
+    );
+    let estimate: Uuid = v["estimate"]["estimate_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    // The raw submission (preset only): the resolver finds the estimate, applies the same
+    // safety settings, links the estimate and records the change.
+    let (run, resolved, linked) = submit(&w, sft(&f, &[m.node]), "raw").await;
+    assert_ne!(run["state"], "REJECTED", "{run}");
+    assert_eq!(
+        resolved, v["resolved_config"],
+        "the same config validate returned"
+    );
+    assert_eq!(linked, Some(estimate));
+    assert_eq!(
+        w.count("SELECT count(*) FROM audit_events WHERE action = 'submission.safety_settings'")
+            .await,
+        1
+    );
+
+    // Validate's resolved_config as is: the same estimate, the settings not applied twice.
+    let mut adjusted = sft(&f, &[m.node]);
+    adjusted["config"] = v["resolved_config"].clone();
+    let (run, resolved, linked) = submit(&w, adjusted, "adjusted").await;
+    assert_ne!(run["state"], "REJECTED", "{run}");
+    assert_eq!(resolved, v["resolved_config"]);
+    assert_eq!(linked, Some(estimate));
+    assert_eq!(
+        w.count("SELECT count(*) FROM audit_events WHERE action = 'submission.safety_settings'")
+            .await,
+        1
+    );
+    let resources = w
+        .call(
+            Method::GET,
+            &format!("/api/v1/runs/{}/resources", run["id"].as_str().unwrap()),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(resources.status, 200, "{}", resources.text());
+    assert_eq!(
+        resources.json()["estimate"]["estimate_id"],
+        estimate.to_string()
+    );
+
+    // No preset: the method's defaults still apply at submit, and P24 accepts them.
+    let mut plain = sft(&f, &[m.node]);
+    plain["config"] = json!({"common": {"update": {"strategy": "lora"}}});
+    let (run, resolved, linked) = submit(&w, plain, "plain").await;
+    assert_ne!(run["state"], "REJECTED", "{run}");
+    assert_eq!(resolved["common"]["precision"], "auto", "{resolved}");
+    assert_eq!(resolved["engine"]["logging_steps"], 10, "{resolved}");
+    assert!(resolved["common"]["engine"]
+        .as_str()
+        .unwrap()
+        .starts_with("trl@"));
+    assert_eq!(linked, None, "no estimate of this config yet");
 }
