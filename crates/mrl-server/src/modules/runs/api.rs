@@ -715,6 +715,7 @@ pub async fn submit(
             .iter()
             .map(|d| d.as_uuid())
             .collect(),
+        reward_version_id: sub.reward_version_id.map(|r| r.as_uuid()),
         parent_checkpoint_id: sub.parent_checkpoint_id.map(|c| c.as_uuid()),
         resources: sub.resources.clone().unwrap_or_else(default_resources),
         estimate_id: None,
@@ -734,7 +735,7 @@ pub async fn submit(
         kind: sub.kind.as_str().to_owned(),
         algorithm_id: sub.algorithm_id.clone(),
         base_model_version_id: sub.base_model_version_id.as_uuid(),
-        reward_version_id: sub.reward_version_id.map(|r| r.as_uuid()),
+        reward_version_id: scope.reward_version_id,
         dataset_version_ids: scope.dataset_version_ids.clone(),
         resolved: resolved.clone(),
         resources: resources.clone(),
