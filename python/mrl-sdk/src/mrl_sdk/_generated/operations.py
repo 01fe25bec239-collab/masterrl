@@ -249,6 +249,14 @@ OPERATIONS: dict[str, Operation] = {
         (),
         False,
     ),
+    "export_model_version": Operation(
+        "POST",
+        "/api/v1/model-versions/{mv}:export",
+        ("mv",),
+        (),
+        (),
+        True,
+    ),
     "get_algorithm_schema": Operation(
         "GET",
         "/api/v1/algorithms/{algo}/schema",
@@ -406,6 +414,14 @@ OPERATIONS: dict[str, Operation] = {
         (),
         (),
         False,
+    ),
+    "import_model": Operation(
+        "POST",
+        "/api/v1/projects/{prj}/models:import",
+        ("prj",),
+        (),
+        (),
+        True,
     ),
     "list": Operation(
         "GET",
@@ -674,6 +690,14 @@ OPERATIONS: dict[str, Operation] = {
         (),
         False,
     ),
+    "merge_model_adapter": Operation(
+        "POST",
+        "/api/v1/model-versions/{mv}:merge-adapter",
+        ("mv",),
+        (),
+        (),
+        True,
+    ),
     "open_stream": Operation(
         "GET",
         "/api/v1/streams",
@@ -689,6 +713,14 @@ OPERATIONS: dict[str, Operation] = {
         (),
         (),
         True,
+    ),
+    "promote_checkpoint": Operation(
+        "POST",
+        "/api/v1/checkpoints/{ckpt}:promote",
+        ("ckpt",),
+        (),
+        (),
+        False,
     ),
     "push": Operation(
         "POST",

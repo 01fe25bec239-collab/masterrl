@@ -1,18 +1,21 @@
 //! Recording what a model job produced: the version becomes READY with its inspection, files,
-//! weights hash and compatibility, or INVALID with the reason (the job's completion verifier
-//! calls [`record`] once the job's outputs are registered as an artifact).
+//! weights hash and compatibility, or INVALID with the reason. [`ModelOutputs`] (completion
+//! chain) calls [`record`] once INT-6 registered the job's outputs as an artifact;
+//! [`ModelJobEnds`] (event consumer) marks the version INVALID when its job fails, is
+//! cancelled or rejected. Export jobs get their `exported_as` lineage edge.
 //!
 //! The job's `outputs/` hold `inspection.json` (P15's `ModelInspection` without the tensor
-//! list, plus `license` and `source`) and, for jobs that fetch or build weights, the model
-//! files under `model/`. Versions whose files are known up front (uploads, promoted
-//! checkpoints) keep those.
+//! list, plus `license` and `source`) and the model files under `model/`. Every model job
+//! writes the files (imports copy even staged ones), so a version's files are always objects
+//! of its job's output artifact: they outlive uploads and checkpoint retention.
 
 use super::codes;
 use super::gates;
 use super::store::{self, unhex, FileRow, VersionRow};
 use super::Models;
-use crate::db::{DbError, Tx};
-use crate::modules::jobs::{scope, Rejection, Verification};
+use crate::db::{Db, DbError, Tx};
+use crate::modules::events::{ConsumerError, Event, EventConsumer};
+use crate::modules::jobs::{scope, CompletionVerifier, JobRow, Rejection, Verification};
 use crate::modules::lineage::{LineageWriter, NodeRef, Relation};
 use crate::seams::SeamError;
 use mrl_domain::errors::ErrorCode;
@@ -36,6 +39,8 @@ pub struct Produced {
     pub artifact_id: Uuid,
     /// Its `artifact-manifest/v1` document.
     pub manifest: Value,
+    /// Its full object-key prefix (ends with `/`); a file's key is the prefix plus its path.
+    pub prefix: String,
 }
 
 fn seam(e: impl std::fmt::Display) -> SeamError {
@@ -117,13 +122,17 @@ pub async fn record(
     settle(models, &version, decided).await
 }
 
-/// Marks `version` INVALID because its job ended without results (failed or cancelled).
-pub async fn job_ended(models: &Models, job: Uuid, why: &str) -> Result<(), SeamError> {
-    if let Some(version) = store::version_of_job(&models.db, job).await.map_err(seam)? {
-        if version.state == "IMPORTING" {
-            settle(models, &version, Err(invalid(codes::UNREADABLE, why))).await?;
-        }
-    }
+/// Marks the version `job` builds INVALID (in `tx`) because the job ended without results;
+/// a settled version keeps its outcome.
+pub async fn job_ended(tx: &mut Tx, job: Uuid, why: &str) -> Result<(), DbError> {
+    sqlx::query(
+        "UPDATE model_versions SET state = 'INVALID', invalid_reason = $2
+          WHERE job_id = $1 AND state = 'IMPORTING'",
+    )
+    .bind(job)
+    .bind(json!({"code": codes::UNREADABLE.to_string(), "message": why}))
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -156,7 +165,12 @@ async fn read_report(
         .org_store(&storage_org(version.org_id))
         .await
         .map_err(seam)?;
-    let key = st.keys().blob(sha).map_err(seam)?;
+    let Ok(key) = st.keys().join(&produced.prefix, INSPECTION_FILE) else {
+        return Ok(Err(invalid(
+            codes::UNREADABLE,
+            "The job's outputs are not where they were registered.",
+        )));
+    };
     let bytes = st.get(&key).await.map_err(seam)?;
     if mrl_storage::sha256_hex(&bytes) != sha {
         return Ok(Err(invalid(
@@ -175,8 +189,6 @@ async fn read_report(
 /// What the version is, given its report: the READY update, or why it is INVALID.
 struct Ready {
     files: Vec<FileRow>,
-    /// The files came from the outputs (not recorded yet).
-    fresh: bool,
     report: Value,
     family: String,
     compatibility: Value,
@@ -224,7 +236,7 @@ async fn decide(
             "This is a LoRA adapter: import it with the READY base model version it was trained on.",
         )));
     }
-    let (files, fresh) = match files_of(models, version, produced, &report).await? {
+    let files = match files_of(models, version, produced, &report).await? {
         Ok(f) => f,
         Err(why) => return Ok(Err(why)),
     };
@@ -259,7 +271,6 @@ async fn decide(
     let compatibility = gates::compatibility(&models.db, &gates::facts(&probe)).await?;
     Ok(Ok(Ready {
         files,
-        fresh,
         report,
         family,
         compatibility,
@@ -267,66 +278,61 @@ async fn decide(
     }))
 }
 
-/// The files of the version: those recorded up front, else (`true`) the outputs under
-/// `model/`.
+/// The version's files: the outputs under `model/`.
 async fn files_of(
     models: &Models,
     version: &VersionRow,
     produced: &Produced,
     report: &Value,
-) -> Result<Result<(Vec<FileRow>, bool), Invalid>, SeamError> {
-    let known = store::files(&models.db, version.id).await.map_err(seam)?;
-    let fresh = known.is_empty();
-    let files = if fresh {
-        let roles: HashMap<&str, &str> = report["files"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|f| Some((f["path"].as_str()?, f["role"].as_str()?)))
-            .collect();
-        let st = models
-            .store
-            .org_store(&storage_org(version.org_id))
-            .await
-            .map_err(seam)?;
-        let mut out = Vec::new();
-        for f in produced.manifest["files"].as_array().into_iter().flatten() {
-            let Some(path) = f["path"].as_str().and_then(|p| p.strip_prefix(MODEL_DIR)) else {
-                continue;
-            };
-            let (Some(sha), Some(size)) = (f["sha256"].as_str(), f["size"].as_i64()) else {
-                return Ok(Err(invalid(
-                    codes::UNREADABLE,
-                    "The job's file list is damaged.",
-                )));
-            };
-            let (role, format) = store::classify(path, roles.get(path).copied());
-            out.push(FileRow {
-                path: path.to_owned(),
-                role,
-                object_key: st.keys().blob(sha).map_err(seam)?,
-                sha256: unhex(sha).ok_or_else(|| seam("bad sha256 in the outputs"))?,
-                size_bytes: size,
-                format,
-            });
-        }
-        out
-    } else {
-        known
+) -> Result<Result<Vec<FileRow>, Invalid>, SeamError> {
+    let roles: HashMap<&str, &str> = report["files"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|f| Some((f["path"].as_str()?, f["role"].as_str()?)))
+        .collect();
+    let st = models
+        .store
+        .org_store(&storage_org(version.org_id))
+        .await
+        .map_err(seam)?;
+    let damaged = || {
+        Ok(Err(invalid(
+            codes::UNREADABLE,
+            "The job's file list is damaged.",
+        )))
     };
-    if let Some(p) = files.iter().find(|f| {
-        let lower = f.path.to_ascii_lowercase();
-        PICKLE_SUFFIXES.iter().any(|s| lower.ends_with(s))
-    }) {
-        return Ok(Err(invalid(
-            codes::PICKLE_REFUSED,
-            format!(
-                "{} is a pickle file, which can run code when loaded.",
-                p.path
-            ),
-        )));
+    let mut files = Vec::new();
+    for f in produced.manifest["files"].as_array().into_iter().flatten() {
+        let Some(path) = f["path"].as_str().and_then(|p| p.strip_prefix(MODEL_DIR)) else {
+            continue;
+        };
+        let (Some(sha), Some(size), Ok(key)) = (
+            f["sha256"].as_str().and_then(unhex),
+            f["size"].as_i64(),
+            st.keys()
+                .join(&produced.prefix, &format!("{MODEL_DIR}{path}")),
+        ) else {
+            return damaged();
+        };
+        let lower = path.to_ascii_lowercase();
+        if PICKLE_SUFFIXES.iter().any(|s| lower.ends_with(s)) {
+            return Ok(Err(invalid(
+                codes::PICKLE_REFUSED,
+                format!("{path} is a pickle file, which can run code when loaded."),
+            )));
+        }
+        let (role, format) = store::classify(path, roles.get(path).copied());
+        files.push(FileRow {
+            path: path.to_owned(),
+            role,
+            object_key: key,
+            sha256: sha,
+            size_bytes: size,
+            format,
+        });
     }
-    Ok(Ok((files, fresh)))
+    Ok(Ok(files))
 }
 
 fn apply_facts(v: &mut VersionRow, report: &Value, kind: &str, family: &str) {
@@ -399,15 +405,12 @@ async fn settle(
 async fn write_ready(tx: &mut Tx, v: &VersionRow, ready: Ready) -> Result<(), DbError> {
     let Ready {
         files,
-        fresh,
         mut report,
         family,
         compatibility,
         license,
     } = ready;
-    if fresh {
-        store::insert_files(tx, v, &files).await?;
-    }
+    store::insert_files(tx, v, &files).await?;
     let mut row = v.clone();
     let kind = report["kind"].as_str().unwrap_or_default().to_owned();
     apply_facts(&mut row, &report, &kind, &family);
@@ -489,4 +492,141 @@ async fn link(tx: &mut Tx, v: &VersionRow) -> Result<(), DbError> {
         .await?;
     }
     Ok(())
+}
+
+// ponytail: chains are built from the database alone, so the verifier reaches storage through
+// the models module of this process (set once at startup by `ModelsModule::new`).
+static MODELS: std::sync::OnceLock<std::sync::Arc<Models>> = std::sync::OnceLock::new();
+
+/// Makes `models` the one [`ModelOutputs::new`] uses (first call wins).
+pub(crate) fn install(models: std::sync::Arc<Models>) {
+    let _ = MODELS.set(models);
+}
+
+/// Completion chain: vouches for model jobs (`import_model`, `merge_adapter`,
+/// `export_model`): waits for their registered outputs, records the version (see the module
+/// docs) or the export's lineage. Abstains for every other job.
+pub struct ModelOutputs {
+    db: Db,
+    models: Option<std::sync::Arc<Models>>,
+}
+
+impl ModelOutputs {
+    /// The verifier of this process's models module.
+    pub fn new(db: Db) -> Self {
+        Self { db, models: None }
+    }
+
+    /// The verifier for these models (tests).
+    pub fn with(models: std::sync::Arc<Models>) -> Self {
+        Self {
+            db: models.db.clone(),
+            models: Some(models),
+        }
+    }
+}
+
+/// The built-in tasks whose jobs P26 vouches for.
+const TASKS: [&str; 3] = ["import_model", "merge_adapter", "export_model"];
+
+#[async_trait::async_trait]
+impl CompletionVerifier for ModelOutputs {
+    fn name(&self) -> &'static str {
+        "model_outputs"
+    }
+
+    async fn verify(&self, job: &JobRow) -> Result<Verification, SeamError> {
+        let task: Option<String> =
+            sqlx::query_scalar("SELECT task FROM builtin_jobs WHERE job_id = $1")
+                .bind(job.id)
+                .fetch_optional(self.db.pool())
+                .await
+                .map_err(seam)?;
+        let Some(task) = task.filter(|t| TASKS.contains(&t.as_str())) else {
+            return Ok(Verification::Abstain);
+        };
+        let Some(models) = self.models.as_ref().or_else(|| MODELS.get()) else {
+            return Ok(Verification::RetryLater(
+                "the models module has not started".into(),
+            ));
+        };
+        let Some(out) = crate::modules::builtin::outputs(&self.db, job.org_id, job.id)
+            .await
+            .map_err(seam)?
+        else {
+            // INT-6's own verifier fails jobs whose outputs can't be saved.
+            return Ok(Verification::RetryLater(
+                "the job's results are still being saved".into(),
+            ));
+        };
+        let org = storage_org(job.org_id);
+        let Some(artifact) = models
+            .store
+            .get(&org, out.artifact_id)
+            .await
+            .map_err(seam)?
+        else {
+            return Ok(Verification::RetryLater(
+                "the job's results are not readable yet".into(),
+            ));
+        };
+        if task == "export_model" {
+            return exported(&self.db, job, out.artifact_id).await;
+        }
+        let produced = Produced {
+            artifact_id: out.artifact_id,
+            manifest: out.manifest,
+            prefix: artifact.prefix,
+        };
+        record(models, job.id, Some(&produced)).await
+    }
+}
+
+/// An export job's outputs: the version it exported gets its `exported_as` edge.
+async fn exported(db: &Db, job: &JobRow, artifact: Uuid) -> Result<Verification, SeamError> {
+    let mv = job
+        .subject_ref
+        .as_ref()
+        .and_then(|s| s["model_version_id"].as_str())
+        .and_then(|s| NodeRef::parse(s).ok());
+    let Some(mv) = mv.filter(|n| n.kind == "mv") else {
+        return Ok(Verification::Abstain);
+    };
+    let mut tx = db.begin().await.map_err(seam)?;
+    LineageWriter::link(
+        &mut tx,
+        &storage_org(job.org_id),
+        mv,
+        Relation::ExportedAs,
+        NodeRef::new("art", artifact),
+    )
+    .await
+    .map_err(seam)?;
+    tx.commit().await.map_err(seam)?;
+    Ok(Verification::Verified)
+}
+
+/// Event consumer: a model job that failed, was cancelled or rejected leaves its version
+/// INVALID (see [`job_ended`]).
+pub struct ModelJobEnds;
+
+#[async_trait::async_trait]
+impl EventConsumer for ModelJobEnds {
+    fn name(&self) -> &'static str {
+        "models-job-ends"
+    }
+
+    fn accepts(&self, t: &str) -> bool {
+        matches!(t, "job.failed" | "job.cancelled" | "job.rejected")
+    }
+
+    async fn handle(&self, tx: &mut Tx, event: &Event) -> Result<(), ConsumerError> {
+        let why = match event.event_type.as_str() {
+            "job.cancelled" => "The job making this version was cancelled.",
+            "job.rejected" => "The job making this version was refused before it ran.",
+            _ => "The job making this version failed.",
+        };
+        job_ended(tx, event.aggregate_id, why).await?;
+        Ok(())
+    }
 }

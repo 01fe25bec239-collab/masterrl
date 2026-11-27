@@ -549,6 +549,36 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /api/v1/checkpoints/{ckpt}:promote:
+    post:
+      tags:
+      - models
+      summary: |-
+        `POST /checkpoints/{ckpt}:promote` (P23's route; `row` is authorized for
+        `checkpoints.read` in `scope`): after a full re-hash, the checkpoint's safetensors model
+        files become a new EXPERIMENTAL version of the model named after the run, inspected by an
+        import job (which copies the files, so checkpoint retention can't take them away).
+      operationId: promote_checkpoint
+      parameters:
+      - name: ckpt
+        in: path
+        description: Checkpoint id, `ckpt_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '202':
+          description: The new IMPORTING version, in the model named after the run.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelVersionInfo'
+        '409':
+          description: Not COMMITTED, its bytes changed, or no safetensors weights (MRL-MODEL-265).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/checkpoints/{ckpt}:verify:
     post:
       tags:
@@ -930,6 +960,80 @@ paths:
                 $ref: '#/components/schemas/ModelVersionInfo'
         '409':
           description: Not READY (MRL-MODEL-263), or another revision (MRL-MODEL-266).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/model-versions/{mv}:export:
+    post:
+      tags:
+      - models
+      summary: |-
+        `POST /model-versions/{mv}:export`: the version as a standard Hugging Face folder, kept as
+        the job's artifact and sent to S3 or the Hub when asked.
+      operationId: export_model_version
+      parameters:
+      - name: mv
+        in: path
+        description: Model version id, `mv_…`.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ExportModel'
+        required: true
+      responses:
+        '202':
+          description: The export job.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelExportJob'
+        '409':
+          description: Not READY (MRL-MODEL-263), or code not approved (MRL-MODEL-002).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: A format or target this release can't export to (MRL-MODEL-261).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/model-versions/{mv}:merge-adapter:
+    post:
+      tags:
+      - models
+      summary: |-
+        `POST /model-versions/{mv}:merge-adapter`: a READY LoRA adapter merged into its
+        full-precision base, as a new full-weights version.
+      operationId: merge_model_adapter
+      parameters:
+      - name: mv
+        in: path
+        description: The adapter's version id, `mv_…`.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/MergeAdapter'
+        required: true
+      responses:
+        '202':
+          description: The new IMPORTING version; `job_id` builds it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelVersionInfo'
+        '409':
+          description: Not a READY adapter with a full-precision base (MRL-MODEL-264, MRL-MODEL-263).
           content:
             application/json:
               schema:
@@ -1461,6 +1565,46 @@ paths:
                 $ref: '#/components/schemas/ModelInfo'
         '404':
           description: No such project.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/projects/{prj}/models:import:
+    post:
+      tags:
+      - models
+      summary: |-
+        `POST /projects/{prj}/models:import`: a new version of the model, IMPORTING until its job
+        has fetched and inspected the files.
+      operationId: import_model
+      parameters:
+      - name: prj
+        in: path
+        description: Project id, `prj_…`.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ImportModel'
+        required: true
+      responses:
+        '202':
+          description: The new IMPORTING version; `job_id` fills it in.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ModelVersionInfo'
+        '404':
+          description: No such project, upload or base version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: The request is not valid.
           content:
             application/json:
               schema:
@@ -3673,6 +3817,59 @@ components:
             type: string
           description: New labels (replace the old ones).
       additionalProperties: false
+    ExportModel:
+      type: object
+      description: '`POST /model-versions/{mv}:export` body.'
+      properties:
+        format:
+          type:
+          - string
+          - 'null'
+          description: '`hf-safetensors` (the default; others answer MRL-MODEL-261 in this release).'
+        target:
+          $ref: '#/components/schemas/ExportTarget'
+          description: Where it goes.
+      additionalProperties: false
+    ExportTarget:
+      type: object
+      description: Where an export goes.
+      properties:
+        endpoint:
+          type:
+          - string
+          - 'null'
+          description: S3-compatible endpoint (s3; default AWS).
+        kind:
+          type:
+          - string
+          - 'null'
+          description: '`artifact` (default: download it from the app), `s3` or `hf_hub`.'
+        private:
+          type:
+          - boolean
+          - 'null'
+          description: Make the Hub repository private (hf_hub; default true).
+        region:
+          type:
+          - string
+          - 'null'
+          description: S3 region (s3).
+        repo:
+          type:
+          - string
+          - 'null'
+          description: '`org/name` (hf_hub).'
+        secret_id:
+          type:
+          - string
+          - 'null'
+          description: 'The credentials (`sec_…`): S3 keys as JSON, or a Hub write token.'
+        url:
+          type:
+          - string
+          - 'null'
+          description: '`s3://bucket/prefix` (s3).'
+      additionalProperties: false
     FieldError:
       type: object
       description: One field problem inside a 422 response.
@@ -3796,6 +3993,89 @@ components:
         status:
           type: string
           description: '`ok`.'
+    ImportModel:
+      type: object
+      description: '`POST /projects/{prj}/models:import` body.'
+      required:
+      - name
+      - source
+      properties:
+        base_model_version_id:
+          type:
+          - string
+          - 'null'
+          description: 'For LoRA adapters: the READY base version (`mv_…`) they were trained on.'
+        convert_pickle:
+          type: boolean
+          description: 'Convert pickle-only weights (refused in this release: MRL-MODEL-260).'
+        name:
+          type: string
+          description: The model (created when missing).
+        source:
+          $ref: '#/components/schemas/ImportSource'
+          description: Where the files come from.
+      additionalProperties: false
+    ImportSource:
+      oneOf:
+      - type: object
+        description: A Hugging Face Hub repository at a branch, tag or commit.
+        required:
+        - repo
+        - kind
+        properties:
+          kind:
+            type: string
+            enum:
+            - hub
+          repo:
+            type: string
+            description: '`org/name`.'
+          revision:
+            type:
+            - string
+            - 'null'
+            description: Branch, tag or commit (default `main`); the version records the commit.
+          secret_id:
+            type:
+            - string
+            - 'null'
+            description: A Hub token secret (`sec_…`) for private or gated repositories.
+      - type: object
+        description: 'Finished uploads: path in the model folder → `up_…`.'
+        required:
+        - files
+        - kind
+        properties:
+          files:
+            type: object
+            description: The files.
+            additionalProperties:
+              type: string
+            propertyNames:
+              type: string
+          kind:
+            type: string
+            enum:
+            - upload
+      - type: object
+        description: A folder on a machine.
+        required:
+        - path
+        - kind
+        properties:
+          kind:
+            type: string
+            enum:
+            - node_path
+          node_id:
+            type:
+            - string
+            - 'null'
+            description: The machine (`node_…`); any machine when left out.
+          path:
+            type: string
+            description: Absolute folder path on the machine.
+      description: Where an import's files come from.
     Job:
       type: object
       description: A job, as the API shows it.
@@ -4062,6 +4342,21 @@ components:
           - $ref: '#/components/schemas/UserInfo'
             description: The person (absent for an unknown principal).
           - type: 'null'
+    MergeAdapter:
+      type: object
+      description: '`POST /model-versions/{mv}:merge-adapter` body.'
+      properties:
+        dtype:
+          type:
+          - string
+          - 'null'
+          description: '`auto` (keep each tensor''s type), `float32`, `float16` or `bfloat16`.'
+        name:
+          type:
+          - string
+          - 'null'
+          description: 'The model to add the merged version to (default: the adapter''s model).'
+      additionalProperties: false
     MetricPointView:
       type: object
       description: One point of a query answer.
@@ -4176,6 +4471,19 @@ components:
         split:
           type: string
           description: Split, like `train` or `eval` (may be empty).
+    ModelExportJob:
+      type: object
+      description: A started export.
+      required:
+      - job_id
+      - model_version_id
+      properties:
+        job_id:
+          type: string
+          description: '`job_…`; its outputs are the exported folder and `export-result.json`.'
+        model_version_id:
+          type: string
+          description: The exported version.
     ModelFileInfo:
       type: object
       description: One file of a version.

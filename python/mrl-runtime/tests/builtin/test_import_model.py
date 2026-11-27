@@ -48,9 +48,17 @@ def test_registered_for_import_jobs() -> None:
     assert load_builtin_manifest().job_kinds["IMPORT"].sandbox == "fetch"
 
 
-def test_staged_model_gets_the_golden_inspection(models: Path, tmp_path: Path) -> None:
-    outs = run({"source": {"kind": "staged"}}, {"model": models / "tiny-llama"}, tmp_path)
-    assert [o.path for o in outs] == [INSPECTION_FILE]
+def test_staged_model_is_copied_with_the_golden_inspection(models: Path, tmp_path: Path) -> None:
+    src = Path(shutil.copytree(models / "tiny-llama", tmp_path / "src"))
+    shutil.copyfile(models / "tiny-llama-pickle" / "pytorch_model.bin", src / "optimizer.pt")
+    outs = run({"source": {"kind": "staged"}}, {"model": src}, tmp_path / "out")
+    tmp_path = tmp_path / "out"
+    names = sorted(p.name for p in (models / "tiny-llama").iterdir())
+    # Its own copy (retention can't take it), without pickle files.
+    assert [o.path for o in outs] == [*(f"model/{n}" for n in names), INSPECTION_FILE]
+    assert (tmp_path / "model" / "model.safetensors").read_bytes() == (
+        models / "tiny-llama" / "model.safetensors"
+    ).read_bytes()
     r = report(tmp_path)
     assert r["architecture"] == GOLDEN["architecture"]
     assert r["param_count"] == GOLDEN["param_count"]
@@ -131,7 +139,9 @@ def test_through_the_builtin_engine(models: Path, tmp_path: Path) -> None:
     manifest = json.loads((tmp_path / "staging/outputs/artifact-manifest.json").read_text())
     assert schema_errors(manifest, "artifact-manifest/v1") == []
     assert manifest["kind"] == "model"
-    assert [f["path"] for f in manifest["files"]] == [INSPECTION_FILE]
+    paths = [f["path"] for f in manifest["files"]]
+    assert INSPECTION_FILE in paths
+    assert "model/model.safetensors" in paths
 
 
 @pytest.mark.skipif(not os.environ.get("MRL_TEST_NETWORK"), reason="set MRL_TEST_NETWORK=1 (Hub)")

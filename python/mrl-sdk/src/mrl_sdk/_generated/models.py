@@ -637,6 +637,41 @@ class ExperimentPatch(TypedDict):
     """New labels (replace the old ones)."""
 
 
+class ExportModel(TypedDict):
+    """`POST /model-versions/{mv}:export` body."""
+
+    format: NotRequired[str | None]
+    """`hf-safetensors` (the default; others answer MRL-MODEL-261 in this release)."""
+
+    target: NotRequired[ExportTarget]
+    """Where it goes."""
+
+
+class ExportTarget(TypedDict):
+    """Where an export goes."""
+
+    endpoint: NotRequired[str | None]
+    """S3-compatible endpoint (s3; default AWS)."""
+
+    kind: NotRequired[str | None]
+    """`artifact` (default: download it from the app), `s3` or `hf_hub`."""
+
+    private: NotRequired[bool | None]
+    """Make the Hub repository private (hf_hub; default true)."""
+
+    region: NotRequired[str | None]
+    """S3 region (s3)."""
+
+    repo: NotRequired[str | None]
+    """`org/name` (hf_hub)."""
+
+    secret_id: NotRequired[str | None]
+    """The credentials (`sec_…`): S3 keys as JSON, or a Hub write token."""
+
+    url: NotRequired[str | None]
+    """`s3://bucket/prefix` (s3)."""
+
+
 class FieldError(TypedDict):
     """One field problem inside a 422 response."""
 
@@ -717,6 +752,26 @@ class Health(TypedDict):
 
     status: str
     """`ok`."""
+
+
+class ImportModel(TypedDict):
+    """`POST /projects/{prj}/models:import` body."""
+
+    base_model_version_id: NotRequired[str | None]
+    """For LoRA adapters: the READY base version (`mv_…`) they were trained on."""
+
+    convert_pickle: NotRequired[bool]
+    """Convert pickle-only weights (refused in this release: MRL-MODEL-260)."""
+
+    name: str
+    """The model (created when missing)."""
+
+    source: ImportSource
+    """Where the files come from."""
+
+
+ImportSource = dict[str, Any]
+"""Where an import's files come from."""
 
 
 class Job(TypedDict):
@@ -902,6 +957,16 @@ class Me(TypedDict):
     user: NotRequired[dict[str, Any]]
 
 
+class MergeAdapter(TypedDict):
+    """`POST /model-versions/{mv}:merge-adapter` body."""
+
+    dtype: NotRequired[str | None]
+    """`auto` (keep each tensor's type), `float32`, `float16` or `bfloat16`."""
+
+    name: NotRequired[str | None]
+    """The model to add the merged version to (default: the adapter's model)."""
+
+
 class MetricPointView(TypedDict):
     """One point of a query answer."""
 
@@ -976,6 +1041,16 @@ class MetricSeriesView(TypedDict):
 
     split: str
     """Split, like `train` or `eval` (may be empty)."""
+
+
+class ModelExportJob(TypedDict):
+    """A started export."""
+
+    job_id: str
+    """`job_…`; its outputs are the exported folder and `export-result.json`."""
+
+    model_version_id: str
+    """The exported version."""
 
 
 class ModelFileInfo(TypedDict):
@@ -2401,10 +2476,14 @@ __all__ = [
     "Experiment",
     "ExperimentPage",
     "ExperimentPatch",
+    "ExportModel",
+    "ExportTarget",
     "FieldError",
     "GpuView",
     "Graph",
     "Health",
+    "ImportModel",
+    "ImportSource",
     "Job",
     "JobPage",
     "JobPatch",
@@ -2415,10 +2494,12 @@ __all__ = [
     "LoginStarted",
     "Machine",
     "Me",
+    "MergeAdapter",
     "MetricPointView",
     "MetricQueryResult",
     "MetricSeriesPoints",
     "MetricSeriesView",
+    "ModelExportJob",
     "ModelFileInfo",
     "ModelInfo",
     "ModelInfoPage",

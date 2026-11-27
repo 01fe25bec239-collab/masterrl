@@ -16,6 +16,7 @@ use crate::modules::runs::experiments::project_scope;
 use crate::seams::RequestContext;
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use mrl_domain::ids::{JobId, ModelId, ModelVersionId, ProjectId};
 use serde::{Deserialize, Serialize};
@@ -223,7 +224,7 @@ pub fn version_view(
     }
 }
 
-fn check_name(name: &str) -> Result<(), JobsError> {
+pub(crate) fn check_name(name: &str) -> Result<(), JobsError> {
     let ok = (1..=128).contains(&name.len())
         && name
             .bytes()
@@ -447,16 +448,35 @@ pub struct ModelVersionAction {
     pub license_sha256: Option<String>,
 }
 
+/// The action's body as `T` (an empty body is `T::default()`); unknown fields are refused.
+fn body<T: serde::de::DeserializeOwned + Default>(
+    raw: &Option<serde_json::Value>,
+) -> Result<T, JobsError> {
+    match raw {
+        None | Some(serde_json::Value::Null) => Ok(T::default()),
+        Some(v) => serde_json::from_value(v.clone()).map_err(|e| {
+            ApiError::validation(vec![crate::error::FieldError::new(
+                "/",
+                ErrorCode::FieldValue,
+                format!("The request body does not fit this action: {e}."),
+                "Change the body and send the request again.",
+            )])
+            .into()
+        }),
+    }
+}
+
 /// `POST /model-versions/{mv}:…`: axum sees `/model-versions/{mv}` with the action in the
-/// segment; [`approve`] and [`acknowledge`] do the work.
+/// segment; [`approve`], [`acknowledge`], [`super::jobs::merge`] and [`super::jobs::export`]
+/// do the work.
 pub async fn version_action(
     State(state): State<AppState>,
     Extension(models): Extension<Arc<Models>>,
     ctx: RequestContext,
     Path(segment): Path<String>,
-    body: Option<Json<ModelVersionAction>>,
-) -> Result<Json<ModelVersionInfo>, JobsError> {
-    let body = body.map(|Json(b)| b).unwrap_or_default();
+    raw: Option<Json<serde_json::Value>>,
+) -> Result<Response, JobsError> {
+    let raw = raw.map(|Json(v)| v);
     let (mv, action) = match segment.split_once(':') {
         Some((mv, a)) => (mv, a),
         None => {
@@ -466,8 +486,14 @@ pub async fn version_action(
         }
     };
     match action {
-        "approve-remote-code" => approve(&state, &models, &ctx, mv, &body).await,
-        "acknowledge-license" => acknowledge(&state, &models, &ctx, mv, &body).await,
+        "approve-remote-code" => approve(&state, &models, &ctx, mv, &body(&raw)?)
+            .await
+            .map(IntoResponse::into_response),
+        "acknowledge-license" => acknowledge(&state, &models, &ctx, mv, &body(&raw)?)
+            .await
+            .map(IntoResponse::into_response),
+        "merge-adapter" => super::jobs::merge(&state, &models, &ctx, mv, body(&raw)?).await,
+        "export" => super::jobs::export(&state, &models, &ctx, mv, body(&raw)?).await,
         _ => Err(ApiError::new(ErrorCode::RouteNotFound, "No endpoint has this path.").into()),
     }
 }

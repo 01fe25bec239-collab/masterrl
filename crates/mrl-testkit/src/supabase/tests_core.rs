@@ -684,12 +684,14 @@ async fn every_route_answers_by_role_in_team_mode() {
         .unwrap();
     // <mrl:roles-seed P26> P26 seed data for the role table goes right below this line.
     // P26 routes: one READY model version that ships code (license text and revision fixed),
-    // and a model of another org, which this org's owner never sees.
+    // a READY LoRA adapter on it (merged and exported), and a model of another org, which
+    // this org's owner never sees.
     let (p26_model, p26_mv, p26_rev) = (
         mrl_domain::ids::ModelId::new(),
         mrl_domain::ids::ModelVersionId::new(),
         "9fb191250dd56d0ba7ec9785a025ed29c03d5998",
     );
+    let p26_adapter = mrl_domain::ids::ModelVersionId::new();
     let (p26_foreign, p26_foreign_mv) = (
         mrl_domain::ids::ModelId::new(),
         mrl_domain::ids::ModelVersionId::new(),
@@ -707,7 +709,14 @@ async fn every_route_answers_by_role_in_team_mode() {
                      decode(repeat('ab', 32), 'hex'), decode(repeat('cd', 32), 'hex'), 'seed'),
                     ('{fv}', '{fo}', '{fp}', '{fm}', 1, 'full_weights', 'hub', '{{}}', 'READY',
                      false, 'spdx', decode(repeat('ab', 32), 'hex'),
-                     decode(repeat('cd', 32), 'hex'), 'seed');",
+                     decode(repeat('cd', 32), 'hex'), 'seed');
+             INSERT INTO model_versions (id, org_id, project_id, model_id, seq, kind, source_kind,
+               source_ref, base_model_version_id, state, license_kind, license_sha256,
+               weights_sha256, created_by)
+             VALUES ('{a}', '{o}', '{p}', '{m}', 2, 'adapter', 'upload', '{{}}', '{v}', 'READY',
+                     'spdx', decode(repeat('ab', 32), 'hex'), decode(repeat('ef', 32), 'hex'),
+                     'seed');",
+            a = p26_adapter.as_uuid(),
             m = p26_model.as_uuid(),
             v = p26_mv.as_uuid(),
             o = org.as_uuid(),
@@ -735,6 +744,14 @@ async fn every_route_answers_by_role_in_team_mode() {
         (
             Method::POST,
             format!("/api/v1/model-versions/{p26_foreign_mv}:approve-remote-code"),
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/model-versions/{p26_foreign_mv}:merge-adapter"),
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/model-versions/{p26_foreign_mv}:export"),
         ),
     ] {
         let r = core
@@ -1223,6 +1240,30 @@ async fn every_route_answers_by_role_in_team_mode() {
             Action::PromotionsApprove,
             Some(json!({"revision": p26_rev})),
         ),
+        row(
+            Method::POST,
+            format!("/api/v1/projects/{prj}/models:import"),
+            Action::ModelsImport,
+            Some(json!({"name": "rbac-hub", "source": {"kind": "hub", "repo": "org/tiny"}})),
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/model-versions/{p26_adapter}:merge-adapter"),
+            Action::ModelsImport,
+            Some(json!({})),
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/model-versions/{p26_adapter}:export"),
+            Action::ModelsExport,
+            Some(json!({})),
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/checkpoints/{ckpt}:promote"),
+            Action::ModelsImport,
+            None,
+        ),
         // <mrl:roles-routes P27> P27 role-table rows go right below this line.
         // <mrl:roles-routes P28> P28 role-table rows go right below this line.
         // <mrl:roles-routes P29> P29 role-table rows go right below this line.
@@ -1274,7 +1315,12 @@ async fn every_route_answers_by_role_in_team_mode() {
             ("DELETE", p) if p.starts_with("/api/v1/checkpoints/") => &[204],
             // <mrl:roles-expected P26> P26 expected-status arms go right below this line.
             // P26 routes: creating a model of a taken name answers the model (201); accepting
-            // the license and approving the code again answer the version (200).
+            // the license and approving the code again answer the version (200); imports,
+            // merges and exports start a job (202). The checkpoint is CORRUPT once verified
+            // (its file is not in storage), so promoting it is 409.
+            ("POST", p) if p.ends_with(":promote") => &[409],
+            ("POST", p) if p.ends_with("/models:import") => &[202],
+            ("POST", p) if p.ends_with(":merge-adapter") || p.ends_with(":export") => &[202],
             ("POST", p) if p.starts_with("/api/v1/projects/") && p.ends_with("/models") => &[201],
             ("POST", p) if p.starts_with("/api/v1/model-versions/") => &[200],
             // <mrl:roles-expected P27> P27 expected-status arms go right below this line.

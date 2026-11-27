@@ -117,6 +117,11 @@ impl RehomeLocalRows {
                    WHERE j.project_id = ANY($2))))",
             // Later parts' project-scoped rows ($1 team org, $2 projects, $3 nil org).
             // <mrl:rehome P26> P26 statements go right below this line.
+            "UPDATE models SET org_id = $1 WHERE org_id = $3 AND project_id = ANY($2)",
+            "UPDATE model_versions SET org_id = $1 WHERE org_id = $3 AND project_id = ANY($2)",
+            "UPDATE model_files SET org_id = $1 WHERE org_id = $3 AND model_version_id IN \
+               (SELECT id FROM model_versions WHERE project_id = ANY($2))",
+            "UPDATE license_acknowledgements SET org_id = $1 WHERE org_id = $3 AND project_id = ANY($2)",
             // <mrl:rehome P27> P27 statements go right below this line.
             // <mrl:rehome P28> P28 statements go right below this line.
             // <mrl:rehome P29> P29 statements go right below this line.

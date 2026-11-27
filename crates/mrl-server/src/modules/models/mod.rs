@@ -14,6 +14,7 @@
 
 pub mod api;
 pub mod gates;
+pub mod jobs;
 pub mod launch;
 pub mod outputs;
 pub mod store;
@@ -22,7 +23,7 @@ use crate::app::{AppState, ServerModule};
 use crate::db::Db;
 use crate::modules::artifacts::{ArtifactStore, ArtifactsModule};
 use crate::modules::jobs::Projects;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Extension, Router};
 use std::sync::Arc;
 use utoipa::OpenApi;
@@ -88,7 +89,9 @@ impl ModelsModule {
         // apart from its lazily opened backend, so a second handle reads the same objects.
         let store = ArtifactsModule::new(db.clone(), config).store();
         let projects = Projects::registered(&db);
-        Self::with_parts(db, store, projects)
+        let module = Self::with_parts(db, store, projects);
+        outputs::install(module.models.clone());
+        module
     }
 
     /// The module with this store and project directory (tests and embedders).
@@ -111,9 +114,12 @@ impl ModelsModule {
 #[derive(OpenApi)]
 #[openapi(
     paths(api::list_models, api::create_model, api::get_model, api::list_versions,
-          api::get_version, api::approve, api::acknowledge),
+          api::get_version, api::approve, api::acknowledge, jobs::import, jobs::merge,
+          jobs::export, jobs::promote),
     components(schemas(api::ModelInfo, api::NewModel, api::ModelVersionInfo,
-                       api::ModelFileInfo, api::ModelLicense, api::ModelVersionAction)),
+                       api::ModelFileInfo, api::ModelLicense, api::ModelVersionAction,
+                       jobs::ImportModel, jobs::ImportSource, jobs::MergeAdapter,
+                       jobs::ExportModel, jobs::ExportTarget, jobs::ModelExportJob)),
     tags((name = "models", description = "Models and immutable model versions."))
 )]
 struct Doc;
@@ -129,6 +135,7 @@ impl ServerModule for ModelsModule {
                 "/projects/{prj}/models",
                 get(api::list_models).post(api::create_model),
             )
+            .route("/projects/{prj}/models:import", post(jobs::import))
             .route("/models/{mdl}", get(api::get_model))
             .route("/models/{mdl}/versions", get(api::list_versions))
             .route(

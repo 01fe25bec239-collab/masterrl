@@ -5,7 +5,7 @@ Inputs: `{"source": {...}, "convert_pickle": false}` with one source:
   the revision is resolved to its commit SHA and only that commit is downloaded. A token, if
   any, comes from the granted secret's environment variable, never from the inputs.
 - `{"kind": "staged"}`: the files the server staged as the `model` folder (uploads, promoted
-  checkpoints); they stay where they are, only the report is written.
+  checkpoints), copied into the outputs so the version keeps its own copy.
 - `{"kind": "node_path", "path": "/abs/folder"}`: a folder on this machine, copied in.
 
 Format gate: pickle weights (`.bin`, `.pt`, …) are never downloaded or kept; a model that
@@ -246,16 +246,26 @@ def _node_path(ctx: TaskContext, src: Mapping[str, Any], convert: bool) -> Itera
 
 
 def _staged(ctx: TaskContext, convert: bool) -> Iterator[TaskEvent]:
-    folder = ctx.staged_paths[MODEL_DIR]
-    paths = [p.relative_to(folder).as_posix() for p in folder.rglob("*") if p.is_file()]
+    staged = ctx.staged_paths[MODEL_DIR]
+    paths = sorted(
+        p.relative_to(staged).as_posix()
+        for p in staged.rglob("*")
+        if p.is_file() and not p.is_symlink()
+    )
     out = ctx.output_dir
     out.mkdir(parents=True, exist_ok=True)
     refused = _gate(paths, convert)
     if refused:
         yield from write_refusal(out, *refused)
         return
+    folder = out / MODEL_DIR
+    wanted = [p for p in paths if not _is_pickle(p)]
+    for i, rel in enumerate(wanted):
+        (folder / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(staged / rel, folder / rel)
+        yield Progress(step=i + 1, total_steps=len(wanted), phase="copy")
     yield from write_outputs(
-        out, folder, report(folder, license=license_of(folder), source={}), False
+        out, folder, report(folder, license=license_of(folder), source={}), copied=True
     )
 
 

@@ -28,6 +28,7 @@ pub fn consumers(db: &Db) -> Vec<Arc<dyn EventConsumer>> {
         // <mrl:consumers P23> P23 consumers go right below this line.
         // <mrl:consumers P24> P24 consumers go right below this line.
         // <mrl:consumers P26> P26 consumers go right below this line.
+        Arc::new(crate::modules::models::outputs::ModelJobEnds),
         // <mrl:consumers P27> P27 consumers go right below this line.
         // <mrl:consumers P28> P28 consumers go right below this line.
         // <mrl:consumers P29> P29 consumers go right below this line.
