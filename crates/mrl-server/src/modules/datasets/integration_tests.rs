@@ -1498,13 +1498,28 @@ async fn solo_dataset_lineage_uses_the_local_storage_namespace() {
     assert_eq!(edge_org, LOCAL_ORG);
     let records = DatasetRecords::new(env.core.db.db().clone());
     let (_, resource) = records.find(LOCAL_ORG, child).await.unwrap().unwrap();
-    assert_eq!(resource.org.as_deref(), Some(env.org.to_string().as_str()));
+    assert_eq!(resource.org, None);
     assert!(records
         .find(&env.far_org.to_string(), child)
         .await
         .unwrap()
         .is_none());
 
+    let (status, graph) = env
+        .call(
+            &env.owner,
+            Method::GET,
+            &format!("/lineage/{}", dsv(child)),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{graph}");
+    assert_eq!(
+        graph["edges"],
+        json!([{
+            "from": dsv(child), "to": dsv(parent), "relation": "derived_from"
+        }])
+    );
     env.core.stop().await;
 }
 

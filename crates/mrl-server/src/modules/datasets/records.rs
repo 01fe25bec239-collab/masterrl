@@ -76,15 +76,14 @@ impl crate::modules::artifacts::NodeLookup for DatasetRecords {
         if !owns_node {
             return Ok(None);
         }
-        Ok(Some((
-            "datasets.read",
-            crate::modules::jobs::scope::resource(
-                "dataset",
-                Some(mrl_domain::ids::DatasetId::from_uuid(row.dataset_id).to_string()),
-                row.org_id,
-                row.project_id,
-            ),
-        )))
+        let mut resource = crate::modules::jobs::scope::resource(
+            "dataset",
+            Some(mrl_domain::ids::DatasetId::from_uuid(row.dataset_id).to_string()),
+            row.org_id,
+            row.project_id,
+        );
+        resource.org = crate::modules::artifacts::rbac_org(org);
+        Ok(Some(("datasets.read", resource)))
     }
 }
 
