@@ -2,6 +2,8 @@
 *
 !python/mrl-runtime/pyproject.toml
 !python/mrl-runtime/src/
+!python/mrl-rewards/pyproject.toml
+!python/mrl-rewards/src/
 !python/adapters/mrl-adapter-trl/pyproject.toml
 !python/adapters/mrl-adapter-trl/uv.lock
 !python/adapters/mrl-adapter-trl/runtimes/trainer.lock

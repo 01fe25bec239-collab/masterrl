@@ -2,7 +2,6 @@
 #    runtimes/lock-cpu.sh
 --index-url https://pypi.org/simple
 
--e file:///Users/omkar/Documents/Master_RL-worktrees/wave-06-p29-rewards/python/mrl-rewards
 accelerate==1.15.0 \
     --hash=sha256:5654f8c5eaa0d4fa68b33e287a97765da6849bf6d51dcac874e73fbbddfb6134 \
     --hash=sha256:97eacca0b73e45cb867dbf8c5d5d4dc32219544300e0c8992c7334dc2ef33cec
@@ -2129,4 +2128,5 @@ yarl==1.25.1 \
 
 # The following packages were excluded from the output:
 # mrl-runtime
+# mrl-rewards
 # bitsandbytes

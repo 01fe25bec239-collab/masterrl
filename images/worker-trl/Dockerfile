@@ -18,6 +18,7 @@ COPY --from=uv /uv /usr/local/bin/uv
 ENV UV_NO_CACHE=1 UV_PYTHON_DOWNLOADS=never
 WORKDIR /src
 COPY python/mrl-runtime python/mrl-runtime
+COPY python/mrl-rewards python/mrl-rewards
 COPY python/adapters/mrl-adapter-trl python/adapters/mrl-adapter-trl
 WORKDIR /src/python/adapters/mrl-adapter-trl
 # Exact versions and hashes from the locks; wheels only, so no compiler is ever needed.
@@ -29,7 +30,7 @@ RUN set -eu; \
     esac; \
     uv venv /opt/venv --python /usr/local/bin/python3.12; \
     uv pip install --python /opt/venv/bin/python --only-binary :all: --require-hashes $backend -r /tmp/requirements.txt; \
-    uv pip install --python /opt/venv/bin/python --no-deps ../../mrl-runtime .; \
+    uv pip install --python /opt/venv/bin/python --no-deps ../../mrl-runtime ../../mrl-rewards .; \
     /opt/venv/bin/python -c "from mrl_runtime.adapter import load_engine, resolve_engine; load_engine(resolve_engine('trl')); from mrl_runtime.data.validate import find_schema_dir; find_schema_dir()"
 
 FROM ${PYTHON_IMAGE}
