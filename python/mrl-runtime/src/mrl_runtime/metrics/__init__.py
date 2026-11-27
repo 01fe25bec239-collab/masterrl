@@ -7,6 +7,8 @@ anything else is forwarded as undeclared (Doc 05 §11.6 rule 6).
 """
 
 import json
+import resource
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -64,6 +66,33 @@ class MetricsMapper:
         return sorted(
             m.name for m in self._by_name.values() if m.required and m.name not in self.seen
         )
+
+
+def add_resource_peaks(batch: pb.MetricsBatch, step: int) -> None:
+    """Appends this process's memory peaks as `resource/…` points (bytes, Doc 07 §6.10).
+
+    The server keeps the peak per attempt, device and phase in `resource_actuals`. GPU peaks
+    come from torch when the engine already loaded it and used CUDA; nothing is imported here.
+    """
+    rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    peaks = {"resource/process_peak": float(rss if sys.platform == "darwin" else rss * 1024)}
+    torch = sys.modules.get("torch")
+    try:
+        if torch is not None and torch.cuda.is_initialized():
+            for i in range(torch.cuda.device_count()):
+                uuid = getattr(torch.cuda.get_device_properties(i), "uuid", None)
+                device = f"/GPU-{uuid}" if uuid else ""
+                peaks[f"resource/torch_allocated_peak{device}"] = float(
+                    torch.cuda.max_memory_allocated(i)
+                )
+                peaks[f"resource/torch_reserved_peak{device}"] = float(
+                    torch.cuda.max_memory_reserved(i)
+                )
+    except Exception:  # a sample is never worth failing the run
+        pass
+    for name, value in peaks.items():
+        point = batch.points.add(name=name, step=step, value=value, kind=pb.METRIC_KIND_LIVE)
+        point.time.GetCurrentTime()
 
 
 class SampleEmitter:

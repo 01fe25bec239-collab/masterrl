@@ -462,3 +462,24 @@ fn a_builtin_bundle_needs_data_prep_and_a_sandbox_for_every_job_kind() {
         assert!(Bundle::parse(&bad.to_string()).is_err(), "{kinds}");
     }
 }
+
+#[test]
+fn auto_precision_lets_the_engine_choose() {
+    let b = bundle("golden");
+    let manifest = b.engine.unwrap();
+    let enabled = [HardwareClass::Nvidia].into();
+    let unsupported = |p: &str| {
+        let engine = Engine {
+            manifest: &manifest,
+            enabled: &enabled,
+            schemas: &b.schemas,
+        };
+        let mut req = accepted_sft();
+        req.config = Some(json!({"common": {"precision": p}}));
+        check(engine, &req)
+            .iter()
+            .any(|x| x.code == codes::SETTING_UNSUPPORTED)
+    };
+    assert!(!unsupported("auto"));
+    assert!(unsupported("int3"));
+}

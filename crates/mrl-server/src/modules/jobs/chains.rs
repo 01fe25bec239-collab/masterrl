@@ -102,6 +102,33 @@ pub enum ResolveError {
     Seam(#[from] SeamError),
 }
 
+/// What a submission is for, so a resolver can pick defaults for its method.
+#[derive(Debug, Clone)]
+pub struct SubmitScope {
+    /// The org.
+    pub org_id: Uuid,
+    /// The project.
+    pub project_id: Uuid,
+    /// The job kind (`TRAIN`, `EVAL`, …).
+    pub kind: String,
+    /// The method, like `sft`.
+    pub algorithm_id: String,
+    /// The model version to start from.
+    pub base_model_version_id: Uuid,
+    /// Dataset versions.
+    pub dataset_version_ids: Vec<Uuid>,
+    /// The checkpoint the run starts from; submit has already checked the caller may read it.
+    pub parent_checkpoint_id: Option<Uuid>,
+    /// What the job asks the scheduler for. A resolver may narrow it (like a role's
+    /// `min_vram_bytes`) but keeps the pool and node constraints the submitter set.
+    pub resources: ResourceRequest,
+    /// The estimate this run's config points at; the resolver that sets it saves the row in
+    /// `record` (submit writes it to `run_configs.estimate_id`).
+    pub estimate_id: Option<Uuid>,
+    /// What resolvers decided, keyed by resolver name; each saves its own in `record`.
+    pub notes: serde_json::Map<String, serde_json::Value>,
+}
+
 /// Turns the submitted config into the resolved one.
 #[async_trait]
 pub trait SubmissionResolver: Send + Sync {
@@ -110,9 +137,21 @@ pub trait SubmissionResolver: Send + Sync {
     /// Returns the config after this step; `resolved` is the output of the previous member.
     async fn resolve(
         &self,
+        scope: &mut SubmitScope,
         submitted: &serde_json::Value,
         resolved: serde_json::Value,
     ) -> Result<serde_json::Value, ResolveError>;
+    /// Saves what `resolve` decided, in the submit transaction once the run row exists.
+    /// Validate (a dry run) never calls it. `Err` fails the submit and saves nothing.
+    async fn record(
+        &self,
+        tx: &mut crate::Tx,
+        run_id: Uuid,
+        scope: &SubmitScope,
+    ) -> Result<(), SeamError> {
+        let _ = (tx, run_id, scope);
+        Ok(())
+    }
 }
 
 /// The default validator: checks the submission's own rules. It never vouches for a job.
@@ -318,13 +357,27 @@ impl Chains {
     /// Runs every resolver in order, starting from the submitted config.
     pub async fn resolve(
         &self,
+        scope: &mut SubmitScope,
         submitted: &serde_json::Value,
     ) -> Result<serde_json::Value, ResolveError> {
         let mut resolved = submitted.clone();
         for r in self.resolvers.iter() {
-            resolved = r.resolve(submitted, resolved).await?;
+            resolved = r.resolve(scope, submitted, resolved).await?;
         }
         Ok(resolved)
+    }
+
+    /// Lets every resolver save its decision for the new run `run_id`, in `tx`.
+    pub async fn record(
+        &self,
+        tx: &mut crate::Tx,
+        run_id: Uuid,
+        scope: &SubmitScope,
+    ) -> Result<(), SeamError> {
+        for r in self.resolvers.iter() {
+            r.record(tx, run_id, scope).await?;
+        }
+        Ok(())
     }
 }
 
@@ -517,10 +570,16 @@ mod tests {
         }
         async fn resolve(
             &self,
+            scope: &mut SubmitScope,
             _: &serde_json::Value,
             mut resolved: serde_json::Value,
         ) -> Result<serde_json::Value, ResolveError> {
             resolved["lr"] = serde_json::json!(0.1);
+            resolved["method"] = serde_json::json!(scope.algorithm_id);
+            scope.resources.roles[0].gpu.min_vram_bytes = Some(24 << 30);
+            scope
+                .notes
+                .insert("add-key".into(), serde_json::json!("fits"));
             Ok(resolved)
         }
     }
@@ -528,12 +587,34 @@ mod tests {
     #[tokio::test]
     async fn resolvers_fold_in_order_and_default_keeps_config() {
         let submitted = serde_json::json!({"epochs": 1});
+        let mut scope = SubmitScope {
+            org_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            kind: "TRAIN".into(),
+            algorithm_id: "sft".into(),
+            base_model_version_id: Uuid::nil(),
+            dataset_version_ids: vec![],
+            parent_checkpoint_id: None,
+            resources: crate::modules::runs::api::default_resources(),
+            estimate_id: None,
+            notes: serde_json::Map::new(),
+        };
         let none = Chains::new(vec![], vec![], vec![]);
-        assert_eq!(none.resolve(&submitted).await.unwrap(), submitted);
+        assert_eq!(
+            none.resolve(&mut scope, &submitted).await.unwrap(),
+            submitted
+        );
+        assert_eq!(
+            scope.resources,
+            crate::modules::runs::api::default_resources()
+        );
         let one = Chains::new(vec![], vec![], vec![Arc::new(AddKey)]);
         assert_eq!(
-            one.resolve(&submitted).await.unwrap(),
-            serde_json::json!({"epochs": 1, "lr": 0.1})
+            one.resolve(&mut scope, &submitted).await.unwrap(),
+            serde_json::json!({"epochs": 1, "lr": 0.1, "method": "sft"})
         );
+        // Resolvers may narrow the request and leave notes for `record`.
+        assert_eq!(scope.resources.roles[0].gpu.min_vram_bytes, Some(24 << 30));
+        assert_eq!(scope.notes["add-key"], "fits");
     }
 }

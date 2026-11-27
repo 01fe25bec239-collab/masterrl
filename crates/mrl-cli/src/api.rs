@@ -183,7 +183,8 @@ fn http_client() -> reqwest::Result<reqwest::blocking::Client> {
         }
     });
     reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(60))
+        // Above the server's 60 s settings-check budget, so runs:validate can wait it out.
+        .timeout(Duration::from_secs(90))
         .redirect(policy)
         .build()
 }
