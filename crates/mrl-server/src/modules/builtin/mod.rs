@@ -249,8 +249,14 @@ impl CompletionVerifier for OutputsVerifier {
             }
             Some((_, Some(_), _)) => Verification::Abstain,
             Some((_, None, Some(why))) => failed(&why),
+            // Not RetryLater: that retries the whole job (P17). An error leaves it FINALIZING
+            // for the next finalize pass, as the checkpoint verifier does.
+            // ponytail: logs a warning per pass while saving; add a Wait verdict if that's noisy.
             Some((_, None, None)) => {
-                Verification::RetryLater("the job's results are still being saved".into())
+                return Err(SeamError::new(
+                    "builtin",
+                    "The job's results are still being saved.",
+                ))
             }
         })
     }
