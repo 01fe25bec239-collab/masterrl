@@ -34,7 +34,7 @@
             },
             "id": "cpu-uv",
             "kind": "uv",
-            "lockSha256": "860527baf427a68a8049bbb5f8a2a7d5cbfe41e0450a220af03b3d364cdd0344",
+            "lockSha256": "1786f69699066e5f5aaee910a2236605dfb256d7e1efd3d25d41e009b248da59",
             "lockfile": "uv.lock",
             "mrlRuntime": "0.1.0",
             "python": "3.12"

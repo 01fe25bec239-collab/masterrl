@@ -50,6 +50,19 @@ impl LaunchContributor for DatasetInputs {
         _placement: &Placement,
         plan: &mut LaunchPlan,
     ) -> Result<(), LaunchError> {
+        if matches!(job.kind.as_str(), "IMPORT" | "DATA_PREP") {
+            let allowed: Option<bool> = sqlx::query_scalar(
+                "SELECT d.sensitivity <> 'restricted-pii' AND d.deleted_at IS NULL
+                 FROM dataset_work w JOIN dataset_versions v ON v.id=w.version_id
+                 JOIN datasets d ON d.id=v.dataset_id WHERE w.job_id=$1 AND w.purpose IN ('jsonl','hub_push')",
+            ).bind(job.id).fetch_optional(self.db.pool()).await.map_err(|e| LaunchError::Transient(e.to_string()))?;
+            if allowed == Some(false) {
+                return Err(LaunchError::Fail(
+                    FailureClass::UserConfig,
+                    "The dataset is deleted or marked restricted personal data.".into(),
+                ));
+            }
+        }
         let Some(run) = job.run_id else {
             return Ok(());
         };

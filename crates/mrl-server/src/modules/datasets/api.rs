@@ -509,7 +509,7 @@ pub async fn authorized_version(
     Ok(row)
 }
 
-fn ready(v: &VersionRow) -> Result<(), JobsError> {
+pub(super) fn ready(v: &VersionRow) -> Result<(), JobsError> {
     if v.state == "READY" {
         Ok(())
     } else {
@@ -1290,8 +1290,20 @@ pub async fn version_action(
         let req: DatasetDiffRequest = from_body(json)?;
         return Ok(Json(diff(&state, &svc, &ctx, dsv, &req).await?).into_response());
     }
+    if let Some(dsv) = segment.strip_suffix(":tokenize-preview") {
+        return super::submit::tokenize(&state, &svc, &ctx, dsv, from_body(json)?).await;
+    }
+    if let Some(dsv) = segment.strip_suffix(":transform-preview") {
+        return super::submit::transform_preview(&state, &svc, &ctx, dsv, from_body(json)?).await;
+    }
     if let Some(dsv) = segment.strip_suffix(":export") {
         let req: DatasetExportRequest = from_body(json)?;
+        if req.format == "hub" {
+            return super::submit::push_to_hub(&state, &svc, &ctx, dsv, req).await;
+        }
+        if req.format == "jsonl" {
+            return super::submit::jsonl(&state, &svc, &ctx, dsv).await;
+        }
         return Ok(Json(export(&state, &svc, &ctx, dsv, &req).await?).into_response());
     }
     Err(ApiError::new(ErrorCode::RouteNotFound, "No endpoint has this path.").into())
@@ -1382,8 +1394,12 @@ pub async fn diff(
 #[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DatasetExportRequest {
-    /// `parquet`: the version's shards.
+    /// `parquet` gives shard links. `jsonl` and `hub` queue export jobs.
     pub format: String,
+    /// Hub repository (owner/name) when the format is hub.
+    pub repo: Option<String>,
+    /// Secret with hub_push use when the format is hub.
+    pub secret_id: Option<String>,
 }
 
 /// A file to download.
@@ -1420,6 +1436,7 @@ pub struct DatasetExport {
     params(("dsv" = String, Path, description = "Dataset version id, `dsv_…`.")),
     request_body = DatasetExportRequest,
     responses((status = 200, description = "Download links for every file.", body = DatasetExport),
+              (status = 202, body = super::submit::DatasetWorkAccepted),
               (status = 403, description = "The dataset is restricted personal data (MRL-PERM-270).", body = crate::error::Problem),
               (status = 409, description = "The version is not ready (MRL-DATA-002).", body = crate::error::Problem)))]
 pub async fn export(
@@ -1432,35 +1449,53 @@ pub async fn export(
     if req.format != "parquet" {
         return Err(ApiError::validation(vec![field(
             "/format",
-            "The format must be parquet.",
-            "Use parquet: the version's shards.",
+            "The format must be parquet, jsonl or hub.",
+            "Use parquet for shard links or jsonl to queue a conversion.",
         )])
         .into());
     }
     let v = authorized_version(state, &svc.db, ctx, dsv, "datasets.export").await?;
     export_allowed(&v)?;
     ready(&v)?;
-    let files: Vec<FileRow> = store::files(&svc.db, v.id)
+    let files = store::files(&svc.db, v.id)
         .await?
         .into_iter()
         .filter(|f| f.role == "shard")
+        .map(|f| crate::modules::artifacts::InputFile {
+            local_path: f.path,
+            key: f.object_key,
+            sha256: hex(&f.sha256),
+            size: f.size_bytes as u64,
+            ..Default::default()
+        })
         .collect();
+    export_links(state, svc, ctx, &v, "parquet", files).await
+}
+
+pub(super) async fn export_links(
+    state: &AppState,
+    svc: &Datasets,
+    ctx: &RequestContext,
+    v: &VersionRow,
+    format: &str,
+    files: Vec<crate::modules::artifacts::InputFile>,
+) -> Result<DatasetExport, JobsError> {
     let mut out = Vec::with_capacity(files.len());
     let mut ctx = ctx
         .clone()
         .with_project(ProjectId::from_uuid(v.project_id).to_string());
     ctx.org = Some(storage_org(v.org_id));
     for f in files {
-        let size = u64::try_from(f.size_bytes).unwrap_or_default();
+        let size = f.size;
         let t = svc
             .store
-            .ticket(&state.seams, &ctx, &f.object_key, TicketMethod::Get, size)
+            .ticket(&state.seams, &ctx, &f.key, TicketMethod::Get, size)
             .await
             .map_err(storage)?;
         out.push(DatasetExportFile {
-            path: f.path,
+            path: f.local_path,
             size,
-            sha256: hex(&f.sha256),
+            sha256: f.sha256,
             url: t.url,
             headers: t.headers,
             expires_at: t.expires_at,
@@ -1478,7 +1513,7 @@ pub async fn export(
     .await?;
     tx.commit().await.map_err(crate::db::DbError::from)?;
     Ok(DatasetExport {
-        format: req.format.clone(),
+        format: format.into(),
         files: out,
     })
 }

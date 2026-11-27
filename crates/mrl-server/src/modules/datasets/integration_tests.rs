@@ -9,9 +9,7 @@ use crate::pg::TestDb;
 use crate::supabase::core::{config, Auth, CoreServer};
 use crate::supabase::{MockSupabase, MockUser};
 use axum::http::Method;
-use mrl_domain::ids::{
-    ArtifactId, DatasetId, DatasetVersionId, OrgId, ProjectId, UserId, WorkspaceId,
-};
+use mrl_domain::ids::{DatasetId, DatasetVersionId, OrgId, ProjectId, UserId, WorkspaceId};
 use mrl_domain::rbac::Role;
 use mrl_server::config::Mode;
 use mrl_server::modules::artifacts::{ArtifactStore, ArtifactsModule};
@@ -84,6 +82,10 @@ impl Env {
         let sb = MockSupabase::start().await;
         let objects = tempfile::tempdir().unwrap();
         let mut cfg = config(Mode::Team, &sb);
+        // These fixtures supply worker outputs explicitly, with no scheduler or real node.
+        cfg.server
+            .roles
+            .retain(|role| *role != mrl_server::config::Role::Scheduler);
         cfg.object_store.url = Some(
             reqwest::Url::from_directory_path(objects.path())
                 .unwrap()
@@ -831,37 +833,6 @@ async fn exports_hand_out_shard_links_unless_the_data_is_restricted() {
         )
         .await;
     assert_eq!(s, 403);
-    let artifact: Uuid =
-        sqlx::query_scalar("SELECT artifact_id FROM dataset_versions WHERE id = $1")
-            .bind(v)
-            .fetch_one(env.core.db.pool())
-            .await
-            .unwrap();
-    let manifest = env.publish("ready").await;
-    sqlx::query(
-        "INSERT INTO artifacts (id, org_id, project_id, name, kind, prefix, manifest, size_bytes,
-                                state, created_by, committed_at)
-         VALUES ($1, $2, $3, 'internal-dataset-output', 'dataset', $4, $5, 0,
-                 'COMMITTED', 'system', now())",
-    )
-    .bind(artifact)
-    .bind(env.org.to_string())
-    .bind(env.prj.to_string())
-    .bind(format!("orgs/{}/artifacts/{artifact}/", env.org))
-    .bind(manifest)
-    .execute(env.core.db.pool())
-    .await
-    .unwrap();
-    let (status, _) = env
-        .call(
-            &env.viewer,
-            Method::POST,
-            &format!("/artifacts/{}:download", ArtifactId::from_uuid(artifact)),
-            Some(json!({"path": "shards/train-00000.parquet"})),
-        )
-        .await;
-    assert_eq!(status, 404);
-
     // Restricted personal data never leaves: MRL-PERM-270.
     let (s, _) = env
         .call(
@@ -881,6 +852,18 @@ async fn exports_hand_out_shard_links_unless_the_data_is_restricted() {
         )
         .await;
     assert_eq!((s, e["code"].as_str()), (403, Some("MRL-PERM-270")), "{e}");
+    for format in ["jsonl", "hub"] {
+        let (status, error) = env
+            .call(
+                &env.owner,
+                Method::POST,
+                &path,
+                Some(json!({"format":format})),
+            )
+            .await;
+        assert_eq!(status, 403, "{error}");
+        assert_eq!(error["code"], "MRL-PERM-270");
+    }
     let refused: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM audit_events WHERE action = 'datasets.export' AND outcome = 'success'",
     )
@@ -1121,4 +1104,300 @@ async fn dataset_posts_apply_current_permissions_and_create_replays_durably() {
     assert_eq!(get_diff().await.status, 404);
     assert_eq!(export().await.status, 404);
     assert_eq!(post(path, meta).await.status, 404);
+}
+
+impl Env {
+    // Simulates the registered INT-6 output of a finished worker. The background task and
+    // completion chain run normally against the same database and blob store.
+    async fn worker_outputs(&self, job: Uuid, manifest: Value) {
+        let artifact = self.register_manifest(manifest).await;
+        self.finish_outputs(job, artifact).await;
+    }
+
+    async fn finish_outputs(&self, job: Uuid, artifact: Uuid) {
+        let org = self.org.as_uuid();
+        let attempt = Uuid::now_v7();
+        let mut tx = self.core.db.db().begin().await.unwrap();
+        sqlx::query(
+            "INSERT INTO job_attempts (id,org_id,job_id,attempt_no,epoch,state)
+                     VALUES ($1,$2,$3,1,1,'EXITED_OK')",
+        )
+        .bind(attempt)
+        .bind(org)
+        .bind(job)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+        sqlx::query("UPDATE jobs SET state='FINALIZING',epoch=1,current_attempt_id=$2 WHERE id=$1")
+            .bind(job)
+            .bind(attempt)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE builtin_jobs SET upload_attempt_id=$2,artifact_id=$3 WHERE job_id=$1")
+            .bind(job)
+            .bind(attempt)
+            .bind(artifact)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+
+    async fn register_manifest(&self, manifest: Value) -> Uuid {
+        let artifact = Uuid::now_v7();
+        sqlx::query(
+            "INSERT INTO artifacts (id,org_id,project_id,name,kind,prefix,manifest,size_bytes,state,created_by,committed_at)
+             VALUES ($1,$2,$3,$4,'dataset',$5,$6,0,'COMMITTED','system',now())",
+        )
+        .bind(artifact).bind(self.org.to_string()).bind(self.prj.to_string())
+        .bind(artifact.to_string()).bind(format!("orgs/{}/fixture/{artifact}", self.org))
+        .bind(manifest).execute(self.core.db.pool()).await.unwrap();
+        artifact
+    }
+
+    async fn blob_manifest(&self, files: &[(&str, &[u8])]) -> Value {
+        let st = self.store.org_store(&self.org.to_string()).await.unwrap();
+        let mut entries = Vec::new();
+        for (path, bytes) in files {
+            let sha = mrl_storage::sha256_hex(bytes);
+            st.put(&st.keys().blob(&sha).unwrap(), bytes.to_vec().into())
+                .await
+                .unwrap();
+            entries.push(json!({"path":path,"size":bytes.len(),"sha256":sha,"role":"data"}));
+        }
+        json!({"schema_version":"artifact-manifest/v1","kind":"dataset",
+            "created_at":"2026-11-27T00:00:00Z","files":entries})
+    }
+
+    async fn version_until(&self, version: &str, state: &str) -> Value {
+        let path = format!("/dataset-versions/{version}");
+        tokio::time::timeout(std::time::Duration::from_secs(25), async {
+            loop {
+                let (status, row) = self.call(&self.owner, Method::GET, &path, None).await;
+                assert_eq!(status, 200, "{row}");
+                if row["state"] == state {
+                    return row;
+                }
+                assert!(
+                    !matches!(row["state"].as_str(), Some("READY" | "INVALID")),
+                    "{row}"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("dataset {version} did not reach {state}"))
+    }
+}
+
+fn uuid_job(value: &Value) -> Uuid {
+    value["job_id"]
+        .as_str()
+        .unwrap()
+        .parse::<mrl_domain::ids::JobId>()
+        .unwrap()
+        .as_uuid()
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn upload_to_ready_and_transform_use_int6_and_retry_unregistered_outputs() {
+    let env = Env::start().await;
+    let ds = env.dataset("int6 uploads", json!({})).await;
+    let original = include_bytes!("../../../../../tests/fixtures/datasets/sft.messages.v1.jsonl");
+    let (status, up) = env
+        .call(
+            &env.owner,
+            Method::POST,
+            "/uploads",
+            Some(
+                json!({"project_id":env.prj,"filename":"train.jsonl","size":original.len(),
+            "sha256":mrl_storage::sha256_hex(original)}),
+            ),
+        )
+        .await;
+    assert_eq!(status, 201, "{up}");
+    let upload = up["id"].as_str().unwrap();
+    let path = format!("/uploads/{upload}:presign");
+    let first = env.call(&env.owner, Method::POST, &path, None).await;
+    assert_eq!(first.0, 200, "{}", first.1);
+    let (status, resumed) = env.call(&env.owner, Method::POST, &path, None).await;
+    assert_eq!(status, 200, "{resumed}");
+    let ticket = resumed["tickets"][0]["ticket"]["url"].as_str().unwrap();
+    assert_eq!(
+        env.core
+            .server
+            .request(Method::PUT, ticket, &[], original.as_slice())
+            .await
+            .status,
+        200
+    );
+    assert_eq!(
+        env.call(
+            &env.owner,
+            Method::POST,
+            &format!("/uploads/{upload}:complete"),
+            None
+        )
+        .await
+        .0,
+        200
+    );
+
+    let body = json!({"source":"upload","schema_id":"sft.messages.v1","uploads":[upload]});
+    let path = format!("/api/v1/datasets/{ds}/versions");
+    let post = || {
+        env.core.call_with(
+            Method::POST,
+            &path,
+            &env.owner,
+            Some(body.clone()),
+            &[("idempotency-key", "int6-upload")],
+        )
+    };
+    let response = post().await;
+    assert_eq!(response.status, 202, "{}", response.text());
+    let created = response.json();
+    let version = created["id"].as_str().unwrap();
+    let job = uuid_job(&created);
+    assert_eq!(post().await.json()["id"], version);
+    let mut tx = env.core.db.db().begin().await.unwrap();
+    let mut row = JobTransitions::lock(&mut tx, env.org.as_uuid(), job)
+        .await
+        .unwrap()
+        .unwrap();
+    tx.rollback().await.unwrap();
+    // The stored job stays queued while we verify snapshots without racing the jobs poller.
+    row.state = "FINALIZING".into();
+    use mrl_server::modules::jobs::CompletionVerifier as _;
+    let verifier =
+        mrl_server::modules::datasets::work::DatasetVerifier::new(env.core.db.db().clone());
+    assert!(matches!(
+        verifier.verify(&row).await.unwrap(),
+        mrl_server::modules::jobs::Verification::RetryLater(_)
+    ));
+    let artifact = env.register_manifest(env.publish("ready").await).await;
+    sqlx::query("UPDATE builtin_jobs SET artifact_id=$2 WHERE job_id=$1")
+        .bind(job)
+        .bind(artifact)
+        .execute(env.core.db.pool())
+        .await
+        .unwrap();
+    assert!(verifier.verify(&row).await.is_err());
+    env.finish_outputs(job, artifact).await;
+    let ready = env.version_until(version, "READY").await;
+    assert_eq!(ready["row_count"], 200);
+    assert!(matches!(
+        verifier.verify(&row).await.unwrap(),
+        mrl_server::modules::jobs::Verification::Verified
+    ));
+    let (_, with_files) = env
+        .call(
+            &env.owner,
+            Method::GET,
+            &format!("/dataset-versions/{version}"),
+            None,
+        )
+        .await;
+    assert!(with_files["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f["role"] == "original"));
+
+    let spec = json!({"schema_version":"transform/v1","name":"filter","to":"sft.messages.v1",
+        "steps":[{"op":"filter","expr":"len(messages) > 2"}]});
+    let (status, preview) = env
+        .call(
+            &env.owner,
+            Method::POST,
+            &format!("/dataset-versions/{version}:transform-preview"),
+            Some(json!({"transform_spec":spec})),
+        )
+        .await;
+    assert_eq!(status, 202, "{preview}");
+    let preview_job = uuid_job(&preview);
+    let preview_path = format!(
+        "/dataset-versions/{version}/work/{}",
+        preview["job_id"].as_str().unwrap()
+    );
+    env.worker_outputs(
+        preview_job,
+        env.blob_manifest(&[("preview.json", br#"{"rows":[{}]}"#)])
+            .await,
+    )
+    .await;
+    tokio::time::timeout(std::time::Duration::from_secs(25), async {
+        loop {
+            let (status, r) = env.call(&env.owner, Method::GET, &preview_path, None).await;
+            assert_eq!(status, 200, "{r}");
+            assert!(r["failure"].is_null(), "{r}");
+            if r["report"]["rows"].is_array() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    let (status, child) = env
+        .call(
+            &env.owner,
+            Method::POST,
+            &format!("/datasets/{ds}/versions"),
+            Some(json!({"source":"transform","parent_version_id":version,"transform_spec":spec})),
+        )
+        .await;
+    assert_eq!(status, 202, "{child}");
+    env.worker_outputs(uuid_job(&child), env.publish("filtered").await)
+        .await;
+    let child = env
+        .version_until(child["id"].as_str().unwrap(), "READY")
+        .await;
+    assert_eq!(child["parent_version_id"], version);
+    assert_eq!(child["transform_spec"], spec);
+    assert_ne!(child["content_sha256"], ready["content_sha256"]);
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn hub_pinned_revision_reaches_prep_and_registered_output_sets_invalid() {
+    let env = Env::start().await;
+    let ds = env.dataset("int6 hub", json!({})).await;
+    let (status, created) = env
+        .call(
+            &env.owner,
+            Method::POST,
+            &format!("/datasets/{ds}/versions"),
+            Some(json!({"source":"hub","repo":"openai/gsm8k","schema_id":"sft.messages.v1"})),
+        )
+        .await;
+    assert_eq!(status, 202, "{created}");
+    let fetch = uuid_job(&created);
+    let version = created["id"].as_str().unwrap();
+    let sha = "a".repeat(40);
+    let report = json!({"source":"hub","repo":"openai/gsm8k","revision":"main","sha":sha});
+    let report = serde_json::to_vec(&report).unwrap();
+    let files: &[(&str, &[u8])] = &[("import.json", &report), ("files/train.jsonl", b"{}\n")];
+    env.worker_outputs(fetch, env.blob_manifest(files).await)
+        .await;
+    let checking = env.version_until(version, "VALIDATING").await;
+    assert_eq!(checking["source_ref"]["sha"], sha);
+    let prep = uuid_job(&checking);
+    assert_ne!(prep, fetch);
+    let staged: Value = sqlx::query_scalar("SELECT files FROM builtin_jobs WHERE job_id=$1")
+        .bind(prep)
+        .fetch_one(env.core.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(staged[0]["local_path"], "source/train.jsonl");
+    env.worker_outputs(prep, env.publish("invalid").await).await;
+    let invalid = env.version_until(version, "INVALID").await;
+    assert_eq!(invalid["state_reason"]["code"], "MRL-DATA-001");
+
+    let missing = env.call(&env.outsider, Method::POST, &format!("/datasets/{ds}/versions"),
+        Some(json!({"source":"remote","schema_id":"sft.messages.v1","url":"https://example.org/data"}))).await;
+    assert_eq!(missing.0, 404);
 }

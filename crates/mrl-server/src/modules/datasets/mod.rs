@@ -15,6 +15,9 @@ pub mod expr;
 pub mod launch;
 pub mod records;
 pub mod store;
+mod submit;
+/// Dataset job registration and completion.
+pub mod work;
 
 use crate::app::{AppState, ServerModule};
 use crate::db::Db;
@@ -86,14 +89,17 @@ impl DatasetsModule {
     paths(
         api::list_datasets, api::create_dataset, api::get_dataset, api::update_dataset,
         api::delete_dataset, api::list_versions, api::get_version, api::get_validation,
-        api::get_stats, api::list_records, api::diff, api::export
+        api::get_stats, api::list_records, api::diff, api::export,
+        submit::create_version, submit::tokenize, submit::transform_preview, submit::result
     ),
     components(schemas(
         api::DatasetPolicy, api::DatasetInfo, api::DatasetFileInfo, api::DatasetVersionInfo,
         api::DatasetCreate, api::DatasetPatch, api::DatasetValidation, api::DatasetContamination,
         api::DatasetRecord, api::DatasetRecordsPage, api::DatasetDiffRequest,
         api::DatasetRecordDiff, api::DatasetDiff, api::DatasetExportRequest,
-        api::DatasetExportFile, api::DatasetExport
+        api::DatasetExportFile, api::DatasetExport, submit::DatasetVersionSource,
+        submit::DatasetTokenizeRequest, submit::DatasetTransformPreviewRequest,
+        submit::DatasetWorkAccepted, submit::DatasetWorkResult
     )),
     tags((name = "datasets", description = "Datasets: versions, validation, records, diffs and exports."))
 )]
@@ -105,7 +111,11 @@ impl ServerModule for DatasetsModule {
     }
 
     fn handler_idempotency_paths(&self) -> &'static [&'static str] {
-        &["/projects/{prj}/datasets", "/dataset-versions/{dsv}"]
+        &[
+            "/projects/{prj}/datasets",
+            "/datasets/{ds}/versions",
+            "/dataset-versions/{dsv}",
+        ]
     }
 
     fn routes(&self) -> Router<AppState> {
@@ -120,7 +130,11 @@ impl ServerModule for DatasetsModule {
                     .patch(api::update_dataset)
                     .delete(api::delete_dataset),
             )
-            .route("/datasets/{ds}/versions", get(api::list_versions))
+            .route(
+                "/datasets/{ds}/versions",
+                get(api::list_versions).post(submit::create_version),
+            )
+            .route("/dataset-versions/{dsv}/work/{job}", get(submit::result))
             .route(
                 "/dataset-versions/{dsv}",
                 get(api::get_version).post(api::version_action),
@@ -135,6 +149,25 @@ impl ServerModule for DatasetsModule {
                 crate::modules::jobs::error::render,
             ))
             .layer(Extension(self.svc.clone()))
+    }
+
+    fn background_tasks(&self) -> Vec<crate::app::Task> {
+        let svc = self.svc.clone();
+        vec![crate::app::Task::new(
+            "datasets.outputs",
+            crate::config::Role::Background,
+            move |cancel| async move {
+                loop {
+                    if let Err(error) = work::check_pending(&svc).await {
+                        tracing::warn!(%error, "could not check dataset outputs");
+                    }
+                    tokio::select! {
+                        () = cancel.cancelled() => return Ok(()),
+                        () = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                    }
+                }
+            },
+        )]
     }
 
     fn openapi(&self) -> utoipa::openapi::OpenApi {
@@ -160,6 +193,9 @@ mod tests {
             "/dataset-versions/{dsv}/records",
             "/dataset-versions/{dsv}:diff",
             "/dataset-versions/{dsv}:export",
+            "/dataset-versions/{dsv}:tokenize-preview",
+            "/dataset-versions/{dsv}:transform-preview",
+            "/dataset-versions/{dsv}/work/{job}",
         ] {
             let item = doc
                 .paths
@@ -177,7 +213,7 @@ mod tests {
         ids.sort();
         ids.dedup();
         assert_eq!(ids.len(), n, "operation ids repeat");
-        assert_eq!(n, 12);
+        assert_eq!(n, 16);
         assert!(ids.iter().all(|i| i.contains("dataset")), "{ids:?}");
     }
 }

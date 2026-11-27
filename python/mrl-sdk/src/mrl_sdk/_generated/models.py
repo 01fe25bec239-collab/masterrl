@@ -585,7 +585,13 @@ class DatasetExportRequest(TypedDict):
     """`POST /dataset-versions/{dsv}:export`."""
 
     format: str
-    """`parquet`: the version's shards."""
+    """`parquet` gives shard links. `jsonl` and `hub` queue export jobs."""
+
+    repo: NotRequired[str | None]
+    """Hub repository (owner/name) when the format is hub."""
+
+    secret_id: NotRequired[str | None]
+    """Secret with hub_push use when the format is hub."""
 
 
 class DatasetFileInfo(TypedDict):
@@ -755,6 +761,26 @@ class DatasetRecordsPage(TypedDict):
     """Records looked at for this page."""
 
 
+class DatasetTokenizeRequest(TypedDict):
+    """Request to tokenize a dataset using a registered tokenizer artifact."""
+
+    context_length: NotRequired[int | None]
+    """Context window size."""
+
+    max_records: NotRequired[int | None]
+    """Maximum records to inspect, capped at 2000."""
+
+    tokenizer_artifact_id: str
+    """Committed tokenizer artifact in this project."""
+
+
+class DatasetTransformPreviewRequest(TypedDict):
+    """Request to preview a transform against a READY version."""
+
+    transform_spec: dict[str, Any]
+    """The transform/v1 specification."""
+
+
 class DatasetValidation(TypedDict):
     """The validation report of a checked version."""
 
@@ -846,6 +872,32 @@ class DatasetVersionInfoPage(TypedDict):
 
     next_cursor: NotRequired[str | None]
     """Pass as `cursor` for the next page; `null` on the last page."""
+
+
+DatasetVersionSource = dict[str, Any]
+"""The source for a new dataset version."""
+
+
+class DatasetWorkAccepted(TypedDict):
+    """A queued dataset operation."""
+
+    job_id: str
+    """ID to poll on this version."""
+
+
+class DatasetWorkResult(TypedDict):
+    """What a queued preview or export job produced."""
+
+    export: NotRequired[dict[str, Any]]
+
+    failure: NotRequired[str | None]
+    """Terminal failure, if any."""
+
+    report: NotRequired[dict[str, Any] | None]
+    """Tokenization or transform preview report."""
+
+    state: str
+    """Current job state."""
 
 
 class DownloadRequest(TypedDict):
@@ -2595,9 +2647,14 @@ __all__ = [
     "DatasetRecord",
     "DatasetRecordDiff",
     "DatasetRecordsPage",
+    "DatasetTokenizeRequest",
+    "DatasetTransformPreviewRequest",
     "DatasetValidation",
     "DatasetVersionInfo",
     "DatasetVersionInfoPage",
+    "DatasetVersionSource",
+    "DatasetWorkAccepted",
+    "DatasetWorkResult",
     "DownloadRequest",
     "Edge",
     "Endpoint",
