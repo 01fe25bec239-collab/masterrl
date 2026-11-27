@@ -503,7 +503,7 @@ impl World {
     async fn run(&self) -> Uuid {
         let (exp, run) = (Uuid::now_v7(), Uuid::now_v7());
         sqlx::query(
-            "INSERT INTO experiments (id, org_id, project_id, name, created_by) VALUES ($1, $2, $3, 'e', 't')",
+            "INSERT INTO experiments (id, org_id, project_id, name, created_by) VALUES ($1, $2, $3, $1::text, 't')",
         )
         .bind(exp)
         .bind(self.org)
