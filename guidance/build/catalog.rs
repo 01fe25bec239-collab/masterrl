@@ -2854,6 +2854,18 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-ENV-302")),
+            ("title", Value::Str("The app is reconnecting to its core.")),
+            ("why", Value::Str("The app's core service stopped or isn't answering, so the app is starting it again. Training on your machines keeps running.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Wait a moment; the app reconnects on its own."),
+                    Value::Str("If it keeps failing, choose Try again, or restart the app."),
+                    Value::Str("If it still fails, open Settings, then Privacy, and share the newest crash report."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-IDEM-001")),
             ("title", Value::Str("This request is already running.")),
             ("why", Value::Str("A request with the same request key started earlier and has not finished.")),

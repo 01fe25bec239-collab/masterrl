@@ -26,11 +26,17 @@ export const CONTENT_SECURITY_POLICY = [
   "object-src 'none'",
 ].join('; ');
 
-/** Dev only: Vite's hot reload injects inline scripts and styles. Never used when packaged. */
+/**
+ * Dev only: Vite's hot reload injects inline scripts and styles, and the page (on the Vite
+ * server) reaches the core through the app's own `app://app/api/…` address. Never used when
+ * packaged, where the page itself is on `app://app`.
+ */
 export const DEV_CONTENT_SECURITY_POLICY = CONTENT_SECURITY_POLICY.replace(
   "script-src 'self'",
   "script-src 'self' 'unsafe-inline'",
-).replace("style-src 'self'", "style-src 'self' 'unsafe-inline'");
+)
+  .replace("style-src 'self'", "style-src 'self' 'unsafe-inline'")
+  .replace("connect-src 'self'", "connect-src 'self' app://app");
 
 /** External sites the app may open in the system browser. Everything else is blocked. */
 export const EXTERNAL_ORIGINS: readonly string[] = ['https://github.com'];

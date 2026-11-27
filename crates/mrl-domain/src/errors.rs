@@ -759,10 +759,7 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         "Backups need the database the app runs itself.",
     ),
     (code(Res, 300), "There is no backup with this name."),
-    (
-        code(Internal, 300),
-        "The backup or restore didn't finish.",
-    ),
+    (code(Internal, 300), "The backup or restore didn't finish."),
     (
         code(Env, 301),
         "The computer check couldn't read the agent's settings.",
@@ -771,6 +768,7 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         code(Conflict, 300),
         "Another backup, restore or update check is running.",
     ),
+    (code(Env, 302), "The app is reconnecting to its core."),
 ];
 
 /// Every code with its title: the registry plus every capability rejection.

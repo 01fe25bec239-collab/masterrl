@@ -2795,6 +2795,18 @@
       }
     },
     {
+      "code": "MRL-ENV-302",
+      "title": "The app is reconnecting to its core.",
+      "why": "The app's core service stopped or isn't answering, so the app is starting it again. Training on your machines keeps running.",
+      "what_to_do": {
+        "steps": [
+          "Wait a moment; the app reconnects on its own.",
+          "If it keeps failing, choose Try again, or restart the app.",
+          "If it still fails, open Settings, then Privacy, and share the newest crash report."
+        ]
+      }
+    },
+    {
       "code": "MRL-IDEM-001",
       "title": "This request is already running.",
       "why": "A request with the same request key started earlier and has not finished.",

@@ -52,5 +52,9 @@
       "target": "dir",
       "executableName": "masterrl"
     }
+  },
+  "dependencies": {
+    "electron-updater": "6.8.12",
+    "smol-toml": "1.9.1"
   }
 }
