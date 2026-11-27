@@ -11,7 +11,7 @@ use crate::modules::jobs::scope::{self, resource};
 use crate::modules::jobs::transitions::attempt_cols;
 use crate::modules::jobs::{
     codes, Attempt, AttemptRow, Chains, JobChange, JobSpec, JobTransitions, JobsError, NewJob,
-    Projects, ResolveError, RetryRules, Validation,
+    Projects, ResolveError, RetryRules, SubmitScope, Validation,
 };
 use crate::modules::secrets::SecretResolver;
 use crate::seams::RequestContext;
@@ -612,10 +612,19 @@ pub async fn submit(
         return replay(&existing, &fingerprint);
     }
 
-    let resolved = chains.resolve(&sub.config).await.map_err(|e| match e {
-        ResolveError::Invalid(errors) => JobsError::Api(ApiError::validation(errors)),
-        ResolveError::Seam(s) => JobsError::Seam(s),
-    })?;
+    let scope = SubmitScope {
+        org_id: org,
+        project_id: project,
+        kind: sub.kind.as_str().to_owned(),
+        algorithm_id: sub.algorithm_id.clone(),
+    };
+    let resolved = chains
+        .resolve(&scope, &sub.config)
+        .await
+        .map_err(|e| match e {
+            ResolveError::Invalid(errors) => JobsError::Api(ApiError::validation(errors)),
+            ResolveError::Seam(s) => JobsError::Seam(s),
+        })?;
     let resources = sub.resources.clone().unwrap_or_else(default_resources);
     let spec = JobSpec {
         org_id: org,
