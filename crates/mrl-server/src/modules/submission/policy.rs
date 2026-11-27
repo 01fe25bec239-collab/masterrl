@@ -153,7 +153,7 @@ async fn judge(
     Ok(preflight::decide(&input, &all, &settings.headroom))
 }
 
-/// The job as submit's resolvers see it (no reward model: the scope has none).
+/// The job as submit's resolvers see it.
 pub fn scope_job(scope: &SubmitScope, resolved: Value) -> JobSpec {
     JobSpec {
         org_id: scope.org_id,
@@ -161,7 +161,7 @@ pub fn scope_job(scope: &SubmitScope, resolved: Value) -> JobSpec {
         kind: scope.kind.clone(),
         algorithm_id: scope.algorithm_id.clone(),
         base_model_version_id: scope.base_model_version_id,
-        reward_version_id: None,
+        reward_version_id: scope.reward_version_id,
         dataset_version_ids: scope.dataset_version_ids.clone(),
         resolved,
         resources: scope.resources.clone(),
@@ -176,10 +176,6 @@ pub const SAFETY_NOTE: &str = "safety-settings";
 /// becomes the run's (`scope.estimate_id`), and a `tight` verdict's safety settings go into
 /// the config, unless they are already in (validate's `resolved_config`) or the changed
 /// config would not pass the capability check.
-///
-/// The scope has no reward model: the lookup assumes none, so a run with one gets no safety
-/// settings here (unless the same inputs were checked without a reward model); the Guardian
-/// and every later lookup use the run's full inputs.
 pub async fn safety_at_submit(
     db: &Db,
     capability: &CapabilityValidator,
