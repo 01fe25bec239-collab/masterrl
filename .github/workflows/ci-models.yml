@@ -1,0 +1,85 @@
+name: ci-models
+
+# P26 model registry: versions recorded from job outputs, the routes, gates and launch
+# contributor against PostgreSQL; the import/merge/export tasks with the Hub, SeaweedFS (S3)
+# and the CPU TRL environment (PEFT merge parity, exports that load in vanilla Transformers).
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-models-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  UV_VERSION: "0.11.28"
+  UV_PYTHON: "3.12"
+
+jobs:
+  registry:
+    name: models (postgres)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      DATABASE_URL: postgres://mrl:mrl-dev-only@127.0.0.1:55432/masterrl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+
+      - name: start PostgreSQL
+        run: docker compose -f deploy/local/compose.yaml up -d --wait postgres
+
+      - name: P26 integration tests
+        run: cargo test -p mrl-testkit --locked p26_models -- --ignored
+
+      - name: role table (covers the model routes)
+        run: cargo test -p mrl-testkit --locked every_route_answers_by_role_in_team_mode -- --ignored
+
+      - name: service logs
+        if: failure()
+        run: docker compose -f deploy/local/compose.yaml logs postgres
+
+  tasks:
+    name: model tasks (hub, s3, transformers)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      MRL_TEST_NETWORK: "1"
+      MRL_TEST_S3_ENDPOINT: http://127.0.0.1:8333
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+
+      - name: start SeaweedFS
+        run: docker compose -f deploy/local/compose.yaml up -d --wait seaweedfs
+
+      - name: task tests (runtime environment)
+        run: uv run --locked pytest -q python/mrl-runtime/tests/builtin/test_import_model.py python/mrl-runtime/tests/builtin/test_merge_adapter.py python/mrl-runtime/tests/builtin/test_export_model.py
+
+      - name: CPU environment from runtimes/trainer.lock
+        working-directory: python/adapters/mrl-adapter-trl
+        run: |
+          TRL_VENV="$RUNNER_TEMP/trl-cpu"
+          printf 'TRL_VENV=%s\n' "$TRL_VENV" >> "$GITHUB_ENV"
+          uv venv "$TRL_VENV"
+          uv pip install --python "$TRL_VENV/bin/python" --only-binary :all: --require-hashes \
+            --torch-backend cpu -r runtimes/trainer.lock
+          uv pip install --python "$TRL_VENV/bin/python" --no-deps -e ../../mrl-runtime
+          uv pip install --python "$TRL_VENV/bin/python" pytest==9.2.0
+
+      - name: merge parity with PEFT, exports load in Transformers
+        run: '"$TRL_VENV/bin/python" -m pytest -q python/mrl-runtime/tests/builtin/test_merge_adapter.py python/mrl-runtime/tests/builtin/test_export_model.py'
+
+      - name: service logs
+        if: failure()
+        run: docker compose -f deploy/local/compose.yaml logs seaweedfs

@@ -683,6 +683,70 @@ async fn every_route_answers_by_role_in_team_mode() {
         .await
         .unwrap();
     // <mrl:roles-seed P26> P26 seed data for the role table goes right below this line.
+    // P26 routes: one READY model version that ships code (license text and revision fixed),
+    // and a model of another org, which this org's owner never sees.
+    let (p26_model, p26_mv, p26_rev) = (
+        mrl_domain::ids::ModelId::new(),
+        mrl_domain::ids::ModelVersionId::new(),
+        "9fb191250dd56d0ba7ec9785a025ed29c03d5998",
+    );
+    let (p26_foreign, p26_foreign_mv) = (
+        mrl_domain::ids::ModelId::new(),
+        mrl_domain::ids::ModelVersionId::new(),
+    );
+    core.db
+        .seed(&format!(
+            "INSERT INTO models (id, org_id, project_id, name, created_by)
+             VALUES ('{m}', '{o}', '{p}', 'rbac-model', 'seed'),
+                    ('{fm}', '{fo}', '{fp}', 'theirs', 'seed');
+             INSERT INTO model_versions (id, org_id, project_id, model_id, seq, kind, source_kind,
+               source_ref, state, requires_remote_code, license_kind, license_sha256,
+               weights_sha256, created_by)
+             VALUES ('{v}', '{o}', '{p}', '{m}', 1, 'full_weights', 'hub',
+                     '{{\"commit\": \"{p26_rev}\"}}', 'READY', true, 'spdx',
+                     decode(repeat('ab', 32), 'hex'), decode(repeat('cd', 32), 'hex'), 'seed'),
+                    ('{fv}', '{fo}', '{fp}', '{fm}', 1, 'full_weights', 'hub', '{{}}', 'READY',
+                     false, 'spdx', decode(repeat('ab', 32), 'hex'),
+                     decode(repeat('cd', 32), 'hex'), 'seed');",
+            m = p26_model.as_uuid(),
+            v = p26_mv.as_uuid(),
+            o = org.as_uuid(),
+            p = prj.as_uuid(),
+            fm = p26_foreign.as_uuid(),
+            fv = p26_foreign_mv.as_uuid(),
+            fo = uuid::Uuid::now_v7(),
+            fp = uuid::Uuid::now_v7(),
+        ))
+        .await;
+    for (method, path) in [
+        (Method::GET, format!("/api/v1/models/{p26_foreign}")),
+        (
+            Method::GET,
+            format!("/api/v1/models/{p26_foreign}/versions"),
+        ),
+        (
+            Method::GET,
+            format!("/api/v1/model-versions/{p26_foreign_mv}"),
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/model-versions/{p26_foreign_mv}:acknowledge-license"),
+        ),
+        (
+            Method::POST,
+            format!("/api/v1/model-versions/{p26_foreign_mv}:approve-remote-code"),
+        ),
+    ] {
+        let r = core
+            .call(
+                method,
+                &path,
+                &Auth::Bearer(seed_jwt.clone()),
+                Some(json!({})),
+            )
+            .await;
+        assert_eq!(r.status, 404, "another org's {path}: {}", r.text());
+    }
     // <mrl:roles-seed P27> P27 seed data for the role table goes right below this line.
     // <mrl:roles-seed P28> P28 seed data for the role table goes right below this line.
     // <mrl:roles-seed P29> P29 seed data for the role table goes right below this line.
@@ -1117,6 +1181,48 @@ async fn every_route_answers_by_role_in_team_mode() {
             None,
         ),
         // <mrl:roles-routes P26> P26 role-table rows go right below this line.
+        row(
+            Method::GET,
+            format!("/api/v1/projects/{prj}/models"),
+            Action::ModelsRead,
+            None,
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/projects/{prj}/models"),
+            Action::ModelsImport,
+            Some(json!({"name": "rbac-model"})),
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/models/{p26_model}"),
+            Action::ModelsRead,
+            None,
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/models/{p26_model}/versions"),
+            Action::ModelsRead,
+            None,
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/model-versions/{p26_mv}"),
+            Action::ModelsRead,
+            None,
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/model-versions/{p26_mv}:acknowledge-license"),
+            Action::ModelsImport,
+            Some(json!({"license_sha256": "ab".repeat(32)})),
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/model-versions/{p26_mv}:approve-remote-code"),
+            Action::PromotionsApprove,
+            Some(json!({"revision": p26_rev})),
+        ),
         // <mrl:roles-routes P27> P27 role-table rows go right below this line.
         // <mrl:roles-routes P28> P28 role-table rows go right below this line.
         // <mrl:roles-routes P29> P29 role-table rows go right below this line.
@@ -1167,6 +1273,10 @@ async fn every_route_answers_by_role_in_team_mode() {
             ("POST", p) if p.ends_with(":verify") => &[200, 409],
             ("DELETE", p) if p.starts_with("/api/v1/checkpoints/") => &[204],
             // <mrl:roles-expected P26> P26 expected-status arms go right below this line.
+            // P26 routes: creating a model of a taken name answers the model (201); accepting
+            // the license and approving the code again answer the version (200).
+            ("POST", p) if p.starts_with("/api/v1/projects/") && p.ends_with("/models") => &[201],
+            ("POST", p) if p.starts_with("/api/v1/model-versions/") => &[200],
             // <mrl:roles-expected P27> P27 expected-status arms go right below this line.
             // <mrl:roles-expected P28> P28 expected-status arms go right below this line.
             // <mrl:roles-expected P29> P29 expected-status arms go right below this line.

@@ -24,6 +24,14 @@
         {
           "kind": "IMPORT",
           "sandbox": "fetch"
+        },
+        {
+          "kind": "MERGE_ADAPTER",
+          "sandbox": "data_prep"
+        },
+        {
+          "kind": "EXPORT",
+          "sandbox": "fetch"
         }
       ]
     }

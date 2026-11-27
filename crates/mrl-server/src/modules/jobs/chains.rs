@@ -215,6 +215,7 @@ impl Chains {
                     db.clone(),
                 )),
                 // <mrl:job-validators P26> P26 validators go right below this line.
+                Arc::new(crate::modules::models::gates::ModelGates::new(db.clone())),
                 // <mrl:job-validators P28> P28 validators go right below this line.
             ],
             vec![
