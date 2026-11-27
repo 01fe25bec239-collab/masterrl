@@ -13,7 +13,7 @@ use mrl_proto::worker::v1::agent_message::Body as AgentBody;
 use mrl_proto::worker::v1::worker_message::Body as WorkerBody;
 use mrl_proto::worker::v1::{
     Allocation, CancelRequest, CheckpointCommitAck, CheckpointRequest, CommitState, ExitReport,
-    LeaseDeadline, PauseRequest, Prepare, Start, UploadGrant, WorkerMessage,
+    LeaseDeadline, OutputsUploaded, PauseRequest, Prepare, Start, UploadGrant, WorkerMessage,
 };
 use prost::Message;
 use tokio::sync::{mpsc, oneshot};
@@ -855,7 +855,12 @@ impl Runner {
                     allowed.push(dir.to_path_buf());
                 }
                 let backend = crate::sandbox::select(&cfg.sandbox)?;
-                let profile = crate::sandbox::profile("worker")?;
+                // The core names the profile (built-in jobs: their job kind's); runs get `worker`.
+                let profile = crate::sandbox::profile(
+                    self.rec.spec.job_spec["sandbox"]
+                        .as_str()
+                        .unwrap_or("worker"),
+                )?;
                 let wrapped = backend.wrap(&profile, spec, &allowed)?;
                 #[cfg(unix)]
                 let wrapped = if backend.isolates() {
@@ -1655,6 +1660,15 @@ impl Runner {
             self.adhoc.remove(&command_id);
             // Saved together with its result (in `command_done`).
             self.rec.adhoc_uploads.remove(&command_id);
+            // The worker waits for this before it exits (its job outputs are the only files
+            // uploaded outside a checkpoint).
+            if let Some(role) = self.primary_role() {
+                let body = AgentBody::OutputsUploaded(OutputsUploaded {
+                    ok: failure.is_none(),
+                    reason: failure.clone().unwrap_or_default(),
+                });
+                self.send(&role, body).await;
+            }
             self.command_done(command_id, failure).await;
         }
     }

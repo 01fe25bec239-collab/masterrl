@@ -338,15 +338,7 @@ pub(crate) async fn query(
     };
     let root = NodeRef::parse(&id)
         .map_err(|_| ApiError::new(ErrorCode::NotFound, "No item with this id exists."))?;
-    let org = if root.kind == "dsv" && ctx.principal.kind == crate::seams::PrincipalKind::LocalOwner
-    {
-        // Dataset versions live under the personal project's org, even on a solo server.
-        crate::modules::datasets::records::lineage_org(&store, root.id)
-            .await?
-            .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "No item with this id exists."))?
-    } else {
-        org_of(&ctx)?
-    };
+    let org = org_of(&ctx)?;
     s.authorize(&ctx, READ, &graph_resource(&org)).await?;
     let gone = || ApiError::new(ErrorCode::NotFound, "No item with this id exists.");
     let (action, res) = access(&store, &org, root).await?.ok_or_else(gone)?;

@@ -127,6 +127,7 @@ class WorkerMessage(_message.Message):
         "policy_version",
         "rollout_batch",
         "reward_batch_stats",
+        "outputs_staged",
     )
     SEQ_FIELD_NUMBER: _ClassVar[int]
     SENT_AT_FIELD_NUMBER: _ClassVar[int]
@@ -143,6 +144,7 @@ class WorkerMessage(_message.Message):
     POLICY_VERSION_FIELD_NUMBER: _ClassVar[int]
     ROLLOUT_BATCH_FIELD_NUMBER: _ClassVar[int]
     REWARD_BATCH_STATS_FIELD_NUMBER: _ClassVar[int]
+    OUTPUTS_STAGED_FIELD_NUMBER: _ClassVar[int]
     seq: int
     sent_at: _timestamp_pb2.Timestamp
     hello: Hello
@@ -158,6 +160,7 @@ class WorkerMessage(_message.Message):
     policy_version: PolicyVersionEvent
     rollout_batch: RolloutBatchSummary
     reward_batch_stats: RewardBatchStats
+    outputs_staged: OutputsStaged
     def __init__(
         self,
         seq: _Optional[int] = ...,
@@ -175,6 +178,7 @@ class WorkerMessage(_message.Message):
         policy_version: _Optional[_Union[PolicyVersionEvent, _Mapping]] = ...,
         rollout_batch: _Optional[_Union[RolloutBatchSummary, _Mapping]] = ...,
         reward_batch_stats: _Optional[_Union[RewardBatchStats, _Mapping]] = ...,
+        outputs_staged: _Optional[_Union[OutputsStaged, _Mapping]] = ...,
     ) -> None: ...
 
 class AgentMessage(_message.Message):
@@ -190,6 +194,7 @@ class AgentMessage(_message.Message):
         "heartbeat",
         "checkpoint_request",
         "lease_deadline",
+        "outputs_uploaded",
     )
     ACK_SEQ_FIELD_NUMBER: _ClassVar[int]
     HELLO_ACK_FIELD_NUMBER: _ClassVar[int]
@@ -202,6 +207,7 @@ class AgentMessage(_message.Message):
     HEARTBEAT_FIELD_NUMBER: _ClassVar[int]
     CHECKPOINT_REQUEST_FIELD_NUMBER: _ClassVar[int]
     LEASE_DEADLINE_FIELD_NUMBER: _ClassVar[int]
+    OUTPUTS_UPLOADED_FIELD_NUMBER: _ClassVar[int]
     ack_seq: int
     hello_ack: HelloAck
     prepare: Prepare
@@ -213,6 +219,7 @@ class AgentMessage(_message.Message):
     heartbeat: Heartbeat
     checkpoint_request: CheckpointRequest
     lease_deadline: LeaseDeadline
+    outputs_uploaded: OutputsUploaded
     def __init__(
         self,
         ack_seq: _Optional[int] = ...,
@@ -226,6 +233,7 @@ class AgentMessage(_message.Message):
         heartbeat: _Optional[_Union[Heartbeat, _Mapping]] = ...,
         checkpoint_request: _Optional[_Union[CheckpointRequest, _Mapping]] = ...,
         lease_deadline: _Optional[_Union[LeaseDeadline, _Mapping]] = ...,
+        outputs_uploaded: _Optional[_Union[OutputsUploaded, _Mapping]] = ...,
     ) -> None: ...
 
 class Hello(_message.Message):
@@ -893,6 +901,20 @@ class CheckpointCommitAck(_message.Message):
         state: _Optional[_Union[CommitState, str]] = ...,
         reason: _Optional[str] = ...,
     ) -> None: ...
+
+class OutputsStaged(_message.Message):
+    __slots__ = ("manifest_json",)
+    MANIFEST_JSON_FIELD_NUMBER: _ClassVar[int]
+    manifest_json: str
+    def __init__(self, manifest_json: _Optional[str] = ...) -> None: ...
+
+class OutputsUploaded(_message.Message):
+    __slots__ = ("ok", "reason")
+    OK_FIELD_NUMBER: _ClassVar[int]
+    REASON_FIELD_NUMBER: _ClassVar[int]
+    ok: bool
+    reason: str
+    def __init__(self, ok: _Optional[bool] = ..., reason: _Optional[str] = ...) -> None: ...
 
 class PauseRequest(_message.Message):
     __slots__ = ("request_id", "deadline_s", "reason")

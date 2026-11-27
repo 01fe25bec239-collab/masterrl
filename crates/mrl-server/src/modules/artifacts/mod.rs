@@ -65,14 +65,17 @@ pub struct ArtifactsModule {
 impl ArtifactsModule {
     /// The module for this database and these settings. Connects to storage on first use.
     pub fn new(db: Db, config: &Config) -> Self {
-        let store = Arc::new(ArtifactStore::new(
-            db,
-            backend_config(config),
-            config.server.mode,
-            scratch::default_root(),
-        ));
-        crate::modules::datasets::records::register_lineage(&store);
-        Self { store }
+        Self {
+            store: Arc::new(
+                ArtifactStore::new(
+                    db,
+                    backend_config(config),
+                    config.server.mode,
+                    scratch::default_root(),
+                )
+                .with_module_lookups(),
+            ),
+        }
     }
 
     /// The module with an explicit backend, for a server in `mode`, keeping request scratch
@@ -84,7 +87,9 @@ impl ArtifactsModule {
         scratch_root: std::path::PathBuf,
     ) -> Self {
         Self {
-            store: Arc::new(ArtifactStore::new(db, Ok(backend), mode, scratch_root)),
+            store: Arc::new(
+                ArtifactStore::new(db, Ok(backend), mode, scratch_root).with_module_lookups(),
+            ),
         }
     }
 
@@ -249,6 +254,22 @@ impl ArtifactStore {
             signing: OnceCell::new(),
             lookups: std::sync::RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Adds the lineage lookups other modules own, so every store (the one P19 serves and
+    /// the ones other modules build) resolves their kinds. Each part adds one
+    /// `self.add_lineage_lookup(kind, Arc::new(…))` line below its marker.
+    fn with_module_lookups(self) -> Self {
+        // <mrl:lineage-lookups P26> P26 lookups go right below this line.
+        // <mrl:lineage-lookups P27> P27 lookups go right below this line.
+        self.add_lineage_lookup(
+            "dsv",
+            Arc::new(crate::modules::datasets::records::DatasetRecords::new(
+                self.db.clone(),
+            )),
+        );
+        // <mrl:lineage-lookups P29> P29 lookups go right below this line.
+        self
     }
 
     /// A new private scratch folder (see [`scratch`]).
@@ -1640,9 +1661,6 @@ async fn action(
         .filter(|a| a.state == "COMMITTED")
         .ok_or_else(|| not_found("artifact"))?;
     s.authorize(&ctx, READ, &found.resource(&org)).await?;
-    if crate::modules::datasets::store::is_version_output(store.db(), id).await? {
-        return Err(not_found("artifact"));
-    }
     let (key, file) = store.download_source(&org, &found, &body.path).await?;
     Ok(Json(
         store

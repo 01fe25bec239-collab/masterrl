@@ -111,6 +111,12 @@ class OwnershipTest(unittest.TestCase):
         commit(self.root, files, "gen")
         self.assertEqual(self.run_tool("PART=P09")[0], 0)
 
+    def test_a_manifest_change_to_lock_pins_only_counts_as_generated(self):
+        pin = "lockSha256: " + "a" * 64
+        self.assertTrue(ownership.pins_only(f"--- a/m\n+++ b/m\n@@ -1 +1 @@\n-  {pin}\n+  {pin}\n"))
+        self.assertFalse(ownership.pins_only(f"@@ -1 +1 @@\n-  {pin}\n+  name: x\n"))
+        self.assertFalse(ownership.pins_only(""))
+
     def test_default_base_is_latest_wave_tag(self):
         commit(self.root, ["apps/x.ts"], "earlier")
         git(self.root, "tag", "wave-01-done")

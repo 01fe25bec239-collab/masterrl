@@ -43,6 +43,10 @@ pub mod engines;
 #[cfg(test)]
 #[path = "../../mrl-server/src/modules/engines/integration_tests.rs"]
 mod p24_engines;
+// A1 (INT-6): built-in jobs.
+#[cfg(test)]
+#[path = "../../mrl-server/src/modules/builtin/integration_tests.rs"]
+mod int6_builtin;
 // <mrl:testkit P26> P26 `pub mod` lines go right below this line.
 // <mrl:testkit P27> P27 `pub mod` lines go right below this line.
 #[cfg(test)]

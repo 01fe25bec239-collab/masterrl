@@ -214,14 +214,6 @@ pub async fn dataset(
     .await?)
 }
 
-/// True for internal version outputs, which have a dedicated export policy.
-pub async fn is_version_output(db: &crate::db::Db, artifact: Uuid) -> Result<bool, sqlx::Error> {
-    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM dataset_versions WHERE artifact_id = $1)")
-        .bind(artifact)
-        .fetch_one(db.pool())
-        .await
-}
-
 /// The files of a version.
 pub async fn files(db: &crate::db::Db, version: Uuid) -> Result<Vec<FileRow>, JobsError> {
     Ok(sqlx::query_as::<_, FileRow>(

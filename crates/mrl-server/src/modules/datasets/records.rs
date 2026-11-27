@@ -57,14 +57,6 @@ impl RegistryRecords for DatasetRecords {
     }
 }
 
-/// Registers dataset version visibility with the served lineage graph.
-pub fn register_lineage(store: &crate::modules::artifacts::ArtifactStore) {
-    store.add_lineage_lookup(
-        "dsv",
-        std::sync::Arc::new(DatasetRecords::new(store.db().clone())),
-    );
-}
-
 #[async_trait]
 impl crate::modules::artifacts::NodeLookup for DatasetRecords {
     async fn find(
@@ -89,16 +81,6 @@ impl crate::modules::artifacts::NodeLookup for DatasetRecords {
             ),
         )))
     }
-}
-
-/// Storage org that contains the dataset version's lineage edges.
-pub(crate) async fn lineage_org(
-    store: &crate::modules::artifacts::ArtifactStore,
-    id: uuid::Uuid,
-) -> Result<Option<String>, crate::modules::artifacts::Error> {
-    Ok(lineage_version(store.db(), id)
-        .await?
-        .map(|row| crate::modules::checkpoints::service::storage_org(row.org_id)))
 }
 
 async fn lineage_version(
