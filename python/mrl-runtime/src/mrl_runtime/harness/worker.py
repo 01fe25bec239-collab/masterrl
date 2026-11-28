@@ -59,6 +59,7 @@ from mrl_runtime.adapter.types import (
     ProbeReport,
     ResolvedConfig,
     ResourceEstimate,
+    TargetDevice,
     ValidationRequest,
 )
 from mrl_runtime.checkpoint.files import ARTIFACT_MANIFEST, write_artifact_manifest
@@ -79,6 +80,10 @@ _SEVERITY = {
 }
 EXIT_OK, EXIT_FAILED, EXIT_NO_SESSION, EXIT_REPORT_UNACKED = 0, 1, 2, 3
 _log = logging.getLogger(__name__)
+
+
+# Steps sampled for memory on every progress event (the Guardian's probe mode needs 5).
+EARLY_SAMPLE_STEPS = 5
 
 
 @dataclass(frozen=True)
@@ -419,7 +424,10 @@ class Harness:
                 failure(common.FAILURE_CLASS_DEPENDENCY_ENV, "PROBE_FAILED", first, retryable=True),
             )
         hw = HardwareProfile(
-            ctx.allocation.gpu_indices, ctx.allocation.world_size, ctx.allocation.node_rank
+            ctx.allocation.gpu_indices,
+            ctx.allocation.world_size,
+            ctx.allocation.node_rank,
+            TargetDevice.from_spec(spec.get("target_device")),
         )
         report = await self._call(
             "validate", self.engine.validate, ValidationRequest(ctx.config, ctx.staged_paths, hw)
@@ -581,13 +589,14 @@ class Harness:
                 self._step(event.step)
                 if primary:
                     self.session.send(self._progress(event))
+                    self._early_sample(event)
             case Metrics():
                 self._step(event.step)
                 batch = mapper.batch(event)
                 for point in batch.points:
                     self._metrics[point.name] = point.value
                 self._watch_divergence(batch)
-                add_resource_peaks(batch, event.step)
+                add_resource_peaks(batch, event.step, event.split)
                 if primary:
                     self.session.send(batch)
             case Samples():
@@ -610,6 +619,17 @@ class Harness:
                 self._harness_line(f"[{event.level}] {event.message}")
             case EngineWarning():
                 self._harness_line(f"[warning] {event.message}")
+
+    def _early_sample(self, event: Progress) -> None:
+        """Memory peaks on each of the first steps, whatever the engine's log cadence, so the
+        Guardian's probe mode has measurements to decide on."""
+        assert self.session is not None
+        if event.step - (self._start_step or 0) > EARLY_SAMPLE_STEPS:
+            return
+        early = pb.MetricsBatch()
+        add_resource_peaks(early, event.step, event.phase)
+        if early.points:
+            self.session.send(early)
 
     def _step(self, step: int) -> None:
         if self._start_step is None:

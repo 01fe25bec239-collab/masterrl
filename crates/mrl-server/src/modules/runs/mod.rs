@@ -1,6 +1,6 @@
 //! Experiments, runs and their immutable config snapshots; serves the `/jobs` endpoints too.
 //!
-//! Register with `Box::new(crate::modules::runs::RunsModule::new(db.clone())),`.
+//! Register with `Box::new(crate::modules::runs::RunsModule::new(db.clone(), config)),`.
 
 pub mod api;
 pub mod experiments;
@@ -24,8 +24,8 @@ pub struct RunsModule {
 impl RunsModule {
     /// The module with every registered chain member and project directory
     /// ([`Chains::registered`], [`Projects::registered`]).
-    pub fn new(db: Db) -> Self {
-        let chains = Chains::registered(&db);
+    pub fn new(db: Db, config: &crate::Config) -> Self {
+        let chains = Chains::registered(&db, config);
         let projects = Projects::registered(&db);
         Self {
             db,

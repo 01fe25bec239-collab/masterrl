@@ -159,7 +159,7 @@ impl CheckpointsModule {
             secrets,
             &gateway,
             config.checkpoints.clone(),
-            Chains::registered(&db),
+            Chains::registered(&db, config),
         );
         LaneRouter::global().register(Arc::new(sink::CheckpointSink::new(module.service.clone())));
         module
