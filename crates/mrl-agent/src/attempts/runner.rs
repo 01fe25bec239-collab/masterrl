@@ -2069,7 +2069,15 @@ impl Runner {
             needs_final_checkpoint: self.rec.needs_final_checkpoint(),
             readopted: p.as_ref().is_some_and(|p| p.readopted),
             // <mrl:sandbox-violation P29> P29 sets this from the job's sandbox profile.
-            sandbox_violation: false,
+            sandbox_violation: p.as_ref().is_some_and(|worker| {
+                crate::sandbox::profiles::classify_attempt(
+                    self.rec.spec.job_spec["sandbox"].as_str(),
+                    self.sh.ctx.config.sandbox.backend,
+                    worker.code,
+                    worker.signal,
+                    worker.oom,
+                )
+            }),
             agent_stopped: self.agent_stopped,
         };
         self.finish_with(decide(&ev), control).await

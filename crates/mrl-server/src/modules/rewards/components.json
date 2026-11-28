@@ -691,11 +691,11 @@
       "protobuf==7.36.2",
       "pyyaml==6.0.3"
     ],
-    "lock_sha256": "fe47c547d91d4ac6d4f5845f2e88f6b3466dad1a15523c8d02efcf67257f3bec",
+    "lock_sha256": "03d902d000679e7324be3fcb178864120da8133438af32c952004803930e0ec0",
     "package": "mrl-rewards",
     "version": "0.1.0"
   },
-  "executor_sha256": "3cb82c373c2f052d629d3a30a3d1e4f0f332217f9cd87967d1b61abf223144bf",
+  "executor_sha256": "afc642fa10b972501decc64240f70d848fb26be6e44680358583f5871c16e331",
   "format": "mrl-reward-components/1",
   "sdk_contract": "mrl-rewards/1"
 }

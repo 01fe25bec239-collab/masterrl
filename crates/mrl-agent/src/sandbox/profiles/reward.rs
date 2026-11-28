@@ -763,9 +763,30 @@ mod escape {
             } else {
                 proc.stop(Duration::from_secs(5)).await.unwrap()
             };
+            let decision = crate::attempts::exit::decide(&crate::attempts::exit::ExitEvidence {
+                exit_code: report.code,
+                signal: report.signal,
+                oom_killed: report.oom_killed,
+                sandbox_violation: super::super::classify_attempt(
+                    Some(if launch.tier2 { "code_exec" } else { "reward" }),
+                    crate::config::SandboxChoice::Bubblewrap,
+                    report.code,
+                    report.signal,
+                    report.oom_killed,
+                ),
+                ..Default::default()
+            });
             let ending = match classify(&report) {
                 Ending::Ok => "ok".to_owned(),
-                Ending::Violation(_) => "violation".to_owned(),
+                Ending::Violation(_) => {
+                    let failure = decision
+                        .failure
+                        .expect("the attempt reports a sandbox failure");
+                    assert_eq!(failure.sub_code, "SANDBOX_KILL");
+                    assert!(!failure.retryable_hint);
+                    "violation".to_owned()
+                }
+
                 Ending::OutOfMemory => "oom".to_owned(),
                 Ending::Failed(why) => format!("failed: {why}"),
             };

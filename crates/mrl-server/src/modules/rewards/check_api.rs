@@ -651,38 +651,56 @@ pub(super) async fn list_reports(
 ) -> Result<Json<Page<ReportView>>, RewardsError> {
     let v = read_version(&state, &ctx, &c, &rwdv, "rewards.read").await?;
     let page = q.resolve()?;
-    let after = scope::after::<JobId>(&page, |j| j.as_uuid())?;
-    let rows = sqlx::query_as::<_, ReportRow>(concat!(
-        "SELECT ",
-        crate::reward_report_cols!(),
-        " FROM reward_reports WHERE org_id = $1 AND (version_id = $2 OR other_version_id = $2)
-           AND job_id IS NOT NULL AND ($3::uuid IS NULL OR job_id < $3)
-         ORDER BY job_id DESC LIMIT $4"
-    ))
-    .bind(v.org_id)
-    .bind(v.id)
-    .bind(after)
-    .bind(page.fetch() as i64)
-    .fetch_all(c.db.pool())
-    .await?;
-    let (rows, next_cursor) = scope::cut(rows, &page, |r| {
-        r.job_id
-            .map(|j| JobId::from_uuid(j).to_string())
-            .unwrap_or_default()
-    });
-    let mut items = Vec::with_capacity(rows.len());
-    for report in rows {
-        if report.project_id == v.project_id
-            || scope::allowed(
-                &state,
-                &ctx,
-                "rewards.read",
-                &scope::resource("reward", None, report.org_id, report.project_id),
-            )
-            .await?
-        {
-            items.push(report_view(&report));
+    let mut after = scope::after::<JobId>(&page, |j| j.as_uuid())?;
+    let mut visible = Vec::with_capacity(page.fetch());
+    let mut permissions = std::collections::HashMap::from([(v.project_id, true)]);
+    while visible.len() < page.fetch() {
+        let rows = sqlx::query_as::<_, ReportRow>(concat!(
+            "SELECT ",
+            crate::reward_report_cols!(),
+            " FROM reward_reports WHERE org_id = $1 AND (version_id = $2 OR other_version_id = $2)
+               AND job_id IS NOT NULL AND ($3::uuid IS NULL OR job_id < $3)
+             ORDER BY job_id DESC LIMIT $4"
+        ))
+        .bind(v.org_id)
+        .bind(v.id)
+        .bind(after)
+        .bind(page.fetch() as i64)
+        .fetch_all(c.db.pool())
+        .await?;
+        let exhausted = rows.len() < page.fetch();
+        after = rows.last().and_then(|row| row.job_id);
+        for report in rows {
+            let readable = match permissions.entry(report.project_id) {
+                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::hash_map::Entry::Vacant(entry) => *entry.insert(
+                    scope::allowed(
+                        &state,
+                        &ctx,
+                        "rewards.read",
+                        &scope::resource("reward", None, report.org_id, report.project_id),
+                    )
+                    .await?,
+                ),
+            };
+            if readable {
+                visible.push(report);
+                if visible.len() == page.fetch() {
+                    break;
+                }
+            }
+        }
+        if exhausted {
+            break;
         }
     }
-    Ok(Json(Page { items, next_cursor }))
+    let (rows, next_cursor) = scope::cut(visible, &page, |row| {
+        row.job_id
+            .map(|job| JobId::from_uuid(job).to_string())
+            .unwrap_or_default()
+    });
+    Ok(Json(Page {
+        items: rows.iter().map(report_view).collect(),
+        next_cursor,
+    }))
 }

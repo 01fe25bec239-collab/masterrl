@@ -335,10 +335,10 @@ class _Generator:
         transformers: Any = importlib.import_module("transformers")
         self.torch.manual_seed(seed)
         self.tok: Any = transformers.AutoTokenizer.from_pretrained(
-            str(model_dir), local_files_only=True
+            str(model_dir), local_files_only=True, trust_remote_code=False
         )
         self.model: Any = transformers.AutoModelForCausalLM.from_pretrained(
-            str(model_dir), local_files_only=True
+            str(model_dir), local_files_only=True, trust_remote_code=False, use_safetensors=True
         )
         self.model.eval()
 
@@ -486,6 +486,7 @@ def _run(ctx: TaskContext) -> Iterator[TaskEvent]:
     ctx.output_dir.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="mrl-rp-"))
     services: list[Service] = []
+    violation = False
     try:
         a = Service(work, ctx.staged_paths, cast(Mapping[str, Any], ctx.inputs["reward"]), "reward")
         services.append(a)
@@ -537,10 +538,22 @@ def _run(ctx: TaskContext) -> Iterator[TaskEvent]:
         (ctx.output_dir / REPORT).write_text(json.dumps(report, sort_keys=True), encoding="utf-8")
         yield Progress(step=3, total_steps=3, phase="reward_preview")
         yield from outputs
+    except MrlError as exc:
+        violation = (
+            exc.code == SANDBOX_VIOLATION
+            and os.environ.get("MRL_SANDBOX_PROFILE") == "code_exec"
+            and os.environ.get("MRL_USER_CODE_ALLOWED") == "1"
+            and sys.platform.startswith("linux")
+        )
+        if not violation:
+            raise
     finally:
-        for s in services:
-            s.close()
+        for service in services:
+            service.close()
         shutil.rmtree(work)
+    if violation:
+        # The agent receives the same exit status as a bubblewrap wrapper that caught SIGSYS.
+        os._exit(128 + signal.SIGSYS)
 
 
 REWARD_PREVIEW = BuiltinTask(

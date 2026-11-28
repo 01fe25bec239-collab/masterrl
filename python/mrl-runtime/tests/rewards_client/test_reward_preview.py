@@ -6,6 +6,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import signal
 import sys
 import tempfile
 from collections.abc import Iterator
@@ -14,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from mrl_runtime.builtin import reward_preview
 from mrl_runtime.builtin.engine import discover_tasks
 from mrl_runtime.builtin.reward_preview import REPORT, REPORT_FORMAT, REWARD_PREVIEW, ROWS
 from mrl_runtime.builtin.tasks import TaskContext, TaskOutput
@@ -224,3 +226,78 @@ def test_with_a_jail_the_reward_service_runs_inside_it(tmp: Path) -> None:
     assert "reward_exec.ready" in log, log
     assert "jail_skipped" not in log, log
     assert [c["total"] for c in sorted(report["cases"], key=lambda c: c["position"])] == [1.0, 0.0]
+
+
+@pytest.mark.parametrize("mode", ["preview", "compare"])
+def test_cpu_model_generates_and_scores_local_completions(tmp: Path, mode: str) -> None:
+    torch = pytest.importorskip("torch")
+    hf = pytest.importorskip("transformers")
+    tk = pytest.importorskip("tokenizers")
+    assert torch.version.cuda is None
+    model = tmp / "model"
+    tokenizer = tk.Tokenizer(
+        tk.models.WordLevel({"[unk]": 0, "hello": 1, "[end]": 2}, unk_token="[unk]")
+    )
+    tokenizer.pre_tokenizer = tk.pre_tokenizers.Whitespace()
+    hf.PreTrainedTokenizerFast(
+        tokenizer_object=tokenizer,
+        unk_token="[unk]",
+        eos_token="[end]",
+    ).save_pretrained(model)
+    hf.GPT2LMHeadModel(
+        hf.GPT2Config(
+            vocab_size=3,
+            n_layer=1,
+            n_head=1,
+            n_embd=8,
+            n_positions=16,
+            bos_token_id=2,
+            eos_token_id=2,
+            pad_token_id=2,
+            tie_word_embeddings=False,
+        )
+    ).save_pretrained(model)
+    data = tmp / "rows.jsonl"
+    data.write_text('{"prompt":"hello","reference":"42"}\n', encoding="utf-8")
+    inputs = {
+        "mode": mode,
+        "reward": reward(),
+        "other": reward("rwdv_b"),
+        "preview": {"n": 1, "completions": "generate", "num_generations": 2, "max_new_tokens": 2},
+    }
+    _, _, out = run(tmp, inputs, {"model": model, "dataset": data})
+    rows = [json.loads(line) for line in (out / ROWS).read_text(encoding="utf-8").splitlines()]
+    assert sorted(row["version"] for row in rows) == (
+        ["a", "a", "b", "b"] if mode == "compare" else ["a", "a"]
+    )
+    assert all(row["completion_tokens"] > 0 and row["total"] is not None for row in rows)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="bubblewrap exit status")
+def test_preview_propagates_a_nested_sandbox_failure_to_agent(
+    tmp: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class StoppedService:
+        version = "rwdv_a"
+
+        def __init__(self, *_args: object) -> None:
+            pass
+
+        def start(self) -> str:
+            raise MrlError(reward_preview.SANDBOX_VIOLATION, "The sandbox stopped the service.")
+
+        def close(self) -> None:
+            pass
+
+    def exit_with_status(status: int) -> None:
+        raise SystemExit(status)
+
+    monkeypatch.setenv("MRL_SANDBOX_PROFILE", "code_exec")
+    monkeypatch.setenv("MRL_USER_CODE_ALLOWED", "1")
+    monkeypatch.setattr(reward_preview, "Service", StoppedService)
+    monkeypatch.setattr(os, "_exit", exit_with_status)
+    with pytest.raises(SystemExit) as reported:
+        run(tmp, {"mode": "test", "reward": reward(), "cases": CASES})
+    assert reported.value.code == 128 + signal.SIGSYS
+    assert not (tmp / "out" / REPORT).exists()

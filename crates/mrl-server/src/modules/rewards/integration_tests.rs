@@ -32,7 +32,7 @@ struct Env {
     owner: Auth,
 }
 
-async fn person(env: &Env, name: &str, org: OrgId, role: Role) -> Auth {
+async fn person(env: &Env, name: &str, org: OrgId, role: Role, scope: Scope) -> Auth {
     let user = MockUser::new(&format!("{name}@example.com"), name);
     let auth = Auth::Bearer(env.sb.access_token(&user, 600));
     let me = env
@@ -46,11 +46,25 @@ async fn person(env: &Env, name: &str, org: OrgId, role: Role) -> Auth {
         .await
         .unwrap();
     let mut tx = env.core.db.db().begin().await.unwrap();
-    bind_role(&mut tx, org, UserId::from_uuid(id), role, Scope::Org)
+    bind_role(&mut tx, org, UserId::from_uuid(id), role, scope)
         .await
         .unwrap();
     tx.commit().await.unwrap();
     auth
+}
+
+async fn add_project(env: &Env) -> ProjectId {
+    let project = ProjectId::new();
+    sqlx::query(
+        "INSERT INTO projects (id, org_id, workspace_id, slug, name)
+         SELECT $1, org_id, workspace_id, 'other', 'Other' FROM projects WHERE id = $2",
+    )
+    .bind(project.as_uuid())
+    .bind(env.prj.as_uuid())
+    .execute(env.core.db.pool())
+    .await
+    .unwrap();
+    project
 }
 
 async fn seed_org(core: &CoreServer, org: OrgId, prj: ProjectId) {
@@ -78,7 +92,7 @@ async fn env() -> Env {
         prj,
         owner: Auth::None,
     };
-    env.owner = person(&env, "owner", org, Role::Owner).await;
+    env.owner = person(&env, "owner", org, Role::Owner, Scope::Org).await;
     env
 }
 
@@ -347,7 +361,7 @@ async fn p29_versions_are_content_hashed_idempotent_validated_and_org_scoped() {
     // Another org's person sees none of it (404), and a viewer can't write (403).
     let (other_org, other_prj) = (OrgId::new(), ProjectId::new());
     seed_org(&env.core, other_org, other_prj).await;
-    let stranger = person(&env, "stranger", other_org, Role::Owner).await;
+    let stranger = person(&env, "stranger", other_org, Role::Owner, Scope::Org).await;
     for (m, path, body) in [
         (Method::GET, format!("/api/v1/rewards/{rwd}"), None),
         (Method::GET, format!("/api/v1/reward-versions/{v1}"), None),
@@ -366,7 +380,7 @@ async fn p29_versions_are_content_hashed_idempotent_validated_and_org_scoped() {
         let r = env.core.call(m.clone(), &path, &stranger, body).await;
         assert_eq!(r.status, 404, "{m} {path}: {}", r.text());
     }
-    let viewer = person(&env, "viewer", env.org, Role::Viewer).await;
+    let viewer = person(&env, "viewer", env.org, Role::Viewer, Scope::Org).await;
     let r = env
         .core
         .call(
@@ -679,13 +693,58 @@ async fn p29_published_versions_and_their_cases_are_immutable_in_the_database() 
 
 #[tokio::test]
 #[ignore = "needs DATABASE_URL"]
+async fn p29_report_pages_hide_other_projects_and_exclude_their_cursors() {
+    let env = env().await;
+    let other = add_project(&env).await;
+    let make = |project: ProjectId| {
+        let env = &env;
+        async move {
+            let response = env
+                .call(
+                    Method::POST,
+                    &format!("/api/v1/projects/{project}/rewards"),
+                    Some(json!({"name": "math", "version": {"policy": policy(1.0)}})),
+                )
+                .await;
+            assert_eq!(response.status, 201, "{}", response.text());
+            response.json()["versions"][0]["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    };
+    let a = make(env.prj).await;
+    let b = make(other).await;
+    for _ in 0..2 {
+        preview_job(&env, uuid_of(&a), "compare", Some(uuid_of(&b))).await;
+    }
+    let path = format!("/api/v1/reward-versions/{b}/reports?limit=1");
+    let accessible = env.call(Method::GET, &path, None).await;
+    assert_eq!(accessible.status, 200, "{}", accessible.text());
+    assert_eq!(accessible.json()["items"].as_array().unwrap().len(), 1);
+    assert!(accessible.json()["next_cursor"].is_string());
+    let reader = person(
+        &env,
+        "other-viewer",
+        env.org,
+        Role::Viewer,
+        Scope::Project(other),
+    )
+    .await;
+    let hidden = env.core.call(Method::GET, &path, &reader, None).await;
+    assert_eq!(hidden.status, 200, "{}", hidden.text());
+    assert_eq!(hidden.json()["items"], json!([]));
+    assert!(hidden.json()["next_cursor"].is_null());
+    env.core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs DATABASE_URL"]
 async fn p29_a_run_can_launch_only_with_a_published_reward() {
     use mrl_domain::ids::{DatasetVersionId, ModelVersionId};
     use mrl_server::modules::jobs::AttemptRow;
     use mrl_server::modules::rewards::launch::RewardInputs;
-    use mrl_server::modules::scheduler::pipeline::{
-        LaunchContributor, LaunchError, LaunchPlan, Placement,
-    };
+    use mrl_server::modules::scheduler::pipeline::{LaunchContributor, LaunchPlan, Placement};
     let env = env().await;
     let prj = env.prj;
     let made = env
@@ -697,20 +756,77 @@ async fn p29_a_run_can_launch_only_with_a_published_reward() {
         .await
         .json();
     let vtext = made["versions"][0]["id"].as_str().unwrap().to_owned();
-    let run = env
+    let body = json!({
+        "name": "r", "algorithm_id": "grpo", "reward_version_id": vtext,
+        "base_model_version_id": ModelVersionId::new().to_string(),
+        "dataset_version_ids": [DatasetVersionId::new().to_string()], "config": {}
+    });
+    let submit = |body: Value, key: &'static str| {
+        let env = &env;
+        async move {
+            env.core
+                .call_with(
+                    Method::POST,
+                    &format!("/api/v1/projects/{prj}/runs"),
+                    &env.owner,
+                    Some(body),
+                    &[("idempotency-key", key)],
+                )
+                .await
+        }
+    };
+    let mut missing = body.clone();
+    missing["reward_version_id"] = json!(RewardVersionId::new().to_string());
+    for (input, key) in [(missing, "p29-missing"), (body.clone(), "p29-draft")] {
+        let response = submit(input, key).await;
+        assert_eq!(response.status, 422, "{}", response.text());
+        assert_eq!(response.json()["errors"][0]["path"], "/reward_version_id");
+    }
+    sqlx::query("UPDATE reward_versions SET state = 'PUBLISHED', exec_sha256 = $2 WHERE id = $1")
+        .bind(uuid_of(&vtext))
+        .bind("d".repeat(64))
+        .execute(env.core.db.pool())
+        .await
+        .unwrap();
+    let other_project = add_project(&env).await;
+    let refused = env
         .core
         .call_with(
             Method::POST,
-            &format!("/api/v1/projects/{prj}/runs"),
+            &format!("/api/v1/projects/{other_project}/runs"),
             &env.owner,
-            Some(json!({
-            "name": "r", "algorithm_id": "grpo", "reward_version_id": vtext,
-            "base_model_version_id": ModelVersionId::new().to_string(),
-            "dataset_version_ids": [DatasetVersionId::new().to_string()], "config": {}})),
-            &[("idempotency-key", "p29-run")],
+            Some(body.clone()),
+            &[("idempotency-key", "p29-other-project")],
         )
         .await;
+    assert_eq!(refused.status, 422, "{}", refused.text());
+    assert_eq!(refused.json()["errors"][0]["path"], "/reward_version_id");
+
+    let run = submit(body.clone(), "p29-run").await;
     assert_eq!(run.status, 201, "{}", run.text());
+    let run_id: mrl_domain::ids::RunId = run.json()["id"].as_str().unwrap().parse().unwrap();
+    let edge: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM lineage_edges WHERE org_id = $1 AND from_kind = 'run'
+           AND from_id = $2 AND relation = 'rewarded_by' AND to_kind = 'rwdv' AND to_id = $3",
+    )
+    .bind(env.org.to_string())
+    .bind(run_id.as_uuid())
+    .bind(uuid_of(&vtext))
+    .fetch_one(env.core.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(edge, 1);
+    let deprecated = env
+        .call(
+            Method::POST,
+            &format!("/api/v1/reward-versions/{vtext}:deprecate"),
+            None,
+        )
+        .await;
+    assert_eq!(deprecated.status, 200, "{}", deprecated.text());
+    let new_pin = submit(body, "p29-deprecated").await;
+    assert_eq!(new_pin.status, 422, "{}", new_pin.text());
+    assert_eq!(new_pin.json()["errors"][0]["path"], "/reward_version_id");
     let job_id = mrl_domain::ids::JobId::from_str(run.json()["job_id"].as_str().unwrap())
         .unwrap()
         .as_uuid();
@@ -741,19 +857,6 @@ async fn p29_a_run_can_launch_only_with_a_published_reward() {
     .store();
     let contributor = RewardInputs::with_store(env.core.db.db().clone(), store);
     let mut plan = LaunchPlan::default();
-    let draft = contributor
-        .contribute(&job, &attempt, &placement, &mut plan)
-        .await;
-    assert!(
-        matches!(&draft, Err(LaunchError::Fail(mrl_domain::failure::FailureClass::UserConfig, why)) if why.contains("DRAFT")),
-        "{draft:?}"
-    );
-    sqlx::query("UPDATE reward_versions SET state = 'PUBLISHED', exec_sha256 = $2 WHERE id = $1")
-        .bind(uuid_of(&vtext))
-        .bind("d".repeat(64))
-        .execute(env.core.db.pool())
-        .await
-        .unwrap();
     plan.launch.job_spec_json = json!({"run_id": "x"}).to_string();
     contributor
         .contribute(&job, &attempt, &placement, &mut plan)

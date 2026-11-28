@@ -268,6 +268,12 @@ impl ArtifactStore {
         // <mrl:lineage-lookups P26> P26 lookups go right below this line.
         // <mrl:lineage-lookups P27> P27 lookups go right below this line.
         // <mrl:lineage-lookups P29> P29 lookups go right below this line.
+        self.add_lineage_lookup(
+            "rwdv",
+            Arc::new(crate::modules::rewards::submission::RewardVersions::new(
+                self.db.clone(),
+            )),
+        );
         self
     }
 

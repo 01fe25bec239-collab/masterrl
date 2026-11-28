@@ -66,3 +66,8 @@ jobs:
 
       - name: reward client, sandboxed bundle, preview task and the escape corpus's own checks
         run: uv run --locked pytest -q python/mrl-runtime/tests/rewards_client tests/security/reward_escape
+
+      - name: generate preview and compare completions with the pinned CPU runtime
+        run: >-
+          uv run --project python/builtin-env --locked --with pytest==9.2.0 pytest -q
+          python/mrl-runtime/tests/rewards_client/test_reward_preview.py -k cpu_model
