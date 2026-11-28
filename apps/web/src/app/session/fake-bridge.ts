@@ -23,6 +23,7 @@ export function fakeBridge(): FakeBridge {
   const routeWaiters = new Set<() => void>();
   let settings: DesktopSettings = { closeToTray: true, checkForUpdates: true };
   const update: UpdateStatus = { phase: 'idle' };
+  const sleep = { manual: false, training: false };
   const crashes: CrashSummary[] = [
     {
       id: 'mrl-server-1764320000000-42',
@@ -70,7 +71,13 @@ export function fakeBridge(): FakeBridge {
       signIn: vi.fn(() => Promise.resolve({ status: 'signed_in' as const })),
       cancelSignIn: vi.fn(() => Promise.resolve(true)),
     },
-    desktop: { blockSleep: vi.fn((on: boolean) => Promise.resolve(on)) },
+    desktop: {
+      blockSleep: vi.fn((on: boolean) => {
+        sleep.manual = on;
+        return Promise.resolve(on || sleep.training);
+      }),
+      sleepState: vi.fn(() => Promise.resolve({ ...sleep, awake: sleep.manual || sleep.training })),
+    },
     nav: {
       next: vi.fn(
         () =>

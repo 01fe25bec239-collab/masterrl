@@ -13,7 +13,8 @@
     "typecheck": "tsc",
     "test": "vitest run",
     "test:smoke": "playwright test",
-    "test:e2e": "playwright test -c playwright.e2e.config.ts"
+    "test:e2e": "playwright test -c playwright.e2e.config.ts",
+    "package": "pnpm run build:main && node scripts/stage-core.ts && electron-builder --dir"
   },
   "devDependencies": {
     "@playwright/test": "1.64.1",
@@ -40,6 +41,10 @@
       {
         "from": "../web/dist",
         "to": "renderer"
+      },
+      {
+        "from": "dist/bin",
+        "to": "bin"
       }
     ],
     "mac": {

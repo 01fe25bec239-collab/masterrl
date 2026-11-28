@@ -17,7 +17,15 @@ test.describe.configure({ mode: 'serial' });
 const PASSPHRASE = 'correct horse battery staple';
 /** CI machines are slower than the owner's Mac; the limits there are scaled by this. */
 const SCALE = Number(process.env.MRL_BUDGET_SCALE ?? '1');
-const BUDGET = { shellMb: 350, coreMb: 300, coldStartMs: 4000 * SCALE };
+/**
+ * Owner's limits (2026-11-28): app shell ≤ 350 MB on the Mac, ≤ 450 MB on headless Linux CI
+ * (software GPU and Playwright's debugger connection; set there by MRL_SHELL_BUDGET_MB).
+ */
+const BUDGET = {
+  shellMb: Number(process.env.MRL_SHELL_BUDGET_MB ?? '350'),
+  coreMb: 300,
+  coldStartMs: 4000 * SCALE,
+};
 
 let supabase: MockSupabase;
 let first: Computer;
@@ -108,6 +116,25 @@ test('quit and start again keeps the state, within the cold-start budget', async
   await page.getByRole('link', { name: 'Account' }).click();
   await expect(page.getByText('Signed in', { exact: true })).toBeVisible();
   expect(budgets.coldStartMs).toBeLessThanOrEqual(BUDGET.coldStartMs);
+});
+
+test('quitting while the core is still starting leaves no PostgreSQL running', async () => {
+  const fresh = new Computer('quit-early', supabase.url);
+  const d = await launch(fresh);
+  // First run: the core creates and starts its database before it listens.
+  await until(
+    'the database to start',
+    () => (fresh.postgres().length > 0 ? true : undefined),
+    120_000,
+  );
+  const phase = await d.page.evaluate(
+    async () => (await (window as unknown as { mrl: Bridge }).mrl.core.status()).phase,
+  );
+  await d.quit();
+  open = null;
+  expect(fresh.postgres()).toEqual([]);
+  // Record whether this really stopped a core that was still starting.
+  console.log(`quit during start: the core was ${phase}`);
 });
 
 test('a second computer restores the saved setup', async () => {

@@ -19,6 +19,7 @@ import { SignIn } from './auth';
 import { agentConfigPath, linkLocalAgent } from './core/agent-config';
 import { CoreClient } from './core/client';
 import { proxyToCore } from './core/proxy';
+import { GrpcPortMemory } from './core/ports';
 import { CoreSupervisor, type CoreLaunch } from './core/supervisor';
 import { framesOf, CrashReports } from './crash/reports';
 import { deepLinkIn, routeDeepLink, SCHEME } from './deeplinks';
@@ -27,6 +28,7 @@ import { NavQueue } from './nav';
 import { SleepGuard } from './power';
 import { APP_URL, resolveAppFile } from './protocol';
 import {
+  browserLogFile,
   CONTENT_SECURITY_POLICY,
   DEV_CONTENT_SECURITY_POLICY,
   isAllowedExternal,
@@ -65,7 +67,7 @@ function isRendererPage(url: string): boolean {
  * Opens the system browser. A dev build started with `MRL_BROWSER_LOG` (tests/e2e/desktop)
  * writes the address to that file instead, for the test to play the person in the browser.
  */
-const browserLog = app.isPackaged ? undefined : process.env.MRL_BROWSER_LOG;
+const browserLog = browserLogFile(app.isPackaged, process.env);
 async function openInBrowser(url: string): Promise<void> {
   if (browserLog) await appendFile(browserLog, `${url}\n`, { mode: 0o600 });
   else await shell.openExternal(url);
@@ -126,7 +128,10 @@ const reports = new CrashReports(
 const nav = new NavQueue();
 const sleep = new SleepGuard(powerSaveBlocker);
 
-function coreLaunch(): CoreLaunch {
+const grpcPorts = new GrpcPortMemory(path.join(userData, 'core', 'ports.json'));
+const GRPC_ENV = 'MRL_SERVER__LISTENERS__GRPC';
+
+async function coreLaunch(): Promise<CoreLaunch> {
   const program =
     process.env.MRL_CORE_BIN ??
     (app.isPackaged
@@ -135,12 +140,14 @@ function coreLaunch(): CoreLaunch {
   const config = process.env.MRL_CORE_CONFIG;
   return {
     program,
-    args: ['--mode', 'solo', ...(config ? ['--config', config] : [])],
+    args: ['--mode', 'solo', '--stop-on-stdin-close', ...(config ? ['--config', config] : [])],
     env: {
       ...process.env,
       MRL_LAUNCH_SECRET: secret,
       MRL_CRASH_DIR: reports.folder,
       MRL_DESKTOP__AGENT_CONFIG: agentConfig,
+      // The same gRPC port as last time, so running agents keep reaching the gateway.
+      [GRPC_ENV]: process.env[GRPC_ENV] ?? `127.0.0.1:${String(await grpcPorts.choose())}`,
     },
   };
 }
@@ -154,6 +161,11 @@ const supervisor: CoreSupervisor = new CoreSupervisor({
   },
   onReady: (ep) => {
     activity?.start();
+    if (ep.grpcPort) {
+      void grpcPorts.remember(ep.grpcPort).catch((e: unknown) => {
+        console.warn(`MasterRL: the core's gRPC port was not remembered: ${String(e)}`);
+      });
+    }
     if (linkAgent) {
       void linkLocalAgent(agentConfig, secret, {
         serverUrl: `http://127.0.0.1:${String(ep.port)}`,
@@ -353,6 +365,7 @@ void app.whenReady().then(async () => {
     'auth:signIn': (provider) => signIn.start(provider),
     'auth:cancelSignIn': () => signIn.cancel(),
     'desktop:blockSleep': (on) => sleep.set('manual', on),
+    'desktop:sleepState': () => sleep.state(),
     'nav:next': () => nav.next(),
     'crash:list': () => reports.list(),
     'crash:read': (id) => reports.read(id),

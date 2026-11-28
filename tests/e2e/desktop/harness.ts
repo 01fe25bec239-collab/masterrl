@@ -107,6 +107,24 @@ export class MockSupabase {
   }
 }
 
+/** The unpacked app `electron-builder --dir` writes for this OS (the dev package). */
+export function packagedApp(): string {
+  const release = path.join(desktopDir, 'release');
+  if (process.platform === 'darwin') {
+    const dir = process.arch === 'arm64' ? 'mac-arm64' : 'mac';
+    return path.join(release, dir, 'MasterRL.app/Contents/MacOS/MasterRL');
+  }
+  if (process.platform === 'win32') return path.join(release, 'win-unpacked/MasterRL.exe');
+  return path.join(release, 'linux-unpacked/masterrl');
+}
+
+/** The folder of the packaged app's bundled programs (`resources/bin`). */
+export function packagedBin(): string {
+  const app = packagedApp();
+  if (process.platform === 'darwin') return path.join(app, '../../Resources/bin');
+  return path.join(path.dirname(app), 'resources/bin');
+}
+
 /** One install of the app: its own home, app data, core settings and agent settings. */
 export class Computer {
   readonly home: string;
@@ -136,7 +154,40 @@ export class Computer {
   }
 
   /** Starts the app and waits for its window. */
-  async launch(env: Record<string, string> = {}): Promise<Desktop> {
+  /** The gRPC port the app remembered for the core (`<user data>/core/ports.json`). */
+  grpcPort(): number | undefined {
+    try {
+      const saved = JSON.parse(
+        readFileSync(path.join(this.home, 'user-data/core/ports.json'), 'utf8'),
+      ) as { grpc?: unknown };
+      return typeof saved.grpc === 'number' ? saved.grpc : undefined;
+    } catch {
+      return undefined;
+    }
+  }
+
+  /** The local agent's settings file as the app last wrote it. */
+  agentSettings(): string {
+    try {
+      return readFileSync(path.join(this.home, 'agent.toml'), 'utf8');
+    } catch {
+      return '';
+    }
+  }
+
+  /** PostgreSQL processes running on this computer's database folder. */
+  postgres(): number[] {
+    const folder = path.join(this.home, 'pg');
+    return processes()
+      .filter((p) => /postgres/.test(p.args) && p.args.includes(folder))
+      .map((p) => p.pid);
+  }
+
+  /**
+   * Starts the app and waits for its window: the dev build with the debug core, or with
+   * `packaged` the dev package (`pnpm --filter desktop package`) with the core it bundles.
+   */
+  async launch(env: Record<string, string> = {}, { packaged = false } = {}): Promise<Desktop> {
     const started = Date.now();
     const browserLog = path.join(this.home, `browser-${String(started)}.log`);
     // A host that is itself Electron may set this; the app must not run as plain Node.
@@ -145,9 +196,14 @@ export class Computer {
         (e): e is [string, string] => e[1] !== undefined && e[0] !== 'ELECTRON_RUN_AS_NODE',
       ),
     );
+    const where = packaged
+      ? { executablePath: packagedApp() }
+      : {
+          args: [desktopDir],
+          cwd: desktopDir,
+        };
     const app = await _electron.launch({
-      args: [desktopDir],
-      cwd: desktopDir,
+      ...where,
       timeout: 60_000,
       env: {
         ...inherited,
@@ -157,11 +213,15 @@ export class Computer {
         MRL_USER_DATA: path.join(this.home, 'user-data'),
         MRL_AGENT_CONFIG: path.join(this.home, 'agent.toml'),
         MRL_CORE_CONFIG: path.join(this.home, 'core.toml'),
-        MRL_CORE_BIN: path.join(
-          repo,
-          'target/debug',
-          process.platform === 'win32' ? 'mrl-server.exe' : 'mrl-server',
-        ),
+        ...(packaged
+          ? {}
+          : {
+              MRL_CORE_BIN: path.join(
+                repo,
+                'target/debug',
+                process.platform === 'win32' ? 'mrl-server.exe' : 'mrl-server',
+              ),
+            }),
         MRL_NO_PROTOCOL_REGISTER: '1',
         MRL_BROWSER_LOG: browserLog,
         ...env,
@@ -315,6 +375,8 @@ export class Desktop {
     coreMb: number;
     rssMb: number;
     corePid: number | undefined;
+    /** The core's command line (to see which program runs). */
+    coreArgs: string | undefined;
     /** Each app process, like `gpu-process 120`, to see where the shell's memory goes. */
     shellDetail: string[];
   } {
@@ -332,6 +394,7 @@ export class Desktop {
       coreMb: memoryMb(coreTree),
       rssMb: Math.round(tree.reduce((n, p) => n + p.rssKb, 0) / 1024),
       corePid: core?.pid,
+      coreArgs: core?.args,
     };
   }
 

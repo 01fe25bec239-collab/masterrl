@@ -1,10 +1,9 @@
 import { createApiClient, type ClientOptions } from '@mrl/api-client';
-// The generated client is not exported by @mrl/api-client yet (handoff: item for A1).
 import {
   createMrlClient,
   type components,
   type MrlApiClient,
-} from '../../../../../packages/api-client/src/generated/mrl-api-v1';
+} from '@mrl/api-client/generated/mrl-api-v1';
 import { API_URL, connectApi, MOCK_TOKEN, mocksEnabled } from '../../lib/api';
 import { desktopBridge, type Bridge } from './bridge';
 

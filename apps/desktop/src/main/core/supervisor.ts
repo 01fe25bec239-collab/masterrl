@@ -21,7 +21,7 @@ export interface CoreEndpoint {
 
 export interface SupervisorOptions {
   /** Called before every start, so settings changes apply on the next start. */
-  launch: () => CoreLaunch;
+  launch: () => CoreLaunch | Promise<CoreLaunch>;
   /** The per-launch secret (also in `launch().env.MRL_LAUNCH_SECRET`). */
   secret: string;
   spawn?: typeof nodeSpawn;
@@ -36,6 +36,8 @@ export interface SupervisorOptions {
   healthFailures?: number;
   /** How long a start may take until the core reports its port and answers. */
   startTimeoutMs?: number;
+  /** How long a stop waits for the core to exit after stdin closed before SIGTERM (Unix). */
+  termAfterMs?: number;
   /** How long a stop waits before the process is killed. */
   stopTimeoutMs?: number;
   /** More crashes than this within `crashWindowMs` stop the retries (`failed`). */
@@ -91,9 +93,11 @@ function codeIn(lines: readonly string[]): string | undefined {
  *   then for `/healthz` to answer. Then `ready`.
  * - Crash or hang (health fails `healthFailures` times in a row): `reconnecting`, start again
  *   after a backoff. More than `maxCrashes` within `crashWindowMs`: `failed` until `restart()`.
- * - Stop: SIGTERM; the core stops taking work, finishes requests, then stops its PostgreSQL.
- *   After `stopTimeoutMs` the process is killed. Agents and training are separate user
- *   services and keep running.
+ * - Stop: the core runs with `--stop-on-stdin-close` and stdin as a pipe; closing stdin asks it
+ *   to stop on every OS (Windows has no SIGTERM), even while it is still starting. It stops
+ *   taking work, finishes requests, then stops its PostgreSQL. On Unix a SIGTERM follows after
+ *   `termAfterMs` if it is still running; after `stopTimeoutMs` it is killed. Agents and
+ *   training are separate user services and keep running.
  * - Leftovers: on Linux and macOS the core leads its own process group. Whenever it exits
  *   (stop, crash, hang, or a SIGTERM that came before it could handle one), what is left in
  *   the group — its PostgreSQL — gets SIGINT (PostgreSQL's fast shutdown), then SIGKILL after
@@ -126,6 +130,7 @@ export class CoreSupervisor {
       healthTimeoutMs: 2000,
       healthFailures: 3,
       startTimeoutMs: 120_000,
+      termAfterMs: 5000,
       stopTimeoutMs: 45_000,
       maxCrashes: 6,
       crashWindowMs: 10 * 60_000,
@@ -222,15 +227,22 @@ export class CoreSupervisor {
     }
     this.set({ phase: 'stopping', reason: undefined, retryAt: undefined });
     await new Promise<void>((resolve) => {
+      const term = GROUPS
+        ? setTimeout(() => {
+            child.kill('SIGTERM');
+          }, this.o.termAfterMs)
+        : undefined;
       const kill = setTimeout(() => {
         this.o.log?.('the core did not stop in time; ending it');
         child.kill('SIGKILL');
       }, this.o.stopTimeoutMs);
       child.once('exit', () => {
+        clearTimeout(term);
         clearTimeout(kill);
         resolve();
       });
-      child.kill('SIGTERM');
+      // The core stops when its stdin closes (`--stop-on-stdin-close`).
+      child.stdin?.end();
     });
   }
 
@@ -264,12 +276,28 @@ export class CoreSupervisor {
     this.endpointNow = null;
     this.stderrTail = [];
     this.set({ phase: 'starting', reason: undefined, retryAt: undefined });
+    void (async () => {
+      let launch: CoreLaunch;
+      try {
+        launch = await this.o.launch();
+      } catch (e) {
+        if (current()) this.crashed(generation, `The core could not be prepared (${String(e)}).`);
+        return;
+      }
+      // A stop or another start may have come while the launch was prepared.
+      if (current() && !this.halted && this.phase() === 'starting')
+        this.spawnCore(generation, launch);
+    })();
+  }
+
+  private spawnCore(generation: number, { program, args, env }: CoreLaunch): void {
+    const current = () => generation === this.generation;
     let child: ChildProcess;
     try {
-      const { program, args, env } = this.o.launch();
       child = this.o.spawn(program, args, {
         env,
-        stdio: ['ignore', 'pipe', 'pipe'],
+        // stdin stays open while the core runs; closing it is the stop request.
+        stdio: ['pipe', 'pipe', 'pipe'],
         detached: GROUPS,
       });
     } catch (e) {
@@ -277,6 +305,8 @@ export class CoreSupervisor {
       return;
     }
     this.child = child;
+    // Writing to (or closing) the stdin of a core that already exited must not throw in main.
+    child.stdin?.on('error', () => undefined);
     child.on('error', (e) => {
       if (current()) this.crashed(generation, `The core program could not start (${e.message}).`);
     });

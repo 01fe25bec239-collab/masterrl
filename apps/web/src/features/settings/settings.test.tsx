@@ -2,6 +2,7 @@ import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it } from 'vitest';
 import { resetSession, setDesktopBridge } from '../../app/session';
+import { fakeBridge } from '../../app/session/fake-bridge';
 import { fakeCore } from '../../app/session/fake-core';
 import { renderDesktop, seriousViolations } from '../../app/session/test-render';
 
@@ -165,8 +166,20 @@ describe('settings', () => {
     const app = await section('This app');
     await user.click(await within(app).findByLabelText(/Closing the window keeps MasterRL/));
     expect(fake.bridge.settings.set).toHaveBeenCalledWith({ closeToTray: false });
-    await user.click(within(app).getByLabelText(/Keep this computer awake/));
+    await user.click(await within(app).findByLabelText(/Keep this computer awake/));
     expect(fake.bridge.desktop.blockSleep).toHaveBeenCalledWith(true);
+  });
+
+  it('shows the real keep-awake state after the window reloads', async () => {
+    const fake = fakeBridge();
+    await fake.bridge.desktop.blockSleep(true);
+    // A fresh render stands for the reload: the page reads the state from Electron main.
+    await renderDesktop('/settings', { core: done(), bridge: fake });
+    const app = await section('This app');
+    const box = await within(app).findByLabelText(/Keep this computer awake/);
+    await waitFor(() => {
+      expect((box as HTMLInputElement).checked).toBe(true);
+    });
   });
 
   it('says desktop-only settings need the app in a plain browser', async () => {

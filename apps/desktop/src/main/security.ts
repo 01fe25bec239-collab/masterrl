@@ -59,3 +59,13 @@ export function windowOptions(preload: string): BrowserWindowConstructorOptions 
     webPreferences: { ...WEB_PREFERENCES, preload },
   };
 }
+
+/**
+ * Where an unpackaged build under test writes the addresses it would open in the browser
+ * (`MRL_BROWSER_LOG`, used by tests/e2e/desktop). Always undefined in an installed app.
+ */
+export function browserLogFile(packaged: boolean, env: NodeJS.ProcessEnv): string | undefined {
+  if (packaged) return undefined;
+  const file = env.MRL_BROWSER_LOG;
+  return file && file.trim() !== '' ? file : undefined;
+}

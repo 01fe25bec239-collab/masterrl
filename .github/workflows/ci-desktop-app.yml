@@ -1,8 +1,10 @@
 name: ci-desktop-app
 
 # P30: the desktop app end to end (tests/e2e/desktop) — the dev build of Electron with the
-# real Solo core, its own PostgreSQL and a mock Supabase — and its budgets: app shell ≤ 350 MB
-# and core + PostgreSQL ≤ 300 MB idle, cold start ≤ 4 s on the owner's Mac (scaled on CI).
+# real Solo core, its own PostgreSQL and a mock Supabase, and the dev package with the release
+# core and agent it bundles — and its budgets: app shell ≤ 350 MB on the Mac (≤ 450 MB on
+# headless Linux), core + PostgreSQL ≤ 300 MB idle, cold start ≤ 4 s on the owner's Mac
+# (scaled on CI).
 
 on:
   pull_request:
@@ -25,11 +27,15 @@ jobs:
       matrix:
         os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["ubuntu-24.04","macos-15"]') }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 60
+    timeout-minutes: 90
     env:
-      # CI runners are slower than the owner's Mac and run a debug core: cold start may take
-      # this many times the 4 s budget. Memory budgets are not scaled.
+      # CI runners are slower than the owner's Mac: cold start may take this many times the
+      # 4 s budget. Memory budgets are not scaled.
       MRL_BUDGET_SCALE: '3'
+      # Owner (2026-11-28): headless Linux runs Chromium's GPU process in software.
+      MRL_SHELL_BUDGET_MB: ${{ startsWith(matrix.os, 'ubuntu') && '450' || '350' }}
+      # The package suite must run here (locally it skips without a package).
+      MRL_E2E_PACKAGE: '1'
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
@@ -54,14 +60,15 @@ jobs:
           brew install postgresql@17
           echo "MRL_PGBUNDLE__BIN_DIR=$(brew --prefix postgresql@17)/bin" >> "$GITHUB_ENV"
       - run: pnpm install --frozen-lockfile
-      - name: Build the core and the mock Supabase
+      - name: Build the core (debug and release), the agent and the mock Supabase
         run: |
           cargo build -p mrl-server
           cargo test -p mrl-testkit --lib --no-run
-      - name: Build the renderer and Electron main
+          cargo build --release -p mrl-server -p mrl-agent
+      - name: Build the renderer, Electron main and the dev package
         run: |
           pnpm --filter web build
-          pnpm --filter desktop build:main
+          pnpm --filter desktop package
       - name: Desktop e2e (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -74,8 +81,9 @@ jobs:
       - name: Budget numbers
         if: always()
         run: |
-          f=apps/desktop/release/desktop-budgets.json
-          if [ -f "$f" ]; then
-            { echo "### Desktop budgets (${{ matrix.os }})"; echo '```json'; cat "$f"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
-            cat "$f"
-          fi
+          for f in apps/desktop/release/desktop-budgets.json apps/desktop/release/desktop-package-budgets.json; do
+            if [ -f "$f" ]; then
+              { echo "### $(basename "$f" .json) (${{ matrix.os }})"; echo '```json'; cat "$f"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+              cat "$f"
+            fi
+          done

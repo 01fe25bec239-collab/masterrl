@@ -523,6 +523,7 @@ impl Config {
         // <mrl:validate P28> P28 checks (push to `problems`) go right below this line.
         // <mrl:validate P29> P29 checks (push to `problems`) go right below this line.
         // <mrl:validate P30> P30 checks (push to `problems`) go right below this line.
+        problems.extend(self.desktop.problems());
         if problems.is_empty() {
             Ok(())
         } else {

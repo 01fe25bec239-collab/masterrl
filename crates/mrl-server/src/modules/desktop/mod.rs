@@ -24,7 +24,6 @@ pub mod update;
 
 use crate::app::{AppState, ServerModule};
 use crate::db::Db;
-use crate::seams::{SeamError, StartupStep};
 use axum::routing::{get, post, put};
 use axum::{Extension, Router};
 use serde::{Deserialize, Serialize};
@@ -214,29 +213,6 @@ impl ServerModule for DesktopModule {
     fn openapi(&self) -> utoipa::openapi::OpenApi {
         Doc::openapi()
     }
-
-    fn startup_steps(&self) -> Vec<Arc<dyn StartupStep>> {
-        vec![Arc::new(CheckSettings(self.desktop.config.clone()))]
-    }
-}
-
-/// Refuses `[desktop]` settings the module can't use (MRL-INTERNAL-006 with the reasons).
-struct CheckSettings(DesktopConfig);
-
-#[async_trait::async_trait]
-impl StartupStep for CheckSettings {
-    fn name(&self) -> &str {
-        "desktop-settings"
-    }
-
-    async fn run(&self) -> Result<(), SeamError> {
-        let problems = self.0.problems();
-        if problems.is_empty() {
-            Ok(())
-        } else {
-            Err(SeamError::new("desktop", problems.join("; ")))
-        }
-    }
 }
 
 #[cfg(test)]
@@ -268,5 +244,16 @@ mod tests {
         ] {
             assert!(known.contains(&c.to_string()), "{c} is not registered");
         }
+    }
+
+    #[test]
+    fn bad_desktop_settings_stop_the_config_from_loading() {
+        let c = crate::config::Config::from_toml_with_env(
+            "[desktop]\nupdate_checkpoint_seconds = 1",
+            Vec::new(),
+        )
+        .unwrap();
+        let e = c.validate().unwrap_err();
+        assert!(e.to_string().contains("update_checkpoint_seconds"), "{e}");
     }
 }

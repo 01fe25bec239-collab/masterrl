@@ -93,6 +93,11 @@ export const ipcRegistry = {
   'auth:cancelSignIn': { input: z.tuple([]), output: z.boolean() },
   /** Keeps the computer awake while true (the core's training activity also does). */
   'desktop:blockSleep': { input: z.tuple([z.boolean()]), output: z.boolean() },
+  /** Whether the person asked to keep the computer awake, and whether training does. */
+  'desktop:sleepState': {
+    input: z.tuple([]),
+    output: z.object({ manual: z.boolean(), training: z.boolean(), awake: z.boolean() }),
+  },
   /** Resolves with the next screen a deep link asks for (`''` after 25 s without one). */
   'nav:next': { input: z.tuple([]), output: z.string() },
   'crash:list': { input: z.tuple([]), output: z.array(crashSummarySchema) },

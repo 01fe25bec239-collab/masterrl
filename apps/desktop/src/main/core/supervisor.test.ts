@@ -15,7 +15,7 @@ function supervisor(mode: string, extra: Partial<SupervisorOptions> = {}) {
     secret: SECRET,
     launch: () => ({
       program: process.execPath,
-      args: [fakeCore],
+      args: [fakeCore, '--stop-on-stdin-close'],
       env: { ...process.env, MRL_LAUNCH_SECRET: SECRET, FAKE_CORE_MODE: mode, FAKE_CORE_LOG: log },
     }),
     backoffMs: () => 50,
@@ -102,8 +102,8 @@ describe('core supervisor', () => {
     await until(s, (st) => st.phase === 'ready');
     await s.stop();
     expect(s.status().phase).toBe('stopped');
-    // Windows has no SIGTERM: the process is ended, so it can't note a clean stop.
-    if (process.platform !== 'win32') expect(events()).toEqual(['start', 'stopped']);
+    // Closing stdin is the stop request, on every OS.
+    expect(events()).toEqual(['start', 'stdin-closed', 'stopped']);
 
     const slow = supervisor('slow-stop', { stopTimeoutMs: 300 });
     slow.s.start();
@@ -113,6 +113,19 @@ describe('core supervisor', () => {
     expect(Date.now() - t).toBeGreaterThanOrEqual(250);
     expect(slow.s.status().phase).toBe('stopped');
   });
+
+  it.runIf(process.platform !== 'win32')(
+    'falls back to SIGTERM when closing stdin does not stop the core',
+    async () => {
+      const { s, events } = supervisor('slow-stop', { termAfterMs: 100, stopTimeoutMs: 10_000 });
+      s.start();
+      await until(s, (st) => st.phase === 'ready');
+      const t = Date.now();
+      await s.stop();
+      expect(Date.now() - t).toBeLessThan(5000);
+      expect(events()).toEqual(['start', 'stdin-closed', 'stopped']);
+    },
+  );
 
   it('restarts a running core after a clean stop, but not once the app quits', async () => {
     const { s, events } = supervisor('ok');
@@ -124,7 +137,7 @@ describe('core supervisor', () => {
     expect(s.endpoint()?.port).not.toBe(firstPort);
     // A clean restart is not a crash.
     expect(s.status().restarts).toBe(0);
-    if (process.platform !== 'win32') expect(events()).toEqual(['start', 'stopped', 'start']);
+    expect(events()).toEqual(['start', 'stdin-closed', 'stopped', 'start']);
 
     // Quitting while a restart waits for the old core: nothing starts again.
     const again = s.restart();
@@ -145,7 +158,7 @@ describe('core supervisor', () => {
   const dbPid = (lines: string[], n = 0) =>
     Number(lines.filter((l) => l.startsWith('db '))[n]?.slice(3));
 
-  it.runIf(posix)('stopping a core that is still starting also stops its database', async () => {
+  it('stopping a core that is still starting also stops its database', async () => {
     const { s, events } = supervisor('with-db');
     s.start();
     const lines = () => {
@@ -157,10 +170,12 @@ describe('core supervisor', () => {
     };
     await until(s, () => dbPid(lines()) > 0);
     const pid = dbPid(lines());
-    // The fake core exits without stopping its "db", like the real one before it listens.
+    // Still starting (it never listens): the stdin stop reaches it all the same, and it stops
+    // its "db" first, like the real core with `--stop-on-stdin-close`.
     await s.stop();
     expect(s.status().phase).toBe('stopped');
-    expect(events()).toContain('db-stopped');
+    expect(events()).toContain('stdin-closed');
+    await until(s, () => !alive(pid), 5000).catch(() => undefined);
     expect(alive(pid)).toBe(false);
   });
 
@@ -175,6 +190,32 @@ describe('core supervisor', () => {
       expect(alive(dbPid(events(), 0))).toBe(false);
     },
   );
+
+  it('a stop while the launch is still being prepared starts nothing', async () => {
+    let release: (() => void) | undefined;
+    const spawned: string[] = [];
+    const s = new CoreSupervisor({
+      secret: SECRET,
+      launch: () =>
+        new Promise((resolve) => {
+          release = () => {
+            resolve({ program: process.execPath, args: [fakeCore], env: process.env });
+          };
+        }),
+      spawn: (program: string) => {
+        spawned.push(program);
+        throw new Error('must not spawn');
+      },
+    });
+    running.push(s);
+    s.start();
+    expect(s.status().phase).toBe('starting');
+    await s.stop();
+    release?.();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(spawned).toEqual([]);
+    expect(s.status().phase).toBe('stopped');
+  });
 
   it('a watcher times out with the current state', async () => {
     const { s } = supervisor('ok');

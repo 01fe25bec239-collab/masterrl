@@ -4,11 +4,13 @@
 //   crash-once    like ok, but the first start (no FAKE_CORE_LOG entry yet) exits 3 after 300 ms
 //   hang          like ok, but /healthz stops answering after the first 2 checks
 //   never-listen  stay up without printing the listening line
-//   slow-stop     ignore the first SIGTERM
-//   with-db       like never-listen, after starting a child that stands for PostgreSQL ("db")
+//   slow-stop     ignore the first stop request
+//   with-db       like never-listen, after starting a child that stands for PostgreSQL ("db");
+//                 a stop request stops the db first, like the real core
 //   with-db-crash like ok, after starting the "db"; the first start exits 3 after 300 ms
-// Every start and clean stop is appended to FAKE_CORE_LOG, one word per line.
-import { spawn } from 'node:child_process';
+// Stop requests: SIGTERM, and stdin closing when started with `--stop-on-stdin-close`
+// (noted as `stdin-closed`). Every start and clean stop is appended to FAKE_CORE_LOG.
+import { spawn, type ChildProcess } from 'node:child_process';
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 
@@ -26,9 +28,10 @@ if (mode === 'exit-now') {
   process.exit(1);
 }
 
+let db: ChildProcess | undefined;
 if (mode === 'with-db' || mode === 'with-db-crash') {
   // Like PostgreSQL: a child in the core's process group that stops on SIGINT.
-  const db = spawn(
+  db = spawn(
     process.execPath,
     [
       '-e',
@@ -81,10 +84,19 @@ server.listen(0, '127.0.0.1', () => {
   if (mode === 'crash-once' && starts === 0) setTimeout(() => process.exit(3), 300);
 });
 
-let terms = 0;
-process.on('SIGTERM', () => {
-  terms += 1;
-  if (mode === 'slow-stop' && terms === 1) return;
+let requests = 0;
+function requestStop(): void {
+  requests += 1;
+  if (mode === 'slow-stop' && requests === 1) return;
+  db?.kill('SIGINT');
   note('stopped');
   server.close(() => process.exit(0));
-});
+}
+process.on('SIGTERM', requestStop);
+if (process.argv.includes('--stop-on-stdin-close')) {
+  process.stdin.on('end', () => {
+    note('stdin-closed');
+    requestStop();
+  });
+  process.stdin.resume();
+}

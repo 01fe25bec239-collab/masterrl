@@ -32,4 +32,13 @@ export class SleepGuard {
   blocking(): boolean {
     return this.id !== null;
   }
+
+  /** Which reasons hold now, for the renderer to show after a reload. */
+  state(): { manual: boolean; training: boolean; awake: boolean } {
+    return {
+      manual: this.reasons.has('manual'),
+      training: this.reasons.has('training'),
+      awake: this.blocking(),
+    };
+  }
 }
