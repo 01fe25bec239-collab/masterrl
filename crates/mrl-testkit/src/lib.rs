@@ -50,6 +50,9 @@ mod int6_builtin;
 // <mrl:testkit P26> P26 `pub mod` lines go right below this line.
 // <mrl:testkit P27> P27 `pub mod` lines go right below this line.
 // <mrl:testkit P28> P28 `pub mod` lines go right below this line.
+#[cfg(test)]
+#[path = "../../mrl-server/src/modules/submission/integration_tests.rs"]
+mod p28_submission;
 // <mrl:testkit P29> P29 `pub mod` lines go right below this line.
 // <mrl:testkit P30> P30 `pub mod` lines go right below this line.
 

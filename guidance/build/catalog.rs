@@ -2308,6 +2308,61 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-CAP-280")),
+            ("title", Value::Str("This run is estimated not to fit in memory.")),
+            ("why", Value::Str("The app compared the run's estimated memory with every connected machine that can run it. None has enough left after the memory it keeps free.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Try the alternatives in Details, like QLoRA, a smaller model or another machine."),
+                    Value::Str("Or lower the batch size or sequence length and check again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CAP-281")),
+            ("title", Value::Str("This run can't resume from that checkpoint.")),
+            ("why", Value::Str("Only the same method on the same major engine version can resume a checkpoint. Its training state would not load correctly otherwise.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Resume with the engine version and method named in Details."),
+                    Value::Str("Or start a new run that uses the checkpoint's weights as its starting model."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CAP-282")),
+            ("title", Value::Str("No machine checked these settings.")),
+            ("why", Value::Str("The app checks a run's settings on a connected machine and estimates its memory there. No machine was connected, or none answered in time, so only the app's own checks ran.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Connect a machine in Machines, or wait until one is online, and check again."),
+                    Value::Str("You can still submit; the run starts in probe mode and is measured first."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CAP-283")),
+            ("title", Value::Str("This engine checks its settings only when the run starts.")),
+            ("why", Value::Str("This engine has no settings check before the run, so the app checked what it could alone. Problems the engine finds show up at the start.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Submit the run and watch its first minutes."),
+                    Value::Str("Or choose an engine that checks settings ahead of time."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-CAP-284")),
+            ("title", Value::Str("The run starts with safety settings to fit in memory.")),
+            ("why", Value::Str("The estimated memory is close to what the machine can give. The app turned on settings that use less memory; Details list each change and why.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Review the changes in Details; they are already in the settings."),
+                    Value::Str("Or pick a bigger machine to run without them."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-CONFLICT-001")),
             ("title", Value::Str("Someone changed this item after you opened it.")),
             ("why", Value::Str("The version you edited is older than the saved one.")),
@@ -4143,6 +4198,17 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Use a path inside the attempt folder, like `data/train.jsonl`."),
                     Value::Str("If the app sent the path, report it as a problem with the app."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-280")),
+            ("title", Value::Str("No engine here offers this preset.")),
+            ("why", Value::Str("A preset is a ready-made set of settings for one method of one engine. None of the engines here offers a preset with this name for this method, or several do.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Pick a preset listed in the method's settings form."),
+                    Value::Str("If several engines offer it, name the engine in common.engine."),
                 ])),
             ])),
         ]),

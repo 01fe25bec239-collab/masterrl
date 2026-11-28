@@ -1,4 +1,5 @@
-//! P17's subcommands: `config`, `projects`, `experiments`, `runs`, `jobs` and `dev seed`.
+//! P17's subcommands: `config`, `projects`, `experiments`, `runs`, `jobs` and `dev seed`
+//! (`runs validate`, `--preset` and `--dry-run` are P28's).
 
 use crate::api::Api;
 use crate::config_file::{self, CliConfig};
@@ -94,6 +95,9 @@ pub enum ExperimentsCommand {
 pub enum RunsCommand {
     /// Submit a run from a JSON file and/or options.
     Submit(Box<SubmitArgs>),
+    /// Check a run without submitting it: settings, a dry run on a connected machine, the
+    /// memory estimate and whether it fits (same options as `submit`).
+    Validate(Box<SubmitArgs>),
     /// List a project's runs, newest first.
     List {
         /// Project id (default: the saved project).
@@ -153,6 +157,12 @@ pub struct SubmitArgs {
     /// Request key; reuse one to retry a submit safely (default: a new random key).
     #[arg(long)]
     pub key: Option<String>,
+    /// Start from one of the method's presets, like `sft-lora-beginner` (sets `config.preset`).
+    #[arg(long)]
+    pub preset: Option<String>,
+    /// Check the run like `mrl runs validate` and submit nothing.
+    #[arg(long)]
+    pub dry_run: bool,
     #[command(flatten)]
     pub out: Output,
 }
@@ -433,16 +443,106 @@ pub fn submission(args: &SubmitArgs) -> Result<Value, String> {
     if !args.dataset.is_empty() {
         set("dataset_version_ids", Some(json!(args.dataset)));
     }
+    if let Some(preset) = &args.preset {
+        let config = obj.entry("config").or_insert_with(|| json!({}));
+        let Some(config) = config.as_object_mut() else {
+            return Err("the run file's `config` must be a JSON object".to_owned());
+        };
+        config.insert("preset".to_owned(), json!(preset));
+    }
     Ok(body)
+}
+
+/// A `runs:validate` answer in plain words: the verdict, every issue with its hint, the
+/// estimate, and what the preflight changed or suggests.
+pub fn describe_validation(v: &Value) -> String {
+    let text = |x: &Value| x.as_str().unwrap_or("").to_owned();
+    let mut out = if v["ok"] == true {
+        "Ready: submitting this would queue the run.".to_owned()
+    } else {
+        "Not ready: fix the errors below first.".to_owned()
+    };
+    for i in v["issues"].as_array().into_iter().flatten() {
+        out.push_str(&format!(
+            "\n  {} {}{}: {}",
+            text(&i["severity"]),
+            text(&i["code"]),
+            i["path"]
+                .as_str()
+                .map(|p| format!(" at {p}"))
+                .unwrap_or_default(),
+            text(&i["message"]),
+        ));
+        if !text(&i["hint"]).is_empty() {
+            out.push_str(&format!("\n    Hint: {}", text(&i["hint"])));
+        }
+    }
+    let e = &v["estimate"];
+    match e["per_gpu_memory_gib"].as_object() {
+        Some(r) => out.push_str(&format!(
+            "\nEstimated GPU memory: {:.1}–{:.1} GiB (likely {:.1}), confidence {}.",
+            r["lo"].as_f64().unwrap_or(0.0),
+            r["hi"].as_f64().unwrap_or(0.0),
+            r["expected"].as_f64().unwrap_or(0.0),
+            text(&e["confidence"]),
+        )),
+        None => out.push_str("\nEstimated GPU memory: unknown."),
+    }
+    let p = &v["preflight"];
+    if p.is_object() {
+        out.push_str(&format!(
+            "\nFit: {}. {}",
+            text(&p["verdict"]).replace('_', " "),
+            text(&p["message"])
+        ));
+        for c in p["changes"].as_array().into_iter().flatten() {
+            out.push_str(&format!(
+                "\n  changed {}: {} -> {} ({})",
+                text(&c["path"]),
+                c["from"],
+                c["to"],
+                text(&c["why"])
+            ));
+        }
+        for a in p["alternatives"].as_array().into_iter().flatten() {
+            out.push_str(&format!("\n  instead: {}", text(&a["message"])));
+        }
+    }
+    out
+}
+
+fn validate_run(api: &Api, prj: &str, body: &Value, out: &Output) -> Result<(), String> {
+    let v = api.post(
+        &format!("/projects/{}/runs:validate", encode(prj)),
+        Some(body),
+        None,
+    )?;
+    if out.json {
+        print_json(&v);
+    } else {
+        println!("{}", describe_validation(&v));
+    }
+    if v["ok"] == true {
+        Ok(())
+    } else {
+        Err("the run is not ready to submit".to_owned())
+    }
 }
 
 /// `mrl runs …`
 pub fn runs(cmd: RunsCommand) -> Result<(), String> {
     let (cfg, api) = connect()?;
     match cmd {
+        RunsCommand::Validate(args) => {
+            let prj = project(&cfg, args.project.clone())?;
+            validate_run(&api, &prj, &submission(&args)?, &args.out)?;
+        }
         RunsCommand::Submit(args) => {
             let prj = project(&cfg, args.project.clone())?;
             let body = submission(&args)?;
+            if args.dry_run {
+                return validate_run(&api, &prj, &body, &args.out);
+            }
             let key = args
                 .key
                 .clone()
@@ -528,8 +628,33 @@ mod tests {
             dataset: vec!["dsv_1".into(), "dsv_2".into()],
             experiment: None,
             key: None,
+            preset: None,
+            dry_run: false,
             out: Output { json: false },
         }
+    }
+
+    #[test]
+    fn presets_go_into_the_config_and_validation_reads_plainly() {
+        let mut a = args(None);
+        a.preset = Some("sft-lora-beginner".into());
+        let body = submission(&a).unwrap();
+        assert_eq!(body["config"]["preset"], "sft-lora-beginner");
+        let v = json!({"ok": false, "issues": [
+            {"severity": "error", "code": "MRL-CAP-280", "path": "/resources",
+             "message": "Too big.", "hint": "Use QLoRA."}],
+            "estimate": {"per_gpu_memory_gib": {"lo": 6.0, "expected": 7.5, "hi": 9.0}, "confidence": "low"},
+            "preflight": {"verdict": "does_not_fit", "message": "It won't start.",
+              "changes": [], "alternatives": [{"message": "Use QLoRA."}]}});
+        let text = describe_validation(&v);
+        assert!(text.starts_with("Not ready"), "{text}");
+        assert!(text.contains("error MRL-CAP-280 at /resources: Too big."));
+        assert!(text.contains("Hint: Use QLoRA."));
+        assert!(text.contains("6.0–9.0 GiB (likely 7.5), confidence low"));
+        assert!(text.contains("Fit: does not fit. It won't start."));
+        assert!(text.contains("instead: Use QLoRA."));
+        let unknown = describe_validation(&json!({"ok": true, "issues": [], "estimate": {}}));
+        assert!(unknown.starts_with("Ready") && unknown.contains("unknown"));
     }
 
     #[test]

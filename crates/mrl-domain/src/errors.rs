@@ -748,6 +748,30 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
     // <mrl:errors P26> rows for P26 go right below this line.
     // <mrl:errors P27> rows for P27 go right below this line.
     // <mrl:errors P28> rows for P28 go right below this line.
+    (
+        code(ErrorFamily::Cap, 280),
+        "This run is estimated not to fit in memory.",
+    ),
+    (
+        code(ErrorFamily::Cap, 281),
+        "This run can't resume from that checkpoint.",
+    ),
+    (
+        code(ErrorFamily::Cap, 282),
+        "No machine checked these settings.",
+    ),
+    (
+        code(ErrorFamily::Cap, 283),
+        "This engine checks its settings only when the run starts.",
+    ),
+    (
+        code(ErrorFamily::Cap, 284),
+        "The run starts with safety settings to fit in memory.",
+    ),
+    (
+        code(ErrorFamily::Val, 280),
+        "No engine here offers this preset.",
+    ),
     // <mrl:errors P29> rows for P29 go right below this line.
     // <mrl:errors P30> rows for P30 go right below this line.
 ];

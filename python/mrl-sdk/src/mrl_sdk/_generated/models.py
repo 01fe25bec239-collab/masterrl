@@ -238,6 +238,22 @@ class AuditRecordPage(TypedDict):
     """Pass as `cursor` for the next page; `null` on the last page."""
 
 
+class CalibrationView(TypedDict):
+    """How the estimate was corrected."""
+
+    factor: float
+    """Correction applied to the expected value (`e^μ`; 1 = none)."""
+
+    key: str
+    """Configuration class: engine|method|PEFT|GPU."""
+
+    n: int
+    """Finished runs of this class."""
+
+    spread: float
+    """Spread of the measurements (standard deviation of the log ratio)."""
+
+
 class CallbackRequest(TypedDict):
     """Finish a sign-in with the code from the callback."""
 
@@ -409,6 +425,26 @@ class CheckpointInfoPage(TypedDict):
 
     next_cursor: NotRequired[str | None]
     """Pass as `cursor` for the next page; `null` on the last page."""
+
+
+Confidence = Literal["high", "medium", "low"]
+"""How far an estimate can be trusted (Doc 07 §6.11)."""
+
+
+class ConfigChange(TypedDict):
+    """One setting the preflight changed, and why."""
+
+    from_: dict[str, Any]
+    """The value before (null when unset)."""
+
+    path: str
+    """JSON Pointer into the config, like `/engine/gradient_checkpointing`."""
+
+    to: dict[str, Any]
+    """The value after."""
+
+    why: str
+    """Why, in plain words."""
 
 
 class CopyInfo(TypedDict):
@@ -583,6 +619,19 @@ class EngineVersionSummary(TypedDict):
     """Adapter version."""
 
 
+class EstimateRange(TypedDict):
+    """A low-expected-high range."""
+
+    expected: float
+    """Most likely value."""
+
+    hi: float
+    """High end."""
+
+    lo: float
+    """Low end."""
+
+
 class Experiment(TypedDict):
     """An experiment, as the API shows it."""
 
@@ -717,6 +766,10 @@ class Health(TypedDict):
 
     status: str
     """`ok`."""
+
+
+IssueSeverity = Literal["error", "warning", "info"]
+"""How serious an issue is."""
 
 
 class Job(TypedDict):
@@ -900,6 +953,10 @@ class Me(TypedDict):
     """`tok_…` when the caller uses an access token."""
 
     user: NotRequired[dict[str, Any]]
+
+
+MemoryKind = Literal["gpu", "unified", "system"]
+"""Which memory a machine check is about."""
 
 
 class MetricPointView(TypedDict):
@@ -1268,6 +1325,21 @@ class PartTicket(TypedDict):
     """The ticket: `PUT` its `url` (the server's `/api/v1/transfer/{ticket}`, so"""
 
 
+class PhaseComparison(TypedDict):
+    """Estimated vs measured for one phase."""
+
+    actual_peak_gib: NotRequired[float | None]
+    """Highest per-GPU peak measured in this phase (process peak, else reserved), GiB."""
+
+    estimate_gib: NotRequired[dict[str, Any]]
+
+    phase: str
+    """Phase."""
+
+    ratio: NotRequired[float | None]
+    """`actual / expected`."""
+
+
 class PoolView(TypedDict):
     """A pool."""
 
@@ -1298,6 +1370,51 @@ class PoolViewPage(TypedDict):
 
     next_cursor: NotRequired[str | None]
     """Pass as `cursor` for the next page; `null` on the last page."""
+
+
+class PreflightAlternative(TypedDict):
+    """A configuration that may fit instead."""
+
+    kind: str
+    """`qlora`, `smaller_model` or `machine`."""
+
+    message: str
+    """What to do, in plain words."""
+
+    node_id: NotRequired[str | None]
+    """The machine, for `machine`."""
+
+
+class PreflightMachine(TypedDict):
+    """One machine's answer."""
+
+    capacity_gib: float
+    """Memory per GPU (or all of it), GiB."""
+
+    hostname: str
+    """Host name."""
+
+    memory: MemoryKind
+    """Which memory was compared."""
+
+    node_id: str
+    """`node_…`."""
+
+    usable_gib: float
+    """What the run may use after the headroom, GiB."""
+
+    verdict: Verdict
+    """This machine's verdict."""
+
+
+class PreflightRequest(TypedDict):
+    """`POST /runs:preflight` body."""
+
+    project_id: str
+    """Project, `prj_…`."""
+
+    run: dict[str, Any]
+    """The run, as for submit."""
 
 
 class PresignRequest(TypedDict):
@@ -1433,6 +1550,25 @@ Relation = Literal[
     "generated_by",
 ]
 """How two entities are related (Doc 09 §3.10)."""
+
+
+class ResourceActual(TypedDict):
+    """One measured peak."""
+
+    attempt_id: str
+    """`att_…`."""
+
+    device: str
+    """GPU UUID, or empty for the whole host."""
+
+    peak_gib: float
+    """Peak, GiB."""
+
+    phase: str
+    """Phase, like `update`."""
+
+    signal: str
+    """`process_peak`, `torch_reserved_peak`, `torch_allocated_peak`, `host_rss_peak` or"""
 
 
 class ResourceActualView(TypedDict):
@@ -1660,6 +1796,33 @@ class RunConfig(TypedDict):
     """What was submitted (the whole request body)."""
 
 
+class RunEstimate(TypedDict):
+    """An estimate as the API shows it (Doc 09 §6.5 `Estimate`)."""
+
+    analytic_gpu_memory_gib: NotRequired[dict[str, Any]]
+
+    assumptions: list[str]
+    """What the range assumes, in plain words."""
+
+    calibration: NotRequired[dict[str, Any]]
+
+    confidence: Confidence
+    """`high`, `medium` or `low`."""
+
+    estimate_id: NotRequired[str | None]
+    """Id of the stored estimate (a UUID), when there is one."""
+
+    per_gpu_memory_gib: NotRequired[dict[str, Any]]
+
+    total_steps: NotRequired[int | None]
+    """Planned optimizer steps."""
+
+    verdict: Verdict
+    """`fits`, `tight`, `does_not_fit` or `unknown`."""
+
+    wall_seconds: NotRequired[dict[str, Any]]
+
+
 RunKind = Literal["TRAIN", "EVAL"]
 """Run kinds (other job kinds have no run)."""
 
@@ -1689,6 +1852,28 @@ class RunPage(TypedDict):
     """Pass as `cursor` for the next page; `null` on the last page."""
 
 
+class RunPreflight(TypedDict):
+    """The preflight answer."""
+
+    alternatives: list[PreflightAlternative]
+    """For `does_not_fit`: what may fit instead."""
+
+    changes: list[ConfigChange]
+    """For `tight`: the safety settings applied (already in the returned config)."""
+
+    machines: list[PreflightMachine]
+    """Every connected machine that could run this, with its own verdict."""
+
+    message: str
+    """What happens next, in plain words."""
+
+    probe_steps: NotRequired[int | None]
+    """For `unknown`: the run's first steps are measured, then the app decides."""
+
+    verdict: Verdict
+    """`fits`, `tight`, `does_not_fit` or `unknown`."""
+
+
 class RunProgressView(TypedDict):
     """The run's latest progress report."""
 
@@ -1715,6 +1900,21 @@ class RunProgressView(TypedDict):
 
     updated_at: str
     """When it arrived."""
+
+
+class RunResources(TypedDict):
+    """`GET /runs/{run}/resources`."""
+
+    actual: list[ResourceActual]
+    """Every measured peak of every attempt."""
+
+    estimate: NotRequired[dict[str, Any]]
+
+    phases: list[PhaseComparison]
+    """Per phase: the estimate next to the measured peak."""
+
+    run_id: str
+    """`run_…`."""
 
 
 class RunSubmission(TypedDict):
@@ -2149,6 +2349,56 @@ class UserInfo(TypedDict):
     """`usr_…`."""
 
 
+class ValidateIssue(TypedDict):
+    """One finding (Doc 09 §6.5)."""
+
+    code: str
+    """Guidance code, like `MRL-CAP-250`."""
+
+    hint: str
+    """What to do."""
+
+    message: str
+    """What was found, in plain words."""
+
+    path: NotRequired[str | None]
+    """JSON Pointer into the submission, like `/config/engine/optim`."""
+
+    severity: IssueSeverity
+    """`error`, `warning` or `info`."""
+
+
+class ValidateResponse(TypedDict):
+    """`POST /projects/{prj}/runs:validate` answer (Doc 09 §6.5)."""
+
+    checked: str
+    """How far the checks went: `l0` (the app's) or `l1` (also on a machine)."""
+
+    engine_version_id: NotRequired[str | None]
+    """The engine version the run would use (`engine_versions.id`)."""
+
+    estimate: RunEstimate
+    """Memory estimate with its verdict and confidence."""
+
+    issues: list[ValidateIssue]
+    """Every finding: the app's checks (L0), the machine's (L1) and the preflight."""
+
+    ok: bool
+    """True when no issue is an error: submitting this would queue the run."""
+
+    preflight: NotRequired[dict[str, Any]]
+
+    preset: NotRequired[str | None]
+    """The preset applied, if any."""
+
+    resolved_config: dict[str, Any]
+    """The config the run would get (preset, settings, defaults, and any safety settings"""
+
+
+Verdict = Literal["fits", "tight", "does_not_fit", "unknown"]
+"""The four preflight verdicts (Doc 24 §3)."""
+
+
 class Workspace(TypedDict):
     """A workspace."""
 
@@ -2187,6 +2437,7 @@ __all__ = [
     "AttemptPage",
     "AuditRecord",
     "AuditRecordPage",
+    "CalibrationView",
     "CallbackRequest",
     "CapabilityItem",
     "CapabilityProblem",
@@ -2195,6 +2446,8 @@ __all__ = [
     "CheckpointFileInfo",
     "CheckpointInfo",
     "CheckpointInfoPage",
+    "Confidence",
+    "ConfigChange",
     "CopyInfo",
     "CreateEnrollmentToken",
     "CreatePool",
@@ -2207,6 +2460,7 @@ __all__ = [
     "EngineSummary",
     "EngineVersionDetail",
     "EngineVersionSummary",
+    "EstimateRange",
     "Experiment",
     "ExperimentPage",
     "ExperimentPatch",
@@ -2214,6 +2468,7 @@ __all__ = [
     "GpuView",
     "Graph",
     "Health",
+    "IssueSeverity",
     "Job",
     "JobPage",
     "JobPatch",
@@ -2224,6 +2479,7 @@ __all__ = [
     "LoginStarted",
     "Machine",
     "Me",
+    "MemoryKind",
     "MetricPointView",
     "MetricQueryResult",
     "MetricSeriesPoints",
@@ -2242,8 +2498,12 @@ __all__ = [
     "Org",
     "OrgPage",
     "PartTicket",
+    "PhaseComparison",
     "PoolView",
     "PoolViewPage",
+    "PreflightAlternative",
+    "PreflightMachine",
+    "PreflightRequest",
     "PresignRequest",
     "PresignResponse",
     "Problem",
@@ -2254,6 +2514,7 @@ __all__ = [
     "Readiness",
     "Rejection",
     "Relation",
+    "ResourceActual",
     "ResourceActualView",
     "RestoreRequest",
     "Restored",
@@ -2266,10 +2527,13 @@ __all__ = [
     "RunCompareRun",
     "RunCompareSeries",
     "RunConfig",
+    "RunEstimate",
     "RunKind",
     "RunMetrics",
     "RunPage",
+    "RunPreflight",
     "RunProgressView",
+    "RunResources",
     "RunSubmission",
     "SamplePage",
     "SampleView",
@@ -2292,6 +2556,9 @@ __all__ = [
     "Transport",
     "Upload",
     "UserInfo",
+    "ValidateIssue",
+    "ValidateResponse",
+    "Verdict",
     "Workspace",
     "WorkspacePage",
 ]
