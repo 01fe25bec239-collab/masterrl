@@ -133,6 +133,49 @@ describe('core supervisor', () => {
     expect(s.status().phase).toBe('stopped');
   });
 
+  const posix = process.platform !== 'win32';
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  const dbPid = (lines: string[], n = 0) =>
+    Number(lines.filter((l) => l.startsWith('db '))[n]?.slice(3));
+
+  it.runIf(posix)('stopping a core that is still starting also stops its database', async () => {
+    const { s, events } = supervisor('with-db');
+    s.start();
+    const lines = () => {
+      try {
+        return events();
+      } catch {
+        return [];
+      }
+    };
+    await until(s, () => dbPid(lines()) > 0);
+    const pid = dbPid(lines());
+    // The fake core exits without stopping its "db", like the real one before it listens.
+    await s.stop();
+    expect(s.status().phase).toBe('stopped');
+    expect(events()).toContain('db-stopped');
+    expect(alive(pid)).toBe(false);
+  });
+
+  it.runIf(posix)(
+    'after a crash, the database is stopped before the next core starts',
+    async () => {
+      const { s, events } = supervisor('with-db-crash');
+      s.start();
+      await until(s, (st) => st.phase === 'ready' && st.restarts === 1);
+      const lines = events().map((l) => l.replace(/^db \d+$/, 'db'));
+      expect(lines.slice(0, 4)).toEqual(['start', 'db', 'db-stopped', 'start']);
+      expect(alive(dbPid(events(), 0))).toBe(false);
+    },
+  );
+
   it('a watcher times out with the current state', async () => {
     const { s } = supervisor('ok');
     const st = await s.watch(s.status().version, 20);

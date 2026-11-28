@@ -48,6 +48,27 @@ export interface SupervisorOptions {
   log?: (message: string) => void;
 }
 
+/** Process groups: everything the core starts can be found and stopped (not on Windows). */
+const GROUPS = process.platform !== 'win32';
+
+function groupAlive(pid: number): boolean {
+  try {
+    process.kill(-pid, 0);
+    return true;
+  } catch {
+    // ESRCH: the group is gone. EPERM: the id belongs to someone else now, not ours to stop.
+    return false;
+  }
+}
+
+function signalGroup(pid: number, signal: NodeJS.Signals): void {
+  try {
+    process.kill(-pid, signal);
+  } catch {
+    // The group is gone already.
+  }
+}
+
 const listeningLine = z.object({
   event: z.literal('listening'),
   port: z.number().check(z.int(), z.gte(1), z.lte(65535)),
@@ -73,6 +94,10 @@ function codeIn(lines: readonly string[]): string | undefined {
  * - Stop: SIGTERM; the core stops taking work, finishes requests, then stops its PostgreSQL.
  *   After `stopTimeoutMs` the process is killed. Agents and training are separate user
  *   services and keep running.
+ * - Leftovers: on Linux and macOS the core leads its own process group. Whenever it exits
+ *   (stop, crash, hang, or a SIGTERM that came before it could handle one), what is left in
+ *   the group — its PostgreSQL — gets SIGINT (PostgreSQL's fast shutdown), then SIGKILL after
+ *   `stopTimeoutMs`. The next core starts only after that, so it finds the database free.
  */
 export class CoreSupervisor {
   private state: CoreStatus = { version: 0, phase: 'stopped', restarts: 0 };
@@ -85,6 +110,8 @@ export class CoreSupervisor {
   private stderrTail: string[] = [];
   /** `stop()` was asked for: nothing starts the core again but `start()`. */
   private halted = false;
+  /** Leftovers of exited cores still being stopped (see the class docs). */
+  private sweeps = new Set<Promise<void>>();
   private readonly o: Required<
     Omit<SupervisorOptions, 'onReady' | 'onLost' | 'log' | 'launch' | 'secret'>
   > &
@@ -146,6 +173,7 @@ export class CoreSupervisor {
     const quitting = () => this.halted || this.phase() === 'stopping';
     if (quitting()) return this.state;
     if (this.phase() === 'ready' || this.phase() === 'starting') await this.stopChild();
+    await this.swept();
     // Read again: `stop()` may have been asked for while the old core stopped.
     if (quitting()) return this.state;
     this.crashes = [];
@@ -157,6 +185,31 @@ export class CoreSupervisor {
   async stop(): Promise<void> {
     this.halted = true;
     await this.stopChild();
+    await this.swept();
+  }
+
+  /** Resolves when the leftovers of every exited core are stopped. */
+  private async swept(): Promise<void> {
+    while (this.sweeps.size > 0) await Promise.all([...this.sweeps]);
+  }
+
+  /** Stops what is left in the process group of the core `pid`, which has exited. */
+  private sweep(pid: number | undefined): void {
+    if (!GROUPS || pid === undefined) return;
+    const done = (async () => {
+      signalGroup(pid, 'SIGINT');
+      const end = Date.now() + this.o.stopTimeoutMs;
+      while (groupAlive(pid)) {
+        if (Date.now() > end) {
+          this.o.log?.('what the core started did not stop in time; ending it');
+          signalGroup(pid, 'SIGKILL');
+          return;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+    })();
+    this.sweeps.add(done);
+    void done.finally(() => this.sweeps.delete(done));
   }
 
   private async stopChild(): Promise<void> {
@@ -214,7 +267,11 @@ export class CoreSupervisor {
     let child: ChildProcess;
     try {
       const { program, args, env } = this.o.launch();
-      child = this.o.spawn(program, args, { env, stdio: ['ignore', 'pipe', 'pipe'] });
+      child = this.o.spawn(program, args, {
+        env,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        detached: GROUPS,
+      });
     } catch (e) {
       this.crashed(generation, `The core program could not start (${String(e)}).`);
       return;
@@ -224,6 +281,7 @@ export class CoreSupervisor {
       if (current()) this.crashed(generation, `The core program could not start (${e.message}).`);
     });
     child.on('exit', (code, signal) => {
+      this.sweep(child.pid);
       if (!current()) return;
       this.child = null;
       if (this.state.phase === 'stopping') {
@@ -311,6 +369,7 @@ export class CoreSupervisor {
     this.child = null;
     child?.removeAllListeners('exit');
     child?.kill('SIGKILL');
+    this.sweep(child?.pid);
     this.crashed(generation, reason);
   }
 
@@ -339,7 +398,10 @@ export class CoreSupervisor {
       restarts: this.state.restarts + 1,
     });
     this.later(wait, () => {
-      if (this.state.phase === 'reconnecting') this.launchNow();
+      // The crashed core's database must be stopped before the next core opens it.
+      void this.swept().then(() => {
+        if (this.state.phase === 'reconnecting') this.launchNow();
+      });
     });
   }
 }

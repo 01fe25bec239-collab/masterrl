@@ -1,0 +1,81 @@
+name: ci-desktop-app
+
+# P30: the desktop app end to end (tests/e2e/desktop) — the dev build of Electron with the
+# real Solo core, its own PostgreSQL and a mock Supabase — and its budgets: app shell ≤ 350 MB
+# and core + PostgreSQL ≤ 300 MB idle, cold start ≤ 4 s on the owner's Mac (scaled on CI).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  e2e:
+    # Linux on every PR; macOS on main and manual runs (it costs more minutes).
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["ubuntu-24.04"]' || '["ubuntu-24.04","macos-15"]') }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      # CI runners are slower than the owner's Mac and run a debug core: cold start may take
+      # this many times the 4 s budget. Memory budgets are not scaled.
+      MRL_BUDGET_SCALE: '3'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+      - uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+          cache: pnpm
+      - name: Install PostgreSQL 17 programs (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # Programs only: the core starts its own cluster; no apt clusters.
+          sudo mkdir -p /etc/postgresql-common/createcluster.d
+          echo "create_main_cluster = false" | sudo tee /etc/postgresql-common/createcluster.d/no-main.conf
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends postgresql-common
+          sudo /usr/share/postgresql-common/pgdg/apt.postgresql.org.sh -y
+          sudo apt-get install -y --no-install-recommends postgresql-17
+          echo "MRL_PGBUNDLE__BIN_DIR=/usr/lib/postgresql/17/bin" >> "$GITHUB_ENV"
+      - name: Install PostgreSQL 17 programs (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install postgresql@17
+          echo "MRL_PGBUNDLE__BIN_DIR=$(brew --prefix postgresql@17)/bin" >> "$GITHUB_ENV"
+      - run: pnpm install --frozen-lockfile
+      - name: Build the core and the mock Supabase
+        run: |
+          cargo build -p mrl-server
+          cargo test -p mrl-testkit --lib --no-run
+      - name: Build the renderer and Electron main
+        run: |
+          pnpm --filter web build
+          pnpm --filter desktop build:main
+      - name: Desktop e2e (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          # Ubuntu 24.04 blocks the user namespaces Chromium's sandbox needs; allow them here.
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+          xvfb-run -a pnpm --filter desktop test:e2e
+      - name: Desktop e2e
+        if: runner.os != 'Linux'
+        run: pnpm --filter desktop test:e2e
+      - name: Budget numbers
+        if: always()
+        run: |
+          f=apps/desktop/release/desktop-budgets.json
+          if [ -f "$f" ]; then
+            { echo "### Desktop budgets (${{ matrix.os }})"; echo '```json'; cat "$f"; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
+            cat "$f"
+          fi

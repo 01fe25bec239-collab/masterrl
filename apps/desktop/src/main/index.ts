@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { appendFile } from 'node:fs/promises';
 import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
@@ -60,8 +61,18 @@ function isRendererPage(url: string): boolean {
   }
 }
 
+/**
+ * Opens the system browser. A dev build started with `MRL_BROWSER_LOG` (tests/e2e/desktop)
+ * writes the address to that file instead, for the test to play the person in the browser.
+ */
+const browserLog = app.isPackaged ? undefined : process.env.MRL_BROWSER_LOG;
+async function openInBrowser(url: string): Promise<void> {
+  if (browserLog) await appendFile(browserLog, `${url}\n`, { mode: 0o600 });
+  else await shell.openExternal(url);
+}
+
 function openExternal(url: string): void {
-  if (isAllowedExternal(url)) void shell.openExternal(url);
+  if (isAllowedExternal(url)) void openInBrowser(url);
 }
 
 protocol.registerSchemesAsPrivileged([
@@ -160,7 +171,7 @@ const signIn = new SignIn({
   core,
   // Linux desktops may not hand `masterrl://` links to the app; a loopback page always works.
   loopback: process.platform === 'linux' || process.env.MRL_SIGNIN_LOOPBACK === '1',
-  openBrowser: (url) => shell.openExternal(url),
+  openBrowser: openInBrowser,
 });
 const updates = new Updates({
   current: app.getVersion(),
@@ -353,7 +364,7 @@ void app.whenReady().then(async () => {
     'crash:openIssue': async (id) => {
       const url = await reports.issueUrl(id);
       if (!isAllowedExternal(url)) return false;
-      await shell.openExternal(url);
+      await openInBrowser(url);
       return true;
     },
     'update:status': () => updates.status(),

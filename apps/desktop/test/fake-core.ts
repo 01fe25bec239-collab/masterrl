@@ -5,7 +5,10 @@
 //   hang          like ok, but /healthz stops answering after the first 2 checks
 //   never-listen  stay up without printing the listening line
 //   slow-stop     ignore the first SIGTERM
+//   with-db       like never-listen, after starting a child that stands for PostgreSQL ("db")
+//   with-db-crash like ok, after starting the "db"; the first start exits 3 after 300 ms
 // Every start and clean stop is appended to FAKE_CORE_LOG, one word per line.
+import { spawn } from 'node:child_process';
 import { appendFileSync, existsSync, readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 
@@ -21,6 +24,20 @@ note('start');
 if (mode === 'exit-now') {
   process.stderr.write('mrl-server: MRL-ENV-110 no PostgreSQL programs found\n');
   process.exit(1);
+}
+
+if (mode === 'with-db' || mode === 'with-db-crash') {
+  // Like PostgreSQL: a child in the core's process group that stops on SIGINT.
+  const db = spawn(
+    process.execPath,
+    [
+      '-e',
+      `process.on('SIGINT', () => { require('node:fs').appendFileSync(${JSON.stringify(log ?? '/dev/null')}, 'db-stopped\\n'); process.exit(0); }); setInterval(() => {}, 1e6);`,
+    ],
+    { stdio: 'ignore' },
+  );
+  note(`db ${String(db.pid)}`);
+  if (mode === 'with-db-crash' && starts === 0) setTimeout(() => process.exit(3), 300);
 }
 
 let checks = 0;
@@ -52,7 +69,13 @@ const server = createServer((req, res) => {
 
 server.listen(0, '127.0.0.1', () => {
   const address = server.address();
-  if (mode === 'never-listen' || address === null || typeof address === 'string') return;
+  if (
+    mode === 'never-listen' ||
+    mode === 'with-db' ||
+    address === null ||
+    typeof address === 'string'
+  )
+    return;
   process.stdout.write('starting up\n');
   process.stdout.write(`${JSON.stringify({ event: 'listening', port: address.port })}\n`);
   if (mode === 'crash-once' && starts === 0) setTimeout(() => process.exit(3), 300);
