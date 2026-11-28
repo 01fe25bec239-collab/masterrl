@@ -2426,6 +2426,17 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-CONFLICT-290")),
+            ("title", Value::Str("A reward with this name already exists in this project.")),
+            ("why", Value::Str("Reward names are unique within a project so you can tell them apart.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Pick another name."),
+                    Value::Str("Or add a new version to the existing reward."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-DATA-001")),
             ("title", Value::Str("Your dataset did not pass its checks.")),
             ("why", Value::Str("Some rows are empty, are missing fields, or don't match the chosen format.")),
@@ -3680,6 +3691,109 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-RWD-290")),
+            ("title", Value::Str("This reward uses a learned reward model or a judge model, which isn't available yet.")),
+            ("why", Value::Str("Rewards that call a trained reward model or a judge model arrive in a later release. Today a reward can use built-in components and your own code.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Remove the `model.*` or `judge` components from the reward."),
+                    Value::Str("Use built-in components, like `builtin/math.verify@1`, or your own code instead."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-291")),
+            ("title", Value::Str("The reward service sent an answer the app can't trust.")),
+            ("why", Value::Str("The answer had the wrong number of scores, scores for other samples, or values that aren't numbers. The app counts those samples as failed instead of guessing.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Look at the reward diagnostics for the samples marked failed."),
+                    Value::Str("If your own reward code returns the scores, check that it returns one finite number per sample."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-292")),
+            ("title", Value::Str("The reward service runs a different reward than this job uses.")),
+            ("why", Value::Str("The job pins one reward version by its content hash. The reward service reported another hash, so its files changed or belong to another version.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Start the job again so the app sends the pinned reward files."),
+                    Value::Str("If it happens again, test the reward version again and use the new result."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-293")),
+            ("title", Value::Str("The reward service stopped working.")),
+            ("why", Value::Str("The reward service didn't answer, or too many samples failed, and one retry didn't help. The job stops instead of training on missing rewards.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Look at the job log for the reward service's last messages."),
+                    Value::Str("Check that the reward doesn't run longer than its time limit per sample."),
+                    Value::Str("Retry the job. It may have been a short problem on the machine."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-294")),
+            ("title", Value::Str("The sandbox stopped the reward code.")),
+            ("why", Value::Str("The reward code tried something the reward sandbox doesn't allow, like opening a network connection or reading another job's files.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Look at the audit log entry for what the code tried."),
+                    Value::Str("Change the reward code so it only reads its inputs and returns a score."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-295")),
+            ("title", Value::Str("Custom reward code can't run on this machine.")),
+            ("why", Value::Str("Custom reward code runs only in the reward sandbox. That sandbox needs Linux with bubblewrap, so macOS and Windows machines refuse custom code.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Run the reward on a Linux machine with bubblewrap installed."),
+                    Value::Str("Or use only built-in components, which run everywhere."),
+                ])),
+                ("linux", Value::List(&[
+                    Value::Str("Run `sudo apt install bubblewrap` on Ubuntu or Debian."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-296")),
+            ("title", Value::Str("The reward preview can't write answers on this machine.")),
+            ("why", Value::Str("Writing fresh answers with a model needs PyTorch and Transformers in the preview's environment. This machine's environment doesn't have them.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Preview with the answers stored in the dataset (`completions` set to `stored`)."),
+                    Value::Str("Or run the preview on a machine whose environment has PyTorch and Transformers."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-297")),
+            ("title", Value::Str("The results of a reward check could not be read.")),
+            ("why", Value::Str("The reward check finished, but its report is missing, damaged or doesn't match the reward version.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Run the check again."),
+                    Value::Str("If it fails again, look at the job log for the reason."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-RWD-298")),
+            ("title", Value::Str("The command took too long or printed too much.")),
+            ("why", Value::Str("Commands in the command sandbox have a time limit and a limit on how much they print. This command passed one of them, so the app stopped it.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Make the command finish sooner, or print less."),
+                    Value::Str("Raise the limit in the provider settings if the command needs more."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-STATE-160")),
             ("title", Value::Str("Setup sync isn't turned on yet.")),
             ("why", Value::Str("Sync needs a passphrase first. The app locks your setup with it before it leaves this computer.")),
@@ -3753,6 +3867,39 @@ pub static CATALOG: Value = Value::Map(&[
                     Value::Str("Refresh to see the checkpoint's state."),
                     Value::Str("If it is still being saved, wait a moment and try again."),
                     Value::Str("If it is damaged, use an earlier checkpoint of the same run."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STATE-290")),
+            ("title", Value::Str("This reward version can't take that step right now.")),
+            ("why", Value::Str("Each step needs a certain state. For example, only a published version can be deprecated, and a version being tested can't be tested again.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Refresh to see the version's state."),
+                    Value::Str("Create a new version if you need to change the reward."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STATE-291")),
+            ("title", Value::Str("This reward version can't be published until its checks pass.")),
+            ("why", Value::Str("A version is published only after its test cases pass in the sandbox. When an earlier version is published, a comparison with it must also exist.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Run the version's tests, and fix the reward if a case fails."),
+                    Value::Str("If an earlier version is published, run the comparison with it, then publish again."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-STATE-292")),
+            ("title", Value::Str("This reward version has nothing to check against yet.")),
+            ("why", Value::Str("A test run needs the version's test cases. A comparison needs an earlier published version of the same reward, with test cases.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("To run tests, create a version with test cases."),
+                    Value::Str("To compare, publish an earlier version first. A first version needs no comparison."),
                 ])),
             ])),
         ]),
@@ -4143,6 +4290,17 @@ pub static CATALOG: Value = Value::Map(&[
                 ("steps", Value::List(&[
                     Value::Str("Use a path inside the attempt folder, like `data/train.jsonl`."),
                     Value::Str("If the app sent the path, report it as a problem with the app."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
+            ("code", Value::Str("MRL-VAL-290")),
+            ("title", Value::Str("A reward test case can't be read.")),
+            ("why", Value::Str("Each test case needs a name, a sample with a prompt and an answer, and at least one expected result. Details names the case and the field.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("Fix the test case named in the details."),
+                    Value::Str("See the reward docs for the test case format."),
                 ])),
             ])),
         ]),

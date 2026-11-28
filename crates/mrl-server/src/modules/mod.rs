@@ -39,5 +39,6 @@ pub mod engines;
 // <mrl:modules P27> P27 `pub mod` lines go right below this line.
 // <mrl:modules P28> P28 `pub mod` lines go right below this line.
 // <mrl:modules P29> P29 `pub mod` lines go right below this line.
+pub mod rewards;
 // <mrl:modules P30> P30 `pub mod` lines go right below this line.
 // </mrl:modules>

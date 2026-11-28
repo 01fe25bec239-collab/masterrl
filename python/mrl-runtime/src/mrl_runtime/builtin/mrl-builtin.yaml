@@ -32,3 +32,5 @@ spec:
     # <mrl:job-kinds P26> P26 job kinds go right below this line.
     # <mrl:job-kinds P27> P27 job kinds go right below this line.
     # <mrl:job-kinds P29> P29 job kinds go right below this line.
+    - kind: REWARD_PREVIEW
+      sandbox: code_exec   # no network, no secrets; the reward service runs in its own nested jail

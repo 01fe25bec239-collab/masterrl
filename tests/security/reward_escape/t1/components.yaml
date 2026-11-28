@@ -1,0 +1,2 @@
+components:
+  - {module: attacks, class: Probe}

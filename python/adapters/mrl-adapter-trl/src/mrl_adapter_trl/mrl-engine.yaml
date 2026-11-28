@@ -40,7 +40,7 @@ spec:
       - id: cuda13-uv
         kind: uv
         lockfile: uv.lock
-        lockSha256: 1341ee05deec523beff0a5dc77c256a042768e77bd01146ff94506c75a80b3d9
+        lockSha256: 85c00fe1764f06fc2334d97f21fee2ccc7beee5d4281ae3c10ba24cf62e29efb
         python: "3.12"
         platform: linux/amd64
         accelerator: { vendor: nvidia, runtime: cuda13, minComputeCapability: "7.5" }
@@ -48,7 +48,7 @@ spec:
       - id: cpu-uv
         kind: uv
         lockfile: uv.lock
-        lockSha256: 1341ee05deec523beff0a5dc77c256a042768e77bd01146ff94506c75a80b3d9
+        lockSha256: 85c00fe1764f06fc2334d97f21fee2ccc7beee5d4281ae3c10ba24cf62e29efb
         python: "3.12"
         platform: linux/amd64
         accelerator: { vendor: cpu }
@@ -56,7 +56,7 @@ spec:
       - id: mps-uv
         kind: uv
         lockfile: uv.lock
-        lockSha256: 1341ee05deec523beff0a5dc77c256a042768e77bd01146ff94506c75a80b3d9
+        lockSha256: 85c00fe1764f06fc2334d97f21fee2ccc7beee5d4281ae3c10ba24cf62e29efb
         python: "3.12"
         platform: darwin/arm64
         accelerator: { vendor: apple, runtime: mps }

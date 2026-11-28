@@ -749,6 +749,62 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
     // <mrl:errors P27> rows for P27 go right below this line.
     // <mrl:errors P28> rows for P28 go right below this line.
     // <mrl:errors P29> rows for P29 go right below this line.
+    (
+        code(ErrorFamily::Rwd, 290),
+        "This reward uses a learned reward model or a judge model, which isn't available yet.",
+    ),
+    (
+        code(ErrorFamily::Rwd, 291),
+        "The reward service sent an answer the app can't trust.",
+    ),
+    (
+        code(ErrorFamily::Rwd, 292),
+        "The reward service runs a different reward than this job uses.",
+    ),
+    (
+        code(ErrorFamily::Rwd, 293),
+        "The reward service stopped working.",
+    ),
+    (
+        code(ErrorFamily::Rwd, 294),
+        "The sandbox stopped the reward code.",
+    ),
+    (
+        code(ErrorFamily::Rwd, 295),
+        "Custom reward code can't run on this machine.",
+    ),
+    (
+        code(ErrorFamily::Rwd, 296),
+        "The reward preview can't write answers on this machine.",
+    ),
+    (
+        code(ErrorFamily::Rwd, 297),
+        "The results of a reward check could not be read.",
+    ),
+    (
+        code(ErrorFamily::Rwd, 298),
+        "The command took too long or printed too much.",
+    ),
+    (
+        code(ErrorFamily::State, 290),
+        "This reward version can't take that step right now.",
+    ),
+    (
+        code(ErrorFamily::State, 291),
+        "This reward version can't be published until its checks pass.",
+    ),
+    (
+        code(ErrorFamily::State, 292),
+        "This reward version has nothing to check against yet.",
+    ),
+    (
+        code(ErrorFamily::Conflict, 290),
+        "A reward with this name already exists in this project.",
+    ),
+    (
+        code(ErrorFamily::Val, 290),
+        "A reward test case can't be read.",
+    ),
     // <mrl:errors P30> rows for P30 go right below this line.
 ];
 

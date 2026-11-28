@@ -81,6 +81,7 @@ url = "=2.5.9"
 # <mrl:deps P27> P27 dependencies go right below this line.
 # <mrl:deps P28> P28 dependencies go right below this line.
 # <mrl:deps P29> P29 dependencies go right below this line.
+jsonschema = { version = "=0.58.6", default-features = false }
 # <mrl:deps P30> P30 dependencies go right below this line.
 
 [dev-dependencies]

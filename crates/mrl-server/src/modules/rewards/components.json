@@ -1,0 +1,700 @@
+{
+  "components": [
+    {
+      "beta": true,
+      "code_sha256": "a5e5951caa4f6bd54ca46c13d6c0e0f324aa6bbc2405808246ecafcb66d6b1cb",
+      "description": "1 when the extracted Python code compiles (it is never run), else 0.",
+      "deterministic": true,
+      "kind": "code_exec",
+      "needs": [],
+      "param_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "answer_extractor": {
+            "default": "code_fence",
+            "description": "Where the answer is: full text, tag:<name>, boxed, last_number or code_fence.",
+            "pattern": "^(full|boxed|last_number|code_fence|tag:[A-Za-z][A-Za-z0-9_-]{0,31})$",
+            "type": "string"
+          },
+          "cpu_s": {
+            "description": "CPU time limit per run, in seconds (default 3, at most 5).",
+            "maximum": 5,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "timeout_s": {
+            "description": "Wall-clock limit per run, in seconds (default 4, at most 10).",
+            "exclusiveMinimum": 0,
+            "maximum": 10,
+            "type": "number"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "ref": "builtin/code.compiles@1",
+      "shape": "scalar.sequence",
+      "stateful": false,
+      "tier": 2,
+      "value_range": [
+        0.0,
+        1.0
+      ],
+      "version": "1.0.0"
+    },
+    {
+      "beta": true,
+      "code_sha256": "a5e5951caa4f6bd54ca46c13d6c0e0f324aa6bbc2405808246ecafcb66d6b1cb",
+      "description": "Runs the reference's Python tests against the extracted code. `scoring`:\n    `all_or_nothing` (default: 1 only when every test passes) or `fraction` (share passed).\n    Tests come from the sample's `reference.verifier.tests`; top-level asserts count as one\n    test, `test_*` functions as one each.",
+      "deterministic": true,
+      "kind": "code_exec",
+      "needs": [
+        "reference"
+      ],
+      "param_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "answer_extractor": {
+            "default": "code_fence",
+            "description": "Where the answer is: full text, tag:<name>, boxed, last_number or code_fence.",
+            "pattern": "^(full|boxed|last_number|code_fence|tag:[A-Za-z][A-Za-z0-9_-]{0,31})$",
+            "type": "string"
+          },
+          "cpu_s": {
+            "description": "CPU time limit per run, in seconds (default 3, at most 5).",
+            "maximum": 5,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "scoring": {
+            "default": "all_or_nothing",
+            "enum": [
+              "all_or_nothing",
+              "fraction"
+            ]
+          },
+          "timeout_s": {
+            "description": "Wall-clock limit per run, in seconds (default 4, at most 10).",
+            "exclusiveMinimum": 0,
+            "maximum": 10,
+            "type": "number"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "ref": "builtin/code.unit_tests@1",
+      "shape": "scalar.sequence",
+      "stateful": false,
+      "tier": 2,
+      "value_range": [
+        0.0,
+        1.0
+      ],
+      "version": "1.0.0"
+    },
+    {
+      "beta": false,
+      "code_sha256": "6fd0e232e666ad253388a2dd0d1cffbafb8a8e8c7ebf388f0bac2ae21f4cb7ca",
+      "description": "1 when the extracted text is JSON that the given schema (2020-12, local $ref only)\n    accepts, else 0. Diagnostics: valid, error.",
+      "deterministic": true,
+      "kind": "builtin",
+      "needs": [],
+      "param_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "answer_extractor": {
+            "default": "full",
+            "description": "Where the answer is: full text, tag:<name>, boxed, last_number or code_fence.",
+            "pattern": "^(full|boxed|last_number|code_fence|tag:[A-Za-z][A-Za-z0-9_-]{0,31})$",
+            "type": "string"
+          },
+          "max_bytes": {
+            "default": 65536,
+            "maximum": 1048576,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "schema": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "schema"
+        ],
+        "type": "object"
+      },
+      "ref": "builtin/format.json_schema@1",
+      "shape": "scalar.sequence",
+      "stateful": false,
+      "tier": 1,
+      "value_range": [
+        0.0,
+        1.0
+      ],
+      "version": "1.0.0"
+    },
+    {
+      "beta": false,
+      "code_sha256": "6fd0e232e666ad253388a2dd0d1cffbafb8a8e8c7ebf388f0bac2ae21f4cb7ca",
+      "description": "1 when the whole completion (trimmed unless `strip` is false) matches the RE2\n    pattern, else 0.",
+      "deterministic": true,
+      "kind": "builtin",
+      "needs": [],
+      "param_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "dot_matches_newline": {
+            "default": false,
+            "type": "boolean"
+          },
+          "ignore_case": {
+            "default": false,
+            "type": "boolean"
+          },
+          "pattern": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          },
+          "strip": {
+            "default": true,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "type": "object"
+      },
+      "ref": "builtin/format.regex_full@1",
+      "shape": "scalar.sequence",
+      "stateful": false,
+      "tier": 1,
+      "value_range": [
+        0.0,
+        1.0
+      ],
+      "version": "1.0.0"
+    },
+    {
+      "beta": false,
+      "code_sha256": "6fd0e232e666ad253388a2dd0d1cffbafb8a8e8c7ebf388f0bac2ae21f4cb7ca",
+      "description": "1 when the completion has exactly one <think>…</think> followed by exactly one\n    <answer>…</answer> and no other text, else 0. Diagnostics: answer_tag_found,\n    think_tag_found, answer_count, text_outside_tags.",
+      "deterministic": true,
+      "kind": "builtin",
+      "needs": [],
+      "param_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "allow_text_outside": {
+            "default": false,
+            "type": "boolean"
+          },
+          "answer_tag": {
+            "default": "answer",
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,31}$",
+            "type": "string"
+          },
+          "require_think": {
+            "default": true,
+            "type": "boolean"
+          },
+          "think_tag": {
+            "default": "think",
+            "pattern": "^[A-Za-z][A-Za-z0-9_-]{0,31}$",
+            "type": "string"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "ref": "builtin/format.think_answer_tags@1",
+      "shape": "scalar.sequence",
+      "stateful": false,
+      "tier": 1,
+      "value_range": [
+        0.0,
+        1.0
+      ],
+      "version": "1.0.0"
+    },
+    {
+      "beta": true,
+      "code_sha256": "2a519a553c6ba7d5c3b61ff71bcd14fad6e0a770c85e62f751d1ccdba6961421",
+      "description": "1 when most letters of the completion are in the writing system of the expected\n    language (`expected` param, else the reference's `lang`), else 0. Beta: it tells scripts\n    apart (Latin, Cyrillic, Han, …), not languages that share one (English vs French).",
+      "deterministic": true,
+      "kind": "builtin",
+      "needs": [
+        "reference"
+      ],
+      "param_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "expected": {
+            "enum": [
+              "af",
+              "ar",
+              "be",
+              "bg",
+              "bn",
+              "ca",
+              "cs",
+              "cy",
+              "da",
+              "de",
+              "el",
+              "en",
+              "es",
+              "et",
+              "eu",
+              "fa",
+              "fi",
+              "fr",
+              "ga",
+              "gl",
+              "gu",
+              "he",
+              "hi",
+              "hr",
+              "hu",
+              "hy",
+              "id",
+              "is",
+              "it",
+              "ja",
+              "ka",
+              "kk",
+              "kn",
+              "ko",
+              "ky",
+              "lt",
+              "lv",
+              "mk",
+              "ml",
+              "mn",
+              "mr",
+              "ms",
+              "mt",
+              "nb",
+              "ne",
+              "nl",
+              "nn",
+              "no",
+              "pa",
+              "pl",
+              "ps",
+              "pt",
+              "ro",
+              "ru",
+              "sa",
+              "sk",
+              "sl",
+              "sq",
+              "sr",
+              "sv",
+              "sw",
+              "ta",
+              "te",
+              "tg",
+              "th",
+              "tl",
+              "tr",
+              "uk",
+              "ur",
+              "uz",
+              "vi",
+              "yo",
+              "zh",
+              "zu"
+            ]
+          },
+          "min_share": {
+            "default": 0.5,
+            "exclusiveMinimum": 0,
+            "maximum": 1,
+            "type": "number"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "ref": "builtin/lang.match@1",
+      "shape": "scalar.sequence",
+      "stateful": false,
+      "tier": 1,
+      "value_range": [
+        0.0,
+        1.0
+      ],
+      "version": "1.0.0"
+    },
+    {
+      "beta": false,
+      "code_sha256": "e5a110524abf22bef3d1e350232c4c55621fb92f1ba0a362dc73ed91f587c94a",
+      "description": "0 up to `free_tokens`, then falls linearly to -1 at `max_tokens` and stays there.",
+      "deterministic": true,
+      "kind": "builtin",
+      "needs": [
+        "completion_token_count"
+      ],
+      "param_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "free_tokens": {
+            "default": 0,
+            "maximum": 10000000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "max_tokens": {
+            "maximum": 10000000,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "max_tokens"
+        ],
+        "type": "object"
+      },
+      "ref": "builtin/length.penalty_linear@1",
+      "shape": "scalar.sequence",
+      "stateful": false,
+      "tier": 1,
+      "value_range": [
+        -1.0,
+        0.0
+      ],
+      "version": "1.0.0"
+    },
+    {
+      "beta": false,
+      "code_sha256": "e5a110524abf22bef3d1e350232c4c55621fb92f1ba0a362dc73ed91f587c94a",
+      "description": "DAPO soft overlong penalty: 0 up to max_tokens - cache_tokens, then falls linearly to\n    -1 at max_tokens; -1 beyond it.",
+      "deterministic": true,
+      "kind": "builtin",
+      "needs": [
+        "completion_token_count"
+      ],
+      "param_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "cache_tokens": {
+            "maximum": 10000000,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "max_tokens": {
+            "maximum": 10000000,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "max_tokens",
+          "cache_tokens"
+        ],
+        "type": "object"
+      },
+      "ref": "builtin/length.soft_overlong@1",
+      "shape": "scalar.sequence",
+      "stateful": false,
+      "tier": 1,
+      "value_range": [
+        -1.0,
+        0.0
+      ],
+      "version": "1.0.0"
+    },
+    {
+      "beta": false,
+      "code_sha256": "e5a110524abf22bef3d1e350232c4c55621fb92f1ba0a362dc73ed91f587c94a",
+      "description": "1 inside [min_tokens, max_tokens]; outside it falls linearly to 0 over `slack_tokens`\n    (0 slack: straight to 0).",
+      "deterministic": true,
+      "kind": "builtin",
+      "needs": [
+        "completion_token_count"
+      ],
+      "param_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "max_tokens": {
+            "maximum": 10000000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "min_tokens": {
+            "maximum": 10000000,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "slack_tokens": {
+            "default": 0,
+            "maximum": 10000000,
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "min_tokens",
+          "max_tokens"
+        ],
+        "type": "object"
+      },
+      "ref": "builtin/length.target_band@1",
+      "shape": "scalar.sequence",
+      "stateful": false,
+      "tier": 1,
+      "value_range": [
+        0.0,
+        1.0
+      ],
+      "version": "1.0.0"
+    },
+    {
+      "beta": false,
+      "code_sha256": "d3b7dc444232bc75ad5d46f6054d26b7538b6eabfa457e0a3f149a335b1602d0",
+      "description": "1 when the extracted number is within the absolute or relative tolerance of the\n    reference number, else 0. A non-numeric answer scores 0 (`parse_failed`).",
+      "deterministic": true,
+      "kind": "builtin",
+      "needs": [
+        "reference"
+      ],
+      "param_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "abs_tolerance": {
+            "default": 1e-06,
+            "minimum": 0,
+            "type": "number"
+          },
+          "answer_extractor": {
+            "default": "last_number",
+            "description": "Where the answer is: full text, tag:<name>, boxed, last_number or code_fence.",
+            "pattern": "^(full|boxed|last_number|code_fence|tag:[A-Za-z][A-Za-z0-9_-]{0,31})$",
+            "type": "string"
+          },
+          "rel_tolerance": {
+            "default": 0,
+            "minimum": 0,
+            "type": "number"
+          }
+        },
+        "type": "object"
+      },
+      "ref": "builtin/math.numeric_close@1",
+      "shape": "scalar.sequence",
+      "stateful": false,
+      "tier": 1,
+      "value_range": [
+        0.0,
+        1.0
+      ],
+      "version": "1.0.0"
+    },
+    {
+      "beta": false,
+      "code_sha256": "d3b7dc444232bc75ad5d46f6054d26b7538b6eabfa457e0a3f149a335b1602d0",
+      "description": "1 when the extracted answer equals the reference: exact rational value (decimals,\n    fractions, \\frac, percents as values so 50% = 0.5, thousands commas, units words) or,\n    for non-numbers, the same normalized text. Several different answers score 0.",
+      "deterministic": true,
+      "kind": "builtin",
+      "needs": [
+        "reference"
+      ],
+      "param_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "answer_extractor": {
+            "default": "tag:answer",
+            "description": "Where the answer is: full text, tag:<name>, boxed, last_number or code_fence.",
+            "pattern": "^(full|boxed|last_number|code_fence|tag:[A-Za-z][A-Za-z0-9_-]{0,31})$",
+            "type": "string"
+          },
+          "numeric_tolerance": {
+            "default": 0,
+            "description": "Absolute tolerance; 0 means the values must be equal.",
+            "minimum": 0,
+            "type": "number"
+          }
+        },
+        "type": "object"
+      },
+      "ref": "builtin/math.verify@1",
+      "shape": "scalar.sequence",
+      "stateful": false,
+      "tier": 1,
+      "value_range": [
+        0.0,
+        1.0
+      ],
+      "version": "1.0.0"
+    },
+    {
+      "beta": false,
+      "code_sha256": "030f643b05ef6bf7e907465b216518e0725ef92603a36d47281ac675cdf692f5",
+      "description": "1 when the completion contains the given texts (`any` or `all` of them; the reference\n    answer when none are given), after normalization, else 0.",
+      "deterministic": true,
+      "kind": "builtin",
+      "needs": [],
+      "param_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "mode": {
+            "default": "any",
+            "enum": [
+              "any",
+              "all"
+            ]
+          },
+          "normalize": {
+            "additionalProperties": false,
+            "properties": {
+              "case": {
+                "description": "Ignore upper/lower case.",
+                "type": "boolean"
+              },
+              "nfkc": {
+                "description": "Unicode NFKC normalization.",
+                "type": "boolean"
+              },
+              "whitespace": {
+                "description": "Trim and collapse spaces.",
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          },
+          "texts": {
+            "items": {
+              "maxLength": 4096,
+              "minLength": 1,
+              "type": "string"
+            },
+            "maxItems": 64,
+            "type": "array"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "ref": "builtin/text.contains@1",
+      "shape": "scalar.sequence",
+      "stateful": false,
+      "tier": 1,
+      "value_range": [
+        0.0,
+        1.0
+      ],
+      "version": "1.0.0"
+    },
+    {
+      "beta": false,
+      "code_sha256": "030f643b05ef6bf7e907465b216518e0725ef92603a36d47281ac675cdf692f5",
+      "description": "1 when the extracted answer equals the reference after normalization (NFKC and\n    whitespace on by default, case optional), else 0. Several different answers score 0.",
+      "deterministic": true,
+      "kind": "builtin",
+      "needs": [
+        "reference"
+      ],
+      "param_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "answer_extractor": {
+            "default": "full",
+            "description": "Where the answer is: full text, tag:<name>, boxed, last_number or code_fence.",
+            "pattern": "^(full|boxed|last_number|code_fence|tag:[A-Za-z][A-Za-z0-9_-]{0,31})$",
+            "type": "string"
+          },
+          "normalize": {
+            "additionalProperties": false,
+            "properties": {
+              "case": {
+                "description": "Ignore upper/lower case.",
+                "type": "boolean"
+              },
+              "nfkc": {
+                "description": "Unicode NFKC normalization.",
+                "type": "boolean"
+              },
+              "whitespace": {
+                "description": "Trim and collapse spaces.",
+                "type": "boolean"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "required": [],
+        "type": "object"
+      },
+      "ref": "builtin/text.exact_match@1",
+      "shape": "scalar.sequence",
+      "stateful": false,
+      "tier": 1,
+      "value_range": [
+        0.0,
+        1.0
+      ],
+      "version": "1.0.0"
+    },
+    {
+      "beta": false,
+      "code_sha256": "030f643b05ef6bf7e907465b216518e0725ef92603a36d47281ac675cdf692f5",
+      "description": "1 when the RE2 pattern is found anywhere in the completion, else 0 (`invert` swaps).",
+      "deterministic": true,
+      "kind": "builtin",
+      "needs": [],
+      "param_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "dot_matches_newline": {
+            "default": false,
+            "type": "boolean"
+          },
+          "ignore_case": {
+            "default": false,
+            "type": "boolean"
+          },
+          "invert": {
+            "default": false,
+            "type": "boolean"
+          },
+          "pattern": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "type": "string"
+          }
+        },
+        "required": [
+          "pattern"
+        ],
+        "type": "object"
+      },
+      "ref": "builtin/text.regex@1",
+      "shape": "scalar.sequence",
+      "stateful": false,
+      "tier": 1,
+      "value_range": [
+        0.0,
+        1.0
+      ],
+      "version": "1.0.0"
+    }
+  ],
+  "executor": {
+    "components_digest": "694902706e0dac005d94ecd404c3d04bb74209e4f76c7b979cbf6221ab4e7f8c",
+    "dependencies": [
+      "google-re2==1.1.20251105",
+      "grpcio==1.85.1",
+      "jsonschema==4.26.0",
+      "protobuf==7.36.2",
+      "pyyaml==6.0.3"
+    ],
+    "package": "mrl-rewards",
+    "version": "0.1.0"
+  },
+  "executor_sha256": "a76e18e37f4f65e93a5060184fa6882b5be7e46c461480d5c54f65b02bd92182",
+  "format": "mrl-reward-components/1",
+  "sdk_contract": "mrl-rewards/1"
+}

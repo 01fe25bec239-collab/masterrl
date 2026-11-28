@@ -1,0 +1,68 @@
+name: ci-rewards
+
+# Reward Studio's backend (P29): the reward module against PostgreSQL (content hashing,
+# lifecycle, the publish gate, the immutability trigger, launch pinning), the generated
+# component list, and the reward client, sandboxed bundle and preview task.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-rewards-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rewards:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16.16-alpine3.24
+        env:
+          # Dev-only credentials, same as deploy/local/compose.yaml.
+          POSTGRES_USER: mrl
+          POSTGRES_PASSWORD: mrl-dev-only
+          POSTGRES_DB: masterrl
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U mrl -d masterrl"
+          --health-interval 2s --health-timeout 3s --health-retries 30
+    env:
+      DATABASE_URL: postgres://mrl:mrl-dev-only@127.0.0.1:5432/masterrl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: 0.11.28
+
+      - name: Python environment
+        run: uv sync --locked
+
+      - name: the component list matches mrl-rewards
+        run: tools/gen/rewards.py --check
+
+      - name: reward module unit tests
+        run: cargo test -p mrl-server --lib --locked modules::rewards
+
+      - name: reward module against PostgreSQL
+        # The checks' tests run the real reward_preview task; fail if Python is missing.
+        env:
+          MRL_TEST_REWARDS_PYTHON_REQUIRED: "1"
+        run: cargo test -p mrl-testkit --lib --locked -- --ignored p29_
+
+      - name: every route answers by role (team mode)
+        run: cargo test -p mrl-testkit --lib --locked -- --ignored every_route_answers_by_role_in_team_mode
+
+      - name: reward client, sandboxed bundle, preview task and the escape corpus's own checks
+        run: uv run --locked pytest -q python/mrl-runtime/tests/rewards_client tests/security/reward_escape

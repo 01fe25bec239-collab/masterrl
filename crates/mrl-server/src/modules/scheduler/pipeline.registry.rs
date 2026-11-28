@@ -41,6 +41,9 @@ pub fn pipeline(db: &Db, cfg: &SchedulerConfig) -> Pipeline {
             // <mrl:launch-contributors P27> P27 launch contributors go right below this line.
             // <mrl:launch-contributors P28> P28 launch contributors go right below this line.
             // <mrl:launch-contributors P29> P29 launch contributors go right below this line.
+            Arc::new(crate::modules::rewards::launch::RewardInputs::registered(
+                db.clone(),
+            )),
         ],
         vec![
             // <mrl:pause-support> Engines that can pause go right below this line.
