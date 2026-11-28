@@ -588,7 +588,8 @@ impl Live {
                   WHERE (o.xid, o.id) > (($1::bigint)::text::xid8, $2)
                     AND o.xid < ($3::bigint)::text::xid8
                     AND ((o.aggregate_kind = 'job' AND (o.aggregate_id = ANY($4)
-                           OR o.aggregate_id IN (SELECT id FROM jobs WHERE project_id = ANY($5))))
+                           OR o.aggregate_id IN (SELECT id FROM jobs WHERE project_id = ANY($5)
+                                                 AND subject_ref->>'kind' IS DISTINCT FROM 'run_probe')))
                       OR (o.aggregate_kind = 'attempt'
                            AND o.aggregate_id IN (SELECT id FROM job_attempts WHERE job_id = ANY($4))))
                   ORDER BY o.xid, o.id LIMIT $6",
