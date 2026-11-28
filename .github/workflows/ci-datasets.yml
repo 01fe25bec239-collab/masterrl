@@ -1,0 +1,62 @@
+name: ci-datasets
+
+# P27 Dataset Studio: the dataset routes, job-output decisions, registry lookup and launch
+# staging against PostgreSQL, and the Hub import against the real Hugging Face Hub (network).
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-datasets-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  UV_VERSION: "0.11.28"
+  UV_PYTHON: "3.12"
+
+jobs:
+  server:
+    name: datasets (postgres)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      DATABASE_URL: postgres://mrl:mrl-dev-only@127.0.0.1:55432/masterrl
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2.0.1
+
+      - name: start PostgreSQL
+        run: docker compose -f deploy/local/compose.yaml up -d --wait postgres
+
+      - name: P27 integration tests
+        run: cargo test -p mrl-testkit --locked p27_datasets -- --ignored
+
+      - name: the role table covers the dataset routes
+        run: cargo test -p mrl-testkit --locked every_route_answers_by_role_in_team_mode -- --ignored
+
+      - name: service logs
+        if: failure()
+        run: docker compose -f deploy/local/compose.yaml logs postgres
+
+  hub:
+    name: datasets (hub import, network)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      MRL_NETWORK_TESTS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+        with:
+          version: ${{ env.UV_VERSION }}
+          enable-cache: true
+      - run: uv sync --locked
+      - name: import a public dataset and keep its commit SHA
+        run: uv run --locked pytest python/mrl-runtime/tests/builtin/test_import_dataset.py

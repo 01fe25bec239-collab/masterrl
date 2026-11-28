@@ -224,6 +224,9 @@ impl Records {
             // <mrl:engine-records> Registry lookups go right below this line.
             // <mrl:engine-records P26> P26 lookups go right below this line.
             // <mrl:engine-records P27> P27 lookups go right below this line.
+            Arc::new(crate::modules::datasets::records::DatasetRecords::new(
+                db.clone(),
+            )),
         ];
         Self(members.into())
     }

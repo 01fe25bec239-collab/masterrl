@@ -577,6 +577,336 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /api/v1/dataset-versions/{dsv}:
+    get:
+      tags:
+      - datasets
+      summary: '`GET /dataset-versions/{dsv}`.'
+      operationId: get_dataset_version
+      parameters:
+      - name: dsv
+        in: path
+        description: Dataset version id, `dsv_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The version with its files.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetVersionInfo'
+        '404':
+          description: No such version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/dataset-versions/{dsv}/records:
+    get:
+      tags:
+      - datasets
+      summary: '`GET /dataset-versions/{dsv}/records?cursor&limit&filter`.'
+      operationId: list_dataset_records
+      parameters:
+      - name: dsv
+        in: path
+        description: Dataset version id, `dsv_…`.
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: path
+        description: Records per page, 1–100 (default 20).
+        required: true
+        schema:
+          type:
+          - string
+          - 'null'
+      - name: cursor
+        in: path
+        description: '`next_cursor` from the previous page.'
+        required: true
+        schema:
+          type:
+          - string
+          - 'null'
+      - name: filter
+        in: path
+        description: A filter expression, like `len(completion) > 0 and lang == 'en'`.
+        required: true
+        schema:
+          type:
+          - string
+          - 'null'
+      responses:
+        '200':
+          description: Records in order, filtered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetRecordsPage'
+        '400':
+          description: The filter can't be read (MRL-VAL-006) or the cursor is wrong.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: The version is not ready (MRL-DATA-002).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/dataset-versions/{dsv}/stats:
+    get:
+      tags:
+      - datasets
+      summary: '`GET /dataset-versions/{dsv}/stats`.'
+      operationId: get_dataset_stats
+      parameters:
+      - name: dsv
+        in: path
+        description: Dataset version id, `dsv_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Field lengths, role counts and turns per record.
+          content:
+            application/json:
+              schema:
+                type: object
+        '409':
+          description: The version is not ready (MRL-DATA-002).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/dataset-versions/{dsv}/validation:
+    get:
+      tags:
+      - datasets
+      summary: '`GET /dataset-versions/{dsv}/validation`.'
+      operationId: get_dataset_validation
+      parameters:
+      - name: dsv
+        in: path
+        description: Dataset version id, `dsv_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The report (empty while the version is still being checked).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetValidation'
+        '404':
+          description: No such version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/dataset-versions/{dsv}:diff:
+    post:
+      tags:
+      - datasets
+      summary: '`:diff`.'
+      operationId: diff_dataset_versions
+      parameters:
+      - name: dsv
+        in: path
+        description: Dataset version id, `dsv_…`.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DatasetDiffRequest'
+        required: true
+      responses:
+        '200':
+          description: Schema, rows and record changes, with samples.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetDiff'
+        '409':
+          description: A version is not ready (MRL-DATA-002).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/dataset-versions/{dsv}:export:
+    post:
+      tags:
+      - datasets
+      summary: |-
+        Download links for the version's files in `format`. Refused (403 MRL-PERM-270) for a
+        `restricted-pii` dataset; audited as `datasets.export`.
+      operationId: export_dataset_version
+      parameters:
+      - name: dsv
+        in: path
+        description: Dataset version id, `dsv_…`.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DatasetExportRequest'
+        required: true
+      responses:
+        '200':
+          description: Download links for every file.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetExport'
+        '403':
+          description: The dataset is restricted personal data (MRL-PERM-270).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: The version is not ready (MRL-DATA-002).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/datasets/{ds}:
+    get:
+      tags:
+      - datasets
+      summary: '`GET /datasets/{ds}`.'
+      operationId: get_dataset
+      parameters:
+      - name: ds
+        in: path
+        description: Dataset id, `ds_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The dataset.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetInfo'
+        '404':
+          description: No such dataset.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    delete:
+      tags:
+      - datasets
+      summary: |-
+        `DELETE /datasets/{ds}`: the dataset and its versions disappear for everyone (runs that
+        already staged them keep their copies). Its name is free again.
+      operationId: delete_dataset
+      parameters:
+      - name: ds
+        in: path
+        description: Dataset id, `ds_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '204':
+          description: Deleted (also when it already was).
+        '404':
+          description: No such dataset.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    patch:
+      tags:
+      - datasets
+      summary: '`PATCH /datasets/{ds}`.'
+      operationId: update_dataset
+      parameters:
+      - name: ds
+        in: path
+        description: Dataset id, `ds_…`.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DatasetPatch'
+        required: true
+      responses:
+        '200':
+          description: The dataset afterwards.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetInfo'
+        '409':
+          description: The name is taken (MRL-CONFLICT-270).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: A field needs a change.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/datasets/{ds}/versions:
+    get:
+      tags:
+      - datasets
+      summary: '`GET /datasets/{ds}/versions`.'
+      operationId: list_dataset_versions
+      parameters:
+      - name: ds
+        in: path
+        description: Dataset id, `ds_…`.
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Its versions, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_DatasetVersionInfo'
+        '404':
+          description: No such dataset.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/engines:
     get:
       tags:
@@ -1171,6 +1501,81 @@ paths:
                 $ref: '#/components/schemas/Page_NodeView'
         '404':
           description: No such pool.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/projects/{prj}/datasets:
+    get:
+      tags:
+      - datasets
+      summary: '`GET /projects/{prj}/datasets`.'
+      operationId: list_datasets
+      parameters:
+      - name: prj
+        in: path
+        description: Project id, `prj_…`.
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: The project's datasets, newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_DatasetInfo'
+        '404':
+          description: No such project.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    post:
+      tags:
+      - datasets
+      summary: '`POST /projects/{prj}/datasets`.'
+      operationId: create_dataset
+      parameters:
+      - name: prj
+        in: path
+        description: Project id, `prj_…`.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DatasetCreate'
+        required: true
+      responses:
+        '201':
+          description: The new dataset.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetInfo'
+        '409':
+          description: The name is taken (MRL-CONFLICT-270).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: A field needs a change.
           content:
             application/json:
               schema:
@@ -3133,6 +3538,574 @@ components:
             type: string
           description: '`["*"]`, or areas like `["runs:write", "datasets:read"]`.'
       additionalProperties: false
+    DatasetContamination:
+      type: object
+      description: Overlap of a version with an evaluation version.
+      required:
+      - eval_dataset_version_id
+      - overlap_ratio
+      - overlapping_rows
+      - method
+      properties:
+        eval_dataset_version_id:
+          type: string
+          description: '`dsv_…` of the evaluation set.'
+        method:
+          type: string
+          description: '`exact`.'
+        overlap_ratio:
+          type: number
+          format: double
+          description: Share of this version's records that share a prompt with it (0–1).
+        overlapping_rows:
+          type: integer
+          format: int64
+          description: How many.
+    DatasetCreate:
+      type: object
+      description: '`POST /projects/{prj}/datasets`.'
+      required:
+      - name
+      properties:
+        card_md:
+          type:
+          - string
+          - 'null'
+          description: Dataset card (Markdown).
+        consent_basis:
+          type:
+          - string
+          - 'null'
+          description: Why the data may be used.
+        description:
+          type:
+          - string
+          - 'null'
+          description: Short description.
+        eval_set:
+          type:
+          - boolean
+          - 'null'
+          description: Check new versions of other datasets for overlap with this one.
+        license:
+          type:
+          - string
+          - 'null'
+          description: SPDX licence id, `custom` or `unknown` (default).
+        name:
+          type: string
+          description: Unique in the project (1–200 characters).
+        permitted_use:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+          description: '`research`, `commercial`, `internal`.'
+        sensitivity:
+          type:
+          - string
+          - 'null'
+          description: '`public`, `internal` (default), `confidential` or `restricted-pii`.'
+        source_urls:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+          description: Where the data came from (http or https links).
+      additionalProperties: false
+    DatasetDiff:
+      type: object
+      description: How two versions differ (Doc 08 §2.6).
+      required:
+      - base
+      - against
+      - same_schema
+      - row_delta
+      - same_content
+      - records
+      - base_sample
+      - against_sample
+      properties:
+        against:
+          $ref: '#/components/schemas/DatasetVersionInfo'
+          description: The other.
+        against_sample:
+          type: array
+          items:
+            type: object
+          description: The first records of `against`.
+        base:
+          $ref: '#/components/schemas/DatasetVersionInfo'
+          description: This version.
+        base_sample:
+          type: array
+          items:
+            type: object
+          description: The first records of this version.
+        records:
+          $ref: '#/components/schemas/DatasetRecordDiff'
+          description: Record changes, by exact record hash.
+        row_delta:
+          type: integer
+          format: int64
+          description: '`against` rows minus these rows.'
+        same_content:
+          type: boolean
+          description: 'Same content hash: the same records.'
+        same_schema:
+          type: boolean
+          description: Both use the same schema.
+    DatasetDiffRequest:
+      type: object
+      description: '`POST /dataset-versions/{dsv}:diff`.'
+      required:
+      - against
+      properties:
+        against:
+          type: string
+          description: 'The version to compare with (`dsv_…`): "added" means in it but not in this one.'
+      additionalProperties: false
+    DatasetExport:
+      type: object
+      description: An export.
+      required:
+      - format
+      - files
+      properties:
+        files:
+          type: array
+          items:
+            $ref: '#/components/schemas/DatasetExportFile'
+          description: The files, with download links.
+        format:
+          type: string
+          description: The format asked for.
+    DatasetExportFile:
+      type: object
+      description: A file to download.
+      required:
+      - path
+      - size
+      - sha256
+      - url
+      - expires_at
+      properties:
+        expires_at:
+          type: string
+          format: date-time
+          description: When the link stops working.
+        path:
+          type: string
+          description: Path inside the export.
+        sha256:
+          type: string
+          description: 'sha256 (hex): check the download against it.'
+        size:
+          type: integer
+          format: int64
+          description: Size in bytes.
+          minimum: 0
+        url:
+          type: string
+          description: Download link (relative to the server), valid until `expires_at`.
+    DatasetExportRequest:
+      type: object
+      description: '`POST /dataset-versions/{dsv}:export`.'
+      required:
+      - format
+      properties:
+        format:
+          type: string
+          description: '`parquet`: the version''s shards.'
+      additionalProperties: false
+    DatasetFileInfo:
+      type: object
+      description: One stored file of a version.
+      required:
+      - path
+      - role
+      - sha256
+      - size
+      properties:
+        path:
+          type: string
+          description: Path inside the version.
+        role:
+          type: string
+          description: '`shard`, `original` or `derived`.'
+        rows:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Rows (shards).
+        sha256:
+          type: string
+          description: sha256 (hex).
+        size:
+          type: integer
+          format: int64
+          description: Size in bytes.
+        split:
+          type:
+          - string
+          - 'null'
+          description: Split (shards).
+    DatasetInfo:
+      type: object
+      description: A dataset.
+      required:
+      - id
+      - project_id
+      - name
+      - description
+      - license
+      - sensitivity
+      - permitted_use
+      - source_urls
+      - card_md
+      - eval_set
+      - policy
+      - created_by
+      - created_at
+      - updated_at
+      properties:
+        card_md:
+          type: string
+          description: Dataset card (Markdown, shown sanitized).
+        consent_basis:
+          type:
+          - string
+          - 'null'
+          description: Why the data may be used.
+        created_at:
+          type: string
+          format: date-time
+          description: Created.
+        created_by:
+          type: string
+          description: Who made it.
+        description:
+          type: string
+          description: Short description.
+        eval_set:
+          type: boolean
+          description: New versions of other datasets are checked for overlap with this one.
+        id:
+          type: string
+          description: '`ds_…`.'
+        license:
+          type: string
+          description: SPDX licence id, `custom` or `unknown`.
+        name:
+          type: string
+          description: Unique in the project.
+        permitted_use:
+          type: array
+          items:
+            type: string
+          description: '`research`, `commercial`, `internal`.'
+        policy:
+          $ref: '#/components/schemas/DatasetPolicy'
+          description: What the sensitivity allows.
+        project_id:
+          type: string
+          description: '`prj_…`.'
+        sensitivity:
+          type: string
+          description: '`public`, `internal`, `confidential` or `restricted-pii`.'
+        source_urls:
+          type: array
+          items:
+            type: string
+          description: Where the data came from.
+        updated_at:
+          type: string
+          format: date-time
+          description: Last changed.
+    DatasetPatch:
+      type: object
+      description: '`PATCH /datasets/{ds}`: the fields to change (the name too).'
+      properties:
+        card_md:
+          type:
+          - string
+          - 'null'
+          description: New card.
+        consent_basis:
+          type:
+          - string
+          - 'null'
+          description: New consent basis.
+        description:
+          type:
+          - string
+          - 'null'
+          description: New description.
+        eval_set:
+          type:
+          - boolean
+          - 'null'
+          description: Registered as an evaluation set.
+        license:
+          type:
+          - string
+          - 'null'
+          description: New licence.
+        name:
+          type:
+          - string
+          - 'null'
+          description: New name.
+        permitted_use:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+          description: New permitted uses.
+        sensitivity:
+          type:
+          - string
+          - 'null'
+          description: New sensitivity.
+        source_urls:
+          type:
+          - array
+          - 'null'
+          items:
+            type: string
+          description: New source links.
+      additionalProperties: false
+    DatasetPolicy:
+      type: object
+      description: What a dataset's sensitivity allows (P22/P23 read `sample_logging`).
+      required:
+      - export_allowed
+      - hub_push_allowed
+      - sample_logging
+      properties:
+        export_allowed:
+          type: boolean
+          description: Its files may be downloaded or exported.
+        hub_push_allowed:
+          type: boolean
+          description: It may be pushed to the Hugging Face Hub.
+        sample_logging:
+          type: boolean
+          description: Runs on it may log raw samples.
+    DatasetRecord:
+      type: object
+      description: One record.
+      required:
+      - index
+      - record
+      properties:
+        index:
+          type: integer
+          format: int64
+          description: Position in the version (0-based, in shard order).
+          minimum: 0
+        record:
+          type: object
+          description: 'The record. Show it as text only: it is untrusted.'
+    DatasetRecordDiff:
+      type: object
+      description: Records that differ between two versions.
+      required:
+      - added
+      - removed
+      - unchanged
+      - added_examples
+      - removed_examples
+      properties:
+        added:
+          type: integer
+          format: int64
+          description: In `against` only.
+          minimum: 0
+        added_examples:
+          type: array
+          items:
+            type: string
+          description: Record hashes (sha256 of the record as canonical JSON) of some added records.
+        removed:
+          type: integer
+          format: int64
+          description: In this version only.
+          minimum: 0
+        removed_examples:
+          type: array
+          items:
+            type: string
+          description: … of some removed records.
+        unchanged:
+          type: integer
+          format: int64
+          description: In both.
+          minimum: 0
+    DatasetRecordsPage:
+      type: object
+      description: A page of records.
+      required:
+      - items
+      - scanned
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DatasetRecord'
+          description: Records that match.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: |-
+            Continue here; `null` at the end. A page may hold fewer than `limit` records when a
+            filter matches few: follow the cursor to keep looking.
+        scanned:
+          type: integer
+          format: int64
+          description: Records looked at for this page.
+          minimum: 0
+    DatasetValidation:
+      type: object
+      description: The validation report of a checked version.
+      required:
+      - dataset_version_id
+      - state
+      - contamination
+      properties:
+        contamination:
+          type: array
+          items:
+            $ref: '#/components/schemas/DatasetContamination'
+          description: Overlap with registered evaluation sets.
+        dataset_version_id:
+          type: string
+          description: '`dsv_…`.'
+        report:
+          type:
+          - object
+          - 'null'
+          description: |-
+            Counts, defect codes, invalid examples (record, code, field, message), duplicates,
+            leakage and which checks were full or sampled.
+        state:
+          type: string
+          description: The version's state.
+        state_reason:
+          type:
+          - object
+          - 'null'
+          description: Why it is INVALID.
+        summary:
+          type:
+          - object
+          - 'null'
+          description: |-
+            What the check wrote about the files (records per file, skipped files, images,
+            leakage by evaluation version).
+    DatasetVersionInfo:
+      type: object
+      description: A dataset version.
+      required:
+      - id
+      - dataset_id
+      - seq
+      - schema_id
+      - state
+      - source_kind
+      - source_ref
+      - created_by
+      - created_at
+      properties:
+        byte_size:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Bytes in its shards.
+        content_sha256:
+          type:
+          - string
+          - 'null'
+          description: 'sha256 over its sorted shard hashes (hex): the same records give the same value.'
+        created_at:
+          type: string
+          format: date-time
+          description: Created.
+        created_by:
+          type: string
+          description: Who made it.
+        dataset_id:
+          type: string
+          description: '`ds_…`.'
+        files:
+          type:
+          - array
+          - 'null'
+          items:
+            $ref: '#/components/schemas/DatasetFileInfo'
+          description: Its files (only on `GET /dataset-versions/{dsv}`).
+        id:
+          type: string
+          description: '`dsv_…`.'
+        job_id:
+          type:
+          - string
+          - 'null'
+          description: The job working on it (`job_…`), while it is being prepared.
+        parent_version_id:
+          type:
+          - string
+          - 'null'
+          description: The version it was made from.
+        ready_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: Became READY.
+        row_count:
+          type:
+          - integer
+          - 'null'
+          format: int64
+          description: Rows.
+        schema_id:
+          type: string
+          description: Canonical schema id, like `sft.messages.v1`.
+        seq:
+          type: integer
+          format: int32
+          description: 1, 2, … within the dataset.
+        source_kind:
+          type: string
+          description: '`upload`, `hub`, `remote_ref` or `transform`.'
+        source_ref:
+          type: object
+          description: Where it came from (uploads, Hub repo with its commit SHA, link, parent).
+        splits:
+          type:
+          - object
+          - 'null'
+          description: Rows per split.
+        state:
+          type: string
+          description: '`INGESTING`, `VALIDATING`, `READY`, `INVALID` or `ARCHIVED`.'
+        state_reason:
+          type:
+          - object
+          - 'null'
+          description: 'Why it is INVALID: `{code, message}`.'
+        transform_spec:
+          type:
+          - object
+          - 'null'
+          description: The transform that made it.
     DownloadRequest:
       type: object
       description: '`POST /artifacts/{art}:download` body.'
@@ -4520,6 +5493,204 @@ components:
                 - 'null'
                 format: date-time
                 description: Last verified.
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_DatasetInfo:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: A dataset.
+            required:
+            - id
+            - project_id
+            - name
+            - description
+            - license
+            - sensitivity
+            - permitted_use
+            - source_urls
+            - card_md
+            - eval_set
+            - policy
+            - created_by
+            - created_at
+            - updated_at
+            properties:
+              card_md:
+                type: string
+                description: Dataset card (Markdown, shown sanitized).
+              consent_basis:
+                type:
+                - string
+                - 'null'
+                description: Why the data may be used.
+              created_at:
+                type: string
+                format: date-time
+                description: Created.
+              created_by:
+                type: string
+                description: Who made it.
+              description:
+                type: string
+                description: Short description.
+              eval_set:
+                type: boolean
+                description: New versions of other datasets are checked for overlap with this one.
+              id:
+                type: string
+                description: '`ds_…`.'
+              license:
+                type: string
+                description: SPDX licence id, `custom` or `unknown`.
+              name:
+                type: string
+                description: Unique in the project.
+              permitted_use:
+                type: array
+                items:
+                  type: string
+                description: '`research`, `commercial`, `internal`.'
+              policy:
+                $ref: '#/components/schemas/DatasetPolicy'
+                description: What the sensitivity allows.
+              project_id:
+                type: string
+                description: '`prj_…`.'
+              sensitivity:
+                type: string
+                description: '`public`, `internal`, `confidential` or `restricted-pii`.'
+              source_urls:
+                type: array
+                items:
+                  type: string
+                description: Where the data came from.
+              updated_at:
+                type: string
+                format: date-time
+                description: Last changed.
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_DatasetVersionInfo:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: A dataset version.
+            required:
+            - id
+            - dataset_id
+            - seq
+            - schema_id
+            - state
+            - source_kind
+            - source_ref
+            - created_by
+            - created_at
+            properties:
+              byte_size:
+                type:
+                - integer
+                - 'null'
+                format: int64
+                description: Bytes in its shards.
+              content_sha256:
+                type:
+                - string
+                - 'null'
+                description: 'sha256 over its sorted shard hashes (hex): the same records give the same value.'
+              created_at:
+                type: string
+                format: date-time
+                description: Created.
+              created_by:
+                type: string
+                description: Who made it.
+              dataset_id:
+                type: string
+                description: '`ds_…`.'
+              files:
+                type:
+                - array
+                - 'null'
+                items:
+                  $ref: '#/components/schemas/DatasetFileInfo'
+                description: Its files (only on `GET /dataset-versions/{dsv}`).
+              id:
+                type: string
+                description: '`dsv_…`.'
+              job_id:
+                type:
+                - string
+                - 'null'
+                description: The job working on it (`job_…`), while it is being prepared.
+              parent_version_id:
+                type:
+                - string
+                - 'null'
+                description: The version it was made from.
+              ready_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+                description: Became READY.
+              row_count:
+                type:
+                - integer
+                - 'null'
+                format: int64
+                description: Rows.
+              schema_id:
+                type: string
+                description: Canonical schema id, like `sft.messages.v1`.
+              seq:
+                type: integer
+                format: int32
+                description: 1, 2, … within the dataset.
+              source_kind:
+                type: string
+                description: '`upload`, `hub`, `remote_ref` or `transform`.'
+              source_ref:
+                type: object
+                description: Where it came from (uploads, Hub repo with its commit SHA, link, parent).
+              splits:
+                type:
+                - object
+                - 'null'
+                description: Rows per split.
+              state:
+                type: string
+                description: '`INGESTING`, `VALIDATING`, `READY`, `INVALID` or `ARCHIVED`.'
+              state_reason:
+                type:
+                - object
+                - 'null'
+                description: 'Why it is INVALID: `{code, message}`.'
+              transform_spec:
+                type:
+                - object
+                - 'null'
+                description: The transform that made it.
           description: The items on this page.
         next_cursor:
           type:
@@ -6530,3 +7701,5 @@ tags:
   description: 'Checkpoints: listing, verification and deletion.'
 - name: engines
   description: Training engines, their methods and what can run where.
+- name: datasets
+  description: 'Datasets: versions, validation, records, diffs and exports.'

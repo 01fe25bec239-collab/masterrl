@@ -2378,6 +2378,17 @@ export const catalog = deepFreeze({
       }
     },
     {
+      "code": "MRL-CONFLICT-270",
+      "title": "This project already has a dataset with that name.",
+      "why": "Dataset names are unique within a project, so you can tell them apart in runs and reports.",
+      "what_to_do": {
+        "steps": [
+          "Pick another name.",
+          "Or add a new version to the dataset that already has this name."
+        ]
+      }
+    },
+    {
       "code": "MRL-DATA-001",
       "title": "Your dataset did not pass its checks.",
       "why": "Some rows are empty, are missing fields, or don't match the chosen format.",
@@ -2428,6 +2439,52 @@ export const catalog = deepFreeze({
         "steps": [
           "Check the dataset version id in the run settings.",
           "Import the dataset first if it isn't in the app yet."
+        ]
+      }
+    },
+    {
+      "code": "MRL-DATA-270",
+      "title": "This dataset has images, and the app can't train on images yet.",
+      "why": "Records with images are a picture-and-text format. Training on pictures comes in a later version of the app, so the app doesn't keep these records now.",
+      "what_to_do": {
+        "steps": [
+          "Remove the images from the records and add the dataset again as text only.",
+          "Or keep the file and add it again once picture training is available."
+        ]
+      }
+    },
+    {
+      "code": "MRL-DATA-271",
+      "title": "The app refused to unpack this archive.",
+      "why": "The archive writes outside its folder, holds links, has too many files, or unpacks to far more than its size. Details says which.",
+      "what_to_do": {
+        "steps": [
+          "Unpack the archive on your computer and check what is inside.",
+          "Pack only the data files again, in plain folders, and add the new archive.",
+          "Or add the data files one by one without an archive."
+        ]
+      }
+    },
+    {
+      "code": "MRL-DATA-272",
+      "title": "The app could not download this dataset.",
+      "why": "The address isn't public `https://`, the server refused, the download is too big, or the connection broke. Details says which.",
+      "what_to_do": {
+        "steps": [
+          "Check the address, the repository name and the revision.",
+          "For a private Hugging Face dataset, add an access token in Settings and pick it.",
+          "Try again. If the dataset is very large, raise the size limit or add the files yourself."
+        ]
+      }
+    },
+    {
+      "code": "MRL-DATA-273",
+      "title": "The dataset job finished, but its results are damaged.",
+      "why": "A file the job wrote is missing, cut short, or doesn't match its checksum. The version is marked as not usable.",
+      "what_to_do": {
+        "steps": [
+          "Add the dataset version again.",
+          "If this keeps happening, check the storage settings and free space on the machine that ran the job."
         ]
       }
     },
@@ -3398,6 +3455,17 @@ export const catalog = deepFreeze({
       "what_to_do": {
         "steps": [
           "Create a pool and add a machine to it, or ask an admin to open a pool to your organization."
+        ]
+      }
+    },
+    {
+      "code": "MRL-PERM-270",
+      "title": "This dataset holds personal data, so it can't leave the app.",
+      "why": "Its sensitivity is set to restricted personal data. Exports and uploads to Hugging Face are turned off for it, and training doesn't log its records.",
+      "what_to_do": {
+        "steps": [
+          "Use the dataset inside the app only.",
+          "If the data is not personal, an admin can change the dataset's sensitivity first."
         ]
       }
     },

@@ -1,0 +1,91 @@
+{
+  "schema": "sft.messages.v1",
+  "source": "sft.messages.v1",
+  "format": "mixed",
+  "records": 8,
+  "valid": 0,
+  "invalid": 8,
+  "defect_counts": {
+    "role_order": 3,
+    "empty_field": 2,
+    "unknown_role": 1,
+    "missing_field": 1,
+    "unknown_field": 1,
+    "bad_utf8": 1
+  },
+  "examples": [
+    {
+      "record": 1,
+      "code": "role_order",
+      "path": "",
+      "message": "Messages must go user, assistant, user, assistant (after an optional system message) and end with assistant."
+    },
+    {
+      "record": 2,
+      "code": "role_order",
+      "path": "",
+      "message": "Messages must go user, assistant, user, assistant (after an optional system message) and end with assistant."
+    },
+    {
+      "record": 3,
+      "code": "role_order",
+      "path": "",
+      "message": "Messages must go user, assistant, user, assistant (after an optional system message) and end with assistant."
+    },
+    {
+      "record": 4,
+      "code": "empty_field",
+      "path": "/messages/1/content",
+      "message": "A field is empty."
+    },
+    {
+      "record": 5,
+      "code": "empty_field",
+      "path": "/messages",
+      "message": "A field is empty."
+    },
+    {
+      "record": 6,
+      "code": "unknown_role",
+      "path": "/messages/1/role",
+      "message": "A message has a role other than system, user or assistant."
+    },
+    {
+      "record": 7,
+      "code": "missing_field",
+      "path": "",
+      "message": "A required field is missing."
+    },
+    {
+      "record": 7,
+      "code": "unknown_field",
+      "path": "",
+      "message": "The record has a field this format doesn't have."
+    },
+    {
+      "record": 8,
+      "code": "bad_utf8",
+      "path": "",
+      "message": "The record is not valid UTF-8 text."
+    }
+  ],
+  "duplicates": 0,
+  "duplicate_examples": [],
+  "leakage": {},
+  "stats": {
+    "records": 0,
+    "field_lengths": {},
+    "roles": {},
+    "turns": null
+  },
+  "checks": {
+    "parse": "full",
+    "schema": "full",
+    "rules": "full",
+    "duplicates": "full",
+    "stats": "full",
+    "leakage": "skipped"
+  },
+  "passed": false,
+  "error_code": "MRL-DATA-001"
+}
