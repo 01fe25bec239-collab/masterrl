@@ -59,6 +59,7 @@ from mrl_runtime.errors import MrlError
 UNTRUSTED_ANSWER = "MRL-RWD-291"
 HASH_MISMATCH = "MRL-RWD-292"
 REWARD_INFRA = "MRL-RWD-293"
+SANDBOX_VIOLATION = "MRL-RWD-294"
 MAX_DIAGNOSTICS_BYTES = 4096
 MAX_FLAGS = 16
 _BATCH_SCOPE = "mrl-batch-scope"
@@ -466,7 +467,16 @@ class RewardClient:
                         self._state.normalizer = checkpoint
                 return scores, elapsed
             except grpc.RpcError as e:
-                code = cast("grpc.Call", e).code() if isinstance(e, grpc.Call) else None
+                call = cast("grpc.Call", e) if isinstance(e, grpc.Call) else None
+                code = call.code() if call is not None else None
+                if (
+                    call is not None
+                    and code == grpc.StatusCode.ABORTED
+                    and call.details() == SANDBOX_VIOLATION
+                ):
+                    raise RewardClientError(
+                        SANDBOX_VIOLATION, "The sandbox stopped the reward code."
+                    ) from e
                 if code not in _RETRYABLE or attempt == 1:
                     raise RewardInfraError(
                         REWARD_INFRA, f"The reward service failed a batch twice: {_rpc(e)}"

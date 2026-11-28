@@ -32,6 +32,7 @@ import signal
 import sys
 import threading
 from collections import OrderedDict
+from collections.abc import Mapping
 from pathlib import Path
 from typing import cast, override
 
@@ -42,7 +43,7 @@ from mrl_rewards.exec.bundle import LoadedBundle
 from mrl_rewards.exec.main import read_nonce
 from mrl_rewards.exec.server import STARTUP_FAILED, Audit, ExecLimits, RewardExecService, serve
 from mrl_rewards.policy.model import Normalization
-from mrl_rewards.policy.runtime import NormalizerState, PolicyRuntime
+from mrl_rewards.policy.runtime import BatchFailedError, NormalizerState, PolicyRuntime, SampleScore
 from mrl_rewards.server_bundle import (
     PROFILE_ENV,
     USER_CODE_ENV,
@@ -52,7 +53,7 @@ from mrl_rewards.server_bundle import (
     python_paths,
     sandbox_proof,
 )
-from mrl_rewards.types import JSONValue, RewardError
+from mrl_rewards.types import JSONValue, RewardBatch, RewardError, RewardResult
 
 JAIL_ENV = "MRL_JAIL_SECCOMP"
 SUPERVISOR_ENV = "MRL_SUPERVISOR_SECCOMP"
@@ -62,6 +63,33 @@ SECCOMP_FD = 3
 _BATCH_SCOPE = "mrl-batch-scope"
 _NORMALIZER_STATE = "mrl-normalizer-state-bin"
 _MAX_STATE_BYTES = 6000
+_SANDBOX_VIOLATION = "MRL-RWD-294"
+_JAILED_COMPONENTS = frozenset({"code.compiles", "code.unit_tests"})
+
+
+class _SandboxBatchError(Exception):
+    pass
+
+
+class _SandboxPolicyRuntime(PolicyRuntime):
+    @override
+    def resolve(
+        self,
+        batch: RewardBatch,
+        raw: Mapping[tuple[int, str], RewardResult],
+        state: NormalizerState,
+    ) -> list[SampleScore]:
+        try:
+            return super().resolve(batch, raw, state)
+        except BatchFailedError as exc:
+            # A refused batch has no scores to carry the jail verdict to the worker.
+            if any(
+                self.providers[component_id].spec.name in _JAILED_COMPONENTS
+                and "sandbox_violation" in result.flags
+                for (_, component_id), result in raw.items()
+            ):
+                raise _SandboxBatchError from exc
+            raise
 
 
 class CheckpointedService(RewardExecService):
@@ -89,6 +117,15 @@ class CheckpointedService(RewardExecService):
         self.running = Normalization.ZSCORE_RUNNING in (policy.per_component, policy.final)
         self._state_lock = threading.Lock()
         self._state_replies: OrderedDict[str, tuple[bytes, bytes]] = OrderedDict()
+
+    @override
+    def _score(
+        self, request: pb.ScoreRequest, start: float, context: grpc.ServicerContext
+    ) -> pb.ScoreResponse:
+        try:
+            return super()._score(request, start, context)
+        except _SandboxBatchError:
+            context.abort(grpc.StatusCode.ABORTED, _SANDBOX_VIOLATION)
 
     @override
     def Describe(
@@ -212,6 +249,8 @@ def start(args: argparse.Namespace, audit: Audit) -> tuple[RewardExecService, ob
     runtime = PolicyRuntime.build(
         bundle.policy, bundle.registry, bundle_dir=bundle.root, seed=args.seed
     )
+    if args.tier == 2:
+        runtime = _SandboxPolicyRuntime(runtime.policy, runtime.providers)
     limits = ExecLimits(
         max_batch=args.max_batch,
         per_sample_timeout_ms=args.per_sample_timeout_ms,

@@ -51,7 +51,13 @@ from mrl_runtime.adapter.events import Progress
 from mrl_runtime.adapter.types import Issue
 from mrl_runtime.builtin.tasks import BuiltinTask, TaskContext, TaskEvent, TaskOutput
 from mrl_runtime.errors import TASK_INPUT_INVALID, MrlError
-from mrl_runtime.rewards_client import RewardClient, RewardInfraError, RewardOutcome, Sample
+from mrl_runtime.rewards_client import (
+    SANDBOX_VIOLATION,
+    RewardClient,
+    RewardInfraError,
+    RewardOutcome,
+    Sample,
+)
 
 REPORT = "report.json"
 ROWS = "rows.jsonl"
@@ -59,7 +65,6 @@ REPORT_FORMAT = "mrl-reward-report/1"
 MODES = ("test", "preview", "regression", "compare")
 NO_GENERATION = "MRL-RWD-296"
 SERVICE_FAILED = "MRL-RWD-293"
-SANDBOX_VIOLATION = "MRL-RWD-294"
 MAX_SAMPLES = 5000
 MAX_GOLDEN_SAMPLES = 16
 MAX_GOLDEN_BYTES = 128 << 10
