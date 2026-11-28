@@ -850,6 +850,28 @@ async fn a_retry_stages_its_resume_checkpoint_as_a_folder() {
         .contribute(&job_row, &attempt, &placement, &mut LaunchPlan::default())
         .await;
     assert!(matches!(gone, Err(LaunchError::Fail(..))), "{gone:?}");
+    // A branched run with no pin: its parent checkpoint became unusable (the scheduler pins
+    // it while COMMITTED), so the launch fails instead of training from scratch.
+    sqlx::query("UPDATE runs SET parent_checkpoint_id = $2 WHERE id = $1")
+        .bind(job_row.run_id.unwrap())
+        .bind(first)
+        .execute(env.db.pool())
+        .await
+        .unwrap();
+    attempt.resume_from_checkpoint_id = None;
+    let orphan = resume
+        .contribute(&job_row, &attempt, &placement, &mut LaunchPlan::default())
+        .await;
+    assert!(
+        matches!(
+            orphan,
+            Err(LaunchError::Fail(
+                mrl_domain::failure::FailureClass::UserConfig,
+                _
+            ))
+        ),
+        "{orphan:?}"
+    );
     env.stop().await;
 }
 

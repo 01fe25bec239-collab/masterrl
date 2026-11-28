@@ -518,6 +518,11 @@ impl Config {
         problems.extend(self.checkpoints.problems());
         // <mrl:validate P24> P24 checks (push to `problems`) go right below this line.
         problems.extend(self.engines.problems());
+        // <mrl:validate P26> P26 checks (push to `problems`) go right below this line.
+        // <mrl:validate P27> P27 checks (push to `problems`) go right below this line.
+        // <mrl:validate P28> P28 checks (push to `problems`) go right below this line.
+        // <mrl:validate P29> P29 checks (push to `problems`) go right below this line.
+        // <mrl:validate P30> P30 checks (push to `problems`) go right below this line.
         if problems.is_empty() {
             Ok(())
         } else {
@@ -526,11 +531,6 @@ impl Config {
                 problems.join("; "),
             ))
         }
-        // <mrl:validate P26> P26 checks (push to `problems`) go right below this line.
-        // <mrl:validate P27> P27 checks (push to `problems`) go right below this line.
-        // <mrl:validate P28> P28 checks (push to `problems`) go right below this line.
-        // <mrl:validate P29> P29 checks (push to `problems`) go right below this line.
-        // <mrl:validate P30> P30 checks (push to `problems`) go right below this line.
     }
 
     /// True when this process takes on `role`.

@@ -67,7 +67,7 @@ fn seed_then_submit_returns_a_rejected_run_with_code_and_hint() {
     let (db, srv) = rt.block_on(async {
         let db = TestDb::new().await;
         let users = [test_user("tok", "usr_admin", OrgId::new(), Role::Owner)];
-        let chains = Chains::registered(db.db());
+        let chains = Chains::registered(db.db(), &mrl_server::Config::default());
         let srv = runs_server(&db, chains, &users, vec![Box::new(tenancy.clone())]).await;
         (db, srv)
     });

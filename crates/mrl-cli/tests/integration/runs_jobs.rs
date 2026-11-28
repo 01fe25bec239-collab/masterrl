@@ -42,7 +42,7 @@ async fn env(accepting: bool) -> Env {
     let chains = if accepting {
         accepting_chains()
     } else {
-        Chains::registered(db.db())
+        Chains::registered(db.db(), &mrl_server::Config::default())
     };
     let org = OrgId::new();
     let project = ProjectId::new();

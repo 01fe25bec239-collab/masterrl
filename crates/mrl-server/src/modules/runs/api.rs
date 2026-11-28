@@ -11,7 +11,7 @@ use crate::modules::jobs::scope::{self, resource};
 use crate::modules::jobs::transitions::attempt_cols;
 use crate::modules::jobs::{
     codes, Attempt, AttemptRow, Chains, JobChange, JobSpec, JobTransitions, JobsError, NewJob,
-    Projects, ResolveError, RetryRules, Validation,
+    Projects, ResolveError, RetryRules, SubmitScope, Validation,
 };
 use crate::modules::secrets::SecretResolver;
 use crate::seams::RequestContext;
@@ -505,6 +505,106 @@ fn launch_input_error(e: artifacts::Error) -> JobsError {
     }
 }
 
+/// What [`check_inputs`] authorized: the run's input files and secret grants.
+pub struct CheckedInputs {
+    /// The artifact files the worker gets.
+    pub launch_inputs: Vec<InputFile>,
+    pub(crate) grants: Vec<crate::modules::secrets::AuthorizedGrant>,
+}
+
+/// Submit's read-only checks, shared with dry runs (P28's validate): the body's own rules,
+/// the experiment, the parent run and checkpoint, artifact inputs and secrets. One the
+/// caller can't read answers exactly like a missing one (404). Writes nothing; submit then
+/// creates the run and its secret grants.
+pub async fn check_inputs(
+    state: &AppState,
+    db: &Db,
+    ctx: &RequestContext,
+    (org, project): (Uuid, Uuid),
+    sub: &RunSubmission,
+) -> Result<CheckedInputs, JobsError> {
+    check_submission(sub)?;
+    if let Some(e) = sub.experiment_id {
+        let found: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM experiments WHERE id = $1 AND org_id = $2 AND project_id = $3",
+        )
+        .bind(e.as_uuid())
+        .bind(org)
+        .bind(project)
+        .fetch_optional(db.pool())
+        .await?;
+        found.ok_or_else(|| JobsError::not_found("experiment"))?;
+    }
+    if let Some(parent) = sub.parent_run_id {
+        let parent_project: Option<Uuid> =
+            sqlx::query_scalar("SELECT project_id FROM runs WHERE id = $1 AND org_id = $2")
+                .bind(parent.as_uuid())
+                .bind(org)
+                .fetch_optional(db.pool())
+                .await?;
+        let readable = match parent_project {
+            Some(p) => {
+                let res = resource("run", Some(parent.to_string()), org, p);
+                scope::allowed(state, ctx, "runs.read", &res).await?
+            }
+            None => false,
+        };
+        if !readable {
+            return Err(JobsError::not_found("parent run"));
+        }
+    }
+    // A COMMITTED checkpoint of a run the caller may read checkpoints of (and of the parent
+    // run, when one is named). The first attempt resumes from it.
+    if let Some(ckpt) = sub.parent_checkpoint_id {
+        let owner: Option<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT r.id, r.project_id FROM checkpoints c JOIN runs r ON r.id = c.run_id \
+              WHERE c.id = $1 AND c.org_id = $2 AND r.org_id = $2 AND c.state = 'COMMITTED'",
+        )
+        .bind(ckpt.as_uuid())
+        .bind(org)
+        .fetch_optional(db.pool())
+        .await?;
+        let readable = match owner {
+            Some((run, p)) if sub.parent_run_id.is_none_or(|r| r.as_uuid() == run) => {
+                let res = resource("run", Some(RunId::from_uuid(run).to_string()), org, p);
+                scope::allowed(state, ctx, "checkpoints.read", &res).await?
+            }
+            _ => false,
+        };
+        if !readable {
+            return Err(JobsError::not_found("parent checkpoint"));
+        }
+    }
+    if sub.artifact_inputs.len() > 64 {
+        return Err(launch_input_error(artifacts::field(
+            "/artifact_inputs",
+            "A run can use up to 64 artifact inputs.",
+        )));
+    }
+    if sub.secret_ids.len() > 64 {
+        return Err(launch_input_error(artifacts::field(
+            "/secret_ids",
+            "A run can use up to 64 secrets.",
+        )));
+    }
+    let storage_org = scope::org_text(org).unwrap_or_else(|| artifacts::LOCAL_ORG.to_owned());
+    let launch_inputs = launch_inputs(db, state, ctx, &storage_org, &sub.artifact_inputs).await?;
+    let resolver = SecretResolver::new(db.clone(), state.config.server.mode);
+    let mut grants = Vec::with_capacity(sub.secret_ids.len());
+    for id in &sub.secret_ids {
+        grants.push(
+            resolver
+                .prepare_grant(&state.seams, ctx, &storage_org, *id, "env")
+                .await
+                .map_err(launch_input_error)?,
+        );
+    }
+    Ok(CheckedInputs {
+        launch_inputs,
+        grants,
+    })
+}
+
 async fn launch_inputs(
     db: &Db,
     state: &AppState,
@@ -600,7 +700,6 @@ pub async fn submit(
     scope::no_nul(&submitted)?;
     let sub: RunSubmission = serde_json::from_value(submitted.clone())
         .map_err(|e| bad_body(format!("The run could not be read: {e}.")))?;
-    check_submission(&sub)?;
     let fingerprint = Sha256::new()
         .chain_update(prj.as_bytes())
         .chain_update(b"\n")
@@ -612,23 +711,44 @@ pub async fn submit(
         return replay(&existing, &fingerprint);
     }
 
-    let resolved = chains.resolve(&sub.config).await.map_err(|e| match e {
-        ResolveError::Invalid(errors) => JobsError::Api(ApiError::validation(errors)),
-        ResolveError::Seam(s) => JobsError::Seam(s),
-    })?;
-    let resources = sub.resources.clone().unwrap_or_else(default_resources);
+    // Authorized before the write transaction (the authorizer may need a pool connection).
+    let CheckedInputs {
+        launch_inputs,
+        grants,
+    } = check_inputs(&state, &db, &ctx, (org, project), &sub).await?;
+    let mut scope = SubmitScope {
+        org_id: org,
+        project_id: project,
+        kind: sub.kind.as_str().to_owned(),
+        algorithm_id: sub.algorithm_id.clone(),
+        base_model_version_id: sub.base_model_version_id.as_uuid(),
+        dataset_version_ids: sub
+            .dataset_version_ids
+            .iter()
+            .map(|d| d.as_uuid())
+            .collect(),
+        reward_version_id: sub.reward_version_id.map(|r| r.as_uuid()),
+        parent_checkpoint_id: sub.parent_checkpoint_id.map(|c| c.as_uuid()),
+        resources: sub.resources.clone().unwrap_or_else(default_resources),
+        estimate_id: None,
+        notes: serde_json::Map::new(),
+    };
+    let resolved = chains
+        .resolve(&mut scope, &sub.config)
+        .await
+        .map_err(|e| match e {
+            ResolveError::Invalid(errors) => JobsError::Api(ApiError::validation(errors)),
+            ResolveError::Seam(s) => JobsError::Seam(s),
+        })?;
+    let resources = scope.resources.clone();
     let spec = JobSpec {
         org_id: org,
         project_id: project,
         kind: sub.kind.as_str().to_owned(),
         algorithm_id: sub.algorithm_id.clone(),
         base_model_version_id: sub.base_model_version_id.as_uuid(),
-        reward_version_id: sub.reward_version_id.map(|r| r.as_uuid()),
-        dataset_version_ids: sub
-            .dataset_version_ids
-            .iter()
-            .map(|d| d.as_uuid())
-            .collect(),
+        reward_version_id: scope.reward_version_id,
+        dataset_version_ids: scope.dataset_version_ids.clone(),
         resolved: resolved.clone(),
         resources: resources.clone(),
         max_runtime_seconds: sub.max_runtime_seconds,
@@ -644,53 +764,6 @@ pub async fn submit(
     });
     let resolved_sha256 =
         Sha256::digest(serde_json::to_vec(&resolved).unwrap_or_default()).to_vec();
-
-    // The parent's project never changes, so it is authorized before the write transaction
-    // (the authorizer may need a pool connection). A parent the submitter can't read
-    // answers exactly like a missing one.
-    if let Some(parent) = sub.parent_run_id {
-        let parent_project: Option<Uuid> =
-            sqlx::query_scalar("SELECT project_id FROM runs WHERE id = $1 AND org_id = $2")
-                .bind(parent.as_uuid())
-                .bind(org)
-                .fetch_optional(db.pool())
-                .await?;
-        let readable = match parent_project {
-            Some(p) => {
-                let res = resource("run", Some(parent.to_string()), org, p);
-                scope::allowed(&state, &ctx, "runs.read", &res).await?
-            }
-            None => false,
-        };
-        if !readable {
-            return Err(JobsError::not_found("parent run"));
-        }
-    }
-    if sub.artifact_inputs.len() > 64 {
-        return Err(launch_input_error(artifacts::field(
-            "/artifact_inputs",
-            "A run can use up to 64 artifact inputs.",
-        )));
-    }
-    if sub.secret_ids.len() > 64 {
-        return Err(launch_input_error(artifacts::field(
-            "/secret_ids",
-            "A run can use up to 64 secrets.",
-        )));
-    }
-    let storage_org = scope::org_text(org).unwrap_or_else(|| artifacts::LOCAL_ORG.to_owned());
-    let launch_inputs =
-        launch_inputs(&db, &state, &ctx, &storage_org, &sub.artifact_inputs).await?;
-    let resolver = SecretResolver::new(db.clone(), state.config.server.mode);
-    let mut grants = Vec::with_capacity(sub.secret_ids.len());
-    for id in &sub.secret_ids {
-        grants.push(
-            resolver
-                .prepare_grant(&state.seams, &ctx, &storage_org, *id, "env")
-                .await
-                .map_err(launch_input_error)?,
-        );
-    }
     let mut tx = db.begin().await?;
     let experiment = match sub.experiment_id {
         Some(e) => sqlx::query_scalar::<_, Uuid>(
@@ -754,9 +827,13 @@ pub async fn submit(
             .await
             .map_err(launch_input_error)?;
     }
+    // Resolvers save their decisions (like the estimate `estimate_id` names) before the
+    // immutable config row points at them.
+    chains.record(&mut tx, run_id, &scope).await?;
     sqlx::query(
         "INSERT INTO run_configs (run_id, org_id, submitted, resolved, resolved_sha256, \
-           dataset_version_ids, seeds, launch_inputs) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+           dataset_version_ids, seeds, launch_inputs, estimate_id) \
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
     )
     .bind(run_id)
     .bind(org)
@@ -766,6 +843,7 @@ pub async fn submit(
     .bind(&spec.dataset_version_ids)
     .bind(&seeds)
     .bind(sqlx::types::Json(launch_inputs))
+    .bind(scope.estimate_id)
     .execute(&mut *tx)
     .await?;
     let job = JobTransitions::create(
