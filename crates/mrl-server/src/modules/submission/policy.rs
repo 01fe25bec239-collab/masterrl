@@ -130,8 +130,7 @@ async fn judge(
     spec: &JobSpec,
     row: &EstimateRow,
 ) -> Result<(RunPreflight, Value), sqlx::Error> {
-    let cal = estimates::calibration(db, &row.calibration_key).await?;
-    let estimate = RunEstimate::of(row, cal);
+    let estimate = RunEstimate::of(row);
     let all = preflight::machines(db, spec.org_id, None).await?;
     let found = methods(
         db,
@@ -172,10 +171,8 @@ pub fn scope_job(scope: &SubmitScope, resolved: Value) -> JobSpec {
 /// The key of [`safety_at_submit`]'s note in [`SubmitScope::notes`].
 pub const SAFETY_NOTE: &str = "safety-settings";
 
-/// Submit's half of the Guardian (run by the resolver): the newest estimate of these inputs
-/// becomes the run's (`scope.estimate_id`), and a `tight` verdict's safety settings go into
-/// the config, unless they are already in (validate's `resolved_config`) or the changed
-/// config would not pass the capability check.
+/// Applies validated safety settings to a tight configuration. Only an estimate of the
+/// final config is pinned to the run, and the source estimate is kept in the audit details.
 pub async fn safety_at_submit(
     db: &Db,
     capability: &CapabilityValidator,
@@ -191,9 +188,6 @@ pub async fn safety_at_submit(
         return Ok(spec.resolved);
     };
     scope.estimate_id = Some(row.id);
-    if row.adjusted {
-        return Ok(spec.resolved);
-    }
     let (p, adjusted) = judge(db, &spec, &row).await.map_err(seam)?;
     if p.verdict != Verdict::Tight || p.changes.is_empty() {
         return Ok(spec.resolved);
@@ -207,13 +201,20 @@ pub async fn safety_at_submit(
     if !matches!(picked, Pick::Engine(_)) {
         return Ok(spec.resolved);
     }
-    // The run's inputs, once saved, find this estimate (`estimates::estimate_for_run`).
-    estimates::mark_adjusted(db, row.id, &estimates::inputs_sha256(&changed))
-        .await
-        .map_err(seam)?;
+    // The probe measured the original inputs. The adjusted run needs its own estimate.
+    scope.estimate_id = estimates::latest(
+        db,
+        changed.org_id,
+        changed.project_id,
+        &estimates::inputs_sha256(&changed),
+    )
+    .await
+    .map_err(seam)?
+    .map(|estimate| estimate.id);
     scope.notes.insert(
         SAFETY_NOTE.into(),
-        json!({"verdict": p.verdict, "changes": p.changes, "message": p.message}),
+        json!({"source_estimate_id": row.id.to_string(), "verdict": p.verdict,
+               "changes": p.changes, "message": p.message}),
     );
     Ok(changed.resolved)
 }

@@ -252,7 +252,6 @@ pub async fn check(
     let mut checked = "l0";
     let mut ok = true;
     let mut estimate = RunEstimate::unknown("No machine checked these settings.");
-    let mut estimate_id = None;
     let all = preflight::machines(&ctx.db, org, None).await?;
     let eligible: Vec<NodeId> = all
         .iter()
@@ -337,9 +336,7 @@ pub async fn check(
                     }
                     let row = if worker_ok { estimates::ready(&ctx.db, id).await? } else { None };
                     if let Some(row) = row {
-                        estimate_id = Some(row.id);
-                        let cal = estimates::calibration(&ctx.db, &row.calibration_key).await?;
-                        estimate = RunEstimate::of(&row, cal);
+                        estimate = RunEstimate::of(&row);
                     }
                 }
                 Outcome::Failed(why) => issues.push(ValidateIssue::new(
@@ -381,13 +378,15 @@ pub async fn check(
             adjusted = config;
             pre.changes.clear();
             pre.message = "The fit is tight. The automatic changes did not pass validation.".into();
-        } else if let Some(id) = estimate_id {
-            // Submitting `resolved_config` as is finds this estimate.
-            estimates::mark_adjusted(&ctx.db, id, &estimates::inputs_sha256(&adjusted_spec))
-                .await?;
+        } else {
+            estimate = RunEstimate::unknown(
+                "The machine estimated the settings before the safety changes.",
+            );
         }
     }
-    estimate.verdict = pre.verdict;
+    if pre.changes.is_empty() {
+        estimate.verdict = pre.verdict;
+    }
     match pre.verdict {
         Verdict::DoesNotFit => {
             let mut issue = ValidateIssue::new(

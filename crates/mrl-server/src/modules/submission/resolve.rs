@@ -335,35 +335,33 @@ pub async fn resolve(
             ),
         ));
     }
-    let method = match pick {
-        Some((capability, job))
-            if choice.is_none()
-                && found
-                    .iter()
-                    .any(|m| m.engine_version_id != first.engine_version_id) =>
-        {
-            let mut job = job.clone();
-            job.resolved = submitted.clone();
-            let picked = capability
-                .pick(&job)
+    let effective = |method: &Method| {
+        let patch = preset.as_deref().and_then(|p| method.preset(p));
+        let mut config = layer(&submitted, patch, method.schema.as_ref());
+        if let Some(obj) = config.as_object_mut() {
+            let common = obj.entry("common").or_insert_with(|| json!({}));
+            if let Some(fields) = common.as_object_mut() {
+                fields.insert("engine".into(), json!(method.engine_ref()));
+            }
+        }
+        config
+    };
+    let mut chosen = (effective(&first), first);
+    if let Some((capability, job)) = pick.filter(|_| found.len() > 1) {
+        let mut spec = job.clone();
+        for method in found {
+            spec.resolved = effective(&method);
+            let verdict = capability
+                .pick(&spec)
                 .await
                 .map_err(|e| ResolveError::Seam(SeamError::new("engines", e.to_string())))?;
-            match picked {
-                Pick::Engine(id) => found.into_iter().find(|m| m.engine_version_id == id),
-                Pick::NoEngine | Pick::Rejected(_) => None,
+            if matches!(verdict, Pick::Engine(id) if id == method.engine_version_id) {
+                chosen = (spec.resolved, method);
+                break;
             }
-            .unwrap_or(first)
-        }
-        _ => first,
-    };
-    let patch = preset.as_deref().and_then(|p| method.preset(p));
-    let mut out = layer(&submitted, patch, method.schema.as_ref());
-    if let Some(o) = out.as_object_mut() {
-        let common = o.entry("common").or_insert_with(|| json!({}));
-        if let Some(c) = common.as_object_mut() {
-            c.insert("engine".into(), json!(method.engine_ref()));
         }
     }
+    let (out, method) = chosen;
     Ok(Resolved {
         config: out,
         method: Some(method),
@@ -422,18 +420,22 @@ impl SubmissionResolver for Presets {
         run_id: Uuid,
         scope: &SubmitScope,
     ) -> Result<(), SeamError> {
-        if !scope.notes.contains_key(super::policy::SAFETY_NOTE) {
+        let Some(details) = scope.notes.get(super::policy::SAFETY_NOTE) else {
             return Ok(());
-        }
-        super::audit(
-            &self.db,
-            tx,
-            (scope.org_id, scope.project_id),
+        };
+        let org = crate::modules::jobs::scope::org_text(scope.org_id);
+        let mut event = crate::modules::audit::event(
+            time::OffsetDateTime::now_utc(),
             "system:guardian",
+            org.as_deref(),
             "submission.safety_settings",
-            mrl_domain::ids::RunId::from_uuid(run_id).to_string(),
-        )
-        .await
+            &mrl_domain::ids::RunId::from_uuid(run_id).to_string(),
+            crate::seams::AuditOutcome::Success,
+            &Uuid::now_v7().to_string(),
+        );
+        event.project = Some(mrl_domain::ids::ProjectId::from_uuid(scope.project_id).to_string());
+        crate::modules::audit::write(tx, &event, details).await?;
+        Ok(())
     }
 }
 

@@ -149,6 +149,8 @@ pub struct EstimateRow {
     pub id: Uuid,
     /// Configuration class.
     pub calibration_key: String,
+    /// Calibration captured when the probe answered.
+    pub calibration: Calibration,
     /// `<engine>@<version>`.
     pub estimator_version: String,
     /// The engine's range per GPU, GiB (absent when the engine gave none).
@@ -159,8 +161,6 @@ pub struct EstimateRow {
     pub wall: Option<(f64, f64)>,
     /// What the range assumes.
     pub assumptions: Vec<String>,
-    /// Found through the fingerprint of its adjusted config: the safety settings are in.
-    pub adjusted: bool,
 }
 
 fn row_to_estimate(r: &sqlx::postgres::PgRow) -> Result<EstimateRow, sqlx::Error> {
@@ -172,6 +172,16 @@ fn row_to_estimate(r: &sqlx::postgres::PgRow) -> Result<EstimateRow, sqlx::Error
     Ok(EstimateRow {
         id: r.try_get("id")?,
         calibration_key: r.try_get("calibration_key")?,
+        calibration: Calibration::from_sums(
+            i64::from(
+                r.try_get::<Option<i32>, _>("calibration_n")?
+                    .unwrap_or_default(),
+            ),
+            r.try_get::<Option<f64>, _>("calibration_sum_ln")?
+                .unwrap_or_default(),
+            r.try_get::<Option<f64>, _>("calibration_sum_ln_sq")?
+                .unwrap_or_default(),
+        ),
         estimator_version: r.try_get("estimator_version")?,
         gpu_mem: lo.zip(hi),
         total_steps: r.try_get("total_steps")?,
@@ -182,14 +192,13 @@ fn row_to_estimate(r: &sqlx::postgres::PgRow) -> Result<EstimateRow, sqlx::Error
             .flatten()
             .filter_map(|a| a.as_str().map(str::to_owned))
             .collect(),
-        adjusted: r.try_get("via_adjusted")?,
     })
 }
 
 macro_rules! estimate_cols {
     () => {
         "id, calibration_key, estimator_version, gpu_mem_lo_gib, gpu_mem_hi_gib, total_steps, \
-         wall_lo_seconds, wall_hi_seconds, assumptions"
+         wall_lo_seconds, wall_hi_seconds, assumptions, calibration_n, calibration_sum_ln, calibration_sum_ln_sq"
     };
 }
 
@@ -207,77 +216,31 @@ pub fn inputs_sha256(spec: &JobSpec) -> Vec<u8> {
     }))
 }
 
-#[derive(sqlx::FromRow)]
-struct SavedInputs {
-    org_id: Uuid,
-    project_id: Uuid,
-    kind: String,
-    algorithm_id: String,
-    base_model_version_id: Uuid,
-    reward_version_id: Option<Uuid>,
-    dataset_version_ids: Vec<Uuid>,
-    resolved: Value,
-    resource_request: sqlx::types::Json<mrl_domain::resources::ResourceRequest>,
-}
-
-impl From<SavedInputs> for JobSpec {
-    fn from(row: SavedInputs) -> Self {
-        Self {
-            org_id: row.org_id,
-            project_id: row.project_id,
-            kind: row.kind,
-            algorithm_id: row.algorithm_id,
-            base_model_version_id: row.base_model_version_id,
-            reward_version_id: row.reward_version_id,
-            dataset_version_ids: row.dataset_version_ids,
-            resolved: row.resolved,
-            resources: row.resource_request.0,
-            max_runtime_seconds: None,
-        }
-    }
-}
-
-async fn saved_inputs(
-    conn: &mut sqlx::PgConnection,
-    run: Uuid,
-) -> Result<Option<JobSpec>, sqlx::Error> {
-    Ok(sqlx::query_as::<_, SavedInputs>(
-        "SELECT r.org_id, r.project_id, r.kind, r.algorithm_id, r.base_model_version_id,
-                r.reward_version_id, c.dataset_version_ids, c.resolved, j.resource_request
-           FROM runs r JOIN run_configs c ON c.run_id = r.id JOIN jobs j ON j.run_id = r.id
-          WHERE r.id = $1",
-    )
-    .bind(run)
-    .fetch_optional(conn)
-    .await?
-    .map(JobSpec::from))
-}
-
-/// The newest estimate matching a saved run's inputs (its config as saved, safety settings
-/// included: see [`mark_adjusted`]).
+/// The estimate selected when the run was submitted. Older adjusted aliases never measured
+/// the saved config and are treated as unknown.
 pub(crate) async fn estimate_for_run(
     conn: &mut sqlx::PgConnection,
     run: Uuid,
 ) -> Result<Option<EstimateRow>, sqlx::Error> {
-    let Some(spec) = saved_inputs(&mut *conn, run).await? else {
-        return Ok(None);
-    };
-    latest_on(conn, spec.org_id, spec.project_id, &inputs_sha256(&spec)).await
+    let row = sqlx::query(
+        "SELECT e.id, e.calibration_key, e.estimator_version, e.gpu_mem_lo_gib, e.gpu_mem_hi_gib,
+                e.total_steps, e.wall_lo_seconds, e.wall_hi_seconds, e.assumptions,
+                e.calibration_n, e.calibration_sum_ln, e.calibration_sum_ln_sq
+           FROM run_configs c JOIN runs r ON r.id = c.run_id
+           JOIN resource_estimates e ON e.id = c.estimate_id
+          WHERE c.run_id = $1 AND e.org_id = r.org_id AND e.project_id = r.project_id
+            AND e.state = 'READY' AND e.ok IS TRUE AND e.gpu_mem_hi_gib > 0
+            AND e.probe_spec->'resolved' = c.resolved",
+    )
+    .bind(run)
+    .fetch_optional(conn)
+    .await?;
+    row.as_ref().map(row_to_estimate).transpose()
 }
 
-/// The newest answered estimate of these exact inputs in the project, also found through the
-/// fingerprint of its adjusted config ([`mark_adjusted`]).
+/// The newest successful estimate of these exact inputs in the project.
 pub async fn latest(
     db: &Db,
-    org: Uuid,
-    project: Uuid,
-    sha: &[u8],
-) -> Result<Option<EstimateRow>, sqlx::Error> {
-    latest_on(db.pool(), org, project, sha).await
-}
-
-async fn latest_on<'a>(
-    conn: impl sqlx::PgExecutor<'a>,
     org: Uuid,
     project: Uuid,
     sha: &[u8],
@@ -285,16 +248,15 @@ async fn latest_on<'a>(
     let row = sqlx::query(concat!(
         "SELECT ",
         estimate_cols!(),
-        ", inputs_sha256 <> $3 AS via_adjusted FROM resource_estimates
-         WHERE org_id = $1 AND project_id = $2 AND state = 'READY'
-           AND (inputs_sha256 = $3 OR adjusted_sha256 = $3)
+        " FROM resource_estimates
+         WHERE org_id = $1 AND project_id = $2 AND state = 'READY' AND inputs_sha256 = $3
            AND ok IS TRUE AND gpu_mem_hi_gib > 0
          ORDER BY decided_at DESC, id DESC LIMIT 1"
     ))
     .bind(org)
     .bind(project)
     .bind(sha)
-    .fetch_optional(conn)
+    .fetch_optional(db.pool())
     .await?;
     row.as_ref().map(row_to_estimate).transpose()
 }
@@ -304,36 +266,12 @@ pub async fn ready(db: &Db, id: Uuid) -> Result<Option<EstimateRow>, sqlx::Error
     let row = sqlx::query(concat!(
         "SELECT ",
         estimate_cols!(),
-        ", false AS via_adjusted FROM resource_estimates WHERE id = $1 AND state = 'READY'"
+        " FROM resource_estimates WHERE id = $1 AND state = 'READY'"
     ))
     .bind(id)
     .fetch_optional(db.pool())
     .await?;
     row.as_ref().map(row_to_estimate).transpose()
-}
-
-/// Lets `sha` (the inputs with estimate `id`'s safety settings applied) find that estimate.
-pub async fn mark_adjusted(db: &Db, id: Uuid, sha: &[u8]) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "UPDATE resource_estimates SET adjusted_sha256 = $2 WHERE id = $1 AND state = 'READY'",
-    )
-    .bind(id)
-    .bind(sha)
-    .execute(db.pool())
-    .await?;
-    Ok(())
-}
-
-/// The calibration of `key` (empty when none).
-pub async fn calibration(db: &Db, key: &str) -> Result<Calibration, sqlx::Error> {
-    let row: Option<(i32, f64, f64)> =
-        sqlx::query_as("SELECT n, sum_ln, sum_ln_sq FROM estimator_calibration WHERE key = $1")
-            .bind(key)
-            .fetch_optional(db.pool())
-            .await?;
-    Ok(row.map_or_else(Calibration::default, |(n, s, q)| {
-        Calibration::from_sums(i64::from(n), s, q)
-    }))
 }
 
 /// How the estimate was corrected.
@@ -389,7 +327,8 @@ impl RunEstimate {
     }
 
     /// `row` corrected by `cal`; the verdict starts `unknown` (the preflight sets it).
-    pub fn of(row: &EstimateRow, cal: Calibration) -> Self {
+    pub fn of(row: &EstimateRow) -> Self {
+        let cal = row.calibration;
         let analytic = row.gpu_mem.map(|(lo, hi)| EstimateRange::analytic(lo, hi));
         Self {
             verdict: Verdict::Unknown,
@@ -418,29 +357,7 @@ impl RunEstimate {
     }
 }
 
-/// The highest per-GPU memory peak an attempt measured, GiB: the process peak (the fit
-/// criterion), else what PyTorch reserved. `None` when nothing was measured.
-async fn attempt_peak(tx: &mut Tx, attempt: Uuid) -> Result<Option<f64>, sqlx::Error> {
-    let row: Option<(Option<f64>, Option<f64>)> = sqlx::query_as(
-        "SELECT max(peak) FILTER (WHERE signal = 'process_peak'),
-                max(peak) FILTER (WHERE signal = 'torch_reserved_peak')
-           FROM resource_actuals ra WHERE ra.attempt_id = $1 AND ra.device <> '' AND ra.peak > 0
-            AND EXISTS (SELECT 1 FROM resource_reservations r
-                          JOIN reservation_devices d ON d.reservation_id = r.id
-                          JOIN gpu_devices g ON g.id = d.gpu_device_id
-                         WHERE r.attempt_id = ra.attempt_id AND g.device_uuid = ra.device)",
-    )
-    .bind(attempt)
-    .fetch_optional(&mut **tx)
-    .await?;
-    Ok(row
-        .and_then(|(p, t)| p.or(t))
-        .filter(|b| *b > 0.0)
-        .map(|b| b / GIB))
-}
-
-/// Event consumer: after a run's job completes, compares its measured peak with the estimate
-/// of its config and adds the ratio to the class's calibration, once per attempt.
+/// Tracks completed attempts and reconciles their calibration against arriving measurements.
 pub struct Calibrate(Db);
 
 impl Calibrate {
@@ -449,15 +366,15 @@ impl Calibrate {
         Self(db)
     }
 
-    /// Applies completed attempts whose actuals arrived after their completion event.
+    /// Applies new or changed peaks, with one contribution per attempt.
     pub async fn reconcile(&self) -> Result<(), ConsumerError> {
         let mut tx = self.0.begin().await?;
         let attempts: Vec<Uuid> = sqlx::query_scalar(
-            "SELECT p.attempt_id FROM estimator_calibration_pending p
-             WHERE EXISTS (SELECT 1 FROM resource_actuals ra
-                           WHERE ra.attempt_id = p.attempt_id AND ra.device <> '' AND ra.peak > 0
-                             AND ra.signal IN ('process_peak', 'torch_reserved_peak'))
-             ORDER BY p.attempt_id LIMIT 100 FOR UPDATE SKIP LOCKED",
+            "SELECT i.attempt_id FROM estimator_calibration_inputs i
+             JOIN estimator_calibration_measurements m ON m.attempt_id = i.attempt_id
+             LEFT JOIN estimator_calibration_samples s ON s.attempt_id = i.attempt_id
+             WHERE m.ratio IS DISTINCT FROM s.ratio
+             ORDER BY i.attempt_id LIMIT 100 FOR UPDATE OF i SKIP LOCKED",
         )
         .fetch_all(&mut *tx)
         .await?;
@@ -469,64 +386,65 @@ impl Calibrate {
     }
 
     async fn sample(&self, tx: &mut Tx, attempt: Uuid) -> Result<(), ConsumerError> {
-        let pending: Option<Uuid> = sqlx::query_scalar(
-            "SELECT estimate_id FROM estimator_calibration_pending WHERE attempt_id = $1 FOR UPDATE",
+        // Read after locking the input so overlapping reconcilers cannot apply a stale delta.
+        let Some(row) = sqlx::query(
+            "SELECT m.*, s.ratio AS previous_ratio, s.key AS previous_key
+               FROM estimator_calibration_measurements m
+               LEFT JOIN estimator_calibration_samples s ON s.attempt_id = m.attempt_id
+              WHERE m.attempt_id = $1 AND m.ratio IS DISTINCT FROM s.ratio",
         )
         .bind(attempt)
         .fetch_optional(&mut **tx)
-        .await?;
-        let (Some(estimate), Some(actual)) = (pending, attempt_peak(tx, attempt).await?) else {
+        .await?
+        else {
             return Ok(());
         };
-        let row = sqlx::query(
-            "SELECT j.org_id, j.project_id, e.estimator_version, e.algorithm_id,
-                    e.gpu_mem_lo_gib, e.gpu_mem_hi_gib, rc.resolved
-               FROM job_attempts a JOIN jobs j ON j.id = a.job_id
-               JOIN run_configs rc ON rc.run_id = j.run_id
-               JOIN resource_estimates e ON e.id = $1
-              WHERE a.id = $2",
-        )
-        .bind(estimate)
-        .bind(attempt)
-        .fetch_one(&mut **tx)
-        .await?;
-        let arches: Vec<String> = sqlx::query_scalar(
-            "SELECT g.vendor || ':' || g.arch FROM resource_reservations r
-               JOIN reservation_devices d ON d.reservation_id = r.id
-               JOIN gpu_devices g ON g.id = d.gpu_device_id
-              WHERE r.attempt_id = $1",
-        )
-        .bind(attempt)
-        .fetch_all(&mut **tx)
-        .await?;
-        let bucket = crate::modules::preflight::architecture_bucket(arches);
-        if bucket != "unknown" {
-            let key = calibration_key(
+        let key = match row.try_get::<Option<String>, _>("previous_key")? {
+            Some(key) => key,
+            None => calibration_key(
                 row.try_get("estimator_version")?,
                 row.try_get("algorithm_id")?,
                 &row.try_get("resolved")?,
-                &bucket,
-            );
-            let range = EstimateRange::analytic(
-                row.try_get("gpu_mem_lo_gib")?,
-                row.try_get("gpu_mem_hi_gib")?,
-            );
-            if record_sample(tx, attempt, &key, estimate, actual / range.expected).await? {
-                crate::modules::submission::audit(
-                    &self.0,
-                    tx,
-                    (row.try_get("org_id")?, row.try_get("project_id")?),
-                    "system:calibration",
-                    "submission.calibrate",
-                    AttemptId::from_uuid(attempt).to_string(),
-                )
-                .await?;
-            }
-        }
-        sqlx::query("DELETE FROM estimator_calibration_pending WHERE attempt_id = $1")
-            .bind(attempt)
-            .execute(&mut **tx)
-            .await?;
+                row.try_get("architecture")?,
+            ),
+        };
+        let ratio: f64 = row.try_get("ratio")?;
+        let previous: Option<f64> = row.try_get("previous_ratio")?;
+        sqlx::query(
+            "INSERT INTO estimator_calibration_samples (attempt_id, key, estimate_id, ratio)
+             VALUES ($1, $2, $3, $4)
+             ON CONFLICT (attempt_id) DO UPDATE SET ratio = EXCLUDED.ratio, at = now()",
+        )
+        .bind(attempt)
+        .bind(&key)
+        .bind(row.try_get::<Uuid, _>("estimate_id")?)
+        .bind(ratio)
+        .execute(&mut **tx)
+        .await?;
+        let x = ratio.ln();
+        let old = previous.map_or(0.0, f64::ln);
+        sqlx::query(
+            "INSERT INTO estimator_calibration (key, n, sum_ln, sum_ln_sq) VALUES ($1, $2, $3, $4)
+             ON CONFLICT (key) DO UPDATE SET n = estimator_calibration.n + EXCLUDED.n,
+               sum_ln = estimator_calibration.sum_ln + EXCLUDED.sum_ln,
+               sum_ln_sq = estimator_calibration.sum_ln_sq + EXCLUDED.sum_ln_sq,
+               updated_at = now()",
+        )
+        .bind(key)
+        .bind(i32::from(previous.is_none()))
+        .bind(x - old)
+        .bind(x * x - old * old)
+        .execute(&mut **tx)
+        .await?;
+        crate::modules::submission::audit(
+            &self.0,
+            tx,
+            (row.try_get("org_id")?, row.try_get("project_id")?),
+            "system:calibration",
+            "submission.calibrate",
+            AttemptId::from_uuid(attempt).to_string(),
+        )
+        .await?;
         Ok(())
     }
 }
@@ -556,58 +474,15 @@ impl EventConsumer for Calibrate {
             return Ok(());
         };
         sqlx::query(
-            "INSERT INTO estimator_calibration_pending (attempt_id, estimate_id)
-             SELECT $1, $2 WHERE NOT EXISTS (
-                 SELECT 1 FROM estimator_calibration_samples WHERE attempt_id = $1
-             ) ON CONFLICT (attempt_id) DO NOTHING",
+            "INSERT INTO estimator_calibration_inputs (attempt_id, estimate_id)
+             VALUES ($1, $2) ON CONFLICT (attempt_id) DO NOTHING",
         )
         .bind(attempt)
         .bind(estimate.id)
         .execute(&mut **tx)
         .await?;
-        self.sample(tx, attempt).await
+        Ok(())
     }
-}
-
-/// Adds one sample to `key`'s calibration; a second sample for the same attempt is ignored.
-async fn record_sample(
-    tx: &mut Tx,
-    attempt: Uuid,
-    key: &str,
-    estimate: Uuid,
-    ratio: f64,
-) -> Result<bool, sqlx::Error> {
-    if !(ratio.is_finite() && ratio > 0.0) {
-        return Ok(false);
-    }
-    let fresh = sqlx::query(
-        "INSERT INTO estimator_calibration_samples (attempt_id, key, estimate_id, ratio)
-         VALUES ($1, $2, $3, $4) ON CONFLICT (attempt_id) DO NOTHING",
-    )
-    .bind(attempt)
-    .bind(key)
-    .bind(estimate)
-    .bind(ratio)
-    .execute(&mut **tx)
-    .await?
-    .rows_affected()
-        == 1;
-    if fresh {
-        let x = ratio.ln();
-        sqlx::query(
-            "INSERT INTO estimator_calibration (key, n, sum_ln, sum_ln_sq) VALUES ($1, 1, $2, $3)
-             ON CONFLICT (key) DO UPDATE SET n = estimator_calibration.n + 1,
-               sum_ln = estimator_calibration.sum_ln + EXCLUDED.sum_ln,
-               sum_ln_sq = estimator_calibration.sum_ln_sq + EXCLUDED.sum_ln_sq,
-               updated_at = now()",
-        )
-        .bind(key)
-        .bind(x)
-        .bind(x * x)
-        .execute(&mut **tx)
-        .await?;
-    }
-    Ok(fresh)
 }
 
 /// One measured peak.
@@ -675,8 +550,7 @@ pub async fn resources(
         estimate_for_run(&mut conn, row.id).await?
     };
     let estimate = if let Some(e) = matched {
-        let cal = calibration(&db, &e.calibration_key).await?;
-        let mut view = RunEstimate::of(&e, cal);
+        let mut view = RunEstimate::of(&e);
         view.verdict = crate::modules::preflight::verdict_on_last_machine(
             &db,
             &headroom,

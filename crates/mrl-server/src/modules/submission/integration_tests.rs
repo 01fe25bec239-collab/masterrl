@@ -14,7 +14,7 @@ use axum::http::Method;
 use mrl_agent::hw::{GpuDevice, GpuVendor};
 use mrl_agent::session::{CommandHandler, Link};
 use mrl_domain::capability::manifest::Bundle;
-use mrl_domain::ids::{AttemptId, NodeId, PoolId, ProjectId, RunId};
+use mrl_domain::ids::{AttemptId, NodeId, OrgId, PoolId, ProjectId, RunId};
 use mrl_proto::agent::v1::agent_message::Body as Msg;
 use mrl_proto::agent::v1::command::Kind;
 use mrl_proto::agent::v1::{AgentMessage, AttemptPhase, AttemptStatus, Command, WorkerRelay};
@@ -28,7 +28,9 @@ use mrl_server::modules::engines::launch::EngineRuntime;
 use mrl_server::modules::engines::CapabilityValidator;
 use mrl_server::modules::estimates::Calibrate;
 use mrl_server::modules::events::EventConsumer;
-use mrl_server::modules::jobs::{Chains, Projects, SchemaChecks};
+use mrl_server::modules::jobs::{
+    Chains, ProjectDirectory, Projects, RehomeLocalRows, SchemaChecks,
+};
 use mrl_server::modules::nodes::lanes::{LaneItem, LaneKind, LaneRouter};
 use mrl_server::modules::nodes::NodesModule;
 use mrl_server::modules::scheduler::admission::{MaxQueuedPerProject, PoolFlags, PoolMembership};
@@ -42,6 +44,7 @@ use mrl_server::modules::submission::resolve::Presets;
 use mrl_server::modules::submission::{SubmissionConfig, SubmissionModule};
 use mrl_server::modules::telemetry::ingest::{Delivery, Owner};
 use mrl_server::modules::telemetry::{Ingest, MetricObservers};
+use mrl_server::seams::StartupStep;
 use mrl_server::seams::{
     Authorizer, Decision, LocalOwnerAuthorizer, RequestContext, Resource, SeamError, SecretStore,
     LAUNCH_SECRET_HEADER,
@@ -760,33 +763,19 @@ async fn dry_run_fits_24_gb_and_not_4_gb_and_submit_agrees() {
     assert_eq!(r.status, 200, "{}", r.text());
     let res = r.json();
     assert_eq!(res["estimate"]["verdict"], "fits", "{res}");
-    let original_model: Uuid =
-        sqlx::query_scalar("SELECT base_model_version_id FROM runs WHERE id = $1")
-            .bind(run.as_uuid())
-            .fetch_one(w.pool())
-            .await
-            .unwrap();
-    sqlx::query("UPDATE runs SET base_model_version_id = $2 WHERE id = $1")
-        .bind(run.as_uuid())
-        .bind(Uuid::now_v7())
-        .execute(w.pool())
-        .await
-        .unwrap();
-    let changed = w
+    let original = res["estimate"]["estimate_id"].clone();
+    *big._script.answer.lock().unwrap() = Answer::Estimate(10.0, 12.0);
+    let later = w.validate(sft(&f, &[big.node])).await;
+    assert_ne!(later["estimate"]["estimate_id"], original, "{later}");
+    let historical = w
         .call(
             Method::GET,
             &format!("/api/v1/runs/{run}/resources"),
             Value::Null,
         )
         .await;
-    assert_eq!(changed.status, 200, "{}", changed.text());
-    assert!(changed.json()["estimate"].is_null(), "{}", changed.text());
-    sqlx::query("UPDATE runs SET base_model_version_id = $2 WHERE id = $1")
-        .bind(run.as_uuid())
-        .bind(original_model)
-        .execute(w.pool())
-        .await
-        .unwrap();
+    assert_eq!(historical.status, 200, "{}", historical.text());
+    assert_eq!(historical.json()["estimate"]["estimate_id"], original);
     let update = res["phases"]
         .as_array()
         .unwrap()
@@ -823,40 +812,54 @@ async fn dry_run_fits_24_gb_and_not_4_gb_and_submit_agrees() {
         tx.commit().await.unwrap();
     }
     assert_eq!(
-        w.count("SELECT count(*) FROM estimator_calibration_pending")
+        w.count("SELECT count(*) FROM estimator_calibration_inputs")
             .await,
         1
     );
-    w.ingest
-        .metrics(
-            Owner {
-                org: Uuid::nil(),
-                run: run.as_uuid(),
-                attempt,
-                attempt_no: 1,
-            },
-            Delivery {
-                node: big.node,
-                stream: mrl_proto::agent::v1::Lane::Telemetry,
-                seq: 10,
-            },
-            None,
-            &[MetricPoint {
-                name: format!("resource/process_peak/{device}"),
-                split: "update".into(),
-                step: 5,
-                value: 9.0 * f64::from(1u32 << 30),
-                ..MetricPoint::default()
-            }],
-        )
+    let ingest_peak = |sequence, gib: f64| {
+        let device = &device;
+        let w = &w;
+        async move {
+            w.ingest
+                .metrics(
+                    Owner {
+                        org: Uuid::nil(),
+                        run: run.as_uuid(),
+                        attempt,
+                        attempt_no: 1,
+                    },
+                    Delivery {
+                        node: big.node,
+                        stream: mrl_proto::agent::v1::Lane::Telemetry,
+                        seq: sequence,
+                    },
+                    None,
+                    &[MetricPoint {
+                        name: format!("resource/process_peak/{device}"),
+                        split: "update".into(),
+                        step: sequence,
+                        value: gib * f64::from(1u32 << 30),
+                        ..MetricPoint::default()
+                    }],
+                )
+                .await
+                .unwrap();
+        }
+    };
+    ingest_peak(10, 5.0).await;
+    cal.reconcile().await.unwrap();
+    let first: f64 = sqlx::query_scalar("SELECT ratio FROM estimator_calibration_samples")
+        .fetch_one(w.pool())
         .await
         .unwrap();
+    assert!((first - 5.0 / 7.5).abs() < 1e-9);
+    ingest_peak(11, 9.0).await;
     cal.reconcile().await.unwrap();
     cal.reconcile().await.unwrap();
     assert_eq!(
-        w.count("SELECT count(*) FROM estimator_calibration_pending")
+        w.count("SELECT count(*) FROM estimator_calibration_samples")
             .await,
-        0
+        1
     );
     let (n, sum): (i32, f64) = sqlx::query_as("SELECT n, sum_ln FROM estimator_calibration")
         .fetch_one(w.pool())
@@ -864,6 +867,35 @@ async fn dry_run_fits_24_gb_and_not_4_gb_and_submit_agrees() {
         .unwrap();
     assert_eq!(n, 1, "one sample per attempt");
     assert!((sum - 1.2f64.ln()).abs() < 1e-9, "{sum}");
+    sqlx::query("UPDATE estimator_calibration SET n = 5, sum_ln = $1, sum_ln_sq = $2")
+        .bind(5.0 * 1.2f64.ln())
+        .bind(5.0 * 1.2f64.ln().powi(2))
+        .execute(w.pool())
+        .await
+        .unwrap();
+    let next = w.validate(sft(&f, &[big.node])).await;
+    assert_eq!(next["estimate"]["confidence"], "medium", "{next}");
+    assert!(
+        (next["estimate"]["per_gpu_memory_gib"]["expected"]
+            .as_f64()
+            .unwrap()
+            - 13.2)
+            .abs()
+            < 1e-9
+    );
+    let historical = w
+        .call(
+            Method::GET,
+            &format!("/api/v1/runs/{run}/resources"),
+            Value::Null,
+        )
+        .await;
+    assert_eq!(historical.json()["estimate"]["confidence"], "low");
+    assert_eq!(
+        historical.json()["estimate"]["per_gpu_memory_gib"]["expected"],
+        7.5
+    );
+
     // The resume check: a checkpoint of another method can't be resumed.
     sqlx::query("UPDATE runs SET algorithm_id = 'cpt' WHERE id = $1")
         .bind(run.as_uuid())
@@ -919,7 +951,7 @@ async fn dry_run_fits_24_gb_and_not_4_gb_and_submit_agrees() {
         .call_with(
             Method::POST,
             &format!("/api/v1/projects/{}/runs", w.project),
-            unmeasured,
+            unmeasured.clone(),
             &[("idempotency-key", "unmeasured")],
         )
         .await;
@@ -930,6 +962,8 @@ async fn dry_run_fits_24_gb_and_not_4_gb_and_submit_agrees() {
         "no estimate: unknown, not refused"
     );
     let probe_run = RunId::from_str(r.json()["id"].as_str().unwrap()).unwrap();
+    let later = w.validate(unmeasured).await;
+    assert!(later["estimate"]["estimate_id"].is_string(), "{later}");
     until("the unmeasured run is running", || async {
         w.count(&format!(
             "SELECT count(*) FROM jobs WHERE run_id = '{}' AND state = 'RUNNING'",
@@ -981,8 +1015,10 @@ async fn dry_run_fits_24_gb_and_not_4_gb_and_submit_agrees() {
         .unwrap();
     guard.reconcile().await.unwrap();
     assert_eq!(
-        w.count("SELECT count(*) FROM submission_probe_decisions")
-            .await,
+        w.count(&format!(
+            "SELECT count(*) FROM submission_probe_decisions WHERE attempt_id = '{attempt}'"
+        ))
+        .await,
         0
     );
 
@@ -1386,7 +1422,9 @@ async fn submit_applies_method_defaults_and_tight_safety_settings() {
     let m = w.machine(9, Answer::Estimate(6.0, 9.0)).await;
     let v = w.validate(sft(&f, &[m.node])).await;
     assert_eq!(v["ok"], true, "{v}");
-    assert_eq!(v["estimate"]["verdict"], "tight", "{v}");
+    assert_eq!(v["preflight"]["verdict"], "tight", "{v}");
+    assert_eq!(v["estimate"]["verdict"], "unknown", "{v}");
+    assert!(v["estimate"]["per_gpu_memory_gib"].is_null());
     assert!(codes(&v).contains(&"MRL-CAP-284".to_owned()), "{v}");
     assert_eq!(
         v["resolved_config"]["engine"]["gradient_checkpointing"],
@@ -1396,39 +1434,31 @@ async fn submit_applies_method_defaults_and_tight_safety_settings() {
         v["resolved_config"]["common"]["precision"], "auto",
         "common defaults"
     );
-    let estimate: Uuid = v["estimate"]["estimate_id"]
-        .as_str()
-        .unwrap()
-        .parse()
+    let estimate: Uuid = sqlx::query_scalar("SELECT id FROM resource_estimates")
+        .fetch_one(w.pool())
+        .await
         .unwrap();
 
-    // The raw submission (preset only): the resolver finds the estimate, applies the same
-    // safety settings, links the estimate and records the change.
     let (run, resolved, linked) = submit(&w, sft(&f, &[m.node]), "raw").await;
     assert_ne!(run["state"], "REJECTED", "{run}");
-    assert_eq!(
-        resolved, v["resolved_config"],
-        "the same config validate returned"
-    );
-    assert_eq!(linked, Some(estimate));
-    assert_eq!(
-        w.count("SELECT count(*) FROM audit_events WHERE action = 'submission.safety_settings'")
-            .await,
-        1
-    );
+    assert_eq!(resolved, v["resolved_config"]);
+    assert_eq!(linked, None, "the probe measured the original settings");
+    let details: Value = sqlx::query_scalar(
+        "SELECT details FROM audit_events WHERE action = 'submission.safety_settings'",
+    )
+    .fetch_one(w.pool())
+    .await
+    .unwrap();
+    assert_eq!(details["source_estimate_id"], estimate.to_string());
+    assert_eq!(details["changes"], v["preflight"]["changes"]);
+    assert_eq!(details["message"], v["preflight"]["message"]);
 
-    // Validate's resolved_config as is: the same estimate, the settings not applied twice.
     let mut adjusted = sft(&f, &[m.node]);
     adjusted["config"] = v["resolved_config"].clone();
     let (run, resolved, linked) = submit(&w, adjusted, "adjusted").await;
     assert_ne!(run["state"], "REJECTED", "{run}");
     assert_eq!(resolved, v["resolved_config"]);
-    assert_eq!(linked, Some(estimate));
-    assert_eq!(
-        w.count("SELECT count(*) FROM audit_events WHERE action = 'submission.safety_settings'")
-            .await,
-        1
-    );
+    assert_eq!(linked, None);
     let resources = w
         .call(
             Method::GET,
@@ -1437,9 +1467,10 @@ async fn submit_applies_method_defaults_and_tight_safety_settings() {
         )
         .await;
     assert_eq!(resources.status, 200, "{}", resources.text());
-    assert_eq!(
-        resources.json()["estimate"]["estimate_id"],
-        estimate.to_string()
+    assert!(
+        resources.json()["estimate"].is_null(),
+        "{}",
+        resources.text()
     );
 
     // No preset: the method's defaults still apply at submit, and P24 accepts them.
@@ -1454,4 +1485,89 @@ async fn submit_applies_method_defaults_and_tight_safety_settings() {
         .unwrap()
         .starts_with("trl@"));
     assert_eq!(linked, None, "no estimate of this config yet");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn an_engine_name_selects_a_version_that_can_run_the_resolved_preset() {
+    let w = World::start(60).await;
+    let m = w.machine(24, Answer::Estimate(6.0, 9.0)).await;
+    let mut version: Value = serde_json::from_str(TRL).unwrap();
+    version["manifest"]["metadata"]["version"] = json!("0.1.1");
+    let version = Bundle::parse(&version.to_string()).unwrap();
+    mrl_server::modules::engines::store::register(w.db.db(), &[&version], false)
+        .await
+        .unwrap();
+    w.db.seed(
+        r#"UPDATE engine_versions SET status = 'ENABLED',
+        probe_results = CASE WHEN version = '0.1.0' THEN '{"cpu": {"status": "ENABLED"}}'::jsonb
+            ELSE '{"nvidia": {"status": "ENABLED"}}'::jsonb END"#,
+    )
+    .await;
+    let mut request = sft(&w.fixture, &[m.node]);
+    request["config"]["common"] = json!({"engine": "trl"});
+    let (run, resolved, _) = submit(&w, request, "later-engine").await;
+    assert_ne!(run["state"], "REJECTED", "{run}");
+    assert_eq!(resolved["common"]["engine"], "trl@0.1.1");
+    assert_eq!(resolved["common"]["update"]["strategy"], "lora");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn a_legacy_probe_and_its_estimate_move_to_the_same_org() {
+    struct Directory(ProjectId, OrgId);
+    #[async_trait::async_trait]
+    impl ProjectDirectory for Directory {
+        async fn owner(&self, project: ProjectId) -> Result<Option<OrgId>, SeamError> {
+            Ok((project == self.0).then_some(self.1))
+        }
+    }
+
+    let w = World::start(60).await;
+    let engine: Uuid = sqlx::query_scalar("SELECT id FROM engine_versions")
+        .fetch_one(w.pool())
+        .await
+        .unwrap();
+    let (estimate, job) = probe::start(
+        w.db.db(),
+        &probe::NewProbe {
+            org: Uuid::nil(),
+            project: w.project.as_uuid(),
+            created_by: "test",
+            spec: &probe::ProbeSpec {
+                algorithm: "sft".into(),
+                base_model_version_id: "mv_x".into(),
+                dataset_version_ids: vec![],
+                reward_version_id: None,
+                target_resources: None,
+                seeds: json!({}),
+                resolved: json!({}),
+            },
+            engine_version_id: engine,
+            estimator_version: "trl@0.1.0".into(),
+            calibration_key: "test".into(),
+            inputs_sha256: vec![0; 32],
+            node_ids: Vec::new(),
+            timeout_seconds: 60,
+            max_runtime_seconds: 120,
+        },
+    )
+    .await
+    .unwrap();
+    let org = OrgId::new();
+    let projects = Projects::with(Arc::new(Directory(w.project, org)));
+    RehomeLocalRows::new(w.db.db().clone(), projects)
+        .run()
+        .await
+        .unwrap();
+    let owners: (Uuid, Uuid) = sqlx::query_as(
+        "SELECT e.org_id, j.org_id FROM resource_estimates e
+        JOIN jobs j ON j.id = e.job_id WHERE e.id = $1 AND j.id = $2",
+    )
+    .bind(estimate)
+    .bind(job)
+    .fetch_one(w.pool())
+    .await
+    .unwrap();
+    assert_eq!(owners, (org.as_uuid(), org.as_uuid()));
 }

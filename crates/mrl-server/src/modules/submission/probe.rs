@@ -631,11 +631,17 @@ impl PreparedSink {
                     &spec.resolved,
                     &bucket,
                 );
-                sqlx::query("UPDATE resource_estimates SET calibration_key = $2 WHERE job_id = $1")
-                    .bind(job)
-                    .bind(key)
-                    .execute(&mut *tx)
-                    .await?;
+                sqlx::query(
+                    "UPDATE resource_estimates SET calibration_key = $2,
+                         (calibration_n, calibration_sum_ln, calibration_sum_ln_sq) = (
+                             SELECT n, sum_ln, sum_ln_sq FROM estimator_calibration WHERE key = $2
+                         )
+                     WHERE job_id = $1",
+                )
+                .bind(job)
+                .bind(key)
+                .execute(&mut *tx)
+                .await?;
             }
         }
         super::audit(

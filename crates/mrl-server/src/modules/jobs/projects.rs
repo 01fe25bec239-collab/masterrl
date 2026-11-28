@@ -119,6 +119,7 @@ impl RehomeLocalRows {
             // <mrl:rehome P26> P26 statements go right below this line.
             // <mrl:rehome P27> P27 statements go right below this line.
             // <mrl:rehome P28> P28 statements go right below this line.
+            "UPDATE resource_estimates SET org_id = $1 WHERE org_id = $3 AND project_id = ANY($2)",
             // <mrl:rehome P29> P29 statements go right below this line.
         ] {
             sqlx::query(sql)
