@@ -6,6 +6,7 @@ import http.server
 import json
 import os
 import threading
+import traceback
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,8 @@ class _Hub(http.server.BaseHTTPRequestHandler):
             if "bad-sha" in self.path:
                 sib[0]["lfs"] = {"sha256": "0" * 64}
             return self._send(json.dumps({"sha": SHA, "siblings": sib}).encode())
+        if self.path.startswith("/signed.jsonl?"):
+            return self._send(FILES["data/train.jsonl"])
         if self.path == "/short.jsonl":
             self.send_response(200)
             self.send_header("Content-Length", "100")
@@ -86,6 +89,18 @@ def _run(tmp: Path, inputs: dict[str, Any]) -> dict[str, Any]:
     out = tmp / "outputs"
     list(IMPORT_DATASET.run(TaskContext(inputs, {}, out, lambda: False)))
     return json.loads((out / "import.json").read_text("utf-8"))
+
+
+@pytest.mark.usefixtures("mirror")
+def test_remote_url_stays_out_of_reports_and_errors(tmp_path: Path, hub: str) -> None:
+    query = "?signature=private-marker"
+    doc = _run(tmp_path, {"source": "remote", "url": f"{hub}/signed.jsonl{query}"})
+    assert doc["files"][0]["path"] == "signed.jsonl"
+    assert "private-marker" not in json.dumps(doc)
+
+    with pytest.raises(MrlError, match="answered 404") as error:
+        _run(tmp_path, {"source": "remote", "url": f"{hub}/missing.jsonl{query}"})
+    assert "private-marker" not in "".join(traceback.format_exception(error.value))
 
 
 @pytest.mark.usefixtures("mirror")

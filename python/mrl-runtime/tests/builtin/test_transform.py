@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from mrl_runtime.builtin import transform
 from mrl_runtime.builtin.tasks import TaskContext
 from mrl_runtime.builtin.transform import TRANSFORM, Expr, ExprError, spec_problems
 from mrl_runtime.data.adapter import DatasetAdapter, ShardWriter, write_manifest
@@ -137,6 +138,22 @@ def test_preview_shows_twenty_rows(tmp_path: Path) -> None:
     assert dropped["after"] is None
     assert dropped["dropped"] == {"step": 0, "op": "filter", "reason": "filtered out"}
     assert not (out / "dataset.json").exists()
+
+
+def test_preview_respects_the_json_output_byte_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(transform, "PREVIEW_MAX_BYTES", 4096)
+    spec = _spec([{"op": "rename", "from": "question", "to": "prompt"}])
+    rows = [{**row, "answer": "é" * 256} for row in QA]
+    out = _run(tmp_path, spec, rows, preview=True)
+    payload = (out / "preview.json").read_bytes()
+    assert len(payload) <= transform.PREVIEW_MAX_BYTES
+    preview = json.loads(payload)
+    assert preview["truncated"] is True
+    assert 0 < len(preview["rows"]) < 20
+    assert preview["rows"][0]["after"]["answer"] == rows[0]["answer"]
+    assert preview["steps"][0]["out"] == 20
 
 
 @pytest.mark.parametrize(

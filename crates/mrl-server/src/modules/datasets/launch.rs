@@ -57,7 +57,7 @@ impl LaunchContributor for DatasetInputs {
     ) -> Result<(), LaunchError> {
         if matches!(job.kind.as_str(), "IMPORT" | "DATA_PREP") {
             let allowed: Option<bool> = sqlx::query_scalar(
-                "SELECT d.sensitivity <> 'restricted-pii' AND d.deleted_at IS NULL
+                "SELECT NOT dataset_version_is_restricted(v.id) AND d.deleted_at IS NULL
                  FROM dataset_work w JOIN dataset_versions v ON v.id=w.version_id
                  JOIN datasets d ON d.id=v.dataset_id WHERE w.job_id=$1 AND w.purpose IN ('jsonl','hub_push')",
             ).bind(job.id).fetch_optional(self.db.pool()).await.map_err(|e| LaunchError::Transient(e.to_string()))?;

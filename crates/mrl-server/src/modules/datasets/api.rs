@@ -127,7 +127,11 @@ fn dataset_view(d: &DatasetRow) -> DatasetInfo {
         source_urls: d.source_urls.clone(),
         card_md: d.card_md.clone(),
         eval_set: d.eval_set,
-        policy: DatasetPolicy::of(&d.sensitivity),
+        policy: DatasetPolicy::of(if d.has_restricted_lineage {
+            "restricted-pii"
+        } else {
+            &d.sensitivity
+        }),
         created_by: d.created_by.clone(),
         created_at: d.created_at,
         updated_at: d.updated_at,
@@ -1271,6 +1275,7 @@ pub async fn version_action(
     Extension(svc): Extension<Arc<Datasets>>,
     ctx: RequestContext,
     Path(segment): Path<String>,
+    headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Result<Response, JobsError> {
     let parse = |b: &[u8]| -> Result<Value, JobsError> {
@@ -1286,23 +1291,25 @@ pub async fn version_action(
         })
     };
     let json = parse(&body)?;
+    let idem = crate::modules::artifacts::Idempotency::of(&headers, &json);
     if let Some(dsv) = segment.strip_suffix(":diff") {
         let req: DatasetDiffRequest = from_body(json)?;
         return Ok(Json(diff(&state, &svc, &ctx, dsv, &req).await?).into_response());
     }
     if let Some(dsv) = segment.strip_suffix(":tokenize-preview") {
-        return super::submit::tokenize(&state, &svc, &ctx, dsv, from_body(json)?).await;
+        return super::submit::tokenize(&state, &svc, &ctx, dsv, from_body(json)?, idem).await;
     }
     if let Some(dsv) = segment.strip_suffix(":transform-preview") {
-        return super::submit::transform_preview(&state, &svc, &ctx, dsv, from_body(json)?).await;
+        return super::submit::transform_preview(&state, &svc, &ctx, dsv, from_body(json)?, idem)
+            .await;
     }
     if let Some(dsv) = segment.strip_suffix(":export") {
         let req: DatasetExportRequest = from_body(json)?;
         if req.format == "hub" {
-            return super::submit::push_to_hub(&state, &svc, &ctx, dsv, req).await;
+            return super::submit::push_to_hub(&state, &svc, &ctx, dsv, req, idem).await;
         }
         if req.format == "jsonl" {
-            return super::submit::jsonl(&state, &svc, &ctx, dsv).await;
+            return super::submit::jsonl(&state, &svc, &ctx, dsv, idem).await;
         }
         return Ok(Json(export(&state, &svc, &ctx, dsv, &req).await?).into_response());
     }

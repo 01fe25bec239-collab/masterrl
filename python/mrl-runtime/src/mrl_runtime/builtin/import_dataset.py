@@ -71,8 +71,8 @@ class Policy:
         try:
             parts = urllib.parse.urlsplit(url)
             port = parts.port or 443
-        except ValueError as exc:
-            raise _refused("the download URL is malformed") from exc
+        except ValueError:
+            raise _refused("the download URL is malformed") from None
         if parts.scheme != "https" and not (self.allow_private and parts.scheme == "http"):
             raise _refused(f"only https:// links are allowed, not {parts.scheme or 'none'}://")
         if not parts.hostname or parts.username or parts.password:
@@ -156,32 +156,34 @@ class Fetcher:
 
     def _open(self, url: str) -> Any:
         self.policy.check(url)
-        req = urllib.request.Request(url, headers={"User-Agent": "masterrl-import/1"})
-        if self.token and urllib.parse.urlsplit(url).netloc == urllib.parse.urlsplit(HUB).netloc:
-            req.add_unredirected_header("Authorization", f"Bearer {self.token}")
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({}), _Redirects(self.policy), _PinnedHTTPS(self.policy)
-        )
         try:
+            req = urllib.request.Request(url, headers={"User-Agent": "masterrl-import/1"})
+            if self.token and req.host == urllib.parse.urlsplit(HUB).netloc:
+                req.add_unredirected_header("Authorization", f"Bearer {self.token}")
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({}), _Redirects(self.policy), _PinnedHTTPS(self.policy)
+            )
             return opener.open(req, timeout=TIMEOUT_S)
         except urllib.error.HTTPError as exc:
             hint = " (is the repo private? it needs a token)" if exc.code in (401, 403) else ""
-            raise _refused(f"{url} answered {exc.code}{hint}") from exc
-        except OSError as exc:
-            raise _refused(f"{url}: {exc}") from exc
+            raise _refused(f"the download server answered {exc.code}{hint}") from None
+        except (ConnectionError, TimeoutError):
+            raise _refused("the download server could not be reached") from ConnectionError()
+        except (OSError, ValueError, http.client.HTTPException):
+            raise _refused("the download server could not be reached") from None
 
     def json(self, url: str) -> object:
         with self._open(url) as resp:
             expected: int | None = resp.length
             body = resp.read(16 * 1024 * 1024 + 1)
         if len(body) > 16 * 1024 * 1024:
-            raise _refused(f"{url} answered with too much data")
+            raise _refused("the metadata response exceeded the download limit")
         if expected is not None and len(body) != expected:
             raise _refused("the Hub metadata download ended early") from ConnectionError()
         try:
             return json.loads(body)
-        except ValueError as exc:
-            raise _refused(f"{url} did not answer with JSON") from exc
+        except ValueError:
+            raise _refused("the metadata response was not JSON") from None
 
     def download(self, url: str, dest: Path, expected_sha256: str | None = None) -> tuple[int, str]:
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -202,17 +204,19 @@ class Fetcher:
                         digest.update(chunk)
                         f.write(chunk)
                 if expected is not None and size != expected:
-                    raise ConnectionError(f"the download ended after {size} of {expected} bytes")
+                    raise _refused(
+                        f"the download ended after {size} of {expected} bytes"
+                    ) from ConnectionError()
                 if expected_sha256 is not None and digest.hexdigest() != expected_sha256:
-                    raise ConnectionError(f"{dest.name} does not match the Hub's file hash")
+                    raise _refused(
+                        f"{dest.name} does not match the Hub's file hash"
+                    ) from ConnectionError()
             except Exception as exc:
                 dest.unlink()
-                if isinstance(exc, http.client.IncompleteRead):
-                    raise _refused("the download stopped before it finished") from ConnectionError(
-                        str(exc)
-                    )
+                if isinstance(exc, (http.client.IncompleteRead, ConnectionError)):
+                    raise _refused("the download stopped before it finished") from ConnectionError()
                 if isinstance(exc, (OSError, http.client.HTTPException)):
-                    raise _refused(str(exc)) from exc
+                    raise _refused("reading the download failed") from None
                 raise
         return size, digest.hexdigest()
 
@@ -327,7 +331,7 @@ def _remote(ctx: TaskContext, fetch: Fetcher, out: Path) -> Iterator[TaskEvent]:
     size, digest = fetch.download(url, out / FILES_DIR / rel)
     yield Progress(step=1, total_steps=1, phase="download")
     files = [{"path": rel, "size": size, "sha256": digest}]
-    _write(out, {"source": "remote", "url": url, "files": files})
+    _write(out, {"source": "remote", "files": files})
 
 
 def _write(out: Path, doc: dict[str, Any]) -> None:

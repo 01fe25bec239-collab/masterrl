@@ -35,6 +35,33 @@ fn fixture(name: &str) -> PathBuf {
         .join(name)
 }
 
+fn fixture_manifest(name: &str) -> Value {
+    let root = fixture(name);
+    let mut files = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(dir) = stack.pop() {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            let rel = p
+                .strip_prefix(&root)
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            if rel != ".gitattributes" {
+                let bytes = std::fs::read(&p).unwrap();
+                files.push(json!({"path":rel,"size":bytes.len(),
+                    "sha256":mrl_storage::sha256_hex(&bytes),"role":"data"}));
+            }
+        }
+    }
+    json!({"schema_version":"artifact-manifest/v1","kind":"dataset",
+           "created_at":"2026-11-27T00:00:00Z","files":files})
+}
+
 struct Env {
     core: CoreServer,
     store: Arc<ArtifactStore>,
@@ -208,43 +235,20 @@ impl Env {
         id
     }
 
-    /// Puts every file of the fixture folder `name` in the org's storage, as the agent uploads
-    /// a job's outputs, and returns their `artifact-manifest/v1`.
+    /// Puts the fixture's checked blobs in the org's storage for tests that start after registration.
     async fn publish(&self, name: &str) -> Value {
+        let manifest = fixture_manifest(name);
         let st = self
             .store
             .org_store(&storage_org(self.org.as_uuid()))
             .await
             .unwrap();
-        let root = fixture(name);
-        let mut files = Vec::new();
-        let mut stack = vec![root.clone()];
-        while let Some(dir) = stack.pop() {
-            for e in std::fs::read_dir(dir).unwrap() {
-                let p = e.unwrap().path();
-                if p.is_dir() {
-                    stack.push(p);
-                    continue;
-                }
-                let rel = p
-                    .strip_prefix(&root)
-                    .unwrap()
-                    .to_string_lossy()
-                    .replace('\\', "/");
-                if rel == ".gitattributes" {
-                    continue;
-                }
-                let bytes = std::fs::read(&p).unwrap();
-                let sha = mrl_storage::sha256_hex(&bytes);
-                st.put(&st.keys().blob(&sha).unwrap(), bytes.clone().into())
-                    .await
-                    .unwrap();
-                files
-                    .push(json!({"path": rel, "size": bytes.len(), "sha256": sha, "role": "data"}));
-            }
+        for file in manifest["files"].as_array().unwrap() {
+            let bytes = std::fs::read(fixture(name).join(file["path"].as_str().unwrap())).unwrap();
+            let key = st.keys().blob(file["sha256"].as_str().unwrap()).unwrap();
+            st.put(&key, bytes.into()).await.unwrap();
         }
-        json!({"schema_version": "artifact-manifest/v1", "kind": "dataset",
-               "created_at": "2026-11-27T00:00:00Z", "files": files})
+        manifest
     }
 
     /// Reads the outputs and records the decision, like the verifier does.
@@ -1161,6 +1165,42 @@ async fn dataset_posts_apply_current_permissions_and_create_replays_durably() {
     };
     assert_eq!(export().await.status, 200);
 
+    let action_headers = &[("Idempotency-Key", "dataset-work-replay")];
+    let queue = || {
+        env.core.call_with(
+            Method::POST,
+            &export_path,
+            &env.owner,
+            Some(json!({"format":"jsonl"})),
+            action_headers,
+        )
+    };
+    let (first, second) = tokio::join!(queue(), queue());
+    assert_eq!(first.status, 202, "{}", first.text());
+    assert_eq!(second.status, 202, "{}", second.text());
+    assert_eq!(first.json(), second.json());
+    let mismatch = env
+        .core
+        .call_with(
+            Method::POST,
+            &format!("/api/v1/dataset-versions/{version}:transform-preview"),
+            &env.owner,
+            Some(
+                json!({"transform_spec":{"schema_version":"transform/v1","name":"preview",
+            "to":"sft.messages.v1","steps":[{"op":"dedupe"}]}}),
+            ),
+            action_headers,
+        )
+        .await;
+    assert_eq!(mismatch.status, 422, "{}", mismatch.text());
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE action='datasets.jsonl' AND outcome='success'",
+    )
+    .fetch_one(env.core.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(audits, 1);
+
     let user: Uuid = sqlx::query_scalar(
         "DELETE FROM role_bindings WHERE org_id = $1 AND role = 'owner' RETURNING principal_id",
     )
@@ -1181,10 +1221,118 @@ async fn dataset_posts_apply_current_permissions_and_create_replays_durably() {
     tx.commit().await.unwrap();
     assert_eq!(get_diff().await.status, 404);
     assert_eq!(export().await.status, 404);
+    assert_eq!(queue().await.status, 404);
     assert_eq!(post(path, meta).await.status, 404);
 }
 
 impl Env {
+    async fn upload_worker_outputs(&self, job: Uuid, folder: &str, manifest: &Value) -> Uuid {
+        use mrl_domain::ids::{AttemptId, JobId};
+        use mrl_proto::agent::v1::{command, Command, CommandResult};
+        use mrl_proto::common::v1::AttemptRef;
+        use mrl_proto::worker::v1::OutputsStaged;
+        use mrl_server::modules::builtin::sink::{register_pass, Outputs as WorkerOutputs};
+        use mrl_server::modules::nodes::{lanes::LaneRouter, store as nodes, NodesModule};
+        use mrl_server::modules::scheduler::launch::Transfer;
+        use prost::Message;
+
+        let db = self.core.db.db();
+        let cfg = &self.core.config;
+        let node = Uuid::now_v7();
+        let pool = Uuid::now_v7();
+        let attempt = AttemptId::new();
+        let org = self.org.as_uuid();
+        self.core.db.seed(&format!(
+            "INSERT INTO compute_pools (id, org_id, name) VALUES ('{pool}', '{org}', 'worker');
+             INSERT INTO compute_nodes (id, pool_id, hostname, lifecycle, status, session_holder, session_epoch)
+               VALUES ('{node}', '{pool}', 'worker', 'STATIC', 'ONLINE', 'test', 1);
+             INSERT INTO job_attempts (id, org_id, job_id, attempt_no, epoch, state)
+               VALUES ('{attempt_id}', '{org}', '{job}', 1, 1, 'RUNNING');
+             INSERT INTO attempt_placements (attempt_id, node_id, org_id, node_rank, rank_lo, rank_hi, role)
+               VALUES ('{attempt_id}', '{node}', '{org}', 0, 0, 0, 'service');
+             UPDATE jobs SET state='RUNNING', epoch=1, current_attempt_id='{attempt_id}' WHERE id='{job}';",
+            attempt_id = attempt.as_uuid(),
+        )).await;
+
+        let gateway = NodesModule::new(
+            db.clone(),
+            cfg,
+            self.core.secrets.clone(),
+            LaneRouter::new(),
+        )
+        .gateway();
+        let resolver = ArtifactsModule::new(db.clone(), cfg).secrets();
+        let transfer = Transfer::new(self.store.clone(), resolver, self.core.secrets.clone());
+        let outputs = WorkerOutputs::new(db.clone(), self.store.clone(), transfer, &gateway);
+        let at = AttemptRef {
+            job_id: JobId::from_uuid(job).to_string(),
+            attempt_id: attempt.to_string(),
+            fencing_epoch: 1,
+        };
+        let staged = OutputsStaged {
+            manifest_json: manifest.to_string(),
+        };
+        outputs.on_staged(node, &at, &staged).await.unwrap();
+        outputs.on_staged(node, &at, &staged).await.unwrap();
+        let nodes::Claim::Send(commands) = nodes::claim_commands(db, node, 1, 0).await.unwrap()
+        else {
+            panic!("the worker session should own its commands");
+        };
+        assert_eq!(commands.len(), 1);
+        let (_, _, payload) = &commands[0];
+        let command = Command::decode(payload.as_slice()).unwrap();
+        let Some(command::Kind::UploadArtifacts(upload)) = command.kind else {
+            panic!("expected an upload command");
+        };
+        assert_eq!(
+            upload.items.len(),
+            manifest["files"].as_array().unwrap().len()
+        );
+        for item in upload.items {
+            let path = item.local_path.strip_prefix("outputs/").unwrap();
+            let bytes = std::fs::read(fixture(folder).join(path)).unwrap();
+            let r = self
+                .core
+                .server
+                .request(Method::PUT, &item.url, &[], bytes)
+                .await;
+            assert_eq!(r.status, 200, "{}", r.text());
+        }
+        let accept = CommandResult {
+            command_id: command.command_id,
+            accepted: true,
+            failure: None,
+        };
+        let mut tx = db.begin().await.unwrap();
+        nodes::command_result(&mut tx, node, &accept).await.unwrap();
+        tx.commit().await.unwrap();
+        register_pass(&outputs).await;
+        assert!(mrl_server::modules::builtin::outputs(db, org, job)
+            .await
+            .unwrap()
+            .is_none());
+
+        let mut tx = db.begin().await.unwrap();
+        nodes::command_result(&mut tx, node, &accept).await.unwrap();
+        sqlx::query("UPDATE job_attempts SET state='EXITED_OK' WHERE id=$1")
+            .bind(attempt.as_uuid())
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE jobs SET state='FINALIZING' WHERE id=$1")
+            .bind(job)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        register_pass(&outputs).await;
+        mrl_server::modules::builtin::outputs(db, org, job)
+            .await
+            .unwrap()
+            .unwrap()
+            .artifact_id
+    }
+
     // Simulates the registered INT-6 output of a finished worker. The background task and
     // completion chain run normally against the same database and blob store.
     async fn worker_outputs(&self, job: Uuid, manifest: Value) {
@@ -1352,16 +1500,18 @@ async fn upload_to_ready_and_transform_use_int6_and_retry_unregistered_outputs()
     let verifier =
         mrl_server::modules::datasets::work::DatasetVerifier::new(env.core.db.db().clone());
     assert!(verifier.verify(&row).await.is_err());
-    let artifact = env.register_manifest(env.publish("ready").await).await;
-    sqlx::query("UPDATE builtin_jobs SET artifact_id=$2 WHERE job_id=$1")
-        .bind(job)
-        .bind(artifact)
-        .execute(env.core.db.pool())
-        .await
-        .unwrap();
-    assert!(verifier.verify(&row).await.is_err());
-    env.finish_outputs(job, artifact).await;
+    let manifest = fixture_manifest("ready");
+    let artifact = env.upload_worker_outputs(job, "ready", &manifest).await;
     let ready = env.version_until(version, "READY").await;
+    assert_eq!(
+        env.store
+            .get(&env.org.to_string(), artifact)
+            .await
+            .unwrap()
+            .unwrap()
+            .created_by,
+        "system:builtin",
+    );
     assert_eq!(ready["row_count"], 200);
     assert!(matches!(
         verifier.verify(&row).await.unwrap(),
@@ -1521,6 +1671,141 @@ async fn solo_dataset_lineage_uses_the_local_storage_namespace() {
         }])
     );
     env.core.stop().await;
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn solo_tokenizers_stage_in_the_job_org() {
+    use mrl_domain::ids::ArtifactId;
+    use mrl_server::modules::artifacts::LOCAL_ORG;
+
+    let env = Env::start_mode(Mode::Solo).await;
+    let ds = env.dataset("local tokenizer", json!({})).await;
+    let version = dsv(env.ready(&ds, "ready", None).await);
+    let bytes = b"{}";
+    let manifest = env.blob_manifest(&[("tokenizer.json", bytes)]).await;
+    let artifact = env.register_manifest(manifest).await;
+    let sha = mrl_storage::sha256_hex(bytes);
+    let local = env.store.org_store(LOCAL_ORG).await.unwrap();
+    local
+        .put(&local.keys().blob(&sha).unwrap(), bytes.as_slice().into())
+        .await
+        .unwrap();
+    let target = env.store.org_store(&env.org.to_string()).await.unwrap();
+    let key = target.keys().blob(&sha).unwrap();
+    target.delete(&key).await.unwrap();
+    let set_org_project = |project: ProjectId| {
+        sqlx::query("UPDATE artifacts SET org_id=$1, project_id=$2 WHERE id=$3")
+            .bind(LOCAL_ORG)
+            .bind(project.to_string())
+            .bind(artifact)
+            .execute(env.core.db.pool())
+    };
+    let tokenize = || async {
+        env.call(
+            &env.owner,
+            Method::POST,
+            &format!("/dataset-versions/{version}:tokenize-preview"),
+            Some(json!({"tokenizer_artifact_id":ArtifactId::from_uuid(artifact)})),
+        )
+        .await
+    };
+    set_org_project(env.side).await.unwrap();
+    assert_eq!(tokenize().await.0, 404);
+    set_org_project(env.prj).await.unwrap();
+    let (status, body) = tokenize().await;
+    assert_eq!(status, 202, "{body}");
+    let job = uuid_job(&body);
+    let files: Value = sqlx::query_scalar("SELECT files FROM builtin_jobs WHERE job_id=$1")
+        .bind(job)
+        .fetch_one(env.core.db.pool())
+        .await
+        .unwrap();
+    assert!(files.as_array().unwrap().iter().any(|f| f["key"] == key));
+    assert_eq!(target.get_range(&key, 0..2).await.unwrap().as_ref(), bytes);
+}
+
+#[tokio::test]
+#[ignore = "needs PostgreSQL (just dev)"]
+async fn derived_versions_keep_restricted_personal_data_inside_the_dataset() {
+    use mrl_domain::ids::ArtifactId;
+
+    let env = Env::start().await;
+    let source = env
+        .dataset("restricted source", json!({"sensitivity":"restricted-pii"}))
+        .await;
+    let target = env
+        .dataset("derived", json!({"sensitivity":"public"}))
+        .await;
+    let parent = dsv(env.ready(&source, "ready", None).await);
+    let (status, child) = env.call(
+        &env.owner, Method::POST, &format!("/datasets/{target}/versions"),
+        Some(json!({"source":"transform","parent_version_id":parent,"transform_spec":{
+            "schema_version":"transform/v1","name":"dedupe","to":"sft.messages.v1","steps":[{"op":"dedupe"}]
+        }})),
+    ).await;
+    assert_eq!(status, 202, "{child}");
+    let job = uuid_job(&child);
+    env.worker_outputs(job, env.publish("filtered").await).await;
+    let child = child["id"].as_str().unwrap();
+    env.version_until(child, "READY").await;
+
+    assert_eq!(
+        env.call(
+            &env.owner,
+            Method::PATCH,
+            &format!("/datasets/{source}"),
+            Some(json!({"sensitivity":"internal"}))
+        )
+        .await
+        .0,
+        200
+    );
+    let (status, dataset) = env
+        .call(
+            &env.owner,
+            Method::GET,
+            &format!("/datasets/{target}"),
+            None,
+        )
+        .await;
+    assert_eq!(status, 200, "{dataset}");
+    assert_eq!(dataset["policy"]["sample_logging"], false);
+
+    let path = format!("/dataset-versions/{child}:export");
+    for format in ["parquet", "jsonl", "hub"] {
+        let (status, error) = env
+            .call(
+                &env.owner,
+                Method::POST,
+                &path,
+                Some(json!({"format":format})),
+            )
+            .await;
+        assert_eq!(
+            (status, error["code"].as_str()),
+            (403, Some("MRL-PERM-270")),
+            "{error}"
+        );
+    }
+    let artifact: Uuid = sqlx::query_scalar("SELECT artifact_id FROM builtin_jobs WHERE job_id=$1")
+        .bind(job)
+        .fetch_one(env.core.db.pool())
+        .await
+        .unwrap();
+    let (status, error) = env
+        .call(
+            &env.owner,
+            Method::POST,
+            &format!("/artifacts/{}:download", ArtifactId::from_uuid(artifact)),
+            Some(json!({"path":"dataset.json"})),
+        )
+        .await;
+    assert_eq!(
+        (status, error["code"].as_str()),
+        (403, Some("MRL-PERM-270")),
+        "{error}"
+    );
 }
 
 #[tokio::test]
