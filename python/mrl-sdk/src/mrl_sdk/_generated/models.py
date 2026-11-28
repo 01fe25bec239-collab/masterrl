@@ -637,6 +637,41 @@ class ExperimentPatch(TypedDict):
     """New labels (replace the old ones)."""
 
 
+class ExportModel(TypedDict):
+    """`POST /model-versions/{mv}:export` body."""
+
+    format: NotRequired[str | None]
+    """`hf-safetensors` (the default; others answer MRL-MODEL-261 in this release)."""
+
+    target: NotRequired[ExportTarget]
+    """Where it goes."""
+
+
+class ExportTarget(TypedDict):
+    """Where an export goes."""
+
+    endpoint: NotRequired[str | None]
+    """S3-compatible endpoint (s3; default AWS)."""
+
+    kind: NotRequired[str | None]
+    """`artifact` (default: download it from the app), `s3` or `hf_hub`."""
+
+    private: NotRequired[bool | None]
+    """Make the Hub repository private (hf_hub; default true)."""
+
+    region: NotRequired[str | None]
+    """S3 region (s3)."""
+
+    repo: NotRequired[str | None]
+    """`org/name` (hf_hub)."""
+
+    secret_id: NotRequired[str | None]
+    """The credentials (`sec_…`): S3 keys as JSON, or a Hub write token."""
+
+    url: NotRequired[str | None]
+    """`s3://bucket/prefix` (s3)."""
+
+
 class FieldError(TypedDict):
     """One field problem inside a 422 response."""
 
@@ -717,6 +752,26 @@ class Health(TypedDict):
 
     status: str
     """`ok`."""
+
+
+class ImportModel(TypedDict):
+    """`POST /projects/{prj}/models:import` body."""
+
+    base_model_version_id: NotRequired[str | None]
+    """For LoRA adapters: the READY base version (`mv_…`) they were trained on."""
+
+    convert_pickle: NotRequired[bool]
+    """Convert pickle-only weights (refused in this release: MRL-MODEL-260)."""
+
+    name: str
+    """The model (created when missing)."""
+
+    source: ImportSource
+    """Where the files come from."""
+
+
+ImportSource = dict[str, Any]
+"""Where an import's files come from."""
 
 
 class Job(TypedDict):
@@ -902,6 +957,16 @@ class Me(TypedDict):
     user: NotRequired[dict[str, Any]]
 
 
+class MergeAdapter(TypedDict):
+    """`POST /model-versions/{mv}:merge-adapter` body."""
+
+    dtype: NotRequired[str | None]
+    """`auto` (keep each tensor's type), `float32`, `float16` or `bfloat16`."""
+
+    name: NotRequired[str | None]
+    """The model to add the merged version to (default: the adapter's model)."""
+
+
 class MetricPointView(TypedDict):
     """One point of a query answer."""
 
@@ -978,6 +1043,200 @@ class MetricSeriesView(TypedDict):
     """Split, like `train` or `eval` (may be empty)."""
 
 
+class ModelExportJob(TypedDict):
+    """A started export."""
+
+    job_id: str
+    """`job_…`; its outputs are the exported folder and `export-result.json`."""
+
+    model_version_id: str
+    """The exported version."""
+
+
+class ModelFileInfo(TypedDict):
+    """One file of a version."""
+
+    format: str
+    """`safetensors`, `gguf`, `json`, `txt` or `other`."""
+
+    path: str
+    """Path inside the model folder."""
+
+    role: str
+    """`weights`, `config`, `tokenizer`, `adapter`, `code` or `other`."""
+
+    sha256: str
+    """sha256 (hex)."""
+
+    size: int
+    """Bytes."""
+
+
+class ModelInfo(TypedDict):
+    """A model as the API shows it."""
+
+    created_at: str
+    """When."""
+
+    created_by: str
+    """Who created it."""
+
+    family: NotRequired[str | None]
+    """Family of the newest READY version."""
+
+    id: str
+    """`mdl_…`."""
+
+    name: str
+    """Unique name in the project."""
+
+    project_id: str
+    """`prj_…`."""
+
+
+class ModelInfoPage(TypedDict):
+    """One page of results."""
+
+    items: list[ModelInfo]
+    """The items on this page."""
+
+    next_cursor: NotRequired[str | None]
+    """Pass as `cursor` for the next page; `null` on the last page."""
+
+
+class ModelLicense(TypedDict):
+    """A version's license and whether its project accepted it."""
+
+    acknowledged: bool
+    """The project accepted exactly this text."""
+
+    kind: NotRequired[str | None]
+    """`spdx`, `custom` or `unknown`."""
+
+    sha256: NotRequired[str | None]
+    """sha256 of the license text; `:acknowledge-license` names it."""
+
+    spdx: NotRequired[str | None]
+    """SPDX id, like `apache-2.0`."""
+
+
+class ModelVersionAction(TypedDict):
+    """Body of the `/model-versions/{mv}:…` actions."""
+
+    license_sha256: NotRequired[str | None]
+    """`:acknowledge-license`: the license text hash being accepted (`license.sha256`)."""
+
+    revision: NotRequired[str | None]
+    """`:approve-remote-code`: the revision being approved (the version's `revision`)."""
+
+
+class ModelVersionInfo(TypedDict):
+    """A model version as the API shows it."""
+
+    architecture: NotRequired[str | None]
+    """`architectures[0]`."""
+
+    base_model_version_id: NotRequired[str | None]
+    """The base of an adapter or merge."""
+
+    chat_template_sha256: NotRequired[str | None]
+    """sha256 of the default chat template."""
+
+    compatibility: dict[str, Any]
+    """Per engine version and method: `{ok, problems[]}`."""
+
+    context_length: NotRequired[int | None]
+    """Context length."""
+
+    created_at: str
+    """When."""
+
+    created_by: str
+    """Who created it."""
+
+    dtypes: list[str]
+    """Weight dtypes."""
+
+    family: NotRequired[str | None]
+    """`decoder`, `decoder-moe`, `encoder`, `encoder-decoder`, `vlm` or `unknown`."""
+
+    files: NotRequired[list[ModelFileInfo] | None]
+    """Its files (only on `GET /model-versions/{mv}`)."""
+
+    id: str
+    """`mv_…`."""
+
+    inspection: NotRequired[dict[str, Any] | None]
+    """The inspection report (P15), once inspected."""
+
+    invalid_reason: NotRequired[dict[str, Any] | None]
+    """Why it is INVALID: `{code, message}`."""
+
+    job_id: NotRequired[str | None]
+    """`job_…` that inspects or builds it."""
+
+    kind: NotRequired[str | None]
+    """`full_weights`, `adapter` or `inference_only` (once inspected)."""
+
+    license: ModelLicense
+    """License."""
+
+    model_id: str
+    """`mdl_…`."""
+
+    model_type: NotRequired[str | None]
+    """`model_type`."""
+
+    param_count: NotRequired[int | None]
+    """Parameters."""
+
+    quantization: NotRequired[str | None]
+    """Quantization, if any."""
+
+    ready_at: NotRequired[str | None]
+    """When it became READY."""
+
+    remote_code_approved: bool
+    """The code is approved for this revision (or none is needed)."""
+
+    remote_code_approved_by: NotRequired[str | None]
+    """Who approved it."""
+
+    requires_remote_code: bool
+    """Ships its own Python code."""
+
+    revision: NotRequired[str | None]
+    """The revision approvals name."""
+
+    seq: int
+    """1, 2, … within the model."""
+
+    source_kind: str
+    """`hub`, `upload`, `node_path`, `checkpoint` or `merge`."""
+
+    source_ref: dict[str, Any]
+    """Where it came from (`commit` is the pinned Hub revision)."""
+
+    stage: str
+    """`EXPERIMENTAL`, `CANDIDATE`, `APPROVED` or `ARCHIVED`."""
+
+    state: str
+    """`IMPORTING`, `READY`, `INVALID` or `ARCHIVED`."""
+
+    weights_sha256: NotRequired[str | None]
+    """The hash runs record as `base_model_sha256`."""
+
+
+class ModelVersionInfoPage(TypedDict):
+    """One page of results."""
+
+    items: list[ModelVersionInfo]
+    """The items on this page."""
+
+    next_cursor: NotRequired[str | None]
+    """Pass as `cursor` for the next page; `null` on the last page."""
+
+
 class NewArtifact(TypedDict):
     """`POST /artifacts` body."""
 
@@ -1034,6 +1293,13 @@ class NewLink(TypedDict):
 
     to: NotRequired[str | None]
     """The other entity, when this artifact points at it (like `derived_from` a checkpoint)."""
+
+
+class NewModel(TypedDict):
+    """`POST /projects/{prj}/models` body."""
+
+    name: str
+    """1-128 letters, digits, dots, dashes or underscores."""
 
 
 class NewSecret(TypedDict):
@@ -2210,10 +2476,14 @@ __all__ = [
     "Experiment",
     "ExperimentPage",
     "ExperimentPatch",
+    "ExportModel",
+    "ExportTarget",
     "FieldError",
     "GpuView",
     "Graph",
     "Health",
+    "ImportModel",
+    "ImportSource",
     "Job",
     "JobPage",
     "JobPatch",
@@ -2224,14 +2494,24 @@ __all__ = [
     "LoginStarted",
     "Machine",
     "Me",
+    "MergeAdapter",
     "MetricPointView",
     "MetricQueryResult",
     "MetricSeriesPoints",
     "MetricSeriesView",
+    "ModelExportJob",
+    "ModelFileInfo",
+    "ModelInfo",
+    "ModelInfoPage",
+    "ModelLicense",
+    "ModelVersionAction",
+    "ModelVersionInfo",
+    "ModelVersionInfoPage",
     "NewArtifact",
     "NewExperiment",
     "NewItem",
     "NewLink",
+    "NewModel",
     "NewSecret",
     "NewToken",
     "NewUpload",

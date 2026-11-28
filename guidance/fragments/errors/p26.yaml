@@ -1,0 +1,58 @@
+# P26 model registry: imports, gates, promotion, merging and export.
+errors:
+  - code: MRL-MODEL-260
+    title: Turning pickle weights into safetensors isn't available yet.
+    why: Pickle files can run code when they are loaded, so the app accepts only safetensors weights. A safe, sandboxed conversion is planned for a later release.
+    what_to_do:
+      steps:
+        - Look for a safetensors copy of this model on the Hub (many repos have one, or a "safetensors" branch).
+        - Or convert it yourself on a machine you trust and upload the safetensors files.
+
+  - code: MRL-MODEL-261
+    title: This export format isn't available yet.
+    why: Exports to llama.cpp files or quantized formats come in a later release. Today a model version exports as standard Hugging Face safetensors files.
+    what_to_do:
+      steps:
+        - Export without a format (Hugging Face safetensors).
+        - Convert the exported files with the llama.cpp tools if you need that format now.
+
+  - code: MRL-MODEL-262
+    title: This project hasn't accepted the model's license yet.
+    why: Every model comes with license terms. Before the first run on a model version, someone in the project must read and accept its license.
+    what_to_do:
+      steps:
+        - Open the model version and read its license.
+        - Accept it (acknowledge the license), then submit the run again.
+
+  - code: MRL-MODEL-263
+    title: This model version isn't ready.
+    why: A model version can be used only after its files are checked. This one is still being checked, or it failed the checks.
+    what_to_do:
+      steps:
+        - Wait for the import to finish and refresh.
+        - If it failed, read the reason on the version and import it again.
+
+  - code: MRL-MODEL-264
+    title: This adapter needs a full-precision base model.
+    why: A LoRA adapter only adds small changes to the ready base model version it was trained on. Merging also needs a base that isn't quantized.
+    what_to_do:
+      steps:
+        - Import the base model the adapter was trained on first.
+        - Import or merge the adapter with that base model version.
+        - To merge, use the full-precision (not 4-bit or 8-bit) base.
+
+  - code: MRL-MODEL-265
+    title: This checkpoint can't become a model version.
+    why: Only a saved checkpoint that holds model weights or an adapter can be promoted. Checkpoints still being saved, damaged ones, and ones holding only resume state can't.
+    what_to_do:
+      steps:
+        - Promote the run's final checkpoint after the run has completed.
+        - If the checkpoint is damaged, promote an earlier one.
+
+  - code: MRL-MODEL-266
+    title: This model version changed since you looked at it.
+    why: Approving custom code or accepting a license applies to exactly what you reviewed. The request named another revision or license text than the version holds.
+    what_to_do:
+      steps:
+        - Refresh the model version.
+        - Review its revision and license again, then confirm once more.

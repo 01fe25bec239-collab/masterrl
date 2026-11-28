@@ -48,6 +48,9 @@ mod p24_engines;
 #[path = "../../mrl-server/src/modules/builtin/integration_tests.rs"]
 mod int6_builtin;
 // <mrl:testkit P26> P26 `pub mod` lines go right below this line.
+#[cfg(test)]
+#[path = "../../mrl-server/src/modules/models/integration_tests.rs"]
+mod p26_models;
 // <mrl:testkit P27> P27 `pub mod` lines go right below this line.
 // <mrl:testkit P28> P28 `pub mod` lines go right below this line.
 // <mrl:testkit P29> P29 `pub mod` lines go right below this line.

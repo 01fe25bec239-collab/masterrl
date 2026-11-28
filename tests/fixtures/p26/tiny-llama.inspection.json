@@ -1,0 +1,94 @@
+{
+  "active_param_count": 1033344,
+  "adapter": null,
+  "architecture": "LlamaForCausalLM",
+  "architectures": [
+    "LlamaForCausalLM"
+  ],
+  "auto_map": {},
+  "chat_template_names": [
+    "default"
+  ],
+  "chat_template_sha256": "93f7917c316a23f5718c188562bdd83baba4b682bc06c9ebf2bc9d4ed38fcb12",
+  "context_length": 512,
+  "dtype": "float32",
+  "files": [
+    {
+      "path": "config.json",
+      "role": "config",
+      "sha256": "206ecf46f75cf2c38b1bc67fb5a58f682dc85a04276f44ccdd7265984c86e4cb",
+      "size": 655
+    },
+    {
+      "path": "generation_config.json",
+      "role": "config",
+      "sha256": "f8d6d5d8d8521d521df1f07e83011e7788931f54f69f21673a118e3b94729e1e",
+      "size": 66
+    },
+    {
+      "path": "model.safetensors",
+      "role": "weights",
+      "sha256": null,
+      "size": 4137408
+    },
+    {
+      "path": "tokenizer.json",
+      "role": "tokenizer",
+      "sha256": "740f2cdff670325ad61758f8117aed40540527dfba1be91f838e2e17d5e22b5c",
+      "size": 13391
+    },
+    {
+      "path": "tokenizer_config.json",
+      "role": "tokenizer",
+      "sha256": "178deb6384d2b394966ee0fcf465eabd6ce0439829780c69055acf8c68649d53",
+      "size": 643
+    }
+  ],
+  "format": "safetensors",
+  "generation": {
+    "bos_token_id": 1,
+    "eos_token_ids": [
+      2
+    ],
+    "max_length": null,
+    "pad_token_id": 0
+  },
+  "has_generation_tags": true,
+  "inference_only_code": null,
+  "kind": "full_weights",
+  "license": {
+    "kind": "spdx",
+    "sha256": "4beed031426c99ee6062c953b17b90a3589fe90b3421b090992281b96fd2add7",
+    "spdx": "apache-2.0"
+  },
+  "model_type": "llama",
+  "moe": null,
+  "notes": [],
+  "param_count": 1033344,
+  "param_count_exact": true,
+  "params_by_dtype": {
+    "float32": 1033344
+  },
+  "quantization": null,
+  "refusal": null,
+  "remote_code_code": null,
+  "requires_remote_code": false,
+  "rope_scaling": null,
+  "shape": {
+    "head_dim": 32,
+    "hidden_size": 128,
+    "intermediate_size": 512,
+    "num_attention_heads": 4,
+    "num_kv_heads": 2,
+    "num_layers": 4,
+    "tie_word_embeddings": true,
+    "vocab_size": 384
+  },
+  "source": {},
+  "tokenizer_sha256": {
+    "tokenizer.json": "740f2cdff670325ad61758f8117aed40540527dfba1be91f838e2e17d5e22b5c",
+    "tokenizer_config.json": "178deb6384d2b394966ee0fcf465eabd6ce0439829780c69055acf8c68649d53"
+  },
+  "vision": null,
+  "weight_bytes": 4133376
+}

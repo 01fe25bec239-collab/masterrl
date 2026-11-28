@@ -746,6 +746,28 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         "This checkpoint can't resume training.",
     ),
     // <mrl:errors P26> rows for P26 go right below this line.
+    (
+        code(Model, 260),
+        "Turning pickle weights into safetensors isn't available yet.",
+    ),
+    (code(Model, 261), "This export format isn't available yet."),
+    (
+        code(Model, 262),
+        "This project hasn't accepted the model's license yet.",
+    ),
+    (code(Model, 263), "This model version isn't ready."),
+    (
+        code(Model, 264),
+        "This adapter needs a full-precision base model.",
+    ),
+    (
+        code(Model, 265),
+        "This checkpoint can't become a model version.",
+    ),
+    (
+        code(Model, 266),
+        "This model version changed since you looked at it.",
+    ),
     // <mrl:errors P27> rows for P27 go right below this line.
     // <mrl:errors P28> rows for P28 go right below this line.
     // <mrl:errors P29> rows for P29 go right below this line.
