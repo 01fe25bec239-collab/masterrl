@@ -310,15 +310,25 @@ export class Desktop {
    * Memory of the app's own processes and of the core with its PostgreSQL, in MB, and the
    * plain RSS sum of all of them (reported, not budgeted).
    */
-  memory(): { shellMb: number; coreMb: number; rssMb: number; corePid: number | undefined } {
+  memory(): {
+    shellMb: number;
+    coreMb: number;
+    rssMb: number;
+    corePid: number | undefined;
+    /** Each app process, like `gpu-process 120`, to see where the shell's memory goes. */
+    shellDetail: string[];
+  } {
     const all = processes();
     const pid = this.app.process().pid;
     const tree = pid === undefined ? [] : subtree(all, pid);
     const core = tree.find((p) => /mrl-server(\.exe)?\s+--mode\s+solo/.test(p.args));
     const coreTree = core ? subtree(all, core.pid) : [];
     const coreIds = new Set(coreTree.map((p) => p.pid));
+    const shell = tree.filter((p) => !coreIds.has(p.pid));
+    const kind = (p: Proc) => /--type=([a-z-]+)/.exec(p.args)?.[1] ?? 'main';
     return {
-      shellMb: memoryMb(tree.filter((p) => !coreIds.has(p.pid))),
+      shellDetail: shell.map((p) => `${kind(p)} ${String(memoryMb([p]))}`),
+      shellMb: memoryMb(shell),
       coreMb: memoryMb(coreTree),
       rssMb: Math.round(tree.reduce((n, p) => n + p.rssKb, 0) / 1024),
       corePid: core?.pid,

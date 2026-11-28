@@ -250,6 +250,7 @@ test('idle memory stays within budget', async () => {
   budgets.shellMb = m.shellMb;
   budgets.coreMb = m.coreMb;
   budgets.rssSumMb = m.rssMb;
+  console.log(`app shell processes (MB): ${m.shellDetail.join(', ')}`);
   expect(m.shellMb).toBeLessThanOrEqual(BUDGET.shellMb);
   expect(m.coreMb).toBeLessThanOrEqual(BUDGET.coreMb);
 });
