@@ -194,7 +194,9 @@ class CodeUnitTests(_CodeComponent):
         passed = sum(1 for r in rows if r[1] is True)
         total = len(items)
         if total == 0:
-            return RewardResult.ok(0.0, {"code_found": True, "tests": 0}, *flags)
+            return RewardResult.failed(
+                Status.ERROR, "the verifier returned no complete test results"
+            )
         value = passed / total if self.scoring == "fraction" else float(passed == total)
         first_fail = next((r for r in rows if r[1] is not True), None)
         diag: dict[str, str | int | bool] = {"code_found": True, "passed": passed, "tests": total}

@@ -135,7 +135,7 @@ fn output_bytes(dir: &Path) -> u64 {
 /// The sandboxed command (checks the folders it may read).
 pub fn spec(backend: &dyn SandboxBackend, c: &CommandSpec) -> Result<ExecSpec, ProfileError> {
     let mut reads = c.read_paths.clone();
-    reads.push(c.dir.join("work"));
+    reads.extend([c.dir.join("work"), c.dir.join("staging")]);
     for p in &reads {
         if let Some(root) = c.forbidden.iter().find(|r| inside(p, r)) {
             return Err(ProfileError::UserCodeRefused(format!(
@@ -144,6 +144,11 @@ pub fn spec(backend: &dyn SandboxBackend, c: &CommandSpec) -> Result<ExecSpec, P
                 root.display()
             )));
         }
+    }
+    if !backend.isolates() || backend.name() != "bubblewrap" {
+        return Err(ProfileError::UserCodeRefused(
+            "custom commands need an isolating bubblewrap backend".into(),
+        ));
     }
     let args: Vec<&str> = c.args.iter().map(String::as_str).collect();
     let mut spec = ExecSpec::new(&c.name, &c.program, &args, &c.dir);
@@ -160,7 +165,15 @@ pub async fn run(
     c: &CommandSpec,
     cancel: CancellationToken,
 ) -> Result<CommandResult, ProfileError> {
-    let spec = spec(backend, c)?;
+    run_spec(executor, spec(backend, c)?, c, cancel).await
+}
+
+async fn run_spec(
+    executor: &dyn Executor,
+    spec: ExecSpec,
+    c: &CommandSpec,
+    cancel: CancellationToken,
+) -> Result<CommandResult, ProfileError> {
     let logs = spec.log_dir.clone();
     let mut run = executor.spawn(spec).await?;
     let deadline = tokio::time::Instant::now() + c.timeout;
@@ -248,6 +261,7 @@ mod tests {
         assert_eq!(spec(&NoSandbox, &c).unwrap_err().code(), "MRL-RWD-295");
         let bw = crate::sandbox::bwrap::Bubblewrap::new(Some("/usr/bin/bwrap".into()));
         let c = cmd(dir.path(), "true");
+        assert_eq!(spec(&NoSandbox, &c).unwrap_err().code(), "MRL-RWD-295");
         let s = spec(&bw, &c).unwrap();
         assert!(!s.args.iter().any(|a| a == "--share-net"));
         let mut net = c.clone();
@@ -261,30 +275,16 @@ mod tests {
     async fn time_and_output_limits_stop_the_command() {
         let dir = tempfile::tempdir().unwrap();
         let ex = executor();
-        let ok = run(
-            &ex,
-            &NoSandbox,
-            &cmd(dir.path(), "echo hi"),
-            CancellationToken::new(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(ok.ending, Ending::Ok);
-        let slow = run(
-            &ex,
-            &NoSandbox,
-            &cmd(dir.path(), "sleep 30"),
-            CancellationToken::new(),
-        )
-        .await;
-        assert_eq!(slow.unwrap_err().code(), "MRL-RWD-298");
-        let loud = run(
-            &ex,
-            &NoSandbox,
-            &cmd(dir.path(), "yes flood"),
-            CancellationToken::new(),
-        )
-        .await;
+        let execute = |script| {
+            let c = cmd(dir.path(), script);
+            let args: Vec<&str> = c.args.iter().map(String::as_str).collect();
+            let spec = ExecSpec::new(&c.name, &c.program, &args, &c.dir);
+            let ex = &ex;
+            async move { run_spec(ex, spec, &c, CancellationToken::new()).await }
+        };
+        assert_eq!(execute("echo hi").await.unwrap().ending, Ending::Ok);
+        assert_eq!(execute("sleep 30").await.unwrap_err().code(), "MRL-RWD-298");
+        let loud = execute("yes flood").await;
         let e = loud.unwrap_err();
         assert_eq!(e.code(), limit_code());
         assert!(e.to_string().contains("printed more"), "{e}");

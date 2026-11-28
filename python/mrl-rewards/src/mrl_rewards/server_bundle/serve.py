@@ -24,16 +24,26 @@ socket, nonce on an inherited fd, refuses to start with a network), plus:
 from __future__ import annotations
 
 import argparse
+import json
+import math
 import os
 import shutil
 import signal
 import sys
 import threading
+from collections import OrderedDict
+from collections.abc import Mapping
 from pathlib import Path
+from typing import cast, override
 
+import grpc
+
+from mrl_rewards._generated.mrl.reward.v1 import reward_service_pb2 as pb
+from mrl_rewards.exec.bundle import LoadedBundle
 from mrl_rewards.exec.main import read_nonce
 from mrl_rewards.exec.server import STARTUP_FAILED, Audit, ExecLimits, RewardExecService, serve
-from mrl_rewards.policy.runtime import PolicyRuntime
+from mrl_rewards.policy.model import Normalization
+from mrl_rewards.policy.runtime import BatchFailedError, NormalizerState, PolicyRuntime, SampleScore
 from mrl_rewards.server_bundle import (
     PROFILE_ENV,
     USER_CODE_ENV,
@@ -43,13 +53,155 @@ from mrl_rewards.server_bundle import (
     python_paths,
     sandbox_proof,
 )
-from mrl_rewards.types import RewardError
+from mrl_rewards.types import JSONValue, RewardBatch, RewardError, RewardResult
 
 JAIL_ENV = "MRL_JAIL_SECCOMP"
 SUPERVISOR_ENV = "MRL_SUPERVISOR_SECCOMP"
 JAIL_DIR = "/run/mrl-jail"
 SYSTEM_PATHS = ("/usr", "/bin", "/sbin", "/lib", "/lib32", "/lib64", "/etc")
 SECCOMP_FD = 3
+_BATCH_SCOPE = "mrl-batch-scope"
+_NORMALIZER_STATE = "mrl-normalizer-state-bin"
+_MAX_STATE_BYTES = 6000
+_SANDBOX_VIOLATION = "MRL-RWD-294"
+_JAILED_COMPONENTS = frozenset({"code.compiles", "code.unit_tests"})
+
+
+class _SandboxBatchError(Exception):
+    pass
+
+
+class _SandboxPolicyRuntime(PolicyRuntime):
+    @override
+    def resolve(
+        self,
+        batch: RewardBatch,
+        raw: Mapping[tuple[int, str], RewardResult],
+        state: NormalizerState,
+    ) -> list[SampleScore]:
+        try:
+            return super().resolve(batch, raw, state)
+        except BatchFailedError as exc:
+            # A refused batch has no scores to carry the jail verdict to the worker.
+            if any(
+                self.providers[component_id].spec.name in _JAILED_COMPONENTS
+                and "sandbox_violation" in result.flags
+                for (_, component_id), result in raw.items()
+            ):
+                raise _SandboxBatchError from exc
+            raise
+
+
+class CheckpointedService(RewardExecService):
+    """Transfers running normalizer state with each authenticated Score call."""
+
+    def __init__(  # noqa: PLR0913 (same inputs as the reward service)
+        self,
+        bundle: LoadedBundle,
+        runtime: PolicyRuntime,
+        *,
+        nonce: str,
+        reward_version_id: str,
+        limits: ExecLimits,
+        audit: Audit,
+    ) -> None:
+        super().__init__(
+            bundle,
+            runtime,
+            nonce=nonce,
+            reward_version_id=reward_version_id,
+            limits=limits,
+            audit=audit,
+        )
+        policy = self.runtime.policy
+        self.running = Normalization.ZSCORE_RUNNING in (policy.per_component, policy.final)
+        self._state_lock = threading.Lock()
+        self._state_replies: OrderedDict[str, tuple[bytes, bytes]] = OrderedDict()
+
+    @override
+    def _score(
+        self, request: pb.ScoreRequest, start: float, context: grpc.ServicerContext
+    ) -> pb.ScoreResponse:
+        try:
+            return super()._score(request, start, context)
+        except _SandboxBatchError:
+            context.abort(grpc.StatusCode.ABORTED, _SANDBOX_VIOLATION)
+
+    @override
+    def Describe(
+        self, request: pb.DescribeRequest, context: grpc.ServicerContext
+    ) -> pb.DescribeResponse:
+        answer = super().Describe(request, context)
+        if self.running:
+            context.set_trailing_metadata(((_BATCH_SCOPE, "running"),))
+        elif self.runtime.policy.final is Normalization.MINMAX:
+            context.set_trailing_metadata(((_BATCH_SCOPE, "whole"),))
+        return answer
+
+    @override
+    def Score(self, request: pb.ScoreRequest, context: grpc.ServicerContext) -> pb.ScoreResponse:
+        if not self.running:
+            return super().Score(request, context)
+        self._auth(request.attempt_nonce, context)
+        raw = next((v for k, v in context.invocation_metadata() if k == _NORMALIZER_STATE), None)
+        if not isinstance(raw, bytes) or len(raw) > _MAX_STATE_BYTES:
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, "Supply the checkpointed normalizer state."
+            )
+        try:
+            state = _decode_state(raw)
+        except (ValueError, TypeError, KeyError, OverflowError) as e:
+            context.abort(
+                grpc.StatusCode.INVALID_ARGUMENT, f"The normalizer checkpoint is invalid: {e}"
+            )
+        with self._state_lock:
+            cached = self._state_replies.get(request.request_id)
+            if cached is not None and cached[0] != raw:
+                context.abort(
+                    grpc.StatusCode.ALREADY_EXISTS, "The batch has another normalizer checkpoint."
+                )
+            self.state = state
+            response = super().Score(request, context)
+            encoded = (
+                cached[1]
+                if cached
+                else json.dumps(
+                    self.state.to_dict(), separators=(",", ":"), allow_nan=False
+                ).encode()
+            )
+            if len(encoded) > _MAX_STATE_BYTES:
+                context.abort(
+                    grpc.StatusCode.RESOURCE_EXHAUSTED, "The normalizer state is too large."
+                )
+            if request.request_id:
+                self._state_replies[request.request_id] = (raw, encoded)
+                self._state_replies.move_to_end(request.request_id)
+                while len(self._state_replies) > self.limits.response_cache_entries:
+                    self._state_replies.popitem(last=False)
+            context.set_trailing_metadata(((_NORMALIZER_STATE, encoded),))
+            return response
+
+
+def _decode_state(raw: bytes) -> NormalizerState:
+    state = json.loads(raw)
+    if not isinstance(state, dict):
+        raise ValueError("expected an object")
+    for key, value in cast(dict[str, object], state).items():
+        if not isinstance(value, dict):
+            raise ValueError(f"{key} is missing statistics")
+        stats = cast(dict[str, object], value)
+        n, mean, m2 = (stats[k] for k in ("n", "mean", "m2"))
+        if (
+            type(n) is not int
+            or not 0 <= n <= (1 << 53)
+            or type(mean) not in (int, float)
+            or type(m2) not in (int, float)
+            or not math.isfinite(cast(float, mean))
+            or not math.isfinite(cast(float, m2))
+            or cast(float, m2) < 0
+        ):
+            raise ValueError(f"{key} has invalid statistics")
+    return NormalizerState.from_dict(cast(dict[str, JSONValue], state))
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -73,6 +225,7 @@ def _parser() -> argparse.ArgumentParser:
     ap.add_argument("--per-sample-timeout-ms", type=int, default=d.per_sample_timeout_ms)
     ap.add_argument("--hard-limit-s", type=float, default=d.hard_limit_s)
     ap.add_argument("--workers", type=int, default=d.workers)
+    ap.add_argument("--cache-entries", type=int, default=d.result_cache_entries)
     ap.add_argument("--seed", type=int, default=0)
     return ap
 
@@ -96,13 +249,16 @@ def start(args: argparse.Namespace, audit: Audit) -> tuple[RewardExecService, ob
     runtime = PolicyRuntime.build(
         bundle.policy, bundle.registry, bundle_dir=bundle.root, seed=args.seed
     )
+    if args.tier == 2:
+        runtime = _SandboxPolicyRuntime(runtime.policy, runtime.providers)
     limits = ExecLimits(
         max_batch=args.max_batch,
         per_sample_timeout_ms=args.per_sample_timeout_ms,
         hard_limit_s=args.hard_limit_s,
         workers=args.workers,
+        result_cache_entries=args.cache_entries,
     )
-    service = RewardExecService(
+    service = CheckpointedService(
         bundle,
         runtime,
         nonce=nonce,

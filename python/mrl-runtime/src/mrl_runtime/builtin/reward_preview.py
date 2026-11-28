@@ -36,11 +36,14 @@ import json
 import os
 import random
 import secrets
+import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
 from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, cast
 
@@ -48,7 +51,13 @@ from mrl_runtime.adapter.events import Progress
 from mrl_runtime.adapter.types import Issue
 from mrl_runtime.builtin.tasks import BuiltinTask, TaskContext, TaskEvent, TaskOutput
 from mrl_runtime.errors import TASK_INPUT_INVALID, MrlError
-from mrl_runtime.rewards_client import RewardClient, RewardInfraError, RewardOutcome, Sample
+from mrl_runtime.rewards_client import (
+    SANDBOX_VIOLATION,
+    RewardClient,
+    RewardInfraError,
+    RewardOutcome,
+    Sample,
+)
 
 REPORT = "report.json"
 ROWS = "rows.jsonl"
@@ -57,6 +66,8 @@ MODES = ("test", "preview", "regression", "compare")
 NO_GENERATION = "MRL-RWD-296"
 SERVICE_FAILED = "MRL-RWD-293"
 MAX_SAMPLES = 5000
+MAX_GOLDEN_SAMPLES = 16
+MAX_GOLDEN_BYTES = 128 << 10
 MAX_GENERATIONS = 16
 MAX_NEW_TOKENS = 1024
 START_TIMEOUT_S = 60.0
@@ -142,7 +153,9 @@ class Service:
             for p in code:
                 (bundle / "code" / p.name).write_bytes(p.read_bytes())
         self.user_code = bool(code)
-        self.socket = self.dir / "s.sock"
+        socket_dir = self.dir / "s"
+        socket_dir.mkdir()
+        self.socket = socket_dir / "s.sock"
         self.nonce = secrets.token_hex(24)
         read, write = os.pipe()
         os.write(write, self.nonce.encode())
@@ -165,6 +178,7 @@ class Service:
             "--nonce-fd",
             str(read),
         ]
+        cmd.extend(("--cache-entries", "0"))
         if self.user_code:
             cmd.append("--user-code")
         elif os.environ.get("MRL_USER_CODE_ALLOWED") != "1":
@@ -188,6 +202,7 @@ class Service:
             nonce=self.nonce,
             reward_version_id=self.version,
             attempt_id=f"preview:{self.version}",
+            expected_sha256=cast(str | None, reward.get("exec_sha256")),
             timeout_s=60.0,
         )
 
@@ -210,6 +225,8 @@ class Service:
 
     def start_failure(self) -> tuple[str, str]:
         """The code and message the service gave for not starting (its `start_failed` line)."""
+        if self.violated_sandbox():
+            return SANDBOX_VIOLATION, "The sandbox stopped the reward service."
         code, message = SERVICE_FAILED, "The reward service stopped while starting."
         for line in self.excerpt().splitlines():
             try:
@@ -224,6 +241,23 @@ class Service:
                 if str(d.get("code", "")).startswith("MRL-"):
                     code, message = str(d["code"]), str(d.get("message", message))
         return code, message
+
+    def violated_sandbox(self) -> bool:
+        """Whether the service was stopped by the sandbox's system-call filter."""
+        sigsys = getattr(signal, "SIGSYS", None)
+        return sigsys is not None and self.proc.poll() in (-sigsys, 128 + sigsys)
+
+    def score(self, samples: Sequence[Sample]) -> list[RewardOutcome]:
+        """Scores a batch and reports sandbox termination distinctly from service downtime."""
+        try:
+            outcomes = self.client.score(samples)
+        except RewardInfraError as e:
+            if self.violated_sandbox():
+                raise MrlError(SANDBOX_VIOLATION, "The sandbox stopped the reward service.") from e
+            raise
+        if any("sandbox_violation" in outcome.flags for outcome in outcomes):
+            raise MrlError(SANDBOX_VIOLATION, "The sandbox stopped the reward code.")
+        return outcomes
 
     def excerpt(self) -> str:
         """The end of the service's log."""
@@ -267,25 +301,25 @@ def _case_sample(case: Mapping[str, Any]) -> Sample:
     return Sample(
         prompt=str(s.get("prompt", "")),
         completion=str(s.get("completion", "")),
-        group_id=f"case:{case.get('position', 0)}",
+        group_id=str(s.get("group_id") or f"case:{case.get('position', 0)}"),
         reference=s.get("reference"),
         completion_token_count=int(s.get("completion_token_count", 0) or 0),
         finish_reason=str(s.get("finish_reason", "stop")),
     )
 
 
-def _read_rows(path: Path) -> list[dict[str, Any]]:
+def _read_rows(path: Path) -> Iterator[dict[str, Any]]:
     files = sorted(p for p in path.rglob("*") if p.is_file()) if path.is_dir() else [path]
-    rows: list[dict[str, Any]] = []
-    for f in files:
-        if f.suffix == ".parquet":
+    for file in files:
+        if file.suffix == ".parquet":
             pq: Any = importlib.import_module("pyarrow.parquet")
-            rows.extend(cast(list[dict[str, Any]], pq.read_table(f).to_pylist()))
-        elif f.suffix in (".jsonl", ".json"):
-            for line in f.read_text(encoding="utf-8").splitlines():
-                if line.strip():
-                    rows.append(cast(dict[str, Any], json.loads(line)))
-    return rows
+            for batch in pq.ParquetFile(file).iter_batches(batch_size=1024):
+                yield from cast(list[dict[str, Any]], batch.to_pylist())
+        elif file.suffix in (".jsonl", ".json"):
+            with file.open(encoding="utf-8") as stream:
+                for line in stream:
+                    if line.strip():
+                        yield cast(dict[str, Any], json.loads(line))
 
 
 def _prompt_text(value: object) -> str:
@@ -306,10 +340,10 @@ class _Generator:
         transformers: Any = importlib.import_module("transformers")
         self.torch.manual_seed(seed)
         self.tok: Any = transformers.AutoTokenizer.from_pretrained(
-            str(model_dir), local_files_only=True
+            str(model_dir), local_files_only=True, trust_remote_code=False
         )
         self.model: Any = transformers.AutoModelForCausalLM.from_pretrained(
-            str(model_dir), local_files_only=True
+            str(model_dir), local_files_only=True, trust_remote_code=False, use_safetensors=True
         )
         self.model.eval()
 
@@ -337,8 +371,14 @@ def _preview_samples(inputs: Mapping[str, Any], staged: Mapping[str, Path]) -> l
     p = cast(Mapping[str, Any], inputs.get("preview") or {})
     rows = _read_rows(staged[str(p.get("dataset", "dataset"))])
     rng = random.Random(int(p.get("seed", 0)))
-    n = min(int(p.get("n", 5)), len(rows))
-    picked = rng.sample(rows, n) if n else []
+    n = int(p.get("n", 5))
+    picked: list[dict[str, Any]] = []
+    for index, row in enumerate(rows):
+        if index < n:
+            picked.append(row)
+        elif (slot := rng.randrange(index + 1)) < n:
+            picked[slot] = row
+    rng.shuffle(picked)
     pf, cf, rf = (
         str(p.get(k, d))
         for k, d in (
@@ -379,7 +419,11 @@ def _case_result(
         if st != "OK":
             flags.append(f"{st.lower()}:{cid}")
     repeatable = again is None or all(
-        o.components.get(c) == again.components.get(c) for c in deterministic
+        o.components.get(c) == again.components.get(c)
+        and o.statuses.get(c) == again.statuses.get(c)
+        and c in o.components
+        and c in again.components
+        for c in deterministic
     )
     return {
         "position": position,
@@ -393,7 +437,7 @@ def _case_result(
     }
 
 
-def _row(i: int, s: Sample, o: RewardOutcome, version: str, latency_ms: float) -> dict[str, Any]:
+def _row(i: int, s: Sample, o: RewardOutcome, version: str) -> dict[str, Any]:
     return {
         "i": i,
         "group_id": s.group_id,
@@ -404,10 +448,25 @@ def _row(i: int, s: Sample, o: RewardOutcome, version: str, latency_ms: float) -
         "components": dict(o.components),
         "flags": list(o.flags),
         "completion_tokens": s.completion_token_count,
-        "latency_ms": latency_ms,
+        "chunk_index": o.chunk_index,
+        "latency_ms": o.latency_ms,
         "prompt_sha256": hashlib.sha256(s.prompt.encode()).hexdigest(),
         "completion": s.completion[:2000],
     }
+
+
+def _golden_samples(samples: Sequence[Sample]) -> list[dict[str, Any]]:
+    frozen: list[dict[str, Any]] = []
+    remaining = MAX_GOLDEN_BYTES
+    for sample in samples:
+        entry = asdict(sample)
+        n = len(json.dumps(entry, ensure_ascii=False).encode())
+        if n <= remaining:
+            frozen.append(entry)
+            remaining -= n
+            if len(frozen) == MAX_GOLDEN_SAMPLES:
+                break
+    return frozen
 
 
 def _score_cases(
@@ -419,8 +478,8 @@ def _score_cases(
         for c in (svc.client.description.components if svc.client.description else ())
         if c.deterministic
     }
-    first = svc.client.score(samples)
-    second = svc.client.score(samples) if twice else [None] * len(samples)
+    first = svc.score(samples)
+    second = svc.score(samples) if twice else [None] * len(samples)
     return [
         _case_result(int(c.get("position", i)), a, b, det)
         for i, (c, a, b) in enumerate(zip(cases, first, second, strict=True))
@@ -432,6 +491,7 @@ def _run(ctx: TaskContext) -> Iterator[TaskEvent]:
     ctx.output_dir.mkdir(parents=True, exist_ok=True)
     work = Path(tempfile.mkdtemp(prefix="mrl-rp-"))
     services: list[Service] = []
+    violation = False
     try:
         a = Service(work, ctx.staged_paths, cast(Mapping[str, Any], ctx.inputs["reward"]), "reward")
         services.append(a)
@@ -461,14 +521,14 @@ def _run(ctx: TaskContext) -> Iterator[TaskEvent]:
             report["baseline_cases"] = _score_cases(b, base, twice=False)
         else:
             samples = _preview_samples(ctx.inputs, ctx.staged_paths)
+            if mode == "preview":
+                report["golden_samples"] = _golden_samples(samples)
             yield Progress(step=2, total_steps=3, phase="reward_preview")
             lines: list[str] = []
             for tag, svc in (("a", a), *((("b", b),) if b is not None else ())):
-                t0 = time.monotonic()
-                got = svc.client.score(samples)
-                per = (time.monotonic() - t0) * 1000 / max(1, len(samples))
+                got = svc.score(samples)
                 lines.extend(
-                    json.dumps(_row(i, s, o, tag, per))
+                    json.dumps(_row(i, s, o, tag))
                     for i, (s, o) in enumerate(zip(samples, got, strict=True))
                 )
                 if ctx.cancelled():
@@ -483,9 +543,22 @@ def _run(ctx: TaskContext) -> Iterator[TaskEvent]:
         (ctx.output_dir / REPORT).write_text(json.dumps(report, sort_keys=True), encoding="utf-8")
         yield Progress(step=3, total_steps=3, phase="reward_preview")
         yield from outputs
+    except MrlError as exc:
+        violation = (
+            exc.code == SANDBOX_VIOLATION
+            and os.environ.get("MRL_SANDBOX_PROFILE") == "code_exec"
+            and os.environ.get("MRL_USER_CODE_ALLOWED") == "1"
+            and sys.platform.startswith("linux")
+        )
+        if not violation:
+            raise
     finally:
-        for s in services:
-            s.close()
+        for service in services:
+            service.close()
+        shutil.rmtree(work)
+    if violation:
+        # The agent receives the same exit status as a bubblewrap wrapper that caught SIGSYS.
+        os._exit(128 + signal.SIGSYS)
 
 
 REWARD_PREVIEW = BuiltinTask(

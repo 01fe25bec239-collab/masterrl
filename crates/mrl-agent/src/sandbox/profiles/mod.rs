@@ -219,6 +219,29 @@ pub fn classify(report: &ExitReport) -> Ending {
     }
 }
 
+/// Whether exit evidence is a violation of an active hardened attempt profile.
+pub(crate) fn classify_attempt(
+    profile: Option<&str>,
+    backend: crate::config::SandboxChoice,
+    code: Option<i32>,
+    signal: Option<i32>,
+    oom_killed: bool,
+) -> bool {
+    cfg!(target_os = "linux")
+        && !matches!(backend, crate::config::SandboxChoice::None)
+        && profile.and_then(hardening).is_some()
+        && matches!(
+            classify(&ExitReport {
+                code,
+                signal,
+                oom_killed,
+                limits: Default::default(),
+                runtime_ms: 0,
+            }),
+            Ending::Violation(_)
+        )
+}
+
 // ---- seccomp ----
 
 const BPF_LD_W_ABS: u16 = 0x20;
@@ -660,6 +683,42 @@ mod tests {
 
     const ALLOW: u32 = RET_ALLOW;
     const KILL: u32 = RET_KILL_PROCESS;
+
+    #[test]
+    fn only_an_active_hardened_attempt_classifies_sandbox_kills() {
+        use crate::config::SandboxChoice;
+        assert_eq!(
+            classify_attempt(
+                Some("code_exec"),
+                SandboxChoice::Auto,
+                Some(159),
+                None,
+                false
+            ),
+            cfg!(target_os = "linux")
+        );
+        assert!(!classify_attempt(
+            Some("worker"),
+            SandboxChoice::Auto,
+            Some(159),
+            None,
+            false
+        ));
+        assert!(!classify_attempt(
+            Some("code_exec"),
+            SandboxChoice::None,
+            None,
+            Some(SIGSYS),
+            false
+        ));
+        assert!(!classify_attempt(
+            Some("code_exec"),
+            SandboxChoice::Auto,
+            None,
+            Some(9),
+            true
+        ));
+    }
 
     #[test]
     fn strict_filter_kills_escapes_and_allows_ordinary_calls() {

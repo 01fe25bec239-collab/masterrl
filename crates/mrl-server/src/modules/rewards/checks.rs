@@ -14,7 +14,7 @@ use super::store::{CaseRow, ReportRow, VersionRow};
 use super::verifier::{JOB_KIND, TASK};
 use super::RewardsError;
 use crate::db::Tx;
-use crate::modules::artifacts::InputFile;
+use crate::modules::artifacts::{Idempotency, InputFile};
 use crate::modules::builtin::{self, BuiltinJob};
 use mrl_domain::ids::RewardVersionId;
 use serde_json::{json, Value};
@@ -108,8 +108,53 @@ pub fn inputs(check: &NewCheck<'_>) -> Value {
     inputs
 }
 
+/// Replays a stored check under the same transaction lock used for starting it.
+pub(super) async fn replay(
+    tx: &mut Tx,
+    org: Uuid,
+    principal: &str,
+    idem: Option<&Idempotency>,
+) -> Result<Option<ReportRow>, RewardsError> {
+    let Some(idem) = idem else { return Ok(None) };
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("rewards:{org}:{principal}:{}", idem.key))
+        .execute(&mut **tx)
+        .await?;
+    let row = sqlx::query_as::<_, (Uuid, Option<String>)>(
+        "SELECT id, request_sha256 FROM reward_reports
+         WHERE org_id = $1 AND created_by = $2 AND idempotency_key = $3",
+    )
+    .bind(org)
+    .bind(principal)
+    .bind(&idem.key)
+    .fetch_optional(&mut **tx)
+    .await?;
+    let Some((id, fingerprint)) = row else {
+        return Ok(None);
+    };
+    if fingerprint.as_deref() != Some(&idem.request_sha256) {
+        return Err(crate::error::ApiError::new(
+            crate::error::ErrorCode::IdempotencyMismatch,
+            "This key was already used for a different reward check.",
+        )
+        .into());
+    }
+    Ok(sqlx::query_as::<_, ReportRow>(concat!(
+        "SELECT ",
+        crate::reward_report_cols!(),
+        " FROM reward_reports WHERE id = $1"
+    ))
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?)
+}
+
 /// Creates the check's job (QUEUED) and its PENDING report in `tx`.
-pub async fn start(tx: &mut Tx, check: NewCheck<'_>) -> Result<ReportRow, RewardsError> {
+pub(super) async fn start(
+    tx: &mut Tx,
+    check: NewCheck<'_>,
+    idem: Option<&Idempotency>,
+) -> Result<ReportRow, RewardsError> {
     let v = check.version;
     let job = builtin::submit(
         tx,
@@ -130,8 +175,8 @@ pub async fn start(tx: &mut Tx, check: NewCheck<'_>) -> Result<ReportRow, Reward
     Ok(sqlx::query_as::<_, ReportRow>(concat!(
         "INSERT INTO reward_reports
             (id, org_id, project_id, version_id, other_version_id, mode, job_id, state, request,
-             created_by)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', $8, $9) RETURNING ",
+             created_by, idempotency_key, request_sha256)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, 'PENDING', $8, $9, $10, $11) RETURNING ",
         crate::reward_report_cols!()
     ))
     .bind(Uuid::now_v7())
@@ -143,6 +188,8 @@ pub async fn start(tx: &mut Tx, check: NewCheck<'_>) -> Result<ReportRow, Reward
     .bind(job.id)
     .bind(&check.request)
     .bind(&check.created_by)
+    .bind(idem.map(|i| &i.key))
+    .bind(idem.map(|i| &i.request_sha256))
     .fetch_one(&mut **tx)
     .await?)
 }

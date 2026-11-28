@@ -203,7 +203,7 @@ impl LaunchContributor for RewardInputs {
         let v = store::version(&self.db, version)
             .await
             .map_err(transient)?
-            .filter(|v| v.org_id == job.org_id)
+            .filter(|v| v.org_id == job.org_id && v.project_id == job.project_id)
             .ok_or_else(|| {
                 LaunchError::Fail(
                     FailureClass::UserConfig,

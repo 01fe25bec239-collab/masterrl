@@ -140,13 +140,15 @@ def _clean(raw):
     if isinstance(doc.get("error"), str):
         out["error"] = doc["error"][:300]
     rows = doc.get("results")
-    if isinstance(rows, list):
+    if isinstance(rows, list) and len(rows) <= 1000:
         out["results"] = [
             [r[0][:200], r[1], r[2][:300]]
-            for r in rows[:1000]
+            for r in rows
             if isinstance(r, list) and len(r) == 3 and isinstance(r[0], str)
             and isinstance(r[1], bool) and isinstance(r[2], str)
         ]
+        if len(out["results"]) != len(rows):
+            out.pop("results")
     return out
 
 

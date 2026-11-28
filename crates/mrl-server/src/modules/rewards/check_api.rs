@@ -20,15 +20,15 @@ use super::{codes, RewardsError};
 use crate::app::AppState;
 use crate::error::{ErrorCode, FieldError};
 use crate::http::pagination::{Page, PageQuery};
-use crate::modules::artifacts::{InputFile, LOCAL_ORG};
+use crate::modules::artifacts::{Idempotency, InputFile, LOCAL_ORG};
 use crate::modules::jobs::{scope, JobsError};
-use crate::seams::{Decision, RequestContext, SeamError};
+use crate::seams::{RequestContext, SeamError};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
-use mrl_domain::ids::{ArtifactId, JobId, ProjectId};
+use mrl_domain::ids::{ArtifactId, JobId};
 use mrl_domain::state::RewardVersionEvent;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -168,7 +168,11 @@ fn report_view(r: &ReportRow) -> ReportView {
 }
 
 fn started(r: &ReportRow) -> Response {
-    (StatusCode::ACCEPTED, Json(report_view(r))).into_response()
+    let mut response = (StatusCode::ACCEPTED, Json(report_view(r))).into_response();
+    response
+        .extensions_mut()
+        .insert(crate::http::idempotency::NotReplayable);
+    response
 }
 
 fn field(path: &str, message: impl Into<String>, hint: &str) -> FieldError {
@@ -216,35 +220,12 @@ async fn readable_artifact(
     let id: ArtifactId = raw
         .parse()
         .map_err(|_| bad("This is not an artifact id (art_…).".into()))?;
-    let org_text = org_text(org);
-    let found = c
-        .store
-        .get(&org_text, id.as_uuid())
-        .await
-        .map_err(|e| RewardsError::from(SeamError::new("artifacts", e.to_string())))?;
-    let visible = match &found {
-        Some(a) => {
-            state
-                .seams
-                .authorizer
-                .authorize(ctx, "lineage.read", &a.resource(&org_text))
-                .await?
-                == Decision::Allow
-        }
-        None => false,
-    };
-    let Some(a) = found.filter(|_| visible) else {
-        return Err(bad("No artifact with this id exists.".into()));
-    };
+    let a = super::api::project_artifact(state, ctx, c, (org, project), id).await?;
     if a.state != "COMMITTED" {
         return Err(bad(format!(
             "The artifact is {}; use a committed one.",
             a.state
         )));
-    }
-    let own = ProjectId::from_uuid(project).to_string();
-    if a.project_id.as_deref().is_some_and(|p| p != own) {
-        return Err(bad("The artifact belongs to another project.".into()));
     }
     Ok(id.as_uuid())
 }
@@ -362,6 +343,17 @@ async fn code_of(c: &Ctx, v: &VersionRow, which: usize) -> Result<Vec<InputFile>
         .map_err(staged)
 }
 
+async fn prior_check(
+    c: &Ctx,
+    ctx: &RequestContext,
+    org: Uuid,
+    idem: Option<&Idempotency>,
+) -> Result<Option<ReportRow>, RewardsError> {
+    let Some(idem) = idem else { return Ok(None) };
+    let mut tx = c.db.begin().await?;
+    checks::replay(&mut tx, org, &ctx.principal.id, Some(idem)).await
+}
+
 async fn audit_start(
     tx: &mut crate::db::Tx,
     state: &AppState,
@@ -382,9 +374,14 @@ pub(super) async fn test_version(
     State(state): State<AppState>,
     Extension(c): Extension<Ctx>,
     ctx: RequestContext,
+    headers: HeaderMap,
     Path(rwdv): Path<String>,
 ) -> Result<Response, RewardsError> {
     let found = read_version(&state, &ctx, &c, &rwdv, "rewards.write").await?;
+    let idem = Idempotency::of(&headers, &("test", rwdv.as_str()));
+    if let Some(report) = prior_check(&c, &ctx, found.org_id, idem.as_ref()).await? {
+        return Ok(started(&report));
+    }
     let cases = store::cases(&c.db, found.id).await?;
     if cases.is_empty() {
         return Err(nothing(
@@ -393,6 +390,11 @@ pub(super) async fn test_version(
     }
     let files = code_of(&c, &found, 0).await?;
     let mut tx = c.db.begin().await?;
+    if let Some(report) =
+        checks::replay(&mut tx, found.org_id, &ctx.principal.id, idem.as_ref()).await?
+    {
+        return Ok(started(&report));
+    }
     let v = store::lock_version(&mut tx, found.id)
         .await?
         .ok_or_else(|| JobsError::not_found("reward version"))?;
@@ -414,6 +416,7 @@ pub(super) async fn test_version(
             request: json!({}),
             created_by: ctx.principal.id.clone(),
         },
+        idem.as_ref(),
     )
     .await?;
     let job = report.job_id;
@@ -444,15 +447,28 @@ pub(super) async fn preview_version(
     State(state): State<AppState>,
     Extension(c): Extension<Ctx>,
     ctx: RequestContext,
+    headers: HeaderMap,
     Path(rwdv): Path<String>,
     raw: Bytes,
 ) -> Result<Response, RewardsError> {
     let v = read_version(&state, &ctx, &c, &rwdv, "rewards.write").await?;
     let b: PreviewBody = body(&raw)?;
+    let idem = Idempotency::of(
+        &headers,
+        &("preview", rwdv.as_str(), super::hash::sha256_hex(&raw)),
+    );
+    if let Some(report) = prior_check(&c, &ctx, v.org_id, idem.as_ref()).await? {
+        return Ok(started(&report));
+    }
     let (preview, mut files) = samples(&state, &ctx, &c, (v.org_id, v.project_id), &b, "").await?;
     files.extend(code_of(&c, &v, 0).await?);
     let request: Value = serde_json::from_slice(&raw).unwrap_or_default();
     let mut tx = c.db.begin().await?;
+    if let Some(report) =
+        checks::replay(&mut tx, v.org_id, &ctx.principal.id, idem.as_ref()).await?
+    {
+        return Ok(started(&report));
+    }
     let report = checks::start(
         &mut tx,
         NewCheck {
@@ -466,6 +482,7 @@ pub(super) async fn preview_version(
             request,
             created_by: ctx.principal.id.clone(),
         },
+        idem.as_ref(),
     )
     .await?;
     audit_start(&mut tx, &state, &ctx, &v, "rewards.preview").await?;
@@ -482,6 +499,7 @@ pub(super) async fn regression_version(
     State(state): State<AppState>,
     Extension(c): Extension<Ctx>,
     ctx: RequestContext,
+    headers: HeaderMap,
     Path(rwdv): Path<String>,
 ) -> Result<Response, RewardsError> {
     let found = read_version(&state, &ctx, &c, &rwdv, "rewards.write").await?;
@@ -494,13 +512,19 @@ pub(super) async fn regression_version(
             ))
         }
     };
-    unpublished(&found)?;
+    let idem = Idempotency::of(&headers, &("regression", rwdv.as_str()));
     let mut tx = c.db.begin().await?;
+    if let Some(report) =
+        checks::replay(&mut tx, found.org_id, &ctx.principal.id, idem.as_ref()).await?
+    {
+        return Ok(started(&report));
+    }
+    unpublished(&found)?;
     let baseline = store::latest_published(&mut tx, found.reward_id, found.id).await?;
     tx.commit().await.map_err(crate::db::DbError::from)?;
     let no_baseline = "No earlier version of this reward is published, so there is nothing to compare with. A first version publishes without a comparison.";
     let baseline = baseline.ok_or_else(|| nothing(no_baseline))?;
-    let baseline_cases = store::cases(&c.db, baseline.id).await?;
+    let baseline_cases = store::regression_cases(&c.db, baseline.id).await?;
     if baseline_cases.is_empty() {
         return Err(nothing(
             "The published version has no test cases to compare on.",
@@ -509,6 +533,11 @@ pub(super) async fn regression_version(
     let mut files = code_of(&c, &found, 0).await?;
     files.extend(code_of(&c, &baseline, 1).await?);
     let mut tx = c.db.begin().await?;
+    if let Some(report) =
+        checks::replay(&mut tx, found.org_id, &ctx.principal.id, idem.as_ref()).await?
+    {
+        return Ok(started(&report));
+    }
     store::lock_definition(&mut tx, found.reward_id).await?;
     let v = store::lock_version(&mut tx, found.id)
         .await?
@@ -531,6 +560,7 @@ pub(super) async fn regression_version(
             request: json!({"against_version_id": vid(baseline.id)}),
             created_by: ctx.principal.id.clone(),
         },
+        idem.as_ref(),
     )
     .await?;
     audit_start(&mut tx, &state, &ctx, &v, "rewards.regression").await?;
@@ -547,6 +577,7 @@ pub(super) async fn compare_versions(
     State(state): State<AppState>,
     Extension(c): Extension<Ctx>,
     ctx: RequestContext,
+    headers: HeaderMap,
     raw: Bytes,
 ) -> Result<Response, RewardsError> {
     let b: CompareBody = body(&raw)?;
@@ -564,6 +595,10 @@ pub(super) async fn compare_versions(
             "Name another reward version as b.",
         )]));
     }
+    let idem = Idempotency::of(&headers, &("compare", super::hash::sha256_hex(&raw)));
+    if let Some(report) = prior_check(&c, &ctx, a.org_id, idem.as_ref()).await? {
+        return Ok(started(&report));
+    }
     let (preview, mut files) = samples(
         &state,
         &ctx,
@@ -577,6 +612,11 @@ pub(super) async fn compare_versions(
     files.extend(code_of(&c, &other, 1).await?);
     let request: Value = serde_json::from_slice(&raw).unwrap_or_default();
     let mut tx = c.db.begin().await?;
+    if let Some(report) =
+        checks::replay(&mut tx, a.org_id, &ctx.principal.id, idem.as_ref()).await?
+    {
+        return Ok(started(&report));
+    }
     let report = checks::start(
         &mut tx,
         NewCheck {
@@ -590,6 +630,7 @@ pub(super) async fn compare_versions(
             request,
             created_by: ctx.principal.id.clone(),
         },
+        idem.as_ref(),
     )
     .await?;
     audit_start(&mut tx, &state, &ctx, &a, "rewards.compare").await?;
@@ -610,23 +651,52 @@ pub(super) async fn list_reports(
 ) -> Result<Json<Page<ReportView>>, RewardsError> {
     let v = read_version(&state, &ctx, &c, &rwdv, "rewards.read").await?;
     let page = q.resolve()?;
-    let after = scope::after::<JobId>(&page, |j| j.as_uuid())?;
-    let rows = sqlx::query_as::<_, ReportRow>(concat!(
-        "SELECT ",
-        crate::reward_report_cols!(),
-        " FROM reward_reports WHERE org_id = $1 AND (version_id = $2 OR other_version_id = $2)
-           AND job_id IS NOT NULL AND ($3::uuid IS NULL OR job_id < $3)
-         ORDER BY job_id DESC LIMIT $4"
-    ))
-    .bind(v.org_id)
-    .bind(v.id)
-    .bind(after)
-    .bind(page.fetch() as i64)
-    .fetch_all(c.db.pool())
-    .await?;
-    let (rows, next_cursor) = scope::cut(rows, &page, |r| {
-        r.job_id
-            .map(|j| JobId::from_uuid(j).to_string())
+    let mut after = scope::after::<JobId>(&page, |j| j.as_uuid())?;
+    let mut visible = Vec::with_capacity(page.fetch());
+    let mut permissions = std::collections::HashMap::from([(v.project_id, true)]);
+    while visible.len() < page.fetch() {
+        let rows = sqlx::query_as::<_, ReportRow>(concat!(
+            "SELECT ",
+            crate::reward_report_cols!(),
+            " FROM reward_reports WHERE org_id = $1 AND (version_id = $2 OR other_version_id = $2)
+               AND job_id IS NOT NULL AND ($3::uuid IS NULL OR job_id < $3)
+             ORDER BY job_id DESC LIMIT $4"
+        ))
+        .bind(v.org_id)
+        .bind(v.id)
+        .bind(after)
+        .bind(page.fetch() as i64)
+        .fetch_all(c.db.pool())
+        .await?;
+        let exhausted = rows.len() < page.fetch();
+        after = rows.last().and_then(|row| row.job_id);
+        for report in rows {
+            let readable = match permissions.entry(report.project_id) {
+                std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+                std::collections::hash_map::Entry::Vacant(entry) => *entry.insert(
+                    scope::allowed(
+                        &state,
+                        &ctx,
+                        "rewards.read",
+                        &scope::resource("reward", None, report.org_id, report.project_id),
+                    )
+                    .await?,
+                ),
+            };
+            if readable {
+                visible.push(report);
+                if visible.len() == page.fetch() {
+                    break;
+                }
+            }
+        }
+        if exhausted {
+            break;
+        }
+    }
+    let (rows, next_cursor) = scope::cut(visible, &page, |row| {
+        row.job_id
+            .map(|job| JobId::from_uuid(job).to_string())
             .unwrap_or_default()
     });
     Ok(Json(Page {

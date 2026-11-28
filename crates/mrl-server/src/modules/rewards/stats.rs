@@ -42,6 +42,9 @@ pub struct Row {
     /// Scoring time of its batch per sample, in milliseconds.
     #[serde(default)]
     pub latency_ms: f64,
+    /// The Score RPC a sample was in. Absent on older reports.
+    #[serde(default)]
+    pub chunk_index: Option<u64>,
 }
 
 fn version_a() -> String {
@@ -228,7 +231,7 @@ pub struct Summary {
     pub total: Histogram,
     /// Each component.
     pub components: BTreeMap<String, Histogram>,
-    /// Median scoring time per sample (ms).
+    /// Median scoring request time (ms).
     pub latency_p50_ms: Option<f64>,
     /// 95th percentile (ms).
     pub latency_p95_ms: Option<f64>,
@@ -252,8 +255,10 @@ pub fn summarize(rows: &[&Row], warn_share: f64) -> Summary {
                 .extend(v.iter().copied());
         }
     }
+    let mut measured = std::collections::BTreeSet::new();
     let mut lat: Vec<f64> = rows
         .iter()
+        .filter(|r| r.chunk_index.is_none_or(|i| measured.insert(i)))
         .map(|r| r.latency_ms)
         .filter(|x| x.is_finite())
         .collect();
@@ -341,6 +346,7 @@ mod tests {
             flags: vec![],
             completion_tokens: (i as u32) * 10,
             latency_ms: i as f64,
+            chunk_index: None,
         }
     }
 

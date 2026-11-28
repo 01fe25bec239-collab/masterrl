@@ -28,6 +28,7 @@ pub mod policy;
 pub mod stats;
 pub mod storage;
 pub mod store;
+pub mod submission;
 pub mod verifier;
 
 use crate::app::{AppState, ServerModule};

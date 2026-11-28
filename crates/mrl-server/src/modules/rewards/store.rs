@@ -441,6 +441,53 @@ pub async fn cases(db: &Db, version: Uuid) -> Result<Vec<CaseRow>, RewardsError>
     .await?)
 }
 
+/// Freezes the latest preview sample set only on the definition's first publication.
+pub(super) async fn freeze_golden_samples(tx: &mut Tx, v: &VersionRow) -> Result<(), RewardsError> {
+    sqlx::query(
+        "UPDATE reward_definitions SET golden_samples = COALESCE((
+             SELECT golden_samples FROM reward_reports WHERE version_id = $2
+                   AND mode = 'preview' AND state = 'READY' AND golden_samples IS NOT NULL
+             ORDER BY job_id DESC LIMIT 1
+         ), '[]'::jsonb) WHERE id = $1 AND golden_samples IS NULL",
+    )
+    .bind(v.reward_id)
+    .bind(v.id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+/// The prior version's cases followed by the definition's frozen preview examples.
+pub(super) async fn regression_cases(
+    db: &Db,
+    baseline: Uuid,
+) -> Result<Vec<CaseRow>, RewardsError> {
+    let mut cases = cases(db, baseline).await?;
+    let frozen: Option<Value> = sqlx::query_scalar(
+        "SELECT d.golden_samples FROM reward_definitions d
+         JOIN reward_versions v ON v.reward_id = d.id WHERE v.id = $1",
+    )
+    .bind(baseline)
+    .fetch_one(db.pool())
+    .await?;
+    let first = cases.last().map_or(0, |c| c.position + 1);
+    if let Some(Value::Array(samples)) = frozen {
+        cases.extend(
+            samples
+                .into_iter()
+                .enumerate()
+                .map(|(index, sample)| CaseRow {
+                    position: first + index as i32,
+                    name: format!("Preview sample {}", index + 1),
+                    sample,
+                    expect: json!({}),
+                    last_result: None,
+                }),
+        );
+    }
+    Ok(cases)
+}
+
 /// The newest PUBLISHED version of a definition other than `except`.
 pub async fn latest_published(
     tx: &mut Tx,
@@ -607,7 +654,7 @@ pub async fn settle_report(
     };
     let n = sqlx::query(
         "UPDATE reward_reports SET state = $2, results = $3, reason = $4, artifact_id = $5,
-            finished_at = now()
+            finished_at = now(), prepared_result = NULL, prepared_artifact_id = NULL
          WHERE id = $1 AND state = 'PENDING'",
     )
     .bind(report)
