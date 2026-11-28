@@ -7,6 +7,7 @@ anything else is forwarded as undeclared (Doc 05 §11.6 rule 6).
 """
 
 import json
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -14,6 +15,11 @@ from mrl_runtime._generated.mrl.worker.v1 import worker_control_pb2 as pb
 from mrl_runtime.adapter.events import Metrics, Samples
 from mrl_runtime.adapter.manifest import DeclaredMetric
 from mrl_runtime.redact import Redactor
+
+try:
+    import resource  # Unix only; the runtime runs in WSL2 on Windows
+except ImportError:  # pragma: no cover
+    resource = None
 
 FRESHNESS: dict[str, pb.MetricKind] = {
     "live": pb.METRIC_KIND_LIVE,
@@ -64,6 +70,39 @@ class MetricsMapper:
         return sorted(
             m.name for m in self._by_name.values() if m.required and m.name not in self.seen
         )
+
+
+def add_resource_peaks(batch: pb.MetricsBatch, step: int, phase: str) -> None:
+    """Appends this process's memory peaks as `resource/…` points (bytes, Doc 07 §6.10).
+
+    The server keeps the peak per attempt, device and phase (the point's split) in
+    `resource_actuals`: `host_rss_peak` for the host, and per reserved GPU (the visible CUDA
+    devices, by NVML uuid) what torch allocated and reserved, when the engine already loaded
+    torch and used CUDA. Nothing is imported here.
+    """
+    peaks: dict[str, float] = {}
+    if resource is not None:
+        rss = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        peaks["resource/host_rss_peak"] = float(rss if sys.platform == "darwin" else rss * 1024)
+    torch = sys.modules.get("torch")
+    try:
+        if torch is not None and torch.cuda.is_initialized():
+            for i in range(torch.cuda.device_count()):
+                uuid = getattr(torch.cuda.get_device_properties(i), "uuid", None)
+                device = f"/GPU-{uuid}" if uuid else ""
+                peaks[f"resource/torch_allocated_peak{device}"] = float(
+                    torch.cuda.max_memory_allocated(i)
+                )
+                peaks[f"resource/torch_reserved_peak{device}"] = float(
+                    torch.cuda.max_memory_reserved(i)
+                )
+    except Exception:  # a sample is never worth failing the run
+        pass
+    for name, value in peaks.items():
+        point = batch.points.add(
+            name=name, step=step, value=value, split=phase, kind=pb.METRIC_KIND_LIVE
+        )
+        point.time.GetCurrentTime()
 
 
 class SampleEmitter:

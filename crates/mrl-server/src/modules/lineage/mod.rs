@@ -353,7 +353,7 @@ fn graph_resource(org: &str) -> Resource {
     Resource {
         kind: "lineage".to_owned(),
         id: None,
-        org: Some(org.to_owned()),
+        org: crate::modules::artifacts::rbac_org(org),
         project: None,
     }
 }

@@ -1420,17 +1420,25 @@ with tempfile.TemporaryDirectory() as d:
         .iter()
         .all(|e| e.event != "log" && e.event != "resync"));
     let path = format!("/api/v1/runs/{}", s.run_id());
-    let query = srv
-        .get_authed(&format!("{path}/metrics/query?series=train/loss"))
-        .await;
-    assert_eq!(query.status, 200, "{}", query.text());
-    assert_eq!(
-        query.json()["series"][0]["points"]
-            .as_array()
-            .unwrap()
-            .len(),
-        4
-    );
+    // The harness's own memory samples can be the first "metrics" event, so wait for all
+    // four loss points rather than for any metrics event.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let query = srv
+                .get_authed(&format!("{path}/metrics/query?series=train/loss"))
+                .await;
+            assert_eq!(query.status, 200, "{}", query.text());
+            let n = query.json()["series"][0]["points"]
+                .as_array()
+                .map_or(0, Vec::len);
+            if n == 4 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
     let sample_path = format!("{path}/samples");
     tokio::time::timeout(Duration::from_secs(10), async {
         loop {

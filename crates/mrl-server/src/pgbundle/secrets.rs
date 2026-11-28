@@ -54,7 +54,11 @@ impl SecretStore for FileSecretStore {
         let path = self.path(name)?;
         super::create_private_dir(&self.dir)
             .map_err(|e| io("could not create the secret folder", e))?;
-        let tmp = self.dir.join(format!(".{name}.tmp"));
+        // One temp file per write: writers of the same secret (several servers sharing a
+        // data folder, like test cores) never move each other's file away.
+        let tmp = self
+            .dir
+            .join(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
         super::write_private(&tmp, value.expose().as_bytes())
             .map_err(|e| io("could not write a secret", e))?;
         std::fs::rename(&tmp, &path).map_err(|e| io("could not save a secret", e))
@@ -72,6 +76,30 @@ impl SecretStore for FileSecretStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_writers_of_one_secret_all_succeed() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = std::sync::Arc::new(FileSecretStore::new(dir.path().join("s")));
+        let writes: Vec<_> = (0..16)
+            .map(|i| {
+                let s = s.clone();
+                tokio::spawn(async move { s.set("ca", Secret::new(format!("v{i}"))).await })
+            })
+            .collect();
+        for w in writes {
+            w.await.unwrap().unwrap();
+        }
+        assert!(s
+            .get("ca")
+            .await
+            .unwrap()
+            .unwrap()
+            .expose()
+            .starts_with('v'));
+        let left: Vec<_> = std::fs::read_dir(dir.path().join("s")).unwrap().collect();
+        assert_eq!(left.len(), 1, "temp files left behind");
+    }
 
     #[tokio::test]
     async fn set_get_delete() {

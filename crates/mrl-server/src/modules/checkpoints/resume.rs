@@ -32,12 +32,33 @@ impl LaunchContributor for ResumeInputs {
 
     async fn contribute(
         &self,
-        _job: &JobRow,
+        job: &JobRow,
         attempt: &AttemptRow,
         _placement: &Placement,
         plan: &mut LaunchPlan,
     ) -> Result<(), LaunchError> {
         let Some(checkpoint) = attempt.resume_from_checkpoint_id else {
+            // The scheduler pins a branched run's parent checkpoint while it is COMMITTED, so
+            // no pin means it became unusable: fail rather than train from scratch.
+            let parent: Option<Option<uuid::Uuid>> = match job.run_id {
+                Some(run) => sqlx::query_scalar(
+                    "SELECT parent_checkpoint_id FROM runs WHERE id = $1 AND org_id = $2",
+                )
+                .bind(run)
+                .bind(job.org_id)
+                .fetch_optional(self.db.pool())
+                .await
+                .map_err(|e| LaunchError::Transient(format!("the database did not answer: {e}")))?,
+                None => None,
+            };
+            if matches!(parent, Some(Some(_))) {
+                return Err(LaunchError::Fail(
+                    FailureClass::UserConfig,
+                    "The checkpoint this run starts from is no longer available. Pick another \
+                     checkpoint and submit the run again."
+                        .into(),
+                ));
+            }
             return Ok(());
         };
         let rows = sqlx::query(
