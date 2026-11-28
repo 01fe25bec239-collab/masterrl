@@ -1120,6 +1120,37 @@ async fn probe_jobs_run_but_stay_out_of_the_jobs_routes() {
     w.invariants().await;
 }
 
+/// A sandbox kill fails the job as SANDBOX_VIOLATION (never retried) and is audited.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn a_sandbox_violation_fails_the_job_and_is_audited() {
+    let w = World::start(false).await;
+    let m = w.agent(1).await;
+    let job = w
+        .queue_with(
+            json!({"roles": [{"role": "trainer", "replicas": 1, "gpu_count": 0,
+                "cpu_millis": 100, "mem_bytes": 1 << 20}]}),
+            None,
+        )
+        .await;
+    let attempt = w.running(job).await;
+    m.script.exit(
+        attempt,
+        ExitKind::Failed,
+        Some(FailureClass::SandboxViolation),
+    );
+    let row = w.wait_state(job, "FAILED").await;
+    assert_eq!(row.failure_class.as_deref(), Some("SANDBOX_VIOLATION"));
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM audit_events WHERE action = 'scheduler.sandbox_violation'",
+    )
+    .fetch_one(w.db.pool())
+    .await
+    .unwrap();
+    assert_eq!(audited, 1);
+    w.invariants().await;
+}
+
 /// INT-5: the scheduler's finalize uses P23's guards: a final checkpoint still being saved
 /// keeps the job FINALIZING; once it is COMMITTED the job completes.
 #[tokio::test(flavor = "multi_thread")]

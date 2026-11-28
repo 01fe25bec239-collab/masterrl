@@ -45,6 +45,9 @@ pub struct ExitEvidence {
     pub needs_final_checkpoint: bool,
     /// The worker process was re-adopted after an agent restart (no exit status).
     pub readopted: bool,
+    /// The job's sandbox killed the primary worker for a forbidden call (a seccomp kill:
+    /// P29's `profiles::classify`). Never retried.
+    pub sandbox_violation: bool,
     /// The agent itself stopped the workers (cancel, pause deadline, lease, stall, mismatch),
     /// so a signal or non-zero status is its own doing, not the worker's.
     pub agent_stopped: bool,
@@ -194,6 +197,14 @@ pub(super) fn evidence_failure(ev: &ExitEvidence) -> Option<Failure> {
             true,
         ));
     }
+    if ev.sandbox_violation {
+        return Some(agent_failure(
+            FailureClass::SandboxViolation,
+            "SANDBOX_KILL",
+            "The sandbox stopped the job because its code tried something it is not allowed to do.",
+            false,
+        ));
+    }
     if ev.oom_killed {
         return Some(agent_failure(
             FailureClass::Oom,
@@ -318,6 +329,17 @@ mod tests {
             classified_by: ClassifiedBy::Harness as i32,
             ..Failure::default()
         }
+    }
+
+    #[test]
+    fn a_sandbox_kill_is_a_violation_never_retried() {
+        let d = decide(&ExitEvidence {
+            signal: Some(31),
+            sandbox_violation: true,
+            ..ExitEvidence::default()
+        });
+        assert_eq!(d.class(), Some(FailureClass::SandboxViolation));
+        assert!(!d.failure.as_ref().unwrap().retryable_hint);
     }
 
     #[test]
