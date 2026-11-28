@@ -144,13 +144,14 @@ pub trait SubmissionResolver: Send + Sync {
         resolved: serde_json::Value,
     ) -> Result<serde_json::Value, ResolveError>;
     /// Saves what `resolve` decided, in the submit transaction once the run row exists.
-    /// Validate (a dry run) never calls it. `Err` fails the submit and saves nothing.
+    /// Validate (a dry run) never calls it. `Err` fails the submit and saves nothing;
+    /// `Invalid` answers 422 (like a pin that changed before this transaction locked it).
     async fn record(
         &self,
         tx: &mut crate::Tx,
         run_id: Uuid,
         scope: &SubmitScope,
-    ) -> Result<(), SeamError> {
+    ) -> Result<(), ResolveError> {
         let _ = (tx, run_id, scope);
         Ok(())
     }
@@ -373,7 +374,7 @@ impl Chains {
         tx: &mut crate::Tx,
         run_id: Uuid,
         scope: &SubmitScope,
-    ) -> Result<(), SeamError> {
+    ) -> Result<(), ResolveError> {
         for r in self.resolvers.iter() {
             r.record(tx, run_id, scope).await?;
         }

@@ -299,11 +299,18 @@ pub fn attempt_token(nonce: &str) -> String {
 
 /// Keeps an isolating sandbox's launcher (bubblewrap, which uses `--die-with-parent`) alive
 /// when the agent dies, so the worker can be re-adopted. Forwards SIGTERM and exits with the
-/// launcher's status.
+/// launcher's status, which it also writes to the file `$1` (see [`launcher_status`]).
 #[cfg(unix)]
-const KEEPER: &str = r#""$@" & c=$!
+const KEEPER: &str = r#"f=$1; shift
+"$@" & c=$!
 trap 'kill -TERM "$c" 2>/dev/null' TERM
-while :; do wait "$c"; s=$?; kill -0 "$c" 2>/dev/null || exit "$s"; done"#;
+while :; do wait "$c"; s=$?; kill -0 "$c" 2>/dev/null || { echo "$s" > "$f.tmp" && mv -f "$f.tmp" "$f"; exit "$s"; }; done"#;
+
+/// Where [`KEEPER`] leaves the launcher's exit status, so a re-adopted worker (not the
+/// agent's child) still ends with it: a sandbox kill stays a SANDBOX_VIOLATION.
+fn launcher_status(job_dir: &Path, role_id: &str) -> PathBuf {
+    job_dir.join("logs").join(role_id).join("launcher.status")
+}
 
 /// Now, Unix milliseconds.
 pub fn now_ms() -> i64 {
@@ -446,7 +453,12 @@ impl Runner {
             return Some(self.fail_early(e, &mut control).await);
         }
         for w in self.rec.workers.clone() {
-            let handle = spawn_watch(w.role_id.clone(), w.identity.clone(), self.exits_tx.clone());
+            let handle = spawn_watch(
+                w.role_id.clone(),
+                w.identity.clone(),
+                launcher_status(&self.job_dir, &w.role_id),
+                self.exits_tx.clone(),
+            );
             self.workers.insert(
                 w.role_id.clone(),
                 WorkerHandle {
@@ -864,7 +876,9 @@ impl Runner {
                 let wrapped = backend.wrap(&profile, spec, &allowed)?;
                 #[cfg(unix)]
                 let wrapped = if backend.isolates() {
-                    keep_alive(wrapped)
+                    let status = launcher_status(&self.job_dir, role_id);
+                    let _ = std::fs::remove_file(&status);
+                    keep_alive(wrapped, &status)
                 } else {
                     wrapped
                 };
@@ -2190,13 +2204,14 @@ pub fn upload_result(command_id: String, failure: Option<String>) -> CommandResu
 /// How long an ending attempt waits for uploads still running.
 const UPLOAD_DRAIN: Duration = Duration::from_secs(60);
 
-/// Runs `spec` under [`KEEPER`] (see there).
+/// Runs `spec` under [`KEEPER`] (see there), which writes the exit status to `status`.
 #[cfg(unix)]
-fn keep_alive(spec: ExecSpec) -> ExecSpec {
+fn keep_alive(spec: ExecSpec, status: &Path) -> ExecSpec {
     let mut args = vec![
         "-c".to_owned(),
         KEEPER.to_owned(),
         "mrl-keeper".to_owned(),
+        status.display().to_string(),
         spec.program.clone(),
     ];
     args.extend(spec.args.iter().cloned());
@@ -2454,10 +2469,12 @@ pub fn signal_identity(identity: &ProcIdentity, force: bool) {
     }
 }
 
-/// Watches a re-adopted worker (not the agent's child: no exit status, only liveness).
+/// Watches a re-adopted worker (not the agent's child: only liveness). Its exit status comes
+/// from the keeper's `status` file when it has one, a container's from `docker inspect`.
 fn spawn_watch(
     role_id: String,
     identity: ProcIdentity,
+    status: PathBuf,
     exits: mpsc::Sender<WorkerExit>,
 ) -> mpsc::Sender<StopMsg> {
     let (tx, mut rx) = mpsc::channel(4);
@@ -2500,7 +2517,12 @@ fn spawn_watch(
             ProcIdentity::Container { name, id } => {
                 container_exit(id.as_deref().unwrap_or(name)).await
             }
-            ProcIdentity::Pid { .. } => (None, false),
+            ProcIdentity::Pid { .. } => (
+                std::fs::read_to_string(&status)
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok()),
+                false,
+            ),
         };
         let _ = exits
             .send(WorkerExit {
@@ -2704,12 +2726,34 @@ mod tests {
             &["--die-with-parent", "--", "w"],
             Path::new("/s"),
         );
-        let k = keep_alive(spec);
+        let k = keep_alive(spec, Path::new("/s/st"));
         assert_eq!(k.program, "/bin/sh");
         assert_eq!(k.args[2], "mrl-keeper");
         assert_eq!(
             &k.args[3..],
-            ["/usr/bin/bwrap", "--die-with-parent", "--", "w"]
+            ["/s/st", "/usr/bin/bwrap", "--die-with-parent", "--", "w"]
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_readopted_worker_ends_with_the_keepers_saved_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = launcher_status(dir.path(), "main");
+        std::fs::create_dir_all(status.parent().unwrap()).unwrap();
+        let spec = ExecSpec::new("j", "/bin/sh", &["-c", "exit 159"], dir.path());
+        let k = keep_alive(spec, &status);
+        let mut child = std::process::Command::new(&k.program)
+            .args(&k.args)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert_eq!(child.wait().unwrap().code(), Some(159));
+        // The new agent watches it by pid; it is gone, so the saved status is the answer.
+        let (tx, mut rx) = mpsc::channel(1);
+        let identity = ProcIdentity::Pid { pid, start_time: 0 };
+        let _watch = spawn_watch("main".into(), identity, status, tx);
+        let exit = rx.recv().await.unwrap();
+        assert_eq!((exit.code, exit.readopted), (Some(159), true));
     }
 }

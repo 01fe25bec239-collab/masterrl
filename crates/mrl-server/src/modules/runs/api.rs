@@ -487,6 +487,14 @@ fn replay(row: &RunRow, fingerprint: &[u8]) -> Result<Response, JobsError> {
     Ok(response)
 }
 
+/// A resolver's answer: field errors are 422, a failed backend 503.
+fn resolve_error(e: ResolveError) -> JobsError {
+    match e {
+        ResolveError::Invalid(errors) => JobsError::Api(ApiError::validation(errors)),
+        ResolveError::Seam(s) => JobsError::Seam(s),
+    }
+}
+
 fn launch_input_error(e: artifacts::Error) -> JobsError {
     match e {
         artifacts::Error::Api(e) => e.into(),
@@ -736,10 +744,7 @@ pub async fn submit(
     let resolved = chains
         .resolve(&mut scope, &sub.config)
         .await
-        .map_err(|e| match e {
-            ResolveError::Invalid(errors) => JobsError::Api(ApiError::validation(errors)),
-            ResolveError::Seam(s) => JobsError::Seam(s),
-        })?;
+        .map_err(resolve_error)?;
     let resources = scope.resources.clone();
     let spec = JobSpec {
         org_id: org,
@@ -829,7 +834,10 @@ pub async fn submit(
     }
     // Resolvers save their decisions (like the estimate `estimate_id` names) before the
     // immutable config row points at them.
-    chains.record(&mut tx, run_id, &scope).await?;
+    chains
+        .record(&mut tx, run_id, &scope)
+        .await
+        .map_err(resolve_error)?;
     sqlx::query(
         "INSERT INTO run_configs (run_id, org_id, submitted, resolved, resolved_sha256, \
            dataset_version_ids, seeds, launch_inputs, estimate_id) \
