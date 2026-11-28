@@ -20,6 +20,7 @@ from mrl_runtime.builtin.engine import discover_tasks
 from mrl_runtime.builtin.reward_preview import REPORT, REPORT_FORMAT, REWARD_PREVIEW, ROWS
 from mrl_runtime.builtin.tasks import TaskContext, TaskOutput
 from mrl_runtime.errors import MrlError
+from mrl_runtime.rewards_client import SANDBOX_VIOLATION
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="Unix sockets")
 
@@ -285,7 +286,7 @@ def test_preview_propagates_a_nested_sandbox_failure_to_agent(
             pass
 
         def start(self) -> str:
-            raise MrlError(reward_preview.SANDBOX_VIOLATION, "The sandbox stopped the service.")
+            raise MrlError(SANDBOX_VIOLATION, "The sandbox stopped the service.")
 
         def close(self) -> None:
             pass
