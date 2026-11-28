@@ -239,9 +239,7 @@ async fn copy_local(
     file.flush().await.map_err(work::seam)?;
     drop(file);
     if mrl_storage::sha256_file(&path).await.map_err(work::seam)? != (size, sha.to_owned()) {
-        return Err(work::seam(
-            "The completed upload no longer matches its digest.",
-        ));
+        return Err(work::seam("The input no longer matches its digest."));
     }
     svc.store
         .put_blob(target, &path, destination, size, sha)
@@ -297,7 +295,7 @@ pub(super) struct Prepared {
     schema: String,
     source: &'static str,
     provenance: Value,
-    parent: Option<Uuid>,
+    parent: Option<(Uuid, bool)>,
     spec: Option<Value>,
     inputs: Value,
     files: Vec<InputFile>,
@@ -408,7 +406,10 @@ async fn prepare(
                 schema: transform_spec(&spec)?.into(),
                 source: "transform",
                 provenance: json!({"parent_version_id":parent_version_id}),
-                parent: Some(parent.id),
+                parent: Some((
+                    parent.id,
+                    !api::DatasetPolicy::of(&parent.sensitivity).export_allowed,
+                )),
                 spec: Some(spec.clone()),
                 inputs: json!({"spec":spec}),
                 files: work::dataset_inputs(&svc.db, parent.id, "parent").await?,
@@ -481,8 +482,9 @@ pub async fn create_version(
     };
     sqlx::query(
         "INSERT INTO dataset_versions (id,org_id,dataset_id,seq,schema_id,state,source_kind,
-            source_ref,parent_version_id,transform_spec,created_by,request_key,request_hash)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)",
+            source_ref,parent_version_id,transform_spec,created_by,request_key,request_hash,
+            inherited_restricted_pii)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,($14 OR dataset_version_is_restricted($9)))",
     )
     .bind(id)
     .bind(owner.0)
@@ -492,11 +494,12 @@ pub async fn create_version(
     .bind(status)
     .bind(p.source)
     .bind(p.provenance)
-    .bind(p.parent)
+    .bind(p.parent.map(|(id, _)| id))
     .bind(p.spec)
     .bind(&ctx.principal.id)
     .bind(idem.as_ref().map(|k| &k.key))
     .bind(idem.as_ref().map(|k| &k.request_sha256))
+    .bind(p.parent.is_some_and(|(_, restricted)| restricted))
     .execute(&mut *tx)
     .await?;
     work::originals(&mut tx, id, owner.0, &p.files).await?;
@@ -571,7 +574,7 @@ async fn derive(
     svc: &Datasets,
     ctx: &RequestContext,
     v: &store::VersionRow,
-    operation: (&str, &str, &str),
+    operation: (&str, &str, &str, Option<Idempotency>),
     inputs: Value,
     files: Vec<InputFile>,
 ) -> Result<Response, JobsError> {
@@ -585,7 +588,15 @@ async fn derive(
         files,
         vec![],
     );
-    derive_job(state, svc, ctx, v, operation.0, operation.2, job).await
+    derive_job(
+        state,
+        svc,
+        ctx,
+        v,
+        (operation.0, operation.2, operation.3),
+        job,
+    )
+    .await
 }
 
 async fn derive_job(
@@ -593,13 +604,50 @@ async fn derive_job(
     svc: &Datasets,
     ctx: &RequestContext,
     v: &store::VersionRow,
-    purpose: &str,
-    action: &str,
+    (purpose, action, idem): (&str, &str, Option<Idempotency>),
     job: crate::modules::builtin::BuiltinJob,
 ) -> Result<Response, JobsError> {
     let owner = (v.org_id, v.project_id);
     let mut tx = svc.db.begin().await?;
+    if let Some(key) = &idem {
+        // All keyed actions on a version serialize their lookup and enqueue.
+        sqlx::query("SELECT id FROM dataset_versions WHERE id=$1 FOR NO KEY UPDATE")
+            .bind(v.id)
+            .execute(&mut *tx)
+            .await?;
+        let earlier: Option<(Uuid, String, String)> = sqlx::query_as(
+            "SELECT job_id, purpose, request_hash FROM dataset_work
+             WHERE version_id=$1 AND requested_by=$2 AND request_key=$3",
+        )
+        .bind(v.id)
+        .bind(&ctx.principal.id)
+        .bind(&key.key)
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((id, previous, fingerprint)) = earlier {
+            if previous != purpose || fingerprint != key.request_sha256 {
+                return Err(ApiError::new(
+                    ErrorCode::IdempotencyMismatch,
+                    "This key was already used for a different dataset action request.",
+                )
+                .into());
+            }
+            tx.rollback().await.map_err(crate::db::DbError::from)?;
+            return Ok(work_accepted(id));
+        }
+    }
     let id = work::queue(&mut tx, v.id, purpose, job).await?;
+    if let Some(key) = idem {
+        sqlx::query(
+            "UPDATE dataset_work SET request_key=$1, request_hash=$2, requested_by=$3 WHERE job_id=$4",
+        )
+        .bind(key.key)
+        .bind(key.request_sha256)
+        .bind(&ctx.principal.id)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
     scope::audit(
         &mut tx,
         state,
@@ -610,13 +658,17 @@ async fn derive_job(
     )
     .await?;
     tx.commit().await.map_err(crate::db::DbError::from)?;
-    Ok((
+    Ok(work_accepted(id))
+}
+
+fn work_accepted(id: Uuid) -> Response {
+    (
         StatusCode::ACCEPTED,
         Json(DatasetWorkAccepted {
             job_id: JobId::from_uuid(id).to_string(),
         }),
     )
-        .into_response())
+        .into_response()
 }
 
 /// Queues a preview on the first 20 rows.
@@ -629,6 +681,7 @@ pub async fn transform_preview(
     ctx: &RequestContext,
     dsv: &str,
     req: DatasetTransformPreviewRequest,
+    idem: Option<Idempotency>,
 ) -> Result<Response, JobsError> {
     let v = api::authorized_version(state, &svc.db, ctx, dsv, "datasets.import").await?;
     api::ready(&v)?;
@@ -643,6 +696,7 @@ pub async fn transform_preview(
             "transform_preview",
             "transform",
             "datasets.transform_preview",
+            idem,
         ),
         json!({"spec":req.transform_spec,"preview":true}),
         files,
@@ -660,22 +714,37 @@ pub async fn tokenize(
     ctx: &RequestContext,
     dsv: &str,
     req: DatasetTokenizeRequest,
+    idem: Option<Idempotency>,
 ) -> Result<Response, JobsError> {
     let v = api::authorized_version(state, &svc.db, ctx, dsv, "datasets.read").await?;
     api::ready(&v)?;
     let id: ArtifactId = scope::parse_id(&req.tokenizer_artifact_id, "artifact")?;
     let org = storage_org(v.org_id);
     let project = ProjectId::from_uuid(v.project_id).to_string();
-    let artifact = svc
+    let mut source_org = org.as_str();
+    let mut artifact = svc
         .store
-        .get(&org, id.as_uuid())
+        .get(source_org, id.as_uuid())
         .await
-        .map_err(work::seam)?
+        .map_err(work::seam)?;
+    if artifact.is_none()
+        && org != artifacts::LOCAL_ORG
+        && state.config.server.mode == crate::config::Mode::Solo
+        && ctx.principal.kind == crate::seams::PrincipalKind::LocalOwner
+    {
+        source_org = artifacts::LOCAL_ORG;
+        artifact = svc
+            .store
+            .get(source_org, id.as_uuid())
+            .await
+            .map_err(work::seam)?;
+    }
+    let artifact = artifact
         .filter(|a| a.state == "COMMITTED" && a.project_id.as_deref() == Some(&project))
         .ok_or_else(|| JobsError::not_found("artifact"))?;
-    scope::authorize(state, ctx, "lineage.read", &artifact.resource(&org)).await?;
-    let st = svc.store.org_store(&org).await.map_err(work::seam)?;
-    let mut tokenizer = work::artifact_inputs(&st, &artifact.manifest, "tokenizer", "")
+    scope::authorize(state, ctx, "lineage.read", &artifact.resource(source_org)).await?;
+    let source = svc.store.org_store(source_org).await.map_err(work::seam)?;
+    let mut tokenizer = work::artifact_inputs(&source, &artifact.manifest, "tokenizer", "")
         .map_err(work::seam)?
         .into_iter()
         .filter(|f| {
@@ -706,17 +775,34 @@ pub async fn tokenize(
             "The artifact needs a tokenizer.json file.",
         ));
     }
-    let mut files = work::dataset_inputs(&svc.db, v.id, "dataset").await?;
-    files.extend(tokenizer);
     if req.context_length == Some(0) || req.max_records == Some(0) {
         return Err(bad("/max_records", "Choose a positive limit."));
     }
+    if source_org != org {
+        let target = svc.store.org_store(&org).await.map_err(work::seam)?;
+        for file in &mut tokenizer {
+            let key = target.keys().blob(&file.sha256).map_err(work::seam)?;
+            copy_local(
+                svc,
+                source_org,
+                &target,
+                &file.key,
+                &key,
+                &file.sha256,
+                file.size,
+            )
+            .await?;
+            file.key = key;
+        }
+    }
+    let mut files = work::dataset_inputs(&svc.db, v.id, "dataset").await?;
+    files.extend(tokenizer);
     derive(
         state,
         svc,
         ctx,
         &v,
-        ("tokenize", "data_prep", "datasets.tokenize_preview"),
+        ("tokenize", "data_prep", "datasets.tokenize_preview", idem),
         json!({"mode":"tokenize","context_length":req.context_length,
             "max_records":req.max_records.unwrap_or(2000).min(2000)}),
         files,
@@ -729,6 +815,7 @@ pub(super) async fn jsonl(
     svc: &Datasets,
     ctx: &RequestContext,
     dsv: &str,
+    idem: Option<Idempotency>,
 ) -> Result<Response, JobsError> {
     let v = api::authorized_version(state, &svc.db, ctx, dsv, "datasets.export").await?;
     api::export_allowed(&v)?;
@@ -739,7 +826,7 @@ pub(super) async fn jsonl(
         svc,
         ctx,
         &v,
-        ("jsonl", "materialize_dataset", "datasets.jsonl"),
+        ("jsonl", "materialize_dataset", "datasets.jsonl", idem),
         json!({"format":"jsonl"}),
         files,
     )
@@ -752,6 +839,7 @@ pub(super) async fn push_to_hub(
     ctx: &RequestContext,
     dsv: &str,
     req: api::DatasetExportRequest,
+    idem: Option<Idempotency>,
 ) -> Result<Response, JobsError> {
     let v = api::authorized_version(state, &svc.db, ctx, dsv, "datasets.export").await?;
     api::export_allowed(&v)?;
@@ -785,7 +873,15 @@ pub(super) async fn push_to_hub(
         files,
         vec![grant],
     );
-    derive_job(state, svc, ctx, &v, "hub_push", "datasets.hub_push", job).await
+    derive_job(
+        state,
+        svc,
+        ctx,
+        &v,
+        ("hub_push", "datasets.hub_push", idem),
+        job,
+    )
+    .await
 }
 
 /// Reads a version-scoped preview or export job result.

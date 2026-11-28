@@ -59,6 +59,8 @@ PARENT_INPUT = "parent"
 PREVIEW_FILE = "preview.json"
 REPORT_FILE = "transform_report.json"
 PREVIEW_ROWS = 20
+# Matches the server limit for a built-in JSON output.
+PREVIEW_MAX_BYTES = 8 * 1024 * 1024
 MAX_EXPR_CHARS = 2000
 MAX_DEPTH = 32
 
@@ -926,13 +928,31 @@ def _preview(ctx: TaskContext, spec: Json, parent: DatasetAdapter) -> Iterator[T
     before = {it.index: canonical_json(it.record) for it in _items(parent, PREVIEW_ROWS)}
     pipe = Pipeline(cast(list[Json], spec["steps"]))
     after = {it.index: it for it in pipe.run(_items(parent, PREVIEW_ROWS))}
-    rows: list[Json] = []
+
+    def encode(value: object) -> bytes:
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+
+    rows: list[bytes] = []
+    report = encode({"schema_id": spec["to"], "steps": pipe.report()})
+    truncated = b',"truncated":true'
+    suffix = b"}\n"
+    prefix = b',"rows":['
+    placeholders = {
+        index: encode({"index": index, "before": None, "after": None, "truncated": True})
+        for index in before
+    }
+    reserved = len(prefix + truncated + suffix) + max(0, len(before) - 1)
+    reserved += sum(map(len, placeholders.values()))
+    report_truncated = len(report) + reserved > PREVIEW_MAX_BYTES
+    if report_truncated:
+        report = encode({"schema_id": spec["to"], "steps": []})
+    remaining = PREVIEW_MAX_BYTES - len(report) - reserved
     limits = Limits()
     for index, raw in before.items():
         done = after.get(index)
         dropped = pipe.drops.get(index)
         defect = record_line(done.record, limits)[2] if done else None
-        rows.append(
+        row = encode(
             {
                 "index": index,
                 "before": json.loads(raw),
@@ -947,10 +967,22 @@ def _preview(ctx: TaskContext, spec: Json, parent: DatasetAdapter) -> Iterator[T
                 ),
             }
         )
+        placeholder = placeholders[index]
+        cost = len(row) - len(placeholder)
+        if cost <= remaining:
+            rows.append(row)
+            remaining -= cost
+        else:
+            rows.append(placeholder)
+            report_truncated = True
     ctx.output_dir.mkdir(parents=True, exist_ok=True)
-    body = {"schema_id": spec["to"], "rows": rows, "steps": pipe.report()}
-    (ctx.output_dir / PREVIEW_FILE).write_text(
-        json.dumps(body, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+    (ctx.output_dir / PREVIEW_FILE).write_bytes(
+        report[:-1]
+        + prefix
+        + b",".join(rows)
+        + b"]"
+        + (truncated if report_truncated else b"")
+        + suffix
     )
     yield TaskOutput(PREVIEW_FILE, "report", "json")
 

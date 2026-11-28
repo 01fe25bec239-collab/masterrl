@@ -1,6 +1,6 @@
 //! Keep direct downloads of Dataset Studio job outputs under dataset export policy.
 
-use super::api::{dataset_resource, DatasetPolicy, EXPORT_REFUSED_DETAIL};
+use super::api::{dataset_resource, EXPORT_REFUSED_DETAIL};
 use crate::app::AppState;
 use crate::db::Db;
 use crate::modules::artifacts::{not_found, Artifact, DownloadGuard, Error};
@@ -35,7 +35,7 @@ impl DownloadGuard for DatasetDownloadGuard {
             .flatten()
             .and_then(|(job, _)| job.parse::<JobId>().ok())
             .map(|id| id.as_uuid());
-        let datasets: Vec<(Uuid, Uuid, Uuid, String, bool)> = sqlx::query_as(
+        let datasets: Vec<(Uuid, Uuid, Uuid, bool, bool)> = sqlx::query_as(
             "WITH versions AS (
                  SELECT id FROM dataset_versions WHERE artifact_id=$1
                  UNION
@@ -44,7 +44,8 @@ impl DownloadGuard for DatasetDownloadGuard {
                  SELECT w.version_id FROM builtin_jobs b JOIN dataset_work w ON w.job_id=b.job_id
                  WHERE b.artifact_id=$1
              )
-             SELECT DISTINCT d.id, d.org_id, d.project_id, d.sensitivity, d.deleted_at IS NOT NULL
+             SELECT DISTINCT d.id, d.org_id, d.project_id, dataset_version_is_restricted(v.id),
+                    d.deleted_at IS NOT NULL
              FROM versions ids JOIN dataset_versions v ON v.id=ids.id
              JOIN datasets d ON d.id=v.dataset_id AND d.org_id=v.org_id",
         )
@@ -52,7 +53,7 @@ impl DownloadGuard for DatasetDownloadGuard {
         .bind(job)
         .fetch_all(self.0.pool())
         .await?;
-        for (id, org, project, sensitivity, deleted) in datasets {
+        for (id, org, project, restricted, deleted) in datasets {
             if deleted {
                 return Err(not_found("artifact"));
             }
@@ -62,7 +63,7 @@ impl DownloadGuard for DatasetDownloadGuard {
             state
                 .authorize(&ctx, "datasets.export", &dataset_resource(org, project, id))
                 .await?;
-            if !DatasetPolicy::of(&sensitivity).export_allowed {
+            if restricted {
                 return Err(Error::coded(
                     "MRL-PERM-270",
                     StatusCode::FORBIDDEN,

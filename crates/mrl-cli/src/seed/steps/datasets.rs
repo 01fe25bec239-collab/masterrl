@@ -1,7 +1,7 @@
 //! Seeds the text and chat fixtures through the resumable uploads and dataset APIs.
 
 use super::super::{SeedState, SeedStep};
-use crate::api::{all_items, Api};
+use crate::api::{all_items, Api, Failure};
 use crate::config_file::CliConfig;
 use serde_json::{json, Value};
 use std::time::{Duration, Instant};
@@ -134,28 +134,61 @@ fn upload(
     bytes: &[u8],
     sha: &str,
 ) -> Result<String, String> {
-    let row = api.post(
-        "/uploads",
-        Some(
-            &json!({"project_id":project,"filename":format!("{schema}.jsonl"),
-        "size":bytes.len(),"sha256":sha}),
-        ),
-        Some(&format!("dataset-seed-upload-{project}-{sha}")),
-    )?;
-    let upload = id(&row)?;
-    if row["state"] == "COMPLETED" {
-        return Ok(upload);
+    upload_with(
+        |path, body, key| api.post(path, body, key),
+        |path| put_part(path, bytes),
+        &json!({"project_id":project,"filename":format!("{schema}.jsonl"),
+               "size":bytes.len(),"sha256":sha}),
+        &format!("dataset-seed-upload-{project}-{sha}"),
+    )
+}
+
+fn upload_with(
+    mut post: impl FnMut(&str, Option<&Value>, Option<&str>) -> Result<Value, Failure>,
+    mut put: impl FnMut(&str) -> Result<(), String>,
+    body: &Value,
+    root_key: &str,
+) -> Result<String, String> {
+    let mut key = root_key.to_owned();
+    let mut closed = std::collections::HashSet::new();
+    loop {
+        let row = post("/uploads", Some(body), Some(&key))?;
+        let upload = id(&row)?;
+        let path = format!("/uploads/{upload}");
+        match row["state"].as_str() {
+            Some("COMPLETED") => return Ok(upload),
+            Some("ABORTED" | "EXPIRED") => {}
+            Some("OPEN") => {
+                match post(&format!("{path}:presign"), None, None) {
+                    Ok(presigned) => {
+                        if let Some(t) = presigned["tickets"].as_array().and_then(|a| a.first()) {
+                            put(t["ticket"]["url"]
+                                .as_str()
+                                .ok_or("Upload response had no part URL.")?)?;
+                        }
+                    }
+                    // A concurrent seed may already have completed it.
+                    Err(e) if upload_closed(&e) => {}
+                    Err(e) => return Err(e.into()),
+                }
+                match post(&format!("{path}:complete"), None, None) {
+                    Ok(_) => return Ok(upload),
+                    Err(e) if upload_closed(&e) => {}
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            _ => return Err("The server returned an unknown upload state.".into()),
+        }
+        if !closed.insert(upload.clone()) {
+            return Err("The server repeatedly returned the same closed upload.".into());
+        }
+        // The closed upload identifies the next attempt even across restarts.
+        key = format!("{root_key}-{upload}");
     }
-    let path = format!("/uploads/{upload}");
-    let presigned = api.post(&format!("{path}:presign"), None, None)?;
-    if let Some(t) = presigned["tickets"].as_array().and_then(|a| a.first()) {
-        let path = t["ticket"]["url"]
-            .as_str()
-            .ok_or("Upload response had no part URL.")?;
-        put_part(path, bytes)?;
-    }
-    api.post(&format!("{path}:complete"), None, None)?;
-    Ok(upload)
+}
+
+fn upload_closed(error: &Failure) -> bool {
+    error.status == Some(409) && error.message.starts_with("MRL-CONFLICT-191 ")
 }
 
 fn put_part(path: &str, bytes: &[u8]) -> Result<(), String> {
@@ -193,4 +226,38 @@ fn put_part(path: &str, bytes: &[u8]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seed_replays_through_expired_uploads_to_the_replacement() {
+        let mut created = false;
+        for _ in 0..2 {
+            let id = upload_with(
+                |path, _, key| match (path, key) {
+                    ("/uploads", Some("seed")) => Ok(json!({"id":"up_first","state":"EXPIRED"})),
+                    ("/uploads", Some("seed-up_first")) if created => {
+                        Ok(json!({"id":"up_next","state":"COMPLETED"}))
+                    }
+                    ("/uploads", Some("seed-up_first")) => {
+                        Ok(json!({"id":"up_next","state":"OPEN"}))
+                    }
+                    ("/uploads/up_next:presign", None) => Ok(json!({"tickets":[]})),
+                    ("/uploads/up_next:complete", None) => {
+                        created = true;
+                        Ok(json!({}))
+                    }
+                    _ => panic!("unexpected request {path} {key:?}"),
+                },
+                |_| panic!("the uploaded part is already present"),
+                &json!({}),
+                "seed",
+            )
+            .unwrap();
+            assert_eq!(id, "up_next");
+        }
+    }
 }

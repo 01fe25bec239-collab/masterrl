@@ -90,6 +90,8 @@ pub struct DatasetRow {
     pub license_spdx: String,
     /// `public`, `internal`, `confidential` or `restricted-pii`.
     pub sensitivity: String,
+    /// Whether any version inherits a restriction from its lineage.
+    pub has_restricted_lineage: bool,
     /// `research`, `commercial`, `internal`.
     pub permitted_use: Vec<String>,
     /// Why the data may be used.
@@ -113,7 +115,10 @@ pub struct DatasetRow {
 /// Columns of [`DatasetRow`] (table alias `d`).
 pub const DATASET_COLS: &str = "d.id, d.org_id, d.project_id, d.name, d.description, \
     d.license_spdx, d.sensitivity, d.permitted_use, d.consent_basis, d.source_urls, d.card_md, \
-    d.eval_set, d.version, d.created_by, d.created_at, d.updated_at";
+    d.eval_set, d.version, d.created_by, d.created_at, d.updated_at, \
+    EXISTS (SELECT 1 FROM dataset_versions v WHERE v.dataset_id=d.id AND v.org_id=d.org_id \
+        AND v.parent_version_id IS NOT NULL AND dataset_version_is_restricted(v.id)) \
+    AS has_restricted_lineage";
 
 /// A dataset version, with its dataset's project and sensitivity.
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -165,7 +170,8 @@ pub struct VersionRow {
 }
 
 /// Columns of [`VersionRow`] (aliases `v` and `d`).
-pub const VERSION_COLS: &str = "v.id, v.org_id, v.dataset_id, d.project_id, d.sensitivity, \
+pub const VERSION_COLS: &str = "v.id, v.org_id, v.dataset_id, d.project_id, \
+    CASE WHEN dataset_version_is_restricted(v.id) THEN 'restricted-pii' ELSE d.sensitivity END AS sensitivity, \
     v.seq, v.schema_id, v.state, v.state_reason, v.source_kind, v.source_ref, \
     v.parent_version_id, v.transform_spec, v.row_count, v.byte_size, v.content_sha256, \
     v.splits, v.summary, v.job_id, v.created_by, v.created_at, v.ready_at";
