@@ -482,7 +482,9 @@ pub(super) async fn publish_local_export(
         tokio::fs::copy(&copied.0, &target)
             .await
             .map_err(|e| AgentError::state(&target, e))?;
-        tokio::fs::File::open(&target)
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
             .await
             .map_err(|e| AgentError::state(&target, e))?
             .sync_all()
