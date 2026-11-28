@@ -83,7 +83,7 @@ describe('core supervisor', () => {
     const failed = await until(s, (st) => st.phase === 'failed');
     expect(failed.reason).toMatch(/MRL-ENV-110/);
     expect(events()).toHaveLength(3);
-    s.restart();
+    await s.restart();
     await until(s, (st) => st.phase === 'reconnecting' || st.phase === 'starting');
     await until(s, (st) => st.phase === 'failed');
     expect(events()).toHaveLength(6);
@@ -112,6 +112,25 @@ describe('core supervisor', () => {
     await slow.s.stop();
     expect(Date.now() - t).toBeGreaterThanOrEqual(250);
     expect(slow.s.status().phase).toBe('stopped');
+  });
+
+  it('restarts a running core after a clean stop, but not once the app quits', async () => {
+    const { s, events } = supervisor('ok');
+    s.start();
+    const first = await until(s, (st) => st.phase === 'ready');
+    const firstPort = s.endpoint()?.port;
+    await s.restart();
+    await until(s, (st) => st.phase === 'ready' && st.version > first.version);
+    expect(s.endpoint()?.port).not.toBe(firstPort);
+    // A clean restart is not a crash.
+    expect(s.status().restarts).toBe(0);
+    if (process.platform !== 'win32') expect(events()).toEqual(['start', 'stopped', 'start']);
+
+    // Quitting while a restart waits for the old core: nothing starts again.
+    const again = s.restart();
+    await s.stop();
+    await again;
+    expect(s.status().phase).toBe('stopped');
   });
 
   it('a watcher times out with the current state', async () => {

@@ -83,6 +83,8 @@ export class CoreSupervisor {
   private timers = new Set<NodeJS.Timeout>();
   private waiters = new Set<() => void>();
   private stderrTail: string[] = [];
+  /** `stop()` was asked for: nothing starts the core again but `start()`. */
+  private halted = false;
   private readonly o: Required<
     Omit<SupervisorOptions, 'onReady' | 'onLost' | 'log' | 'launch' | 'secret'>
   > &
@@ -131,20 +133,33 @@ export class CoreSupervisor {
   /** Starts the core unless it is starting or running. */
   start(): void {
     if (['starting', 'ready', 'stopping'].includes(this.state.phase)) return;
+    this.halted = false;
     this.launchNow();
   }
 
-  /** After `failed`: forget earlier crashes and start again. */
-  restart(): CoreStatus {
-    if (this.state.phase === 'failed' || this.state.phase === 'stopped') {
-      this.crashes = [];
-      this.launchNow();
-    }
+  /**
+   * Starts the core again and forgets earlier crashes: right away while it waits to reconnect
+   * or after `failed`; after a clean stop while it runs (e.g. after a backup was restored).
+   * Does nothing once `stop()` was asked for (the app is quitting).
+   */
+  async restart(): Promise<CoreStatus> {
+    const quitting = () => this.halted || this.phase() === 'stopping';
+    if (quitting()) return this.state;
+    if (this.phase() === 'ready' || this.phase() === 'starting') await this.stopChild();
+    // Read again: `stop()` may have been asked for while the old core stopped.
+    if (quitting()) return this.state;
+    this.crashes = [];
+    this.launchNow();
     return this.state;
   }
 
-  /** Asks the core to stop, then kills it if it has not exited in time. */
+  /** Asks the core to stop, then kills it if it has not exited in time. It stays stopped. */
   async stop(): Promise<void> {
+    this.halted = true;
+    await this.stopChild();
+  }
+
+  private async stopChild(): Promise<void> {
     this.clearTimers();
     const child = this.child;
     if (!child || child.exitCode !== null || child.signalCode !== null) {

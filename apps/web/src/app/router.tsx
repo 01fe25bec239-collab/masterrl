@@ -7,6 +7,8 @@ import {
 } from '@tanstack/react-router';
 import { indexRoute } from '../routes/index';
 import { rootRoute } from '../routes/__root';
+import { crashReportRoute } from '../routes/settings/crash';
+import { welcomeRoute } from '../routes/welcome';
 import type { NavEntry } from './nav.registry';
 import { SettingsPage } from './pages';
 
@@ -32,7 +34,13 @@ export function createAppRouter(
     }),
   );
   return createRouter({
-    routeTree: rootRoute.addChildren([indexRoute, settingsRoute, ...pages]),
+    routeTree: rootRoute.addChildren([
+      indexRoute,
+      settingsRoute,
+      welcomeRoute,
+      crashReportRoute,
+      ...pages,
+    ]),
     history,
     context: { nav },
     defaultPreload: 'intent',

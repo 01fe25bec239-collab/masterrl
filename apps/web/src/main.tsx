@@ -5,6 +5,7 @@ import { App } from './App';
 import { navRegistry, type NavEntry } from './app/nav.registry';
 import { getPrefs } from './app/prefs';
 import { createAppRouter } from './app/router';
+import { followDeepLinks, startSession } from './app/session';
 import { createQueryClient, mocksEnabled } from './lib/api';
 import './app/styles.css';
 
@@ -28,8 +29,18 @@ if (import.meta.env.DEV && mocksEnabled) {
   nav = [...navRegistry, ...mockNav];
 }
 
+// In the desktop app: the core's address and this launch's token come over IPC, never in a URL.
+const session = await startSession().catch((err: unknown) => {
+  // Without the bridge nothing reaches the core; the pages then explain each failed call.
+  console.error('MasterRL: the window could not connect to its core.', err);
+  return startSession(null);
+});
+const router = createAppRouter(nav);
+if (session.desktop)
+  void followDeepLinks(session.desktop, router.history, new AbortController().signal);
+
 createRoot(root).render(
   <StrictMode>
-    <App router={createAppRouter(nav)} queryClient={createQueryClient()} />
+    <App router={router} queryClient={createQueryClient()} />
   </StrictMode>,
 );

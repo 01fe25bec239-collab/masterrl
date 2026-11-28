@@ -16,9 +16,11 @@ import {
   type LinkProps,
   type NavSection,
 } from '@mrl/ui';
+import { WorkspaceSwitcher } from '../features/workspaces/WorkspaceSwitcher';
 import { modeOptions, visibleFor } from './pages';
 import { setPrefs, usePrefs } from './prefs';
 import { useCurrentScope } from './scopes';
+import { CoreStatusBanner, FirstRunRedirect, getSession } from './session';
 
 function RouterLink({ href, children, ...rest }: LinkProps) {
   return (
@@ -99,6 +101,7 @@ export function Shell() {
   const tree = query.data;
   const topBar = (
     <>
+      {getSession().desktop && <WorkspaceSwitcher />}
       {tree && tree.orgs.length > 0 && (
         <ScopeSwitcher
           levels={[
@@ -166,6 +169,16 @@ export function Shell() {
 
   const scopeError = query.isError ? describeError(query.error) : null;
 
+  // First-run onboarding gets the whole window.
+  if (path === '/welcome') {
+    return (
+      <main id="main" className="min-h-screen bg-bg p-6 text-fg">
+        <CoreStatusBanner />
+        <Outlet />
+      </main>
+    );
+  }
+
   return (
     <AppShell
       brand="MasterRL"
@@ -174,6 +187,8 @@ export function Shell() {
       nav={<LeftNav sections={sections} currentPath={path} linkComponent={RouterLink} />}
       banner={
         <>
+          <CoreStatusBanner />
+          <FirstRunRedirect />
           <LiveStatusBanner />
           {scopeError && (
             <PlainError
