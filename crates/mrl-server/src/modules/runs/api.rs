@@ -512,16 +512,29 @@ pub struct CheckedInputs {
     pub(crate) grants: Vec<crate::modules::secrets::AuthorizedGrant>,
 }
 
-/// Submit's read-only access checks, shared with dry runs (P28's validate): the parent run
-/// and checkpoint, artifact inputs and secrets. One the caller can't read answers exactly
-/// like a missing one (404). Writes nothing.
+/// Submit's read-only checks, shared with dry runs (P28's validate): the body's own rules,
+/// the experiment, the parent run and checkpoint, artifact inputs and secrets. One the
+/// caller can't read answers exactly like a missing one (404). Writes nothing; submit then
+/// creates the run and its secret grants.
 pub async fn check_inputs(
     state: &AppState,
     db: &Db,
     ctx: &RequestContext,
-    org: Uuid,
+    (org, project): (Uuid, Uuid),
     sub: &RunSubmission,
 ) -> Result<CheckedInputs, JobsError> {
+    check_submission(sub)?;
+    if let Some(e) = sub.experiment_id {
+        let found: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM experiments WHERE id = $1 AND org_id = $2 AND project_id = $3",
+        )
+        .bind(e.as_uuid())
+        .bind(org)
+        .bind(project)
+        .fetch_optional(db.pool())
+        .await?;
+        found.ok_or_else(|| JobsError::not_found("experiment"))?;
+    }
     if let Some(parent) = sub.parent_run_id {
         let parent_project: Option<Uuid> =
             sqlx::query_scalar("SELECT project_id FROM runs WHERE id = $1 AND org_id = $2")
@@ -687,7 +700,6 @@ pub async fn submit(
     scope::no_nul(&submitted)?;
     let sub: RunSubmission = serde_json::from_value(submitted.clone())
         .map_err(|e| bad_body(format!("The run could not be read: {e}.")))?;
-    check_submission(&sub)?;
     let fingerprint = Sha256::new()
         .chain_update(prj.as_bytes())
         .chain_update(b"\n")
@@ -703,7 +715,7 @@ pub async fn submit(
     let CheckedInputs {
         launch_inputs,
         grants,
-    } = check_inputs(&state, &db, &ctx, org, &sub).await?;
+    } = check_inputs(&state, &db, &ctx, (org, project), &sub).await?;
     let mut scope = SubmitScope {
         org_id: org,
         project_id: project,

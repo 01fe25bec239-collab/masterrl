@@ -35,6 +35,7 @@ from mrl_runtime.adapter.types import (
     ProbeReport,
     ResolvedConfig,
     ResourceEstimate,
+    TargetDevice,
     ValidationReport,
     ValidationRequest,
 )
@@ -66,6 +67,7 @@ __all__ = [
     "ResourceEstimate",
     "RolloutSample",
     "Samples",
+    "TargetDevice",
     "TrainingEngine",
     "ValidationReport",
     "ValidationRequest",

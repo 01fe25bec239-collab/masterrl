@@ -7,6 +7,20 @@ use serde::Serialize;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+/// `subject_ref.kind` of an internal dry-run job (P28's settings check). The public jobs
+/// routes and event feeds never show these; the scheduler runs them like any job. SQL that
+/// filters them spells the same literal.
+pub const PROBE_SUBJECT_KIND: &str = "run_probe";
+
+/// Whether `row` is an internal dry-run job ([`PROBE_SUBJECT_KIND`]).
+pub fn is_probe(row: &JobRow) -> bool {
+    row.subject_ref
+        .as_ref()
+        .and_then(|s| s.get("kind"))
+        .and_then(|k| k.as_str())
+        == Some(PROBE_SUBJECT_KIND)
+}
+
 /// Every job kind (the `jobs.kind` check in migration 17004).
 pub const JOB_KINDS: [&str; 10] = [
     "TRAIN",

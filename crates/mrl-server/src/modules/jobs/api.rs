@@ -128,7 +128,8 @@ pub async fn list(
             job_cols!(),
             " FROM jobs WHERE ($1::uuid IS NULL OR org_id = $1) AND ($2::text IS NULL OR state = $2) \
                AND ($3::text IS NULL OR kind = $3) AND ($4::uuid IS NULL OR project_id = $4) \
-               AND ($5::uuid IS NULL OR id < $5) ORDER BY id DESC LIMIT $6"
+               AND ($5::uuid IS NULL OR id < $5) \
+               AND subject_ref->>'kind' IS DISTINCT FROM 'run_probe' ORDER BY id DESC LIMIT $6"
         ))
         .bind(org)
         .bind(&f.state)
@@ -180,6 +181,7 @@ pub async fn read_job(
             .bind(id.as_uuid())
             .fetch_optional(db.pool())
             .await?
+            .filter(|r| !super::is_probe(r))
             .ok_or_else(|| JobsError::not_found("job"))?;
     let res = resource("job", Some(id.to_string()), row.org_id, row.project_id);
     scope::authorize(state, ctx, "runs.read", &res).await?;

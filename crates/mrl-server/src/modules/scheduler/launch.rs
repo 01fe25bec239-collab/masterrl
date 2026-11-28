@@ -353,6 +353,14 @@ impl LaunchContributor for RunConfigSpec {
             );
             spec.insert("seeds".into(), get("seeds")?);
         } else {
+            // A job without a run may carry its spec in `subject_ref.launch_spec` (P28's
+            // dry-run probe: model and dataset ids), so every later contributor sees it,
+            // whatever its order. The keys set below always win.
+            if let Some(Value::Object(launch)) =
+                job.subject_ref.as_ref().and_then(|s| s.get("launch_spec"))
+            {
+                spec.extend(launch.clone());
+            }
             spec.insert(
                 "subject".into(),
                 job.subject_ref.clone().unwrap_or(Value::Null),

@@ -245,9 +245,10 @@ pub struct Chains {
 }
 
 impl Chains {
-    /// The members this build registers. Each part adds one line inside its block.
-    pub fn registered(db: &Db) -> Self {
-        let _ = db;
+    /// The members this build registers. Each part adds one line inside its block; a member
+    /// with settings reads them from `config` (like P28's `config.submission`).
+    pub fn registered(db: &Db, config: &crate::Config) -> Self {
+        let _ = (db, config);
         Self::new(
             vec![
                 Arc::new(SchemaChecks),

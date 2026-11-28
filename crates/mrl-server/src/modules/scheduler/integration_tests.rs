@@ -461,6 +461,15 @@ impl World {
     }
 
     async fn queue_with(&self, resources: Value, run: Option<Uuid>) -> Uuid {
+        self.queue_subject(resources, run, None).await
+    }
+
+    async fn queue_subject(
+        &self,
+        resources: Value,
+        run: Option<Uuid>,
+        subject_ref: Option<Value>,
+    ) -> Uuid {
         let db = self.db.db();
         let mut tx = db.begin().await.unwrap();
         let job = NewJob {
@@ -469,7 +478,7 @@ impl World {
             project_id: self.project,
             kind: if run.is_some() { "TRAIN" } else { "DATA_PREP" }.into(),
             run_id: run,
-            subject_ref: None,
+            subject_ref,
             priority: 0,
             resource_request: resources,
             retry_policy: json!({}),
@@ -1041,6 +1050,73 @@ async fn a_branched_run_starts_from_its_parent_checkpoint() {
     w.retry_now(job).await;
     let second = w.running(job).await;
     assert_eq!(resume(second).await, Some(own));
+    w.invariants().await;
+}
+
+/// A job without a run takes its spec keys from `subject_ref.launch_spec`; the scheduler's
+/// own keys (job id, sandbox, kind) can't be overridden from there.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn a_runless_job_launches_with_its_subject_spec() {
+    let w = World::start(false).await;
+    let m = w.agent(1).await;
+    let job = w
+        .queue_subject(
+            json!({"roles": [{"role": "trainer", "replicas": 1, "gpu_count": 0,
+                "cpu_millis": 100, "mem_bytes": 1 << 20}]}),
+            None,
+            Some(json!({"kind": "probe-test", "launch_spec": {
+                "base_model_version_id": "mv_1", "dataset_version_ids": ["dv_1"],
+                "sandbox": "none", "job_id": "job_forged"}})),
+        )
+        .await;
+    w.running(job).await;
+    let l = m.script.launches();
+    let spec: Value = serde_json::from_str(&l.last().unwrap().job_spec_json).unwrap();
+    assert_eq!(spec["base_model_version_id"], "mv_1");
+    assert_eq!(spec["dataset_version_ids"], json!(["dv_1"]));
+    assert_eq!(spec["sandbox"], "worker");
+    assert_eq!(spec["job_id"], JobId::from_uuid(job).to_string());
+    assert_eq!(spec["subject"]["kind"], "probe-test");
+    w.invariants().await;
+}
+
+/// Internal dry-run jobs (P28's probes) are scheduled like any job but stay out of the
+/// public jobs routes: the list skips them and a direct read, change or cancel is a 404.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn probe_jobs_run_but_stay_out_of_the_jobs_routes() {
+    let w = World::start(false).await;
+    let _m = w.agent(1).await;
+    let cpu = json!({"roles": [{"role": "trainer", "replicas": 1, "gpu_count": 0,
+        "cpu_millis": 100, "mem_bytes": 1 << 20}]});
+    let probe = w
+        .queue_subject(cpu.clone(), None, Some(json!({"kind": "run_probe"})))
+        .await;
+    let visible = w.queue_with(cpu, None).await;
+    w.running(probe).await;
+    let id = JobId::from_uuid(probe).to_string();
+    let listed = w.get("/api/v1/jobs").await;
+    assert_eq!(listed.status, 200, "{}", listed.text());
+    let ids: Vec<String> = listed.json()["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|j| j["id"].as_str().unwrap().to_owned())
+        .collect();
+    assert!(
+        ids.contains(&JobId::from_uuid(visible).to_string()),
+        "{ids:?}"
+    );
+    assert!(!ids.contains(&id), "{ids:?}");
+    assert_eq!(w.get(&format!("/api/v1/jobs/{id}")).await.status, 404);
+    assert_eq!(
+        w.post(&format!("/api/v1/jobs/{id}:cancel"), json!({}))
+            .await
+            .status,
+        404
+    );
+    assert_eq!(w.job(probe).await.state, "RUNNING");
     w.invariants().await;
 }
 

@@ -18,6 +18,6 @@ pub use chains::{
     SubmissionResolver, SubmitScope, Validation, Verdict, Verification,
 };
 pub use error::{codes, DomainProblem, JobsError};
-pub use model::{Attempt, AttemptRow, Job, JobRow, Rejection};
+pub use model::{is_probe, Attempt, AttemptRow, Job, JobRow, Rejection, PROBE_SUBJECT_KIND};
 pub use projects::{ProjectDirectory, Projects, RehomeLocalRows};
 pub use transitions::{AttemptChange, JobChange, JobTransitions, NewJob, RetryRules};
