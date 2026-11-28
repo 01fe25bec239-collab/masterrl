@@ -16,6 +16,7 @@ use sqlx::postgres::PgConnectOptions;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
+use tokio_util::sync::CancellationToken;
 
 const NAME: &str = env!("CARGO_BIN_NAME");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -44,6 +45,9 @@ struct Cli {
     /// Team mode without the desktop app: no startup line on stdout.
     #[arg(long)]
     headless: bool,
+    /// Also stop gracefully when stdin closes (how the desktop app stops the core on every OS).
+    #[arg(long)]
+    stop_on_stdin_close: bool,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -114,6 +118,7 @@ fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<(), Failure> {
+    let stop = stop_requests(cli.stop_on_stdin_close);
     if let Some(Command::Openapi) = cli.command {
         // The document needs no database; this pool never connects.
         let db = Db::connect_lazy(&DatabaseConfig::default(), PgConnectOptions::new());
@@ -159,7 +164,16 @@ async fn run(cli: Cli) -> Result<(), Failure> {
             let service = &config.auth.keychain_service;
             let secrets: Arc<dyn SecretStore> =
                 Arc::new(KeychainStore::open(service, &secrets_dir, config.keychain.backend).await);
-            serve(config, &env, cli.headless, db, bundle.as_ref(), secrets).await
+            serve(
+                config,
+                &env,
+                cli.headless,
+                db,
+                bundle.as_ref(),
+                secrets,
+                stop,
+            )
+            .await
         }
     };
     let stopped = match bundle {
@@ -177,6 +191,7 @@ async fn serve(
     db: Db,
     bundle: Option<&PgBundle>,
     secrets: Arc<dyn SecretStore>,
+    stop: CancellationToken,
 ) -> Result<(), Failure> {
     let mode = config.server.mode;
     let (secret, generated) = launch_secret(env);
@@ -194,12 +209,32 @@ async fn serve(
     let token = running.shutdown_token();
     let db_failed = bundle.map(PgBundle::failed).unwrap_or_default();
     tokio::select! {
-        () = app::shutdown_signal() => token.cancel(),
+        () = stop.cancelled() => token.cancel(),
         () = token.cancelled() => {},
         () = db_failed.cancelled() => token.cancel(),
     }
     running.wait().await?;
     Ok(())
+}
+
+/// Cancelled on Ctrl-C, SIGTERM or (with `stdin`) stdin closing. Listening starts before the
+/// database opens, so a stop during start-up still stops PostgreSQL.
+fn stop_requests(stdin: bool) -> CancellationToken {
+    let stop = CancellationToken::new();
+    let on_signal = stop.clone();
+    tokio::spawn(async move {
+        app::shutdown_signal().await;
+        on_signal.cancel();
+    });
+    if stdin {
+        let on_close = stop.clone();
+        // A plain thread: a tokio stdin read can't be cancelled and would hold up exit.
+        std::thread::spawn(move || {
+            let _ = std::io::copy(&mut std::io::stdin().lock(), &mut std::io::sink());
+            on_close.cancel();
+        });
+    }
+    stop
 }
 
 /// `migrate [--dry-run]`.
@@ -406,8 +441,10 @@ mod tests {
             "--roles",
             "api,background",
             "--headless",
+            "--stop-on-stdin-close",
         ])
         .unwrap();
+        assert!(cli.stop_on_stdin_close);
         assert_eq!(cli.mode, Some(Mode::Team));
         assert_eq!(cli.roles, Some(vec![Role::Api, Role::Background]));
         assert!(cli.headless);

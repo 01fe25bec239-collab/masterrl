@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "exports": {
-    ".": "./src/index.ts"
+    ".": "./src/index.ts",
+    "./generated/mrl-api-v1": "./src/generated/mrl-api-v1.ts"
   },
   "scripts": {
     "lint": "eslint . && prettier --check . --ignore-path ../../.gitignore",
