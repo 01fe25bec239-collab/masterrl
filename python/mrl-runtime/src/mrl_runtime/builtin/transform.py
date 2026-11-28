@@ -937,11 +937,16 @@ def _preview(ctx: TaskContext, spec: Json, parent: DatasetAdapter) -> Iterator[T
     truncated = b',"truncated":true'
     suffix = b"}\n"
     prefix = b',"rows":['
-    remaining = PREVIEW_MAX_BYTES - len(report) - len(prefix + truncated + suffix)
-    report_truncated = remaining < 0
+    placeholders = {
+        index: encode({"index": index, "before": None, "after": None, "truncated": True})
+        for index in before
+    }
+    reserved = len(prefix + truncated + suffix) + max(0, len(before) - 1)
+    reserved += sum(map(len, placeholders.values()))
+    report_truncated = len(report) + reserved > PREVIEW_MAX_BYTES
     if report_truncated:
         report = encode({"schema_id": spec["to"], "steps": []})
-        remaining = PREVIEW_MAX_BYTES - len(report) - len(prefix + truncated + suffix)
+    remaining = PREVIEW_MAX_BYTES - len(report) - reserved
     limits = Limits()
     for index, raw in before.items():
         done = after.get(index)
@@ -962,12 +967,14 @@ def _preview(ctx: TaskContext, spec: Json, parent: DatasetAdapter) -> Iterator[T
                 ),
             }
         )
-        cost = len(row) + bool(rows)
-        if cost > remaining:
+        placeholder = placeholders[index]
+        cost = len(row) - len(placeholder)
+        if cost <= remaining:
+            rows.append(row)
+            remaining -= cost
+        else:
+            rows.append(placeholder)
             report_truncated = True
-            break
-        rows.append(row)
-        remaining -= cost
     ctx.output_dir.mkdir(parents=True, exist_ok=True)
     (ctx.output_dir / PREVIEW_FILE).write_bytes(
         report[:-1]

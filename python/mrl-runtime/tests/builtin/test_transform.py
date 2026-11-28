@@ -146,13 +146,15 @@ def test_preview_respects_the_json_output_byte_limit(
     monkeypatch.setattr(transform, "PREVIEW_MAX_BYTES", 4096)
     spec = _spec([{"op": "rename", "from": "question", "to": "prompt"}])
     rows = [{**row, "answer": "é" * 256} for row in QA]
+    rows[0]["answer"] = "é" * 4096
     out = _run(tmp_path, spec, rows, preview=True)
     payload = (out / "preview.json").read_bytes()
     assert len(payload) <= transform.PREVIEW_MAX_BYTES
     preview = json.loads(payload)
     assert preview["truncated"] is True
-    assert 0 < len(preview["rows"]) < 20
-    assert preview["rows"][0]["after"]["answer"] == rows[0]["answer"]
+    assert len(preview["rows"]) == 20
+    assert preview["rows"][0]["truncated"] is True
+    assert preview["rows"][1]["after"]["answer"] == rows[1]["answer"]
     assert preview["steps"][0]["out"] == 20
 
 
