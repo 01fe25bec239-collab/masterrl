@@ -1151,7 +1151,7 @@ pub(crate) fn destination(kind: &str, org: &str, project: Option<String>) -> Res
     Resource {
         kind: kind.to_owned(),
         id: None,
-        org: Some(org.to_owned()),
+        org: rbac_org(org),
         project,
     }
 }
@@ -1310,9 +1310,15 @@ pub(crate) fn owned(kind: &str, org: &str, id: String, project: Option<String>) 
     Resource {
         kind: kind.to_owned(),
         id: Some(id),
-        org: Some(org.to_owned()),
+        org: rbac_org(org),
         project,
     }
+}
+
+/// The org a [`Resource`] names for storage org `org`. [`LOCAL_ORG`] is the solo owner's
+/// storage name, not an org id, so it names none (RBAC hides resources whose org is not an id).
+pub fn rbac_org(org: &str) -> Option<String> {
+    (org != LOCAL_ORG).then(|| org.to_owned())
 }
 
 /// The action that reads artifacts (and the lineage graph).
@@ -1728,7 +1734,13 @@ struct Doc;
 
 #[cfg(test)]
 mod tests {
-    use super::{is_staging, total_size, ArtifactManifest};
+    use super::{is_staging, rbac_org, total_size, ArtifactManifest, LOCAL_ORG};
+
+    #[test]
+    fn the_solo_storage_org_names_no_rbac_org() {
+        assert_eq!(rbac_org(LOCAL_ORG), None);
+        assert_eq!(rbac_org("org_x").as_deref(), Some("org_x"));
+    }
 
     fn manifest(sizes: &[u64]) -> ArtifactManifest {
         let files: Vec<serde_json::Value> = sizes
