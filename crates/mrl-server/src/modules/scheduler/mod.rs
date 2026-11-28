@@ -661,7 +661,7 @@ impl SchedulerModule {
             config.scheduler.clone(),
             &gw,
             &LaneRouter::global(),
-            Chains::registered(&db),
+            Chains::registered(&db, config),
             registry::pipeline(&db, &config.scheduler),
             launch::Transfer::from_config(&db, config),
         )

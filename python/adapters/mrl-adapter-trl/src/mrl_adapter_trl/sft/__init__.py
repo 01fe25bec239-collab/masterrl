@@ -396,10 +396,19 @@ def _inspect(model_dir: Path | None, algorithm: str) -> tuple[ModelInspection | 
     return inspection, _model_issues(inspection, algorithm)
 
 
+def _device_for(hw: HardwareProfile) -> Device:
+    """The device to check and estimate for: a dry run's target machine, else this one."""
+    t = hw.target
+    return Device(t.kind, t.name, t.bf16, t.memory_gib) if t else detect_device()
+
+
 def _settings_issues(
-    settings: Settings, staged: Mapping[str, Path], inspection: ModelInspection | None
+    settings: Settings,
+    staged: Mapping[str, Path],
+    inspection: ModelInspection | None,
+    device: Device,
 ) -> list[Issue]:
-    issues = _hardware_issues(settings, detect_device())
+    issues = _hardware_issues(settings, device)
     if "resume_from" in staged:
         issues += _resume_issues(staged["resume_from"], settings.strategy != "full")
     context = inspection.context_length if inspection is not None else None
@@ -549,7 +558,7 @@ class TrlSftEngine(BaseEngine):
             if role in staged:
                 issues += _dataset_issues(role, staged[role], cfg.algorithm, inspection)
         if settings is not None:
-            issues += _settings_issues(settings, staged, inspection)
+            issues += _settings_issues(settings, staged, inspection, _device_for(req.hardware))
         return ValidationReport(tuple(issues))
 
     def estimate(self, cfg: ResolvedConfig, hw: HardwareProfile) -> ResourceEstimate:
@@ -558,7 +567,7 @@ class TrlSftEngine(BaseEngine):
             return ResourceEstimate(
                 total_steps=self._total_steps, assumptions=("model not inspected",)
             )
-        device = detect_device()
+        device = _device_for(hw)
         precision = _precision(settings, device)
         e = settings.engine
         lora = settings.common.update.lora

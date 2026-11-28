@@ -12,11 +12,16 @@ checks it against schemas/engine-manifest/v1, inlines the config schemas its alg
 and writes crates/mrl-server/engines/first_party/<engine>.json plus embedded.rs (the list
 the server compiles in). An adapter with no manifest yet is skipped, and the run says so.
 
+It also keeps each first-party manifest's `lockSha256` pins equal to the sha256 of the lock
+they name, so a lane that changes Python dependencies only reruns `just gen`.
+
 Usage: engines.py [--check]          fail if any output would change
        engines.py --validate <dir>   check one manifest folder (tests use it), write nothing
 """
 
+import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any, cast
@@ -32,6 +37,7 @@ ADAPTERS = ROOT / "python/adapters"
 RUNTIME = ROOT / "python/mrl-runtime/src/mrl_runtime"
 FAKE = RUNTIME / "testkit/fake_engine"
 BUILTIN = RUNTIME / "builtin/mrl-builtin.yaml"
+BUILTIN_ENV = ROOT / "python/builtin-env"
 MANIFEST_FILE = "mrl-engine.yaml"
 FRAGMENT_DIR = "mrl-engine.d"
 # Platform metric names (resource peaks per phase); an engine may not emit into this prefix.
@@ -184,6 +190,11 @@ def load_builtin() -> tuple[str, dict[str, Any]]:
         raise ManifestError(
             f"{where}: the built-in bundle needs adapter metadata and the DATA_PREP sandbox"
         )
+    # The runtime's pin goes in the bundle only (lanes that change dependencies change the lock).
+    for env in doc["spec"].get("runtime", {}).get("environments", []):
+        if env.get("kind") == "uv":
+            lock = (BUILTIN_ENV / env["lockfile"]).read_bytes()
+            env["lockSha256"] = hashlib.sha256(lock).hexdigest()
     bundle = {"kind": "builtin", "source": where, "dev_only": False, "manifest": doc, "schemas": {}}
     return meta["name"], bundle
 
@@ -198,6 +209,33 @@ def manifest_dir(adapter: Path) -> Path | None:
     if len(found) > 1:
         raise ManifestError(f"{adapter.relative_to(ROOT)}: more than one {MANIFEST_FILE}: {found}")
     return found[0] if found else None
+
+
+def lock_pins() -> dict[Path, str]:
+    """Manifests whose `lockSha256` pins are stale, with their re-pinned text.
+
+    The fake engine's lock lives in python/fake-engine-env; an adapter's in its own project.
+    """
+    # ponytail: one lock per manifest; per-environment pins if their locks ever differ.
+    found = [(FAKE / MANIFEST_FILE, ROOT / "python/fake-engine-env")]
+    for adapter in sorted(p for p in ADAPTERS.iterdir() if p.is_dir()):
+        root = manifest_dir(adapter)
+        if root is not None:
+            found.append((root / MANIFEST_FILE, adapter))
+    out: dict[Path, str] = {}
+    for manifest, project in found:
+        envs = read_yaml(manifest).get("spec", {}).get("runtime", {}).get("environments", [])
+        locks = {e["lockfile"] for e in envs if e.get("kind") == "uv" and "lockfile" in e}
+        if not locks:
+            continue
+        if len(locks) > 1:
+            raise ManifestError(f"{manifest.relative_to(ROOT)}: environments name different locks")
+        digest = hashlib.sha256((project / locks.pop()).read_bytes()).hexdigest()
+        text = manifest.read_text(encoding="utf-8")
+        new = re.sub(r"(lockSha256:\s*)[0-9a-f]{64}", rf"\g<1>{digest}", text)
+        if new != text:
+            out[manifest] = new
+    return out
 
 
 def outputs() -> dict[Path, str]:
@@ -235,6 +273,11 @@ def main() -> int:
             load_engine(Path(args[1]).resolve(), dev_only=False)
             print("engines: the manifest is valid")
             return 0
+        pins = lock_pins()
+        if not check:
+            for p, text in pins.items():
+                p.write_text(text, encoding="utf-8", newline="\n")
+                print(f"engines: re-pinned {p.relative_to(ROOT)}")
         files = outputs()
     except (ManifestError, SchemaError, TypeError, ValueError) as exc:
         print(f"engines: {exc}", file=sys.stderr)
@@ -242,6 +285,7 @@ def main() -> int:
     stale = {p for p in OUT.glob("*") if p.is_file()} - set(files)
     changed = [p for p, text in files.items() if not p.exists() or p.read_text() != text]
     if check:
+        changed += list(pins)
         for p in sorted([*changed, *stale]):
             print(f"engines: {p.relative_to(ROOT)} is out of date; run `just gen`", file=sys.stderr)
         return 1 if changed or stale else 0

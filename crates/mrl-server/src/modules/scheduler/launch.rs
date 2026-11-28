@@ -87,7 +87,8 @@ impl Transfer {
         }
     }
 
-    async fn seams(&self, db: &Db) -> Result<&Seams, LaunchError> {
+    /// The seams for tickets and secrets (built once; built-in outputs use them too).
+    pub(crate) async fn seams(&self, db: &Db) -> Result<&Seams, LaunchError> {
         self.seams
             .get_or_try_init(|| async {
                 let secrets: Arc<dyn SecretStore> = match &self.secrets {
@@ -133,7 +134,15 @@ impl Transfer {
             plan.inputs.clear();
         }
         let secrets = job.run_id.filter(|_| !credited);
-        if plan.inputs.is_empty() && secrets.is_none() {
+        // A built-in job's secrets (INT-6), each checked against the use it names.
+        let builtin = if credited || job.run_id.is_some() {
+            Vec::new()
+        } else {
+            crate::modules::builtin::grants(db, job.id)
+                .await
+                .map_err(|e| LaunchError::Transient(format!("the database did not answer: {e}")))?
+        };
+        if plan.inputs.is_empty() && secrets.is_none() && builtin.is_empty() {
             return Ok(());
         }
         let seams = self.seams(db).await?;
@@ -188,6 +197,18 @@ impl Transfer {
                     expires_at: None,
                 });
             }
+        }
+        for g in builtin {
+            let value = self
+                .resolver
+                .resolve(seams.secrets.as_ref(), &org, g.secret, &g.allowed_use)
+                .await
+                .map_err(p19)?;
+            plan.credentials.push(Credential {
+                name: g.name,
+                value: value.expose().as_bytes().to_vec(),
+                expires_at: None,
+            });
         }
         let mut names = std::collections::HashSet::new();
         if plan
@@ -332,12 +353,23 @@ impl LaunchContributor for RunConfigSpec {
             );
             spec.insert("seeds".into(), get("seeds")?);
         } else {
+            // A job without a run may carry its spec in `subject_ref.launch_spec` (P28's
+            // dry-run probe: model and dataset ids), so every later contributor sees it,
+            // whatever its order. The keys set below always win.
+            if let Some(Value::Object(launch)) =
+                job.subject_ref.as_ref().and_then(|s| s.get("launch_spec"))
+            {
+                spec.extend(launch.clone());
+            }
             spec.insert(
                 "subject".into(),
                 job.subject_ref.clone().unwrap_or(Value::Null),
             );
         }
         spec.insert("job_id".into(), json!(JobId::from_uuid(job.id).to_string()));
+        // The agent's sandbox profile. Never taken from the user's config: a built-in job's
+        // contributor later sets its job kind's profile (INT-6).
+        spec.insert("sandbox".into(), json!("worker"));
         spec.insert("job_kind".into(), json!(job.kind));
         spec.insert(
             "resume_from_checkpoint_id".into(),

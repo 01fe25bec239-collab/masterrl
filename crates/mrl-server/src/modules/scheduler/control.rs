@@ -228,6 +228,11 @@ pub(crate) async fn on_status(
         let job = lock_job(&mut tx, org, job_id).await?;
         core.audit_job(&mut tx, &job, "scheduler.attempt_status")
             .await?;
+        let violation = mrl_proto::common::v1::FailureClass::SandboxViolation as i32;
+        if s.failure.as_ref().is_some_and(|f| f.class == violation) {
+            core.audit_job(&mut tx, &job, "scheduler.sandbox_violation")
+                .await?;
+        }
     }
     tx.commit().await?;
     run(core, after).await

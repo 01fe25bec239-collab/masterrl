@@ -35,6 +35,7 @@ message WorkerMessage {
     PolicyVersionEvent policy_version = 20;
     RolloutBatchSummary rollout_batch = 21;
     RewardBatchStats reward_batch_stats = 22;
+    OutputsStaged outputs_staged = 23;
   }
 }
 
@@ -53,6 +54,7 @@ message AgentMessage {
     Heartbeat heartbeat = 17;
     CheckpointRequest checkpoint_request = 18;
     LeaseDeadline lease_deadline = 19;
+    OutputsUploaded outputs_uploaded = 20;
   }
 }
 
@@ -325,6 +327,21 @@ enum CommitState {
   COMMIT_STATE_COMMITTED = 1;
   COMMIT_STATE_CORRUPT = 2;
   COMMIT_STATE_REJECTED = 3;
+}
+
+// ---- job outputs (built-in tasks, exports) ----
+
+// The job's results are written: outputs/artifact-manifest.json (artifact-manifest/v1, paths
+// relative to outputs/). The core sends UploadArtifacts for its files; the worker waits for
+// OutputsUploaded before it exits.
+message OutputsStaged {
+  string manifest_json = 1;
+}
+
+// The agent finished the outputs' upload (ok), or could not (reason).
+message OutputsUploaded {
+  bool ok = 1;
+  string reason = 2;
 }
 
 // ---- control ----

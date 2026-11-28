@@ -55,6 +55,12 @@ impl From<Failure> for String {
     }
 }
 
+/// How long a dry run may wait: above the longest settings-check budget the server accepts
+/// (`[submission] probe_timeout_seconds` ≤ 600 s), so the CLI always gets the server's answer,
+/// including its no-probe fallback.
+#[allow(dead_code)] // P28's `runs validate` and `--dry-run` use it (Wave 6 lane).
+pub const DRY_RUN_DEADLINE: Duration = Duration::from_secs(630);
+
 /// A signed-in connection to one server.
 pub struct Api {
     base: String,
@@ -93,7 +99,7 @@ impl Api {
 
     /// `GET /api/v1{path}`.
     pub fn get(&self, path: &str) -> Result<Value, Failure> {
-        self.send(reqwest::Method::GET, path, None, None)
+        self.send(reqwest::Method::GET, path, None, None, None)
     }
 
     /// `POST /api/v1{path}` with an optional JSON body and idempotency key.
@@ -103,7 +109,20 @@ impl Api {
         body: Option<&Value>,
         key: Option<&str>,
     ) -> Result<Value, Failure> {
-        self.send(reqwest::Method::POST, path, body, key)
+        self.send(reqwest::Method::POST, path, body, key, None)
+    }
+
+    /// Like [`Api::post`], but waits up to `deadline` instead of the usual 90 s (a dry run
+    /// that waits for a settings check: [`DRY_RUN_DEADLINE`]).
+    #[allow(dead_code)] // P28's dry-run commands use it (Wave 6 lane).
+    pub fn post_waiting(
+        &self,
+        path: &str,
+        body: Option<&Value>,
+        key: Option<&str>,
+        deadline: Duration,
+    ) -> Result<Value, Failure> {
+        self.send(reqwest::Method::POST, path, body, key, Some(deadline))
     }
 
     fn send(
@@ -112,6 +131,7 @@ impl Api {
         path: &str,
         body: Option<&Value>,
         key: Option<&str>,
+        deadline: Option<Duration>,
     ) -> Result<Value, Failure> {
         let unreachable = |detail: String| Failure {
             status: None,
@@ -119,6 +139,9 @@ impl Api {
         };
         let url = format!("{}/api/v1{path}", self.base);
         let mut req = self.http.request(method, &url);
+        if let Some(d) = deadline {
+            req = req.timeout(d);
+        }
         if let Some(t) = &self.token {
             req = req.bearer_auth(t);
         }
@@ -183,7 +206,9 @@ fn http_client() -> reqwest::Result<reqwest::blocking::Client> {
         }
     });
     reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(60))
+        // Above the server's default 60 s settings-check budget; longer budgets use
+        // `post_waiting` with `DRY_RUN_DEADLINE`.
+        .timeout(Duration::from_secs(90))
         .redirect(policy)
         .build()
 }
