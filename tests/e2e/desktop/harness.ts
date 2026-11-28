@@ -312,6 +312,9 @@ export class Desktop {
     private readonly browserLog: string,
   ) {}
 
+  /** Browser addresses `approveSignIn` already played. */
+  private handled = 0;
+
   /** Addresses the app opened in the "browser" (`MRL_BROWSER_LOG`). */
   opened(): string[] {
     try {
@@ -347,15 +350,16 @@ export class Desktop {
    * approves at once) and follows it back to the app, by deep link or loopback page.
    */
   async approveSignIn(): Promise<void> {
-    const before = this.opened().length;
-    const authorize = await until('the sign-in page', () => {
-      const urls = this.opened();
-      return urls.length > before ? urls[urls.length - 1] : undefined;
-    }).catch(async (e: unknown) => {
-      // Say what the window shows instead (an error from the core, usually).
-      const shown = await this.page.locator('main').innerText();
-      throw new Error(`${String(e)}; the window shows: ${shown}`);
-    });
+    // The address may already be there when this runs (a fast core): take the first one not
+    // handled yet, never "one more than now".
+    const authorize = await until('the sign-in page', () => this.opened()[this.handled]).catch(
+      async (e: unknown) => {
+        // Say what the window shows instead (an error from the core, usually).
+        const shown = await this.page.locator('main').innerText();
+        throw new Error(`${String(e)}; the window shows: ${shown}`);
+      },
+    );
+    this.handled += 1;
     const answer = await fetch(authorize, { redirect: 'manual' });
     const back = answer.headers.get('location');
     if (!back) throw new Error(`sign-in did not redirect (${String(answer.status)})`);
