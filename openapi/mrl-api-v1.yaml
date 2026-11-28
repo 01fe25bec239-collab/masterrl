@@ -577,6 +577,153 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /api/v1/desktop/activity:
+    get:
+      tags:
+      - desktop
+      summary: Running jobs and recent changes, for the tray, notifications and the sleep blocker.
+      operationId: desktop_get_activity
+      parameters:
+      - name: since
+        in: query
+        description: '`cursor` from the previous answer (an RFC 3339 time). Absent on the first call.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DesktopActivity'
+        '400':
+          description: since is not a cursor (MRL-VAL-005)
+        '409':
+          description: A team core (MRL-STATE-300)
+  /api/v1/desktop/backups:
+    get:
+      tags:
+      - desktop
+      summary: The bundled database's backups, newest first.
+      operationId: desktop_list_backups
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DesktopBackupList'
+        '409':
+          description: A team core (MRL-STATE-300)
+    post:
+      tags:
+      - desktop
+      summary: Backs the database up now.
+      operationId: desktop_create_backup
+      responses:
+        '201':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DesktopBackup'
+        '409':
+          description: No bundled database (MRL-ENV-300), busy (MRL-CONFLICT-300) or a team core (MRL-STATE-300)
+        '500':
+          description: The backup failed (MRL-INTERNAL-300)
+  /api/v1/desktop/backups/{name}/restore:
+    post:
+      tags:
+      - desktop
+      summary: |-
+        Replaces the app's data with a backup (after backing up the current data). Restart the core
+        afterwards.
+      operationId: desktop_restore_backup
+      parameters:
+      - name: name
+        in: path
+        description: A backup's file name from the list
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DesktopRestored'
+        '404':
+          description: No such backup (MRL-RES-300)
+        '409':
+          description: No bundled database (MRL-ENV-300), busy (MRL-CONFLICT-300) or a team core (MRL-STATE-300)
+        '500':
+          description: The restore failed (MRL-INTERNAL-300)
+  /api/v1/desktop/doctor:
+    post:
+      tags:
+      - desktop
+      summary: 'Checks this computer: what it has, what it can train, and what to install for more.'
+      operationId: desktop_run_doctor
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DesktopDoctorReport'
+        '409':
+          description: A team core (MRL-STATE-300)
+        '503':
+          description: The agent settings could not be read (MRL-ENV-301)
+  /api/v1/desktop/onboarding:
+    put:
+      tags:
+      - desktop
+      summary: |-
+        Saves the onboarding step. `done` records when onboarding first finished; later steps never
+        clear it, so a finished app never shows first-run again.
+      operationId: desktop_put_onboarding
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DesktopOnboardingUpdate'
+        required: true
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DesktopOnboarding'
+        '409':
+          description: A team core (MRL-STATE-300)
+        '422':
+          description: Unknown step (MRL-VAL-003)
+  /api/v1/desktop/state:
+    get:
+      tags:
+      - desktop
+      summary: 'The desktop app''s view of this core: onboarding, data folder and version.'
+      operationId: desktop_get_state
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DesktopState'
+        '409':
+          description: A team core (MRL-STATE-300)
+  /api/v1/desktop/update/prepare:
+    post:
+      tags:
+      - desktop
+      summary: Saves emergency checkpoints of running jobs and backs the database up, before an update.
+      operationId: desktop_prepare_update
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DesktopUpdateReadiness'
+        '409':
+          description: Busy (MRL-CONFLICT-300) or a team core (MRL-STATE-300)
   /api/v1/engines:
     get:
       tags:
@@ -3133,6 +3280,374 @@ components:
             type: string
           description: '`["*"]`, or areas like `["runs:write", "datasets:read"]`.'
       additionalProperties: false
+    DesktopActivity:
+      type: object
+      description: Activity on this core.
+      required:
+      - cursor
+      - training_active
+      - running
+      - changes
+      properties:
+        changes:
+          type: array
+          items:
+            $ref: '#/components/schemas/DesktopJobChange'
+          description: Changes from shortly before `since`, oldest first (at most 50).
+        cursor:
+          type: string
+          description: Pass as `since` next time.
+        running:
+          type: array
+          items:
+            $ref: '#/components/schemas/DesktopJob'
+          description: Jobs on or getting a machine, oldest first (at most 50).
+        training_active:
+          type: boolean
+          description: A job is training or saving right now.
+    DesktopBackup:
+      type: object
+      description: One backup file.
+      required:
+      - name
+      - reason
+      - size_bytes
+      properties:
+        created_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When it was made.
+        name:
+          type: string
+          description: File name, like `masterrl-20261127T093000123Z-daily.dump`.
+        reason:
+          type: string
+          description: 'Why it was made: `daily`, `manual`, `before-update`, `before-restore`, a migration…'
+        size_bytes:
+          type: integer
+          format: int64
+          description: Size in bytes.
+          minimum: 0
+    DesktopBackupList:
+      type: object
+      description: The backups of the bundled database.
+      required:
+      - available
+      - items
+      properties:
+        available:
+          type: boolean
+          description: False when the core uses another database (nothing to back up here).
+        folder:
+          type:
+          - string
+          - 'null'
+          description: The folder they are kept in.
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/DesktopBackup'
+          description: Newest first.
+    DesktopDoctorCheck:
+      type: object
+      description: One check, like "NVIDIA driver".
+      required:
+      - check
+      - outcome
+      - summary
+      properties:
+        check:
+          type: string
+          description: Check name, like `nvidia_driver`.
+        code:
+          type:
+          - string
+          - 'null'
+          description: Guidance code for a warning or failure.
+        outcome:
+          type: string
+          description: '`ok`, `warn`, `fail` or `not_applicable`.'
+        summary:
+          type: string
+          description: One plain line.
+    DesktopDoctorInstall:
+      type: object
+      description: Something to install to unlock more.
+      required:
+      - id
+      - name
+      - summary
+      - download_gb_low
+      - download_gb_high
+      properties:
+        download_gb_high:
+          type: number
+          format: double
+          description: Download size, high estimate in GB.
+        download_gb_low:
+          type: number
+          format: double
+          description: Download size, low estimate in GB.
+        id:
+          type: string
+          description: Component id, like `pytorch`.
+        name:
+          type: string
+          description: Plain name.
+        summary:
+          type: string
+          description: What it does.
+    DesktopDoctorReport:
+      type: object
+      description: What this computer has, can train, and could unlock.
+      required:
+      - platform
+      - checks
+      - can
+      - cannot
+      - to_install
+      properties:
+        can:
+          type: array
+          items:
+            $ref: '#/components/schemas/DesktopDoctorTask'
+          description: '"This computer can".'
+        cannot:
+          type: array
+          items:
+            $ref: '#/components/schemas/DesktopDoctorTask'
+          description: '"It can''t".'
+        checks:
+          type: array
+          items:
+            $ref: '#/components/schemas/DesktopDoctorCheck'
+          description: Check results.
+        fits:
+          type:
+          - string
+          - 'null'
+          description: What models fit here, in plain words.
+        platform:
+          type: string
+          description: Platform id, like `macos-apple-silicon`.
+        to_install:
+          type: array
+          items:
+            $ref: '#/components/schemas/DesktopDoctorInstall'
+          description: '"To unlock more, install".'
+    DesktopDoctorTask:
+      type: object
+      description: A task this computer can or can't do.
+      required:
+      - task
+      - name
+      properties:
+        blocked_by:
+          type:
+          - string
+          - 'null'
+          description: What stops it here ("can't" only).
+        download_first_gb_high:
+          type:
+          - number
+          - 'null'
+          format: double
+          description: Download still needed first, high estimate in GB ("can" only).
+        download_first_gb_low:
+          type:
+          - number
+          - 'null'
+          format: double
+          description: Download still needed first, low estimate in GB ("can" only).
+        name:
+          type: string
+          description: Plain name.
+        note:
+          type:
+          - string
+          - 'null'
+          description: A note from the catalog.
+        task:
+          type: string
+          description: Task id, like `sft-lora`.
+    DesktopJob:
+      type: object
+      description: A job that holds or is getting a machine.
+      required:
+      - job_id
+      - name
+      - state
+      properties:
+        job_id:
+          type: string
+          description: '`job_…`.'
+        name:
+          type: string
+          description: The run's name, or the job kind.
+        run_id:
+          type:
+          - string
+          - 'null'
+          description: '`run_…` for training and evaluation jobs.'
+        started_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When it started on a machine.
+        state:
+          type: string
+          description: Job state, like `RUNNING`.
+    DesktopJobChange:
+      type: object
+      description: A job that finished, failed, was cancelled or paused.
+      required:
+      - job_id
+      - name
+      - state
+      - state_version
+      - at
+      properties:
+        at:
+          type: string
+          format: date-time
+          description: When it changed.
+        job_id:
+          type: string
+          description: '`job_…`.'
+        name:
+          type: string
+          description: The run's name, or the job kind.
+        run_id:
+          type:
+          - string
+          - 'null'
+          description: '`run_…` for training and evaluation jobs.'
+        state:
+          type: string
+          description: '`COMPLETED`, `FAILED`, `CANCELLED` or `PAUSED`.'
+        state_version:
+          type: integer
+          format: int64
+          description: Grows with every state change of the job; show each `(job_id, state_version)` once.
+    DesktopOnboarding:
+      type: object
+      description: Where first-run onboarding stands.
+      required:
+      - step
+      properties:
+        completed_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When onboarding was first finished; absent until then.
+        step:
+          type: string
+          description: 'The step to show next: `welcome`, `sign_in`, `restore`, `check` or `done`.'
+    DesktopOnboardingUpdate:
+      type: object
+      description: Move onboarding to a step.
+      required:
+      - step
+      properties:
+        step:
+          type: string
+          description: '`welcome`, `sign_in`, `restore`, `check` or `done`. `done` finishes onboarding.'
+      additionalProperties: false
+    DesktopRestored:
+      type: object
+      description: A finished restore.
+      required:
+      - restored
+      - safety_backup
+      - restart_required
+      properties:
+        restart_required:
+          type: boolean
+          description: 'Always true: restart the core so it updates the restored data.'
+        restored:
+          type: string
+          description: The backup now in use.
+        safety_backup:
+          type: string
+          description: The backup of the data from just before, to undo the restore.
+    DesktopState:
+      type: object
+      description: The desktop app's view of this core.
+      required:
+      - onboarding
+      - bundled_database
+      - version
+      properties:
+        bundled_database:
+          type: boolean
+          description: True when this core runs its own PostgreSQL (backups work).
+        data_dir:
+          type:
+          - string
+          - 'null'
+          description: The folder the app's own database lives in; absent when the core uses another database.
+        onboarding:
+          $ref: '#/components/schemas/DesktopOnboarding'
+          description: First-run onboarding.
+        version:
+          type: string
+          description: The core's version.
+    DesktopUpdateCheckpoint:
+      type: object
+      description: How one job's emergency checkpoint went.
+      required:
+      - job_id
+      - name
+      - outcome
+      properties:
+        checkpoint_id:
+          type:
+          - string
+          - 'null'
+          description: '`ckpt_…` when committed.'
+        detail:
+          type:
+          - string
+          - 'null'
+          description: Why, in plain words, when not committed.
+        job_id:
+          type: string
+          description: '`job_…`.'
+        name:
+          type: string
+          description: The run's name, or the job kind.
+        outcome:
+          type: string
+          description: '`committed`, `refused`, `timed_out` or `failed`.'
+    DesktopUpdateReadiness:
+      type: object
+      description: Whether the app may install the update now.
+      required:
+      - ready
+      - checkpoints
+      properties:
+        backup:
+          type:
+          - string
+          - 'null'
+          description: The backup's file name.
+        backup_error:
+          type:
+          - string
+          - 'null'
+          description: Why the backup failed.
+        checkpoints:
+          type: array
+          items:
+            $ref: '#/components/schemas/DesktopUpdateCheckpoint'
+          description: One entry per running job.
+        ready:
+          type: boolean
+          description: 'The backup is made (or there is no bundled database): go ahead.'
     DownloadRequest:
       type: object
       description: '`POST /artifacts/{art}:download` body.'
@@ -6530,3 +7045,5 @@ tags:
   description: 'Checkpoints: listing, verification and deletion.'
 - name: engines
   description: Training engines, their methods and what can run where.
+- name: desktop
+  description: 'The desktop app: first run, this computer, backups and updates (Solo only).'

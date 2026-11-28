@@ -14,5 +14,13 @@
     "allowImportingTsExtensions": true,
     "types": ["node"]
   },
-  "include": ["src", "scripts", "e2e", "playwright.config.ts"]
+  "include": [
+    "src",
+    "scripts",
+    "e2e",
+    "test",
+    "playwright.config.ts",
+    "playwright.e2e.config.ts",
+    "../../tests/e2e/desktop"
+  ]
 }

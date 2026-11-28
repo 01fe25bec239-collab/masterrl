@@ -11,8 +11,13 @@ export const MOCK_TOKEN = 'mock-session';
 
 const token = import.meta.env.VITE_MRL_API_TOKEN ?? (mocksEnabled ? MOCK_TOKEN : undefined);
 
-/** Null until the app has a core address and token (the desktop shell provides them in P30). */
-export const api: ApiClient | null = token ? createApiClient({ baseUrl: API_URL, token }) : null;
+/** Null until the app has a core address and token; the desktop shell connects it at start. */
+let api: ApiClient | null = token ? createApiClient({ baseUrl: API_URL, token }) : null;
+
+/** Use this client from now on (the desktop session calls it before the first render). */
+export function connectApi(client: ApiClient): void {
+  api = client;
+}
 
 export function requireApi(): ApiClient {
   if (!api) throw new ApiError(0, 'The app is not connected to its core service yet.');

@@ -750,6 +750,25 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
     // <mrl:errors P28> rows for P28 go right below this line.
     // <mrl:errors P29> rows for P29 go right below this line.
     // <mrl:errors P30> rows for P30 go right below this line.
+    (
+        code(ErrorFamily::State, 300),
+        "These settings belong to the desktop app, not a team server.",
+    ),
+    (
+        code(Env, 300),
+        "Backups need the database the app runs itself.",
+    ),
+    (code(Res, 300), "There is no backup with this name."),
+    (code(Internal, 300), "The backup or restore didn't finish."),
+    (
+        code(Env, 301),
+        "The computer check couldn't read the agent's settings.",
+    ),
+    (
+        code(Conflict, 300),
+        "Another backup, restore or update check is running.",
+    ),
+    (code(Env, 302), "The app is reconnecting to its core."),
 ];
 
 /// Every code with its title: the registry plus every capability rejection.

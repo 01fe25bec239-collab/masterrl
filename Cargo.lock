@@ -2642,6 +2642,7 @@ dependencies = [
  "hyper-util",
  "jsonwebtoken",
  "keyring",
+ "mrl-agent",
  "mrl-domain",
  "mrl-proto",
  "mrl-storage",

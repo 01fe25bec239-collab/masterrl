@@ -27,4 +27,15 @@ export interface NavEntry {
  *   { id: 'datasets', label: 'Datasets', path: '/datasets', icon: 'file', section: 'project',
  *     load: () => import('../features/datasets/DatasetsPage') },
  */
-export const navRegistry: readonly NavEntry[] = [];
+export const navRegistry: readonly NavEntry[] = [
+  // P30: your profile, sign-in and command-line tokens.
+  {
+    id: 'account',
+    label: 'Account',
+    path: '/account',
+    icon: 'shield',
+    section: 'workspace',
+    keywords: ['profile', 'sign in', 'sign out', 'token', 'cli'],
+    load: () => import('../features/account/AccountPage'),
+  },
+];

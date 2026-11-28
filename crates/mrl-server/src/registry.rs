@@ -100,6 +100,10 @@ pub fn modules(db: &Db, config: &crate::Config) -> Vec<Box<dyn ServerModule>> {
         // <mrl:register P28> P28 modules go right below this line.
         // <mrl:register P29> P29 modules go right below this line.
         // <mrl:register P30> P30 modules go right below this line.
+        Box::new(crate::modules::desktop::DesktopModule::new(
+            db.clone(),
+            config,
+        )),
         // </mrl:register>
     ]
 }

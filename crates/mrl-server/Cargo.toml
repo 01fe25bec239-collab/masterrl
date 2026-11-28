@@ -82,6 +82,7 @@ url = "=2.5.9"
 # <mrl:deps P28> P28 dependencies go right below this line.
 # <mrl:deps P29> P29 dependencies go right below this line.
 # <mrl:deps P30> P30 dependencies go right below this line.
+mrl-agent = { path = "../mrl-agent" }
 
 [dev-dependencies]
 mrl-domain = { path = "../mrl-domain" }

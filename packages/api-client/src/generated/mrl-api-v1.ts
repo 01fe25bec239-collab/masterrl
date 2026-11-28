@@ -306,6 +306,132 @@ export interface paths {
     patch?: never;
     trace?: never;
   };
+  '/api/v1/desktop/activity': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** Running jobs and recent changes, for the tray, notifications and the sleep blocker. */
+    get: operations['desktop_get_activity'];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  '/api/v1/desktop/backups': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** The bundled database's backups, newest first. */
+    get: operations['desktop_list_backups'];
+    put?: never;
+    /** Backs the database up now. */
+    post: operations['desktop_create_backup'];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  '/api/v1/desktop/backups/{name}/restore': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /**
+     * Replaces the app's data with a backup (after backing up the current data). Restart the core
+     *     afterwards.
+     */
+    post: operations['desktop_restore_backup'];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  '/api/v1/desktop/doctor': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Checks this computer: what it has, what it can train, and what to install for more. */
+    post: operations['desktop_run_doctor'];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  '/api/v1/desktop/onboarding': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    /**
+     * Saves the onboarding step. `done` records when onboarding first finished; later steps never
+     *     clear it, so a finished app never shows first-run again.
+     */
+    put: operations['desktop_put_onboarding'];
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  '/api/v1/desktop/state': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    /** The desktop app's view of this core: onboarding, data folder and version. */
+    get: operations['desktop_get_state'];
+    put?: never;
+    post?: never;
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
+  '/api/v1/desktop/update/prepare': {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    get?: never;
+    put?: never;
+    /** Saves emergency checkpoints of running jobs and backs the database up, before an update. */
+    post: operations['desktop_prepare_update'];
+    delete?: never;
+    options?: never;
+    head?: never;
+    patch?: never;
+    trace?: never;
+  };
   '/api/v1/engines': {
     parameters: {
       query?: never;
@@ -1522,6 +1648,205 @@ export interface components {
       project_id?: string | null;
       /** @description `["*"]`, or areas like `["runs:write", "datasets:read"]`. */
       scopes: string[];
+    };
+    /** @description Activity on this core. */
+    DesktopActivity: {
+      /** @description Changes from shortly before `since`, oldest first (at most 50). */
+      changes: components['schemas']['DesktopJobChange'][];
+      /** @description Pass as `since` next time. */
+      cursor: string;
+      /** @description Jobs on or getting a machine, oldest first (at most 50). */
+      running: components['schemas']['DesktopJob'][];
+      /** @description A job is training or saving right now. */
+      training_active: boolean;
+    };
+    /** @description One backup file. */
+    DesktopBackup: {
+      /**
+       * Format: date-time
+       * @description When it was made.
+       */
+      created_at?: string | null;
+      /** @description File name, like `masterrl-20261127T093000123Z-daily.dump`. */
+      name: string;
+      /** @description Why it was made: `daily`, `manual`, `before-update`, `before-restore`, a migration… */
+      reason: string;
+      /**
+       * Format: int64
+       * @description Size in bytes.
+       */
+      size_bytes: number;
+    };
+    /** @description The backups of the bundled database. */
+    DesktopBackupList: {
+      /** @description False when the core uses another database (nothing to back up here). */
+      available: boolean;
+      /** @description The folder they are kept in. */
+      folder?: string | null;
+      /** @description Newest first. */
+      items: components['schemas']['DesktopBackup'][];
+    };
+    /** @description One check, like "NVIDIA driver". */
+    DesktopDoctorCheck: {
+      /** @description Check name, like `nvidia_driver`. */
+      check: string;
+      /** @description Guidance code for a warning or failure. */
+      code?: string | null;
+      /** @description `ok`, `warn`, `fail` or `not_applicable`. */
+      outcome: string;
+      /** @description One plain line. */
+      summary: string;
+    };
+    /** @description Something to install to unlock more. */
+    DesktopDoctorInstall: {
+      /**
+       * Format: double
+       * @description Download size, high estimate in GB.
+       */
+      download_gb_high: number;
+      /**
+       * Format: double
+       * @description Download size, low estimate in GB.
+       */
+      download_gb_low: number;
+      /** @description Component id, like `pytorch`. */
+      id: string;
+      /** @description Plain name. */
+      name: string;
+      /** @description What it does. */
+      summary: string;
+    };
+    /** @description What this computer has, can train, and could unlock. */
+    DesktopDoctorReport: {
+      /** @description "This computer can". */
+      can: components['schemas']['DesktopDoctorTask'][];
+      /** @description "It can't". */
+      cannot: components['schemas']['DesktopDoctorTask'][];
+      /** @description Check results. */
+      checks: components['schemas']['DesktopDoctorCheck'][];
+      /** @description What models fit here, in plain words. */
+      fits?: string | null;
+      /** @description Platform id, like `macos-apple-silicon`. */
+      platform: string;
+      /** @description "To unlock more, install". */
+      to_install: components['schemas']['DesktopDoctorInstall'][];
+    };
+    /** @description A task this computer can or can't do. */
+    DesktopDoctorTask: {
+      /** @description What stops it here ("can't" only). */
+      blocked_by?: string | null;
+      /**
+       * Format: double
+       * @description Download still needed first, high estimate in GB ("can" only).
+       */
+      download_first_gb_high?: number | null;
+      /**
+       * Format: double
+       * @description Download still needed first, low estimate in GB ("can" only).
+       */
+      download_first_gb_low?: number | null;
+      /** @description Plain name. */
+      name: string;
+      /** @description A note from the catalog. */
+      note?: string | null;
+      /** @description Task id, like `sft-lora`. */
+      task: string;
+    };
+    /** @description A job that holds or is getting a machine. */
+    DesktopJob: {
+      /** @description `job_…`. */
+      job_id: string;
+      /** @description The run's name, or the job kind. */
+      name: string;
+      /** @description `run_…` for training and evaluation jobs. */
+      run_id?: string | null;
+      /**
+       * Format: date-time
+       * @description When it started on a machine.
+       */
+      started_at?: string | null;
+      /** @description Job state, like `RUNNING`. */
+      state: string;
+    };
+    /** @description A job that finished, failed, was cancelled or paused. */
+    DesktopJobChange: {
+      /**
+       * Format: date-time
+       * @description When it changed.
+       */
+      at: string;
+      /** @description `job_…`. */
+      job_id: string;
+      /** @description The run's name, or the job kind. */
+      name: string;
+      /** @description `run_…` for training and evaluation jobs. */
+      run_id?: string | null;
+      /** @description `COMPLETED`, `FAILED`, `CANCELLED` or `PAUSED`. */
+      state: string;
+      /**
+       * Format: int64
+       * @description Grows with every state change of the job; show each `(job_id, state_version)` once.
+       */
+      state_version: number;
+    };
+    /** @description Where first-run onboarding stands. */
+    DesktopOnboarding: {
+      /**
+       * Format: date-time
+       * @description When onboarding was first finished; absent until then.
+       */
+      completed_at?: string | null;
+      /** @description The step to show next: `welcome`, `sign_in`, `restore`, `check` or `done`. */
+      step: string;
+    };
+    /** @description Move onboarding to a step. */
+    DesktopOnboardingUpdate: {
+      /** @description `welcome`, `sign_in`, `restore`, `check` or `done`. `done` finishes onboarding. */
+      step: string;
+    };
+    /** @description A finished restore. */
+    DesktopRestored: {
+      /** @description Always true: restart the core so it updates the restored data. */
+      restart_required: boolean;
+      /** @description The backup now in use. */
+      restored: string;
+      /** @description The backup of the data from just before, to undo the restore. */
+      safety_backup: string;
+    };
+    /** @description The desktop app's view of this core. */
+    DesktopState: {
+      /** @description True when this core runs its own PostgreSQL (backups work). */
+      bundled_database: boolean;
+      /** @description The folder the app's own database lives in; absent when the core uses another database. */
+      data_dir?: string | null;
+      /** @description First-run onboarding. */
+      onboarding: components['schemas']['DesktopOnboarding'];
+      /** @description The core's version. */
+      version: string;
+    };
+    /** @description How one job's emergency checkpoint went. */
+    DesktopUpdateCheckpoint: {
+      /** @description `ckpt_…` when committed. */
+      checkpoint_id?: string | null;
+      /** @description Why, in plain words, when not committed. */
+      detail?: string | null;
+      /** @description `job_…`. */
+      job_id: string;
+      /** @description The run's name, or the job kind. */
+      name: string;
+      /** @description `committed`, `refused`, `timed_out` or `failed`. */
+      outcome: string;
+    };
+    /** @description Whether the app may install the update now. */
+    DesktopUpdateReadiness: {
+      /** @description The backup's file name. */
+      backup?: string | null;
+      /** @description Why the backup failed. */
+      backup_error?: string | null;
+      /** @description One entry per running job. */
+      checkpoints: components['schemas']['DesktopUpdateCheckpoint'][];
+      /** @description The backup is made (or there is no bundled database): go ahead. */
+      ready: boolean;
     };
     /** @description `POST /artifacts/{art}:download` body. */
     DownloadRequest: {
@@ -4176,6 +4501,266 @@ export interface operations {
         content: {
           'application/json': components['schemas']['Problem'];
         };
+      };
+    };
+  };
+  desktop_get_activity: {
+    parameters: {
+      query?: {
+        /** @description `cursor` from the previous answer (an RFC 3339 time). Absent on the first call. */
+        since?: string;
+      };
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['DesktopActivity'];
+        };
+      };
+      /** @description since is not a cursor (MRL-VAL-005) */
+      400: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description A team core (MRL-STATE-300) */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+    };
+  };
+  desktop_list_backups: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['DesktopBackupList'];
+        };
+      };
+      /** @description A team core (MRL-STATE-300) */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+    };
+  };
+  desktop_create_backup: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      201: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['DesktopBackup'];
+        };
+      };
+      /** @description No bundled database (MRL-ENV-300), busy (MRL-CONFLICT-300) or a team core (MRL-STATE-300) */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description The backup failed (MRL-INTERNAL-300) */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+    };
+  };
+  desktop_restore_backup: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path: {
+        /** @description A backup's file name from the list */
+        name: string;
+      };
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['DesktopRestored'];
+        };
+      };
+      /** @description No such backup (MRL-RES-300) */
+      404: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description No bundled database (MRL-ENV-300), busy (MRL-CONFLICT-300) or a team core (MRL-STATE-300) */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description The restore failed (MRL-INTERNAL-300) */
+      500: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+    };
+  };
+  desktop_run_doctor: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['DesktopDoctorReport'];
+        };
+      };
+      /** @description A team core (MRL-STATE-300) */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description The agent settings could not be read (MRL-ENV-301) */
+      503: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+    };
+  };
+  desktop_put_onboarding: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody: {
+      content: {
+        'application/json': components['schemas']['DesktopOnboardingUpdate'];
+      };
+    };
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['DesktopOnboarding'];
+        };
+      };
+      /** @description A team core (MRL-STATE-300) */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+      /** @description Unknown step (MRL-VAL-003) */
+      422: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+    };
+  };
+  desktop_get_state: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['DesktopState'];
+        };
+      };
+      /** @description A team core (MRL-STATE-300) */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
+      };
+    };
+  };
+  desktop_prepare_update: {
+    parameters: {
+      query?: never;
+      header?: never;
+      path?: never;
+      cookie?: never;
+    };
+    requestBody?: never;
+    responses: {
+      200: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content: {
+          'application/json': components['schemas']['DesktopUpdateReadiness'];
+        };
+      };
+      /** @description Busy (MRL-CONFLICT-300) or a team core (MRL-STATE-300) */
+      409: {
+        headers: {
+          [name: string]: unknown;
+        };
+        content?: never;
       };
     };
   };

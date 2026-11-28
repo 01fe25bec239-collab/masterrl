@@ -101,6 +101,8 @@ pub struct Config {
     // <mrl:config P28> P28 settings fields go right below this line.
     // <mrl:config P29> P29 settings fields go right below this line.
     // <mrl:config P30> P30 settings fields go right below this line.
+    /// The desktop app's endpoints: the Environment Doctor and updates.
+    pub desktop: crate::modules::desktop::DesktopConfig,
 }
 
 /// `[server]`.
@@ -521,6 +523,7 @@ impl Config {
         // <mrl:validate P28> P28 checks (push to `problems`) go right below this line.
         // <mrl:validate P29> P29 checks (push to `problems`) go right below this line.
         // <mrl:validate P30> P30 checks (push to `problems`) go right below this line.
+        problems.extend(self.desktop.problems());
         if problems.is_empty() {
             Ok(())
         } else {

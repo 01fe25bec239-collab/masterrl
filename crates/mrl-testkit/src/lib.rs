@@ -52,6 +52,9 @@ mod int6_builtin;
 // <mrl:testkit P28> P28 `pub mod` lines go right below this line.
 // <mrl:testkit P29> P29 `pub mod` lines go right below this line.
 // <mrl:testkit P30> P30 `pub mod` lines go right below this line.
+#[cfg(test)]
+#[path = "../../mrl-server/src/modules/desktop/integration_tests.rs"]
+mod p30_desktop;
 
 /// The version of this crate, taken from its `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

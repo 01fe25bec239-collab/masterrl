@@ -26,11 +26,17 @@ export const CONTENT_SECURITY_POLICY = [
   "object-src 'none'",
 ].join('; ');
 
-/** Dev only: Vite's hot reload injects inline scripts and styles. Never used when packaged. */
+/**
+ * Dev only: Vite's hot reload injects inline scripts and styles, and the page (on the Vite
+ * server) reaches the core through the app's own `app://app/api/…` address. Never used when
+ * packaged, where the page itself is on `app://app`.
+ */
 export const DEV_CONTENT_SECURITY_POLICY = CONTENT_SECURITY_POLICY.replace(
   "script-src 'self'",
   "script-src 'self' 'unsafe-inline'",
-).replace("style-src 'self'", "style-src 'self' 'unsafe-inline'");
+)
+  .replace("style-src 'self'", "style-src 'self' 'unsafe-inline'")
+  .replace("connect-src 'self'", "connect-src 'self' app://app");
 
 /** External sites the app may open in the system browser. Everything else is blocked. */
 export const EXTERNAL_ORIGINS: readonly string[] = ['https://github.com'];
@@ -52,4 +58,14 @@ export function windowOptions(preload: string): BrowserWindowConstructorOptions 
     title: 'MasterRL',
     webPreferences: { ...WEB_PREFERENCES, preload },
   };
+}
+
+/**
+ * Where an unpackaged build under test writes the addresses it would open in the browser
+ * (`MRL_BROWSER_LOG`, used by tests/e2e/desktop). Always undefined in an installed app.
+ */
+export function browserLogFile(packaged: boolean, env: NodeJS.ProcessEnv): string | undefined {
+  if (packaged) return undefined;
+  const file = env.MRL_BROWSER_LOG;
+  return file && file.trim() !== '' ? file : undefined;
 }

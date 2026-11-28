@@ -73,10 +73,11 @@ async function seriousViolations(container: HTMLElement) {
 }
 
 describe('registries', () => {
-  it('all start empty and typed; features append one entry each', () => {
-    expect(
-      [navRegistry, settingsSections, runTabs, wizardSteps, machinePanels].map((r) => r.length),
-    ).toEqual([0, 0, 0, 0, 0]);
+  it('are typed lists with unique ids; features append one entry each', () => {
+    for (const r of [navRegistry, settingsSections, runTabs, wizardSteps, machinePanels]) {
+      const ids = r.map((e) => e.id);
+      expect(new Set(ids).size).toBe(ids.length);
+    }
   });
 });
 

@@ -26,7 +26,9 @@ const REQUIRED_CSP =
 const REQUIRED_DEV_CSP = REQUIRED_CSP.replace(
   "script-src 'self'",
   "script-src 'self' 'unsafe-inline'",
-).replace("style-src 'self'", "style-src 'self' 'unsafe-inline'");
+)
+  .replace("style-src 'self'", "style-src 'self' 'unsafe-inline'")
+  .replace("connect-src 'self'", "connect-src 'self' app://app");
 
 // Source patterns that bypass or weaken the settings above.
 const BANNED: [RegExp, string][] = [

@@ -92,7 +92,10 @@ fn version_line() -> String {
     format!("{NAME} {VERSION} ({GIT_SHA})")
 }
 
+mod crash;
+
 fn main() -> ExitCode {
+    crash::install(NAME, VERSION, GIT_SHA);
     let cli = Cli::parse();
     if cli.version {
         println!("{}", version_line());

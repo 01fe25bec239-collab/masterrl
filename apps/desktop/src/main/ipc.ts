@@ -1,4 +1,4 @@
-import { app, ipcMain } from 'electron';
+import { ipcMain } from 'electron';
 import {
   ipcRegistry,
   parseInput,
@@ -7,22 +7,20 @@ import {
   type ChannelOutput,
 } from './ipc.registry';
 
-type Handlers = {
+/** One handler per registry channel; tsc fails until every channel has one. */
+export type Handlers = {
   [C in Channel]: (...args: ChannelInput<C>) => ChannelOutput<C> | Promise<ChannelOutput<C>>;
 };
 
-const handlers: Handlers = {
-  'app:getVersion': () => app.getVersion(),
-};
-
 /** Register one validated `ipcMain.handle` per registry channel. */
-export function registerIpc(isTrustedPage: (url: string) => boolean): void {
+export function registerIpc(isTrustedPage: (url: string) => boolean, handlers: Handlers): void {
   for (const channel of Object.keys(ipcRegistry) as Channel[]) {
     ipcMain.handle(channel, async (event, ...args: unknown[]) => {
       if (!isTrustedPage(event.senderFrame?.url ?? '')) {
         throw new Error(`"${channel}" was called from a page outside the app and was refused.`);
       }
-      const result = await handlers[channel](...parseInput(channel, args));
+      const handler = handlers[channel] as (...a: unknown[]) => unknown;
+      const result = await handler(...(parseInput(channel, args) as unknown[]));
       return ipcRegistry[channel].output.parse(result);
     });
   }
