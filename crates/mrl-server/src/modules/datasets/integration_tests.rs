@@ -1226,12 +1226,12 @@ async fn dataset_posts_apply_current_permissions_and_create_replays_durably() {
 }
 
 impl Env {
-    async fn upload_worker_outputs(&self, job: Uuid, folder: &str, manifest: &Value) -> Uuid {
+    async fn upload_worker_outputs(&self, job: Uuid, folder: &str, manifest: &Value) {
         use mrl_domain::ids::{AttemptId, JobId};
         use mrl_proto::agent::v1::{command, Command, CommandResult};
         use mrl_proto::common::v1::AttemptRef;
         use mrl_proto::worker::v1::OutputsStaged;
-        use mrl_server::modules::builtin::sink::{register_pass, Outputs as WorkerOutputs};
+        use mrl_server::modules::builtin::sink::Outputs as WorkerOutputs;
         use mrl_server::modules::nodes::{lanes::LaneRouter, store as nodes, NodesModule};
         use mrl_server::modules::scheduler::launch::Transfer;
         use prost::Message;
@@ -1306,7 +1306,6 @@ impl Env {
         let mut tx = db.begin().await.unwrap();
         nodes::command_result(&mut tx, node, &accept).await.unwrap();
         tx.commit().await.unwrap();
-        register_pass(&outputs).await;
         assert!(mrl_server::modules::builtin::outputs(db, org, job)
             .await
             .unwrap()
@@ -1325,12 +1324,6 @@ impl Env {
             .await
             .unwrap();
         tx.commit().await.unwrap();
-        register_pass(&outputs).await;
-        mrl_server::modules::builtin::outputs(db, org, job)
-            .await
-            .unwrap()
-            .unwrap()
-            .artifact_id
     }
 
     // Simulates the registered INT-6 output of a finished worker. The background task and
@@ -1501,8 +1494,13 @@ async fn upload_to_ready_and_transform_use_int6_and_retry_unregistered_outputs()
         mrl_server::modules::datasets::work::DatasetVerifier::new(env.core.db.db().clone());
     assert!(verifier.verify(&row).await.is_err());
     let manifest = fixture_manifest("ready");
-    let artifact = env.upload_worker_outputs(job, "ready", &manifest).await;
+    env.upload_worker_outputs(job, "ready", &manifest).await;
     let ready = env.version_until(version, "READY").await;
+    let artifact = mrl_server::modules::builtin::outputs(env.core.db.db(), env.org.as_uuid(), job)
+        .await
+        .unwrap()
+        .unwrap()
+        .artifact_id;
     assert_eq!(
         env.store
             .get(&env.org.to_string(), artifact)
