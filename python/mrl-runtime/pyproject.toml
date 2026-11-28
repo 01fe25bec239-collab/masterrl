@@ -17,6 +17,7 @@ dependencies = [
     "tokenizers==0.23.3",
     # <mrl:deps P26> P26 dependencies go right below this line.
     # <mrl:deps P27> P27 dependencies go right below this line.
+    "huggingface-hub==2.4.0",
     # <mrl:deps P29> P29 dependencies go right below this line.
 ]
 
@@ -39,6 +40,7 @@ data_prep = "mrl_runtime.builtin.data_prep:DATA_PREP"
 import_dataset = "mrl_runtime.builtin.import_dataset:IMPORT_DATASET"
 transform = "mrl_runtime.builtin.transform:TRANSFORM"
 materialize_dataset = "mrl_runtime.builtin.materialize_dataset:MATERIALIZE_DATASET"
+push_dataset_to_hub = "mrl_runtime.builtin.materialize_dataset:PUSH_DATASET_TO_HUB"
 # <mrl:builtin-tasks P29> P29 tasks go right below this line.
 
 [dependency-groups]

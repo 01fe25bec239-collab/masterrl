@@ -19,12 +19,14 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, cast
 
+from mrl_runtime.data.readers import Limits, RawRecord, parse_json, read_records
 from mrl_runtime.model._json import Json, arr, integer, obj, text
 from mrl_runtime.model.errors import DATASET_UNREADABLE, MrlError
 
 MANIFEST = "dataset.json"
 SHARD_DIR = "shards"
 COLUMN = "record"
+SPLITS = ("train", "validation", "test")
 # A shard closes at whichever comes first.
 SHARD_ROWS = 50_000
 SHARD_BYTES = 128 * 1024 * 1024
@@ -54,7 +56,7 @@ def _unreadable(why: str) -> MrlError:
 
 def _safe_relative(path: str) -> str:
     p = PurePosixPath(path)
-    if p.is_absolute() or ".." in p.parts or "\\" in path or not p.parts:
+    if p.is_absolute() or ".." in p.parts or "\\" in path or ":" in path or not p.parts:
         raise _unreadable(f"{MANIFEST} names a file outside the dataset folder: {path!r}")
     return p.as_posix()
 
@@ -85,11 +87,12 @@ class DatasetAdapter:
         for entry in arr(doc.get("shards")) or []:
             e = obj(entry) or {}
             rel, split, rows = text(e.get("path")), text(e.get("split")), integer(e.get("rows"))
-            if rel is None or split is None or rows is None or rows < 0:
+            if rel is None or split not in SPLITS or rows is None or rows < 0:
                 raise _unreadable(f"{MANIFEST} has a malformed shard entry")
             rel = _safe_relative(rel)
             if not (root / rel).is_file():
                 raise _unreadable(f"shard {rel} is missing")
+            assert split is not None
             shards.append(Shard(rel, split, rows))
         self.shards: tuple[Shard, ...] = tuple(shards)
 
@@ -106,22 +109,49 @@ class DatasetAdapter:
 
     def records(self, split: str | None = None) -> Iterator[Json]:
         """Every record (of one split, or of all splits in shard order), as a dict."""
-        _, pq = _pyarrow()
+        for _, record in self.split_records(split):
+            yield record
+
+    def split_records(self, split: str | None = None) -> Iterator[tuple[str, Json]]:
+        """Return the split with every record, in manifest order."""
         for shard in self.shards:
             if split is not None and shard.split != split:
                 continue
-            try:
-                f = pq.ParquetFile(self.root / shard.path)
-                for batch in f.iter_batches(columns=[COLUMN], batch_size=_BATCH_ROWS):
-                    for value in cast(list[object], batch.column(0).to_pylist()):
-                        if not isinstance(value, str):
-                            raise _unreadable(f"{shard.path} has a row without a record")
-                        record = obj(json.loads(value))
-                        if record is None:
-                            raise _unreadable(f"{shard.path} has a row that is not an object")
-                        yield record
-            except (OSError, ValueError) as exc:
-                raise _unreadable(f"{shard.path}: {exc}") from exc
+            for raw in parquet_records(self.root / shard.path, require_shard=True):
+                if raw.defect:
+                    raise _unreadable(f"{shard.path}, row {raw.number}: {raw.defect}")
+                yield shard.split, cast(Json, raw.value)
+
+
+def parquet_records(path: Path, *, require_shard: bool = False) -> Iterator[RawRecord]:
+    """Read MRL shards, or delegate standard column-oriented Parquet to P15."""
+    _, pq = _pyarrow()
+    limits = Limits()
+    try:
+        f = pq.ParquetFile(path)
+        shard = f.schema_arrow.names == [COLUMN]
+        if not (require_shard or shard):
+            yield from read_records(path, None, limits)
+            return
+        if not shard:
+            raise _unreadable(f"{path.name} does not have a record column")
+        n = 0
+        for batch in f.iter_batches(columns=[COLUMN], batch_size=_BATCH_ROWS):
+            for line in cast(list[object], batch.column(0).to_pylist()):
+                n += 1
+                if not isinstance(line, str):
+                    yield RawRecord(n, None, "not_object", 0)
+                    continue
+                size = len(line.encode("utf-8"))
+                if size > limits.max_record_bytes:
+                    yield RawRecord(n, None, "oversized_record", size)
+                    continue
+                record, defect = parse_json(line, limits)
+                if defect is None and obj(record) is None:
+                    defect = "not_object"
+                yield RawRecord(n, record if defect is None else None, defect, size)
+    except (OSError, ValueError) as exc:
+        raise _unreadable(f"{path.name}: {exc}") from exc
 
 
 class ShardWriter:

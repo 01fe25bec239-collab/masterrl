@@ -4,7 +4,7 @@
   "title": "Transform v1",
   "description": "A recorded, repeatable mapping from a source table (file or hub dataset) to a canonical dataset schema. Steps run in order; the output must validate against `to`.",
   "type": "object",
-  "required": ["schema_version", "name", "from", "to", "steps"],
+  "required": ["schema_version", "name", "to", "steps"],
   "properties": {
     "schema_version": { "const": "transform/v1" },
     "name": { "type": "string", "minLength": 1 },
@@ -23,9 +23,49 @@
   },
   "additionalProperties": false,
   "$defs": {
-    "field": { "description": "Column name; dots address nested fields.", "type": "string", "minLength": 1 },
+    "field": { "description": "Column name; dots address nested fields.", "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$" },
+    "share": { "type": "number", "minimum": 0, "maximum": 1 },
+    "seed": { "type": "integer", "minimum": 0, "maximum": 9223372036854775807 },
     "step": {
       "oneOf": [
+        {
+          "description": "Keep records that match a restricted expression.",
+          "type": "object",
+          "required": ["op", "expr"],
+          "properties": { "op": { "const": "filter" }, "expr": { "type": "string", "minLength": 1, "maxLength": 2000 } },
+          "additionalProperties": false
+        },
+        {
+          "description": "Move several columns using a source-to-destination map.",
+          "type": "object",
+          "required": ["op", "columns"],
+          "properties": {
+            "op": { "const": "map_columns" },
+            "columns": { "type": "object", "minProperties": 1, "propertyNames": { "$ref": "#/$defs/field" }, "additionalProperties": { "$ref": "#/$defs/field" } }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Assign a split deterministically. Shares must sum to one.",
+          "type": "object",
+          "required": ["op"],
+          "anyOf": [{ "required": ["train"] }, { "required": ["validation"] }, { "required": ["test"] }],
+          "properties": {
+            "op": { "const": "split" },
+            "train": { "$ref": "#/$defs/share" },
+            "validation": { "$ref": "#/$defs/share" },
+            "test": { "$ref": "#/$defs/share" },
+            "seed": { "$ref": "#/$defs/seed" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "description": "Sample up to n records using a deterministic seed.",
+          "type": "object",
+          "required": ["op", "n"],
+          "properties": { "op": { "const": "sample" }, "n": { "type": "integer", "minimum": 1 }, "seed": { "$ref": "#/$defs/seed" } },
+          "additionalProperties": false
+        },
         {
           "description": "Rename a column.",
           "type": "object",
@@ -89,7 +129,7 @@
         {
           "description": "Drop exact duplicate rows over the given fields.",
           "type": "object",
-          "required": ["op", "fields"],
+          "required": ["op"],
           "properties": { "op": { "const": "dedupe" }, "fields": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/field" } } },
           "additionalProperties": false
         },

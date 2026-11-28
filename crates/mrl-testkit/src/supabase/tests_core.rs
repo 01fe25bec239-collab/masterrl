@@ -711,6 +711,20 @@ async fn every_route_answers_by_role_in_team_mode() {
             p = prj.as_uuid()
         ))
         .await;
+    let p27_tokenizer = mrl_domain::ids::ArtifactId::new();
+    let p27_work = mrl_domain::ids::JobId::new();
+    core.db.seed(&format!(
+        r#"UPDATE datasets SET next_seq=2 WHERE id='{ds}';
+         INSERT INTO artifacts (id,org_id,project_id,name,kind,prefix,manifest,size_bytes,state,created_by,committed_at)
+         VALUES ('{tokenizer}','{o}','{p}','rbac-tokenizer','other','orgs/{o}/tmp/tokenizer',
+         '{{"schema_version":"artifact-manifest/v1","kind":"other","created_at":"2026-11-27T00:00:00Z","files":[{{"path":"tokenizer.json","size":0,"sha256":"{sha}","role":"tokenizer"}}]}}',
+         0,'COMMITTED','seed',now());
+         INSERT INTO jobs (id,org_id,project_id,kind,state,resource_request,retry_policy,created_by)
+         VALUES ('{job}','{org_uuid}','{project_uuid}','DATA_PREP','QUEUED','{{}}','{{}}','seed');
+         INSERT INTO dataset_work (job_id,version_id,purpose) VALUES ('{job}','{v}','tokenize');"#,
+        ds=p27_ds.as_uuid(), o=org, p=prj, tokenizer=p27_tokenizer.as_uuid(),
+        org_uuid=org.as_uuid(), project_uuid=prj.as_uuid(), sha="0".repeat(64), job=p27_work.as_uuid(), v=p27_dsv.as_uuid(),
+    )).await;
     // <mrl:roles-seed P28> P28 seed data for the role table goes right below this line.
     // <mrl:roles-seed P29> P29 seed data for the role table goes right below this line.
     // <mrl:roles-seed P30> P30 seed data for the role table goes right below this line.
@@ -1217,6 +1231,32 @@ async fn every_route_answers_by_role_in_team_mode() {
             Action::DatasetsExport,
             Some(json!({"format": "parquet"})),
         ),
+        row(
+            Method::POST,
+            format!("/api/v1/datasets/{p27_ds}/versions"),
+            Action::DatasetsImport,
+            Some(json!({"source":"remote","schema_id":"sft.messages.v1",
+                "url":"https://example.org/train.jsonl"})),
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/dataset-versions/{p27_dsv}:tokenize-preview"),
+            Action::DatasetsRead,
+            Some(json!({"tokenizer_artifact_id":p27_tokenizer.to_string()})),
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/dataset-versions/{p27_dsv}:transform-preview"),
+            Action::DatasetsImport,
+            Some(json!({"transform_spec":{"schema_version":"transform/v1",
+                "name":"preview","to":"sft.messages.v1","steps":[{"op":"filter","expr":"true"}]}})),
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/dataset-versions/{p27_dsv}/work/{p27_work}"),
+            Action::DatasetsRead,
+            None,
+        ),
         // <mrl:roles-routes P28> P28 role-table rows go right below this line.
         // <mrl:roles-routes P29> P29 role-table rows go right below this line.
         // <mrl:roles-routes P30> P30 role-table rows go right below this line.
@@ -1272,6 +1312,12 @@ async fn every_route_answers_by_role_in_team_mode() {
             ("POST", p) if p.ends_with("/datasets") => &[201, 409],
             ("PATCH", p) if p.starts_with("/api/v1/datasets/") => &[200],
             ("DELETE", p) if p.starts_with("/api/v1/datasets/") => &[204],
+            ("POST", p) if p.ends_with("/versions") && p.starts_with("/api/v1/datasets/") => &[202],
+            ("POST", p)
+                if p.starts_with("/api/v1/dataset-versions/") && p.ends_with("-preview") =>
+            {
+                &[202]
+            }
             ("POST", p) if p.starts_with("/api/v1/dataset-versions/") => &[200],
             // <mrl:roles-expected P28> P28 expected-status arms go right below this line.
             // <mrl:roles-expected P29> P29 expected-status arms go right below this line.

@@ -90,6 +90,14 @@ OPERATIONS: dict[str, Operation] = {
         (),
         True,
     ),
+    "create_dataset_version": Operation(
+        "POST",
+        "/api/v1/datasets/{ds}/versions",
+        ("ds",),
+        (),
+        (),
+        True,
+    ),
     "create_enrollment_token": Operation(
         "POST",
         "/api/v1/pools/{pool}/enrollment-tokens",
@@ -314,6 +322,17 @@ OPERATIONS: dict[str, Operation] = {
         "GET",
         "/api/v1/dataset-versions/{dsv}",
         ("dsv",),
+        (),
+        (),
+        False,
+    ),
+    "get_dataset_work": Operation(
+        "GET",
+        "/api/v1/dataset-versions/{dsv}/work/{job}",
+        (
+            "dsv",
+            "job",
+        ),
         (),
         (),
         False,
@@ -727,6 +746,14 @@ OPERATIONS: dict[str, Operation] = {
         (),
         True,
     ),
+    "preview_dataset_transform": Operation(
+        "POST",
+        "/api/v1/dataset-versions/{dsv}:transform-preview",
+        ("dsv",),
+        (),
+        (),
+        True,
+    ),
     "push": Operation(
         "POST",
         "/api/v1/sync/push",
@@ -859,6 +886,14 @@ OPERATIONS: dict[str, Operation] = {
         ("prj",),
         (),
         ("Idempotency-Key",),
+        True,
+    ),
+    "tokenize_dataset_preview": Operation(
+        "POST",
+        "/api/v1/dataset-versions/{dsv}:tokenize-preview",
+        ("dsv",),
+        (),
+        (),
         True,
     ),
     "update_dataset": Operation(

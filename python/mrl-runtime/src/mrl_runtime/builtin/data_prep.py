@@ -40,12 +40,14 @@ from mrl_runtime.builtin.tasks import BuiltinTask, TaskContext, TaskEvent, TaskO
 from mrl_runtime.checkpoint.files import list_files
 from mrl_runtime.data.adapter import (
     MANIFEST,
+    SPLITS,
     DatasetAdapter,
     ShardWriter,
     canonical_json,
+    parquet_records,
     write_manifest,
 )
-from mrl_runtime.data.readers import SUFFIXES, Limits, RawRecord, read_records
+from mrl_runtime.data.readers import SUFFIXES, Limits, RawRecord, check_value, read_records
 from mrl_runtime.data.tokens import PreviewOptions, preview_tokens
 from mrl_runtime.data.validate import (
     DATASET_SCHEMAS,
@@ -59,7 +61,12 @@ from mrl_runtime.data.validate import (
 )
 from mrl_runtime.errors import TASK_INPUT_INVALID
 from mrl_runtime.model._json import Json, arr, integer, number, obj, text
-from mrl_runtime.model.errors import DATASET_INVALID, DATASET_UNREADABLE, MrlError
+from mrl_runtime.model.errors import (
+    COLUMN_TYPE_REFUSED,
+    DATASET_INVALID,
+    DATASET_UNREADABLE,
+    MrlError,
+)
 
 # Codes this part owns (guidance/fragments/errors/p27.yaml).
 IMAGES_NOT_SUPPORTED = "MRL-DATA-270"
@@ -141,6 +148,13 @@ def _copy(src: IO[bytes], dest: Path, budget: _Budget, packed: int | None, name:
             f.write(chunk)
 
 
+def _check_archive_size(decoded: int, packed: int) -> None:
+    if decoded > MAX_EXTRACT_BYTES or (
+        decoded > RATIO_FLOOR and decoded > MAX_RATIO * max(packed, 1)
+    ):
+        raise RefusedError(ARCHIVE_REFUSED, "The archive expands beyond its limit.")
+
+
 def extract(archive: Path, dest: Path, budget: _Budget) -> None:
     """Unpack `archive` under `dest` with the limits above (members are never trusted)."""
     try:
@@ -160,12 +174,15 @@ def extract(archive: Path, dest: Path, budget: _Budget) -> None:
                         _copy(src, dest / rel, budget, info.compress_size, info.filename)
         else:
             packed = archive.stat().st_size
+            decoded = 0
             with tarfile.open(archive, mode="r:*") as t:
                 for member in t:
                     budget.member()
                     rel = _member_path(member.name)
                     if member.isdir():
                         continue
+                    decoded += member.size
+                    _check_archive_size(decoded, packed)
                     if rel is None and member.isfile():
                         continue
                     if not member.isfile():
@@ -229,12 +246,12 @@ class _BrowseWriter:
     _lines: list[str] = field(default_factory=list[str])
     _bytes: int = 0
     _first: int = 0
-    _rows: int = 0
 
-    def add(self, record: object) -> None:
-        line = canonical_json(record)
+    def add(self, line: str, size: int) -> None:
+        if self._bytes + size > BROWSE_BYTES:
+            self.flush()
         self._lines.append(line)
-        self._bytes += len(line.encode("utf-8")) + 1
+        self._bytes += size
         if len(self._lines) >= BROWSE_ROWS or self._bytes >= BROWSE_BYTES:
             self.flush()
 
@@ -243,7 +260,7 @@ class _BrowseWriter:
             return
         rel = f"{BROWSE_DIR}/{len(self.pages):05d}.jsonl"
         (self.root / BROWSE_DIR).mkdir(parents=True, exist_ok=True)
-        (self.root / rel).write_text("\n".join(self._lines) + "\n", encoding="utf-8")
+        (self.root / rel).write_text("\n".join(self._lines) + "\n", encoding="utf-8", newline="\n")
         self.pages.append({"path": rel, "first": self._first, "rows": len(self._lines)})
         self._first += len(self._lines)
         self._lines, self._bytes = [], 0
@@ -300,7 +317,16 @@ def _verdict(report: ValidationReport, images: int, schema_id: str) -> tuple[str
     )
 
 
-def normalize(
+def record_line(record: Json, limits: Limits) -> tuple[str, int, str | None]:
+    """Serialize a row only after its structure and encoding pass the reader limits."""
+    if defect := check_value(record, limits.max_depth):
+        return "", 0, defect
+    line = canonical_json(record)
+    size = len(line.encode("utf-8")) + 1
+    return line, size, "oversized_record" if size > limits.max_record_bytes else None
+
+
+def normalize(  # noqa: PLR0915 (one streaming pass and one publication decision)
     records: Iterable[tuple[RawRecord, str]], schema_id: str, out: Path, check: Check
 ) -> Normalized:
     """Check `records` (each with its split) and write the version folder into `out`.
@@ -314,6 +340,7 @@ def normalize(
     seen: set[str] = set()
     prompts: set[str] = set()
     images = 0
+    limits = Limits()
 
     def tap() -> Iterator[RawRecord]:
         nonlocal images
@@ -322,10 +349,15 @@ def normalize(
                 check.progress(n)
             if check.cancelled():
                 return
-            yield raw
             if raw.defect is not None:
+                yield raw
                 continue
             rec = cast(Json, raw.value)
+            line, size, defect = record_line(rec, limits)
+            if defect:
+                yield RawRecord(raw.number, None, defect, size)
+                continue
+            yield raw
             if validator.defects(rec):
                 continue
             if has_images(rec):
@@ -337,12 +369,16 @@ def normalize(
             seen.add(digest)
             prompts.update(content_hashes(schema_id, rec))
             shards.add(rec, split)
-            browse.add(rec)
+            browse.add(line, size)
 
     report = validate_records(
         tap(),
         schema_id,
-        CheckOptions(against=check.against, max_invalid_fraction=check.max_invalid_fraction),
+        CheckOptions(
+            against=check.against,
+            max_invalid_fraction=check.max_invalid_fraction,
+            unique_stats=True,
+        ),
         source=schema_id,
         fmt="mixed",
     )
@@ -356,8 +392,12 @@ def normalize(
         TaskOutput("stats.json", "report", "json"),
     ]
     if passed:
-        (out / RECORD_HASHES).write_text("".join(f"{h}\n" for h in sorted(seen)), "utf-8")
-        (out / CONTENT_HASHES).write_text("".join(f"{h}\n" for h in sorted(prompts)), "utf-8")
+        (out / RECORD_HASHES).write_text(
+            "".join(f"{h}\n" for h in sorted(seen)), "utf-8", newline="\n"
+        )
+        (out / CONTENT_HASHES).write_text(
+            "".join(f"{h}\n" for h in sorted(prompts)), "utf-8", newline="\n"
+        )
         outputs += [TaskOutput(s.path, "data", "parquet") for s in listed]
         outputs += [TaskOutput(p["path"], "data", "jsonl") for p in browse.pages]
         outputs += [
@@ -521,6 +561,18 @@ def _validate(inputs: Mapping[str, Any], staged: Mapping[str, Path]) -> list[Iss
     )
 
 
+def source_split(name: str) -> str:
+    """Recognize split directories and shard names, falling back to train."""
+    path = PurePosixPath(name.lower())
+    for part in reversed(path.parts[:-1]):
+        if part in SPLITS:
+            return part
+    for part in path.stem.replace("_", "-").split("-"):
+        if part in SPLITS:
+            return part
+    return "train"
+
+
 def _ingest(ctx: TaskContext) -> Iterator[TaskEvent]:
     schema_id = str(ctx.inputs["schema_id"])
     out = ctx.output_dir
@@ -543,9 +595,15 @@ def _ingest(ctx: TaskContext) -> Iterator[TaskEvent]:
             n = 0
             for name, path in files:
                 first = n + 1
-                for raw in read_records(path, None, Limits()):
+                split = source_split(name)
+                reader = (
+                    parquet_records(path)
+                    if path.suffix.lower() == ".parquet"
+                    else read_records(path, None, Limits())
+                )
+                for raw in reader:
                     n += 1
-                    yield RawRecord(n, raw.value, raw.defect, raw.size), "train"
+                    yield RawRecord(n, raw.value, raw.defect, raw.size), split
                 listing.append({"path": name, "first_record": first, "records": n - first + 1})
 
         against = load_against(ctx.inputs, ctx.staged_paths)
@@ -566,7 +624,7 @@ def _ingest(ctx: TaskContext) -> Iterator[TaskEvent]:
                 "check",
             )
         except MrlError as exc:
-            if exc.code != DATASET_UNREADABLE:
+            if exc.code not in (DATASET_UNREADABLE, COLUMN_TYPE_REFUSED):
                 raise
             refused_manifest(
                 out,

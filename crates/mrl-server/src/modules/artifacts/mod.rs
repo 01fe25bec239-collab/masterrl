@@ -267,6 +267,12 @@ impl ArtifactStore {
     fn with_module_lookups(self) -> Self {
         // <mrl:lineage-lookups P26> P26 lookups go right below this line.
         // <mrl:lineage-lookups P27> P27 lookups go right below this line.
+        self.add_lineage_lookup(
+            "dsv",
+            Arc::new(crate::modules::datasets::records::DatasetRecords::new(
+                self.db.clone(),
+            )),
+        );
         // <mrl:lineage-lookups P29> P29 lookups go right below this line.
         self
     }
@@ -303,6 +309,9 @@ impl ArtifactStore {
     /// `self.add_download_guard(Arc::new(…));` line below its marker.
     fn with_download_guards(self) -> Self {
         // <mrl:download-guards P27> P27 guards go right below this line.
+        self.add_download_guard(Arc::new(
+            crate::modules::datasets::downloads::DatasetDownloadGuard::new(self.db.clone()),
+        ));
         self
     }
 

@@ -711,6 +711,36 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /api/v1/dataset-versions/{dsv}/work/{job}:
+    get:
+      tags:
+      - datasets
+      summary: Reads a version-scoped preview or export job result.
+      operationId: get_dataset_work
+      parameters:
+      - name: dsv
+        in: path
+        description: Dataset version ID
+        required: true
+        schema:
+          type: string
+      - name: job
+        in: path
+        description: Dataset job ID
+        required: true
+        schema:
+          type: string
+      responses:
+        '200':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetWorkResult'
+        '404':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/dataset-versions/{dsv}:diff:
     post:
       tags:
@@ -771,6 +801,11 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/DatasetExport'
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetWorkAccepted'
         '403':
           description: The dataset is restricted personal data (MRL-PERM-270).
           content:
@@ -783,6 +818,56 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /api/v1/dataset-versions/{dsv}:tokenize-preview:
+    post:
+      tags:
+      - datasets
+      summary: Queues a tokenization histogram.
+      operationId: tokenize_dataset_preview
+      parameters:
+      - name: dsv
+        in: path
+        description: Dataset version ID
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DatasetTokenizeRequest'
+        required: true
+      responses:
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetWorkAccepted'
+  /api/v1/dataset-versions/{dsv}:transform-preview:
+    post:
+      tags:
+      - datasets
+      summary: Queues a preview on the first 20 rows.
+      operationId: preview_dataset_transform
+      parameters:
+      - name: dsv
+        in: path
+        description: Dataset version ID
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DatasetTransformPreviewRequest'
+        required: true
+      responses:
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetWorkAccepted'
   /api/v1/datasets/{ds}:
     get:
       tags:
@@ -903,6 +988,35 @@ paths:
                 $ref: '#/components/schemas/Page_DatasetVersionInfo'
         '404':
           description: No such dataset.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+    post:
+      tags:
+      - datasets
+      summary: Creates a version and queues its first INT-6 job.
+      operationId: create_dataset_version
+      parameters:
+      - name: ds
+        in: path
+        description: Dataset ID
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DatasetVersionSource'
+        required: true
+      responses:
+        '202':
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DatasetVersionInfo'
+        '422':
           content:
             application/json:
               schema:
@@ -3690,12 +3804,20 @@ components:
       - size
       - sha256
       - url
+      - headers
       - expires_at
       properties:
         expires_at:
           type: string
           format: date-time
           description: When the link stops working.
+        headers:
+          type: object
+          description: Headers required by the download URL.
+          additionalProperties:
+            type: string
+          propertyNames:
+            type: string
         path:
           type: string
           description: Path inside the export.
@@ -3709,7 +3831,7 @@ components:
           minimum: 0
         url:
           type: string
-          description: Download link (relative to the server), valid until `expires_at`.
+          description: Download URL, valid until `expires_at`.
     DatasetExportRequest:
       type: object
       description: '`POST /dataset-versions/{dsv}:export`.'
@@ -3718,7 +3840,17 @@ components:
       properties:
         format:
           type: string
-          description: '`parquet`: the version''s shards.'
+          description: '`parquet` gives shard links. `jsonl` and `hub` queue export jobs.'
+        repo:
+          type:
+          - string
+          - 'null'
+          description: Hub repository (owner/name) when the format is hub.
+        secret_id:
+          type:
+          - string
+          - 'null'
+          description: Secret with hub_push use when the format is hub.
       additionalProperties: false
     DatasetFileInfo:
       type: object
@@ -3970,6 +4102,40 @@ components:
           format: int64
           description: Records looked at for this page.
           minimum: 0
+    DatasetTokenizeRequest:
+      type: object
+      description: Request to tokenize a dataset using a registered tokenizer artifact.
+      required:
+      - tokenizer_artifact_id
+      properties:
+        context_length:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Context window size.
+          minimum: 0
+        max_records:
+          type:
+          - integer
+          - 'null'
+          format: int32
+          description: Maximum records to inspect, capped at 2000.
+          minimum: 0
+        tokenizer_artifact_id:
+          type: string
+          description: Committed tokenizer artifact in this project.
+      additionalProperties: false
+    DatasetTransformPreviewRequest:
+      type: object
+      description: Request to preview a transform against a READY version.
+      required:
+      - transform_spec
+      properties:
+        transform_spec:
+          type: object
+          description: The transform/v1 specification.
+      additionalProperties: false
     DatasetValidation:
       type: object
       description: The validation report of a checked version.
@@ -4106,6 +4272,132 @@ components:
           - object
           - 'null'
           description: The transform that made it.
+    DatasetVersionSource:
+      oneOf:
+      - type: object
+        description: One or more completed uploads in this project.
+        required:
+        - schema_id
+        - uploads
+        - source
+        properties:
+          schema_id:
+            type: string
+            description: Canonical dataset schema.
+          source:
+            type: string
+            enum:
+            - upload
+          uploads:
+            type: array
+            items:
+              type: string
+            description: Completed upload IDs.
+      - type: object
+        description: A pinned snapshot of a Hugging Face dataset repository.
+        required:
+        - schema_id
+        - repo
+        - source
+        properties:
+          config:
+            type:
+            - string
+            - 'null'
+            description: Optional repository config.
+          repo:
+            type: string
+            description: Hub repository, owner/name.
+          revision:
+            type:
+            - string
+            - 'null'
+            description: Branch, tag or commit. Defaults to main.
+          schema_id:
+            type: string
+            description: Canonical dataset schema.
+          secret_id:
+            type:
+            - string
+            - 'null'
+            description: Project or org secret with hub_import use.
+          source:
+            type: string
+            enum:
+            - hub
+          split:
+            type:
+            - string
+            - 'null'
+            description: Optional split.
+      - type: object
+        description: A snapshot of an HTTPS file.
+        required:
+        - schema_id
+        - url
+        - source
+        properties:
+          schema_id:
+            type: string
+            description: Canonical dataset schema.
+          source:
+            type: string
+            enum:
+            - remote
+          url:
+            type: string
+            description: HTTPS file URL.
+      - type: object
+        description: A declarative transformation of a version in this project.
+        required:
+        - parent_version_id
+        - transform_spec
+        - source
+        properties:
+          parent_version_id:
+            type: string
+            description: Parent dataset version ID.
+          source:
+            type: string
+            enum:
+            - transform
+          transform_spec:
+            type: object
+            description: The transform/v1 specification.
+      description: The source for a new dataset version.
+    DatasetWorkAccepted:
+      type: object
+      description: A queued dataset operation.
+      required:
+      - job_id
+      properties:
+        job_id:
+          type: string
+          description: ID to poll on this version.
+    DatasetWorkResult:
+      type: object
+      description: What a queued preview or export job produced.
+      required:
+      - state
+      properties:
+        export:
+          oneOf:
+          - $ref: '#/components/schemas/DatasetExport'
+            description: Download links for a completed JSONL export.
+          - type: 'null'
+        failure:
+          type:
+          - string
+          - 'null'
+          description: Terminal failure, if any.
+        report:
+          type:
+          - object
+          - 'null'
+          description: Tokenization or transform preview report.
+        state:
+          type: string
+          description: Current job state.
     DownloadRequest:
       type: object
       description: '`POST /artifacts/{art}:download` body.'

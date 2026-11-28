@@ -33,6 +33,8 @@ import re
 import shutil
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
+from itertools import islice
 from pathlib import Path
 from typing import Any, cast
 
@@ -43,11 +45,12 @@ from mrl_runtime.builtin.data_prep import (
     fraction,
     load_against,
     normalize,
+    record_line,
     with_progress,
 )
 from mrl_runtime.builtin.tasks import BuiltinTask, TaskContext, TaskEvent, TaskOutput
-from mrl_runtime.data.adapter import DatasetAdapter, canonical_json
-from mrl_runtime.data.readers import RawRecord
+from mrl_runtime.data.adapter import SPLITS, DatasetAdapter, canonical_json
+from mrl_runtime.data.readers import Limits, RawRecord
 from mrl_runtime.data.validate import DATASET_SCHEMAS, record_hash
 from mrl_runtime.errors import TASK_INPUT_INVALID, MrlError
 from mrl_runtime.model._json import Json, arr, integer, number, obj, text
@@ -58,7 +61,6 @@ REPORT_FILE = "transform_report.json"
 PREVIEW_ROWS = 20
 MAX_EXPR_CHARS = 2000
 MAX_DEPTH = 32
-SPLITS = ("train", "validation", "test")
 
 # ---- the filter language ----
 
@@ -490,19 +492,29 @@ def _cast(value: object, kind: str, true_values: list[str]) -> object:
         if isinstance(value, str) and value.strip().lower() in ("true", "false"):
             return value.strip().lower() == "true"
         raise Dropped(f"can't make {value!r} true or false")
+    if kind == "integer":
+        return _integer_cast(value)
     try:
-        if isinstance(value, bool):
-            raise ValueError
         n = float(value) if isinstance(value, str) else number(value)
-    except ValueError:
+    except (ValueError, OverflowError):
         n = None
     if n is None or not math.isfinite(n):
         raise Dropped(f"can't make {value!r} a number")
-    if kind == "integer":
-        if n != int(n):
-            raise Dropped(f"{value!r} is not a whole number")
-        return int(n)
     return n
+
+
+def _integer_cast(value: object) -> int:
+    if (n := integer(value)) is not None:
+        return n
+    try:
+        exact = Decimal(value) if isinstance(value, (str, float)) else None
+    except InvalidOperation:
+        exact = None
+    if exact is None or not exact.is_finite():
+        raise Dropped(f"can't make {value!r} a number")
+    if exact.adjusted() >= 4000 or exact != exact.to_integral_value():
+        raise Dropped(f"{value!r} is not a whole number")
+    return int(exact)
 
 
 type Stage = Callable[[Iterator[Item]], Iterator[Item]]
@@ -573,8 +585,19 @@ def _template(step: Json, drop: Drop) -> Stage:
     template, to = str(step["template"]), str(step["to"])
 
     def fill(it: Item) -> Item:
-        rendered = _PLACEHOLDER.sub(lambda m: _as_text(_get(it.record, m.group(1))), template)
-        _set(it.record, to, rendered)
+        remaining = Limits().max_record_bytes - len(template.encode("utf-8"))
+
+        def substitute(match: re.Match[str]) -> str:
+            nonlocal remaining
+            value = _as_text(_get(it.record, match.group(1)))
+            remaining += len(match.group(0)) - len(value.encode("utf-8"))
+            if remaining < 0:
+                raise Dropped("the template output is larger than the record limit")
+            return value
+
+        if remaining < 0:
+            raise Dropped("the template is larger than the record limit")
+        _set(it.record, to, _PLACEHOLDER.sub(substitute, template))
         return it
 
     return _per_record(fill, drop)
@@ -801,6 +824,9 @@ def _kind_ok(kind: str, v: object) -> bool:  # noqa: PLR0911 (one line per kind)
         case "count":
             n = integer(v)
             return n is not None and n >= 1
+        case "columns":
+            items = arr(v)
+            return items is not None and all(isinstance(x, str) and x for x in items)
         case "texts":
             items = arr(v)
             return items is not None and all(isinstance(x, str) for x in items)
@@ -822,6 +848,17 @@ def spec_problems(spec: object) -> list[tuple[str, str]]:
         out.append(("/schema_version", 'Set schema_version to "transform/v1".'))
     if not isinstance(s.get("name"), str) or not s.get("name"):
         out.append(("/name", "Give the transform a name."))
+    if "description" in s and not isinstance(s["description"], str):
+        out.append(("/description", "Describe the transform in text."))
+    if "from" in s:
+        source = obj(s["from"])
+        if (
+            source is None
+            or set(source) - {"format", "columns"}
+            or source.get("format") not in ("jsonl", "json", "csv", "parquet", "hf")
+            or ("columns" in source and not _kind_ok("columns", source["columns"]))
+        ):
+            out.append(("/from", "Name the source format and any expected columns."))
     if s.get("to") not in DATASET_SCHEMAS:
         out.append(("/to", "Set `to` to the dataset schema the result must match."))
     known = {"schema_version", "name", "description", "from", "to", "steps"}
@@ -878,10 +915,11 @@ def _validate(inputs: Mapping[str, Any], staged: Mapping[str, Path]) -> list[Iss
 
 
 def _items(parent: DatasetAdapter, limit: int | None = None) -> Iterator[Item]:
-    for i, rec in enumerate(parent.records(), 1):
-        if limit is not None and i > limit:
-            return
-        yield Item(i, rec)
+    rows = parent.split_records()
+    if limit is not None:
+        rows = islice(rows, limit)
+    for i, (split, rec) in enumerate(rows, 1):
+        yield Item(i, rec, split)
 
 
 def _preview(ctx: TaskContext, spec: Json, parent: DatasetAdapter) -> Iterator[TaskEvent]:
@@ -889,18 +927,22 @@ def _preview(ctx: TaskContext, spec: Json, parent: DatasetAdapter) -> Iterator[T
     pipe = Pipeline(cast(list[Json], spec["steps"]))
     after = {it.index: it for it in pipe.run(_items(parent, PREVIEW_ROWS))}
     rows: list[Json] = []
+    limits = Limits()
     for index, raw in before.items():
         done = after.get(index)
         dropped = pipe.drops.get(index)
+        defect = record_line(done.record, limits)[2] if done else None
         rows.append(
             {
                 "index": index,
                 "before": json.loads(raw),
-                "after": done.record if done else None,
+                "after": done.record if done and not defect else None,
                 "split": done.split if done else None,
                 "dropped": (
                     {"step": dropped[0], "op": pipe.counts[dropped[0]].op, "reason": dropped[1]}
                     if dropped and not done
+                    else {"reason": defect}
+                    if defect
                     else None
                 ),
             }
@@ -926,7 +968,7 @@ def _run(ctx: TaskContext) -> Iterator[TaskEvent]:
 
     def records() -> Iterator[tuple[RawRecord, str]]:
         for n, it in enumerate(pipe.run(_items(parent)), 1):
-            yield RawRecord(n, it.record, None, len(canonical_json(it.record))), it.split
+            yield RawRecord(n, it.record, None, 0), it.split
 
     def work(report: Callable[[int], None]) -> Any:
         return normalize(

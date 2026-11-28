@@ -154,3 +154,45 @@ def test_preview_shows_twenty_rows(tmp_path: Path) -> None:
 )
 def test_spec_problems_point_at_the_field(spec: dict[str, Any], pointer: str) -> None:
     assert pointer in {p for p, _ in spec_problems(spec)}
+
+
+def test_filter_and_cast_preserve_splits_and_large_integers(tmp_path: Path) -> None:
+    parent = tmp_path / "parent"
+    writer = ShardWriter(parent)
+    writer.add({"text": "train", "meta": {"id": "9007199254740993"}}, "train")
+    writer.add({"text": "test", "meta": {"id": "9007199254740993"}}, "test")
+    schema = "pretrain.text.v1"
+    write_manifest(parent, schema, writer.close())
+    spec = _spec(
+        [
+            {"op": "filter", "expr": "true"},
+            {"op": "cast", "field": "meta.id", "type": "integer"},
+        ],
+        to=schema,
+    )
+    for preview in (False, True):
+        out = tmp_path / str(preview)
+        body = {"spec": spec, "preview": preview}
+        staged = {"parent": parent}
+        assert TRANSFORM.validate(body, staged) == []
+        list(TRANSFORM.run(TaskContext(body, staged, out, lambda: False)))
+        if preview:
+            doc = json.loads((out / "preview.json").read_text("utf-8"))
+            assert {r["split"] for r in doc["rows"]} == {"train", "test"}
+            assert {r["after"]["meta"]["id"] for r in doc["rows"]} == {9007199254740993}
+        else:
+            dataset = DatasetAdapter(out)
+            assert dataset.splits == {"train": 1, "test": 1}
+            assert list(dataset.records("test")) == [
+                {"text": "test", "meta": {"id": 9007199254740993}},
+            ]
+
+
+def test_oversized_template_result_cannot_publish_a_browse_page(tmp_path: Path) -> None:
+    spec = _spec(
+        [{"op": "template", "to": "text", "template": "{text}" * 17}],
+        to="pretrain.text.v1",
+    )
+    out = _run(tmp_path, spec, [{"text": "x" * (1024 * 1024)}])
+    assert json.loads((out / "dataset.json").read_text("utf-8"))["passed"] is False
+    assert not (out / "browse").exists()

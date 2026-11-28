@@ -21,13 +21,14 @@ use crate::modules::jobs::{scope, JobsError};
 use crate::modules::runs::experiments::project_scope;
 use crate::seams::{RequestContext, Resource, SeamError};
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::{Extension, Json};
 use mrl_domain::ids::{DatasetId, DatasetVersionId, ProjectId};
 use mrl_storage::{Store, TicketMethod};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -428,7 +429,7 @@ fn name_taken(e: JobsError) -> JobsError {
 
 // ---- authorization ----
 
-fn dataset_resource(org: Uuid, project: Uuid, id: Uuid) -> Resource {
+pub(super) fn dataset_resource(org: Uuid, project: Uuid, id: Uuid) -> Resource {
     scope::resource(
         "dataset",
         Some(DatasetId::from_uuid(id).to_string()),
@@ -508,7 +509,7 @@ pub async fn authorized_version(
     Ok(row)
 }
 
-fn ready(v: &VersionRow) -> Result<(), JobsError> {
+pub(super) fn ready(v: &VersionRow) -> Result<(), JobsError> {
     if v.state == "READY" {
         Ok(())
     } else {
@@ -575,6 +576,7 @@ pub async fn create_dataset(
     Extension(svc): Extension<Arc<Datasets>>,
     ctx: RequestContext,
     Path(prj): Path<String>,
+    headers: HeaderMap,
     Json(body): Json<DatasetCreate>,
 ) -> Result<Response, JobsError> {
     scope::no_nul(&serde_json::to_value(&body).unwrap_or_default())?;
@@ -594,6 +596,54 @@ pub async fn create_dataset(
         project_scope(&state, &ctx, &svc.projects, &prj, "datasets.import").await?;
     let id = state.seams.ids.new_uuid();
     let mut tx = svc.db.begin().await?;
+    let idem = crate::modules::artifacts::Idempotency::of(&headers, &body);
+    if let Some(key) = &idem {
+        let inserted = sqlx::query(
+            "INSERT INTO dataset_create_requests (org_id, project_id, actor, key, fingerprint)
+             VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING",
+        )
+        .bind(org)
+        .bind(project)
+        .bind(&ctx.principal.id)
+        .bind(&key.key)
+        .bind(&key.request_sha256)
+        .execute(&mut *tx)
+        .await?;
+        if inserted.rows_affected() == 0 {
+            let (fingerprint, response): (String, Value) = sqlx::query_as(
+                "SELECT fingerprint, response FROM dataset_create_requests
+                 WHERE org_id = $1 AND project_id = $2 AND actor = $3 AND key = $4",
+            )
+            .bind(org)
+            .bind(project)
+            .bind(&ctx.principal.id)
+            .bind(&key.key)
+            .fetch_one(&mut *tx)
+            .await?;
+            if fingerprint != key.request_sha256 {
+                return Err(ApiError::new(
+                    ErrorCode::IdempotencyMismatch,
+                    "This key was already used with a different dataset request.",
+                )
+                .into());
+            }
+            let row_id = response
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| storage("the saved dataset response has no id"))?;
+            let dataset = scope::parse_id::<DatasetId>(row_id, "dataset")?;
+            let live = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM datasets WHERE id = $1 AND deleted_at IS NULL)",
+            )
+            .bind(dataset.as_uuid())
+            .fetch_one(&mut *tx)
+            .await?;
+            if !live {
+                return Err(JobsError::not_found("dataset"));
+            }
+            return Ok(created_response(row_id, response.clone()));
+        }
+    }
     let row = sqlx::query_as::<_, DatasetRow>(sqlx::AssertSqlSafe(format!(
         "INSERT INTO datasets AS d (id, org_id, project_id, name, description, license_spdx, \
            sensitivity, permitted_use, consent_basis, source_urls, card_md, eval_set, created_by) \
@@ -624,14 +674,37 @@ pub async fn create_dataset(
         DatasetId::from_uuid(id).to_string(),
     )
     .await?;
+    let view = serde_json::to_value(dataset_view(&row)).map_err(storage)?;
+    if let Some(key) = &idem {
+        sqlx::query(
+            "UPDATE dataset_create_requests SET response = $5
+             WHERE org_id = $1 AND project_id = $2 AND actor = $3 AND key = $4",
+        )
+        .bind(org)
+        .bind(project)
+        .bind(&ctx.principal.id)
+        .bind(&key.key)
+        .bind(&view)
+        .execute(&mut *tx)
+        .await?;
+    }
     tx.commit().await.map_err(crate::db::DbError::from)?;
-    let location = format!("/api/v1/datasets/{}", DatasetId::from_uuid(id));
-    Ok((
+    Ok(created_response(
+        &DatasetId::from_uuid(id).to_string(),
+        view,
+    ))
+}
+
+fn created_response(id: &str, view: Value) -> Response {
+    (
         StatusCode::CREATED,
-        [(axum::http::header::LOCATION, location)],
-        Json(dataset_view(&row)),
+        [(
+            axum::http::header::LOCATION,
+            format!("/api/v1/datasets/{id}"),
+        )],
+        Json(view),
     )
-        .into_response())
+        .into_response()
 }
 
 /// `GET /datasets/{ds}`.
@@ -839,24 +912,42 @@ pub async fn get_validation(
     Path(dsv): Path<String>,
 ) -> Result<Json<DatasetValidation>, JobsError> {
     let v = authorized_version(&state, &svc.db, &ctx, &dsv, "datasets.read").await?;
-    let report: Option<Value> =
-        sqlx::query_scalar("SELECT validation FROM dataset_versions WHERE id = $1")
-            .bind(v.id)
-            .fetch_one(svc.db.pool())
-            .await?;
-    let rows: Vec<(Uuid, f64, i64, String)> = sqlx::query_as(
-        "SELECT eval_dataset_version_id, overlap_ratio::float8, overlapping_rows, method \
-           FROM eval_contamination WHERE dataset_version_id = $1 ORDER BY eval_dataset_version_id",
+    let row: (String, Option<Value>, Option<Value>, Option<Value>) = sqlx::query_as(
+        "SELECT state, state_reason, validation, summary FROM dataset_versions WHERE id = $1",
     )
     .bind(v.id)
+    .fetch_one(svc.db.pool())
+    .await?;
+    let (state_name, state_reason, mut report, mut summary) = row;
+    let rows: Vec<(Uuid, f64, i64, String)> = sqlx::query_as(
+        "SELECT c.eval_dataset_version_id, c.overlap_ratio::float8, c.overlapping_rows, c.method
+         FROM eval_contamination c
+         JOIN dataset_versions e ON e.id = c.eval_dataset_version_id AND e.org_id = c.org_id
+         JOIN datasets d ON d.id = e.dataset_id AND d.org_id = e.org_id
+         WHERE c.dataset_version_id = $1 AND c.org_id = $2 AND d.project_id = $3
+           AND d.deleted_at IS NULL AND d.eval_set AND e.state = 'READY'
+         ORDER BY c.eval_dataset_version_id",
+    )
+    .bind(v.id)
+    .bind(v.org_id)
+    .bind(v.project_id)
     .fetch_all(svc.db.pool())
     .await?;
+    let visible: std::collections::HashSet<_> = rows
+        .iter()
+        .map(|r| DatasetVersionId::from_uuid(r.0).to_string())
+        .collect();
+    for doc in [&mut report, &mut summary].into_iter().flatten() {
+        if let Some(leakage) = doc.get_mut("leakage").and_then(Value::as_object_mut) {
+            leakage.retain(|label, _| visible.contains(label));
+        }
+    }
     Ok(Json(DatasetValidation {
         dataset_version_id: DatasetVersionId::from_uuid(v.id).to_string(),
-        state: v.state.clone(),
-        state_reason: v.state_reason.clone(),
+        state: state_name,
+        state_reason,
         report,
-        summary: v.summary.clone(),
+        summary,
         contamination: rows
             .into_iter()
             .map(|(e, r, n, m)| DatasetContamination {
@@ -1109,6 +1200,7 @@ struct HashLines {
     size: u64,
     pos: u64,
     buf: Vec<u8>,
+    offset: usize,
 }
 
 impl HashLines {
@@ -1116,9 +1208,12 @@ impl HashLines {
 
     async fn next(&mut self) -> Result<Option<String>, JobsError> {
         loop {
-            if let Some(i) = self.buf.iter().position(|b| *b == b'\n') {
-                let line: Vec<u8> = self.buf.drain(..=i).collect();
-                let text = String::from_utf8_lossy(&line[..i]).into_owned();
+            if let Some(i) = self.buf[self.offset..].iter().position(|b| *b == b'\n') {
+                let end = self.offset + i;
+                let text = String::from_utf8_lossy(&self.buf[self.offset..end])
+                    .trim_end_matches('\r')
+                    .to_owned();
+                self.offset = end + 1;
                 if text.is_empty() {
                     continue;
                 }
@@ -1134,6 +1229,8 @@ impl HashLines {
                 .await
                 .map_err(storage)?;
             self.pos = end;
+            self.buf.drain(..self.offset);
+            self.offset = 0;
             self.buf.extend_from_slice(&piece);
             if self.pos >= self.size && !self.buf.ends_with(b"\n") {
                 self.buf.push(b'\n');
@@ -1152,6 +1249,7 @@ async fn hash_lines(svc: &Datasets, st: &Store, v: &VersionRow) -> Result<HashLi
         size: u64::try_from(f.size_bytes).unwrap_or_default(),
         pos: 0,
         buf: Vec::new(),
+        offset: 0,
     })
 }
 
@@ -1192,8 +1290,20 @@ pub async fn version_action(
         let req: DatasetDiffRequest = from_body(json)?;
         return Ok(Json(diff(&state, &svc, &ctx, dsv, &req).await?).into_response());
     }
+    if let Some(dsv) = segment.strip_suffix(":tokenize-preview") {
+        return super::submit::tokenize(&state, &svc, &ctx, dsv, from_body(json)?).await;
+    }
+    if let Some(dsv) = segment.strip_suffix(":transform-preview") {
+        return super::submit::transform_preview(&state, &svc, &ctx, dsv, from_body(json)?).await;
+    }
     if let Some(dsv) = segment.strip_suffix(":export") {
         let req: DatasetExportRequest = from_body(json)?;
+        if req.format == "hub" {
+            return super::submit::push_to_hub(&state, &svc, &ctx, dsv, req).await;
+        }
+        if req.format == "jsonl" {
+            return super::submit::jsonl(&state, &svc, &ctx, dsv).await;
+        }
         return Ok(Json(export(&state, &svc, &ctx, dsv, &req).await?).into_response());
     }
     Err(ApiError::new(ErrorCode::RouteNotFound, "No endpoint has this path.").into())
@@ -1284,8 +1394,12 @@ pub async fn diff(
 #[derive(Debug, Clone, Deserialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
 pub struct DatasetExportRequest {
-    /// `parquet`: the version's shards.
+    /// `parquet` gives shard links. `jsonl` and `hub` queue export jobs.
     pub format: String,
+    /// Hub repository (owner/name) when the format is hub.
+    pub repo: Option<String>,
+    /// Secret with hub_push use when the format is hub.
+    pub secret_id: Option<String>,
 }
 
 /// A file to download.
@@ -1297,8 +1411,10 @@ pub struct DatasetExportFile {
     pub size: u64,
     /// sha256 (hex): check the download against it.
     pub sha256: String,
-    /// Download link (relative to the server), valid until `expires_at`.
+    /// Download URL, valid until `expires_at`.
     pub url: String,
+    /// Headers required by the download URL.
+    pub headers: BTreeMap<String, String>,
     /// When the link stops working.
     #[serde(with = "time::serde::rfc3339")]
     #[schema(value_type = String, format = DateTime)]
@@ -1320,6 +1436,7 @@ pub struct DatasetExport {
     params(("dsv" = String, Path, description = "Dataset version id, `dsv_…`.")),
     request_body = DatasetExportRequest,
     responses((status = 200, description = "Download links for every file.", body = DatasetExport),
+              (status = 202, body = super::submit::DatasetWorkAccepted),
               (status = 403, description = "The dataset is restricted personal data (MRL-PERM-270).", body = crate::error::Problem),
               (status = 409, description = "The version is not ready (MRL-DATA-002).", body = crate::error::Problem)))]
 pub async fn export(
@@ -1332,54 +1449,77 @@ pub async fn export(
     if req.format != "parquet" {
         return Err(ApiError::validation(vec![field(
             "/format",
-            "The format must be parquet.",
-            "Use parquet: the version's shards.",
+            "The format must be parquet, jsonl or hub.",
+            "Use parquet for shard links or jsonl to queue a conversion.",
         )])
         .into());
     }
     let v = authorized_version(state, &svc.db, ctx, dsv, "datasets.export").await?;
     export_allowed(&v)?;
     ready(&v)?;
-    let files: Vec<FileRow> = store::files(&svc.db, v.id)
+    let files = store::files(&svc.db, v.id)
         .await?
         .into_iter()
         .filter(|f| f.role == "shard")
+        .map(|f| crate::modules::artifacts::InputFile {
+            local_path: f.path,
+            key: f.object_key,
+            sha256: hex(&f.sha256),
+            size: f.size_bytes as u64,
+            ..Default::default()
+        })
         .collect();
+    export_links(state, svc, ctx, &v, "parquet", files).await
+}
+
+pub(super) async fn export_links(
+    state: &AppState,
+    svc: &Datasets,
+    ctx: &RequestContext,
+    v: &VersionRow,
+    format: &str,
+    files: Vec<crate::modules::artifacts::InputFile>,
+) -> Result<DatasetExport, JobsError> {
+    let mut out = Vec::with_capacity(files.len());
+    let mut ctx = ctx
+        .clone()
+        .with_project(ProjectId::from_uuid(v.project_id).to_string());
+    ctx.org = Some(storage_org(v.org_id));
+    for f in files {
+        let size = f.size;
+        let t = svc
+            .store
+            .ticket(&state.seams, &ctx, &f.key, TicketMethod::Get, size)
+            .await
+            .map_err(storage)?;
+        out.push(DatasetExportFile {
+            path: f.local_path,
+            size,
+            sha256: f.sha256,
+            url: t.url,
+            headers: t.headers,
+            expires_at: t.expires_at,
+        });
+    }
     let mut tx = svc.db.begin().await?;
     scope::audit(
         &mut tx,
         state,
-        ctx,
+        &ctx,
         (v.org_id, v.project_id),
         "datasets.export",
         DatasetVersionId::from_uuid(v.id).to_string(),
     )
     .await?;
     tx.commit().await.map_err(crate::db::DbError::from)?;
-    let mut out = Vec::with_capacity(files.len());
-    let ctx = ctx
-        .clone()
-        .with_project(ProjectId::from_uuid(v.project_id).to_string());
-    for f in files {
-        let size = u64::try_from(f.size_bytes).unwrap_or_default();
-        let t = svc
-            .store
-            .ticket(&state.seams, &ctx, &f.object_key, TicketMethod::Get, size)
-            .await
-            .map_err(storage)?;
-        out.push(DatasetExportFile {
-            path: f.path,
-            size,
-            sha256: hex(&f.sha256),
-            url: t.url,
-            expires_at: t.expires_at,
-        });
-    }
     Ok(DatasetExport {
-        format: req.format.clone(),
+        format: format.into(),
         files: out,
     })
 }
+
+pub(super) const EXPORT_REFUSED_DETAIL: &str =
+    "This dataset is marked restricted personal data, so its files can't be exported or pushed to the Hub.";
 
 /// 403 MRL-PERM-270 for `restricted-pii` datasets.
 pub fn export_allowed(v: &VersionRow) -> Result<(), JobsError> {
@@ -1389,6 +1529,6 @@ pub fn export_allowed(v: &VersionRow) -> Result<(), JobsError> {
     Err(JobsError::domain(
         codes::EXPORT_REFUSED,
         StatusCode::FORBIDDEN,
-        "This dataset is marked restricted personal data, so its files can't be exported or pushed to the Hub.",
+        EXPORT_REFUSED_DETAIL,
     ))
 }

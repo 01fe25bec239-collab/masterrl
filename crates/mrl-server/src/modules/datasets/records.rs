@@ -56,3 +56,42 @@ impl RegistryRecords for DatasetRecords {
         }))
     }
 }
+
+#[async_trait]
+impl crate::modules::artifacts::NodeLookup for DatasetRecords {
+    async fn find(
+        &self,
+        org: &str,
+        id: uuid::Uuid,
+    ) -> Result<Option<(&'static str, crate::seams::Resource)>, crate::modules::artifacts::Error>
+    {
+        let Some(row) = lineage_version(&self.db, id).await? else {
+            return Ok(None);
+        };
+        let owns_node = if org == crate::modules::artifacts::LOCAL_ORG {
+            super::store::is_local_lineage_org(self.db.pool(), row.org_id).await?
+        } else {
+            crate::modules::checkpoints::service::storage_org(row.org_id) == org
+        };
+        if !owns_node {
+            return Ok(None);
+        }
+        let mut resource = crate::modules::jobs::scope::resource(
+            "dataset",
+            Some(mrl_domain::ids::DatasetId::from_uuid(row.dataset_id).to_string()),
+            row.org_id,
+            row.project_id,
+        );
+        resource.org = crate::modules::artifacts::rbac_org(org);
+        Ok(Some(("datasets.read", resource)))
+    }
+}
+
+async fn lineage_version(
+    db: &Db,
+    id: uuid::Uuid,
+) -> Result<Option<super::store::VersionRow>, crate::modules::artifacts::Error> {
+    super::store::version(db, id).await.map_err(|error| {
+        crate::modules::artifacts::Error::from(SeamError::new("datasets", error.to_string()))
+    })
+}

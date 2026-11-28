@@ -264,6 +264,9 @@ impl Chains {
                 )),
                 // <mrl:completion-verifiers P26> P26 verifiers go right below this line.
                 // <mrl:completion-verifiers P27> P27 verifiers go right below this line.
+                Arc::new(crate::modules::datasets::work::DatasetVerifier::new(
+                    db.clone(),
+                )),
                 // <mrl:completion-verifiers P28> P28 verifiers go right below this line.
                 // <mrl:completion-verifiers P29> P29 verifiers go right below this line.
             ],

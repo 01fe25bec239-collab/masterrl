@@ -440,6 +440,7 @@ version = "0.1.0"
 source = { editable = "python/mrl-runtime" }
 dependencies = [
     { name = "grpcio" },
+    { name = "huggingface-hub" },
     { name = "jinja2" },
     { name = "jsonschema" },
     { name = "protobuf" },
@@ -456,6 +457,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "grpcio", specifier = "==1.85.1" },
+    { name = "huggingface-hub", specifier = "==2.4.0" },
     { name = "jinja2", specifier = "==3.1.6" },
     { name = "jsonschema", specifier = "==4.26.0" },
     { name = "protobuf", specifier = "==7.36.2" },
