@@ -4,9 +4,11 @@
 //! `DRY_RUN_OK`.
 //!
 //! - [`start`]: the probe job (QUEUED at top priority, no retries) and its PENDING
-//!   `resource_estimates` row, in one transaction.
-//! - [`ProbeLaunch`] (launch chain): fills a probe's spec (resolved config, engine runtime)
-//!   and sets `dry_run`; for runs, refuses a resume the engine can't do
+//!   `resource_estimates` row, in one transaction. `subject_ref.launch_spec` carries the
+//!   model and dataset ids and the GPU the run will get ([`target_device`]); the scheduler
+//!   puts them at the top of the job spec before any launch contributor runs.
+//! - [`ProbeLaunch`] (launch chain): adds the resolved config and engine runtime to a
+//!   probe's spec (keeping what earlier contributors wrote) and sets `dry_run`; for runs, refuses a resume the engine can't do
 //!   ([`super::policy::resume_problem`]).
 //! - [`PreparedSink`] (CONTROL `worker.prepared`): stores the answer once, and only from
 //!   the machine the probe's current attempt is placed on.
@@ -35,8 +37,7 @@ use sqlx::Row;
 use std::time::Duration;
 use uuid::Uuid;
 
-/// `jobs.subject_ref.kind` of a probe job.
-pub const PROBE_KIND: &str = "run_probe";
+use crate::modules::jobs::PROBE_SUBJECT_KIND as PROBE_KIND;
 
 /// What a probe launch needs, stored with its estimate.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -82,6 +83,80 @@ pub struct NewProbe<'a> {
     pub timeout_seconds: u64,
     /// Give up after this long.
     pub max_runtime_seconds: i64,
+    /// The GPU (or CPU) the run will get, for the worker's estimate ([`target_device`]).
+    pub target_device: Option<Value>,
+}
+
+/// `target_device {kind, name, memory_gib, bf16}` of the machine the run will get: the first
+/// of `machines` that has enough GPUs of the main role's maker, and its smallest such GPU
+/// (what the preflight compares against). A CPU-only role gets the machine's RAM. `None`
+/// when no machine fits the ask.
+pub async fn target_device(
+    db: &Db,
+    machines: &[Uuid],
+    resources: &mrl_domain::resources::ResourceRequest,
+) -> Result<Option<Value>, sqlx::Error> {
+    use mrl_domain::resources::GpuVendor;
+    let Some(role) = crate::modules::preflight::main_role(resources) else {
+        return Ok(None);
+    };
+    let vendor = role.gpu.vendor.map(|v| match v {
+        GpuVendor::Nvidia => "nvidia",
+        GpuVendor::Amd => "amd",
+        GpuVendor::Apple => "apple",
+        GpuVendor::Intel => "intel",
+    });
+    for node in machines {
+        if role.gpu_count == 0 {
+            let ram: Option<i64> = sqlx::query_scalar(
+                "SELECT (inventory ->> 'ram_bytes')::bigint FROM compute_nodes WHERE id = $1",
+            )
+            .bind(node)
+            .fetch_optional(db.pool())
+            .await?
+            .flatten();
+            if let Some(bytes) = ram.filter(|b| *b > 0) {
+                return Ok(Some(json!({"kind": "cpu", "name": "CPU",
+                    "memory_gib": bytes as f64 / f64::from(1u32 << 30), "bf16": false})));
+            }
+            continue;
+        }
+        let gpus: Vec<(String, String, String, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT g.vendor, g.model, g.arch, g.vram_total_bytes,
+                        (n.inventory ->> 'unified_memory_bytes')::bigint
+                   FROM gpu_devices g JOIN compute_nodes n ON n.id = g.node_id
+                  WHERE g.node_id = $1 AND g.present AND g.health = 'OK'
+                    AND g.parent_device_id IS NULL AND ($2::text IS NULL OR g.vendor = $2)
+                  ORDER BY g.vram_total_bytes, g.index_on_node",
+        )
+        .bind(node)
+        .bind(vendor)
+        .fetch_all(db.pool())
+        .await?;
+        if gpus.len() < role.gpu_count as usize {
+            continue;
+        }
+        let Some((maker, model, arch, vram, unified)) = gpus.into_iter().next() else {
+            continue;
+        };
+        let (kind, bytes, bf16) = match maker.as_str() {
+            "apple" => ("mps", unified.unwrap_or(vram), false),
+            // bf16 from compute capability 8 (Ampere) on, like torch.cuda.is_bf16_supported.
+            "nvidia" => (
+                "cuda",
+                vram,
+                arch.strip_prefix("sm_")
+                    .and_then(|d| d.get(..1))
+                    .and_then(|d| d.parse::<u8>().ok())
+                    .is_some_and(|major| major >= 8),
+            ),
+            "amd" => ("cuda", vram, false),
+            _ => continue,
+        };
+        return Ok(Some(json!({"kind": kind, "name": model,
+            "memory_gib": bytes as f64 / f64::from(1u32 << 30), "bf16": bf16})));
+    }
+    Ok(None)
 }
 
 /// Creates the probe job (QUEUED) and its PENDING estimate. Returns `(estimate, job)`.
@@ -103,7 +178,17 @@ pub async fn start(db: &Db, p: &NewProbe<'_>) -> Result<(Uuid, Uuid), JobsError>
             project_id: p.project,
             kind: "TRAIN".into(),
             run_id: None,
-            subject_ref: Some(json!({"kind": PROBE_KIND, "estimate_id": estimate.to_string()})),
+            // `launch_spec` goes to the top of the job spec before any launch contributor
+            // runs (P21), so input staging (P26/P27) sees the ids whatever its order.
+            subject_ref: Some(json!({
+                "kind": PROBE_KIND,
+                "estimate_id": estimate.to_string(),
+                "launch_spec": {
+                    "base_model_version_id": p.spec.base_model_version_id,
+                    "dataset_version_ids": p.spec.dataset_version_ids,
+                    "target_device": p.target_device,
+                },
+            })),
             priority: 1000,
             resource_request: resources,
             retry_policy: json!({"auto_tune": false, "budgets": no_retries}),
@@ -288,10 +373,13 @@ pub async fn sweep(db: &Db) -> Result<usize, JobsError> {
 }
 
 fn probe_estimate(job: &JobRow) -> Option<Uuid> {
-    let s = job.subject_ref.as_ref()?;
-    (s["kind"] == PROBE_KIND)
-        .then(|| s["estimate_id"].as_str()?.parse().ok())
-        .flatten()
+    if !crate::modules::jobs::is_probe(job) {
+        return None;
+    }
+    job.subject_ref.as_ref()?["estimate_id"]
+        .as_str()?
+        .parse()
+        .ok()
 }
 
 /// Launch contributor (`// <mrl:launch-contributors P28>`).
@@ -358,10 +446,14 @@ impl LaunchContributor for ProbeLaunch {
             row.try_get("version").map_err(transient)?,
         );
         let manifest: Value = row.try_get("manifest").map_err(transient)?;
-        let mut job_spec = match spec.resolved {
-            Value::Object(m) => m,
+        // On top of what earlier contributors wrote (the `launch_spec` keys, sandbox, inputs).
+        let mut job_spec = match serde_json::from_str(&plan.launch.job_spec_json) {
+            Ok(Value::Object(m)) => m,
             _ => serde_json::Map::new(),
         };
+        if let Value::Object(resolved) = spec.resolved {
+            job_spec.extend(resolved);
+        }
         for (k, v) in [
             ("job_id", json!(JobId::from_uuid(job.id).to_string())),
             ("job_kind", json!("TRAIN")),

@@ -18,7 +18,7 @@ use crate::seams::RequestContext;
 use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::{Extension, Json};
-use mrl_domain::ids::{NodeId, ProjectId, RunId};
+use mrl_domain::ids::{NodeId, ProjectId};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::time::Duration;
@@ -129,31 +129,9 @@ pub async fn check(
     project: Uuid,
     sub: &RunSubmission,
 ) -> Result<ValidateResponse, JobsError> {
-    if let Some(checkpoint) = sub.parent_checkpoint_id {
-        let source: Option<(Uuid, Uuid)> = sqlx::query_as(
-            "SELECT r.id, r.project_id FROM checkpoints c JOIN runs r ON r.id = c.run_id
-             WHERE c.id = $1 AND c.org_id = $2 AND r.org_id = $2",
-        )
-        .bind(checkpoint.as_uuid())
-        .bind(org)
-        .fetch_optional(ctx.db.pool())
-        .await?;
-        let (run, source_project) = source.ok_or_else(|| JobsError::not_found("checkpoint"))?;
-        let resource = scope::resource(
-            "run",
-            Some(RunId::from_uuid(run).to_string()),
-            org,
-            source_project,
-        );
-        scope::authorize(state, req, "checkpoints.read", &resource)
-            .await
-            .map_err(|err| match err {
-                JobsError::Api(a) if a.code == ErrorCode::NotFound => {
-                    JobsError::not_found("checkpoint")
-                }
-                other => other,
-            })?;
-    }
+    // Submit's own read-only checks (body rules, experiment, parent run and checkpoint,
+    // artifact inputs, secrets): validate answers exactly as submit would.
+    crate::modules::runs::api::check_inputs(state, &ctx.db, req, (org, project), sub).await?;
     let mut issues = Vec::new();
     let resources = sub.resources.clone().unwrap_or_else(default_resources);
     let unchecked = |issues: Vec<ValidateIssue>, config: Value, why: &str| ValidateResponse {
@@ -311,6 +289,12 @@ pub async fn check(
                         "unknown",
                     ),
                     inputs_sha256,
+                    target_device: probe::target_device(
+                        &ctx.db,
+                        &eligible.iter().map(|n| n.as_uuid()).collect::<Vec<_>>(),
+                        &resources,
+                    )
+                    .await?,
                     node_ids: eligible,
                     timeout_seconds: budget.as_secs(),
                     max_runtime_seconds: i64::try_from(budget.as_secs() * 2).unwrap_or(120),
@@ -433,7 +417,8 @@ pub async fn check(
     request_body = RunSubmission,
     responses((status = 200, description = "Every finding, the resolved config, the estimate and the preflight.", body = ValidateResponse),
               (status = 400, description = "An unreadable body.", body = crate::error::Problem),
-              (status = 404, description = "No such project, or hidden from you.", body = crate::error::Problem)))]
+              (status = 404, description = "No such project or input (parent run or checkpoint, artifact, secret, experiment), or hidden from you; as submit answers.", body = crate::error::Problem),
+              (status = 422, description = "The body breaks submit's own rules (like the priority range); as submit answers.", body = crate::error::Problem)))]
 pub async fn validate(
     State(state): State<AppState>,
     Extension(ctx): Extension<Ctx>,

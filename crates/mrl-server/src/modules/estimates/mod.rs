@@ -203,7 +203,13 @@ macro_rules! estimate_cols {
 }
 
 /// Fingerprint of the workload the estimator checked. Keep the version tag when adding fields.
+/// A role's `gpu.min_vram_bytes` is left out: submit derives it from the estimate itself
+/// ([`crate::modules::submission::policy::require_vram`]).
 pub fn inputs_sha256(spec: &JobSpec) -> Vec<u8> {
+    let mut resources = spec.resources.clone();
+    for role in &mut resources.roles {
+        role.gpu.min_vram_bytes = None;
+    }
     crate::modules::submission::resolve::sha256(&json!({
         "version": 2,
         "kind": spec.kind,
@@ -212,7 +218,7 @@ pub fn inputs_sha256(spec: &JobSpec) -> Vec<u8> {
         "model": spec.base_model_version_id.to_string(),
         "reward": spec.reward_version_id.map(|id| id.to_string()),
         "datasets": spec.dataset_version_ids.iter().map(ToString::to_string).collect::<Vec<_>>(),
-        "resources": spec.resources,
+        "resources": resources,
     }))
 }
 
@@ -607,7 +613,9 @@ pub fn compare_phases(
                     .map(|a| a.peak_gib)
                     .fold(None, |m: Option<f64>, v| Some(m.map_or(v, |m| m.max(v))))
             };
-            let actual_peak_gib = peak("process_peak").or_else(|| peak("torch_reserved_peak"));
+            let actual_peak_gib = peak("process_peak")
+                .or_else(|| peak("torch_reserved_peak"))
+                .or_else(|| peak("torch_allocated_peak"));
             PhaseComparison {
                 phase: phase.to_owned(),
                 estimate_gib: range,

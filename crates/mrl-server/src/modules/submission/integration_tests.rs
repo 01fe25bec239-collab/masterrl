@@ -73,6 +73,8 @@ struct Script {
     link: Arc<Link>,
     answer: Mutex<Answer>,
     running: Mutex<Vec<AttemptRef>>,
+    /// The job spec of every dry run this machine was asked for.
+    probes: Mutex<Vec<Value>>,
 }
 
 fn status(r: &AttemptRef, phase: AttemptPhase, exit: ExitKind) -> AttemptStatus {
@@ -150,6 +152,10 @@ impl CommandHandler for Handler {
                     "the probe carries the resolved config: {}",
                     l.job_spec_json
                 );
+                s.probes
+                    .lock()
+                    .unwrap()
+                    .push(serde_json::from_str(&l.job_spec_json).unwrap());
                 if let Answer::Reject = answer {
                     s.send(Msg::AttemptStatus(status(
                         &r,
@@ -216,7 +222,7 @@ struct Machine {
     _agent: TestAgent,
     _running: crate::agent::gateway::Running,
     node: Uuid,
-    _script: Arc<Script>,
+    script: Arc<Script>,
 }
 
 struct CheckpointAccess {
@@ -265,6 +271,15 @@ fn sched_config() -> SchedulerConfig {
 
 impl World {
     async fn start(probe_timeout_seconds: u64) -> Self {
+        Self::start_with(SubmissionConfig {
+            probe_timeout_seconds,
+            ..SubmissionConfig::default()
+        })
+        .await
+    }
+
+    /// A core with these `[submission]` settings (its own database).
+    async fn start_with(settings: SubmissionConfig) -> Self {
         let db = TestDb::new().await;
         let secrets: Arc<dyn SecretStore> = Arc::new(InMemorySecretStore::default());
         let objects = tempfile::tempdir().unwrap();
@@ -317,12 +332,13 @@ impl World {
                     d.clone(),
                     CapabilityValidator::with_records(d.clone(), fixture.records()),
                 )),
-                Arc::new(Guardian::new(d.clone())),
+                Arc::new(Guardian::new(d.clone(), settings)),
             ],
             vec![Arc::new(ProbeVerifier)],
             vec![Arc::new(Presets::with_capability(
                 d.clone(),
                 CapabilityValidator::with_records(d.clone(), fixture.records()),
+                settings,
             ))],
         );
         let pipeline = Pipeline::new(
@@ -351,10 +367,7 @@ impl World {
         );
         let submission = SubmissionModule::with(
             d.clone(),
-            SubmissionConfig {
-                probe_timeout_seconds,
-                ..SubmissionConfig::default()
-            },
+            settings,
             chains.clone(),
             Projects::default(),
             &lanes,
@@ -486,6 +499,7 @@ impl World {
             link: link.clone(),
             answer: Mutex::new(answer),
             running: Mutex::default(),
+            probes: Mutex::default(),
         });
         for kind in [
             "LaunchAttempt",
@@ -520,7 +534,7 @@ impl World {
             _agent: agent,
             _running: running,
             node,
-            _script: script,
+            script,
         }
     }
 
@@ -647,6 +661,24 @@ async fn dry_run_fits_24_gb_and_not_4_gb_and_submit_agrees() {
     );
     assert_eq!(v["estimate"]["total_steps"], 120);
     assert_eq!(v["preflight"]["machines"][0]["usable_gib"], 21.6);
+    // The probe carries the run's inputs and the GPU it estimates for, on top of the
+    // scheduler's own keys (`subject_ref.launch_spec` goes in before every contributor).
+    let probe = big.script.probes.lock().unwrap()[0].clone();
+    assert_eq!(
+        probe["base_model_version_id"],
+        f.model.to_string(),
+        "{probe}"
+    );
+    assert_eq!(probe["dataset_version_ids"], json!([f.dataset.to_string()]));
+    assert_eq!(
+        probe["target_device"],
+        json!({"kind": "cuda", "name": "Fake 24 GB", "memory_gib": 24.0, "bf16": true})
+    );
+    assert_eq!(probe["sandbox"], "worker", "the scheduler's keys stay");
+    assert_eq!(
+        probe["engine"]["learning_rate"], 0.0002,
+        "the resolved config"
+    );
     let v4 = w.validate(sft(&f, &[small.node])).await;
     assert_eq!(v4["ok"], false, "{v4}");
     assert_eq!(v4["estimate"]["verdict"], "does_not_fit");
@@ -764,7 +796,7 @@ async fn dry_run_fits_24_gb_and_not_4_gb_and_submit_agrees() {
     let res = r.json();
     assert_eq!(res["estimate"]["verdict"], "fits", "{res}");
     let original = res["estimate"]["estimate_id"].clone();
-    *big._script.answer.lock().unwrap() = Answer::Estimate(10.0, 12.0);
+    *big.script.answer.lock().unwrap() = Answer::Estimate(10.0, 12.0);
     let later = w.validate(sft(&f, &[big.node])).await;
     assert_ne!(later["estimate"]["estimate_id"], original, "{later}");
     let historical = w
@@ -919,7 +951,8 @@ async fn dry_run_fits_24_gb_and_not_4_gb_and_submit_agrees() {
     let mut branch = sft(&f, &[big.node]);
     branch["parent_checkpoint_id"] =
         json!(mrl_domain::ids::CheckpointId::from_uuid(ckpt).to_string());
-    for (decision, expected) in [(Decision::Hide, 404), (Decision::Deny, 403)] {
+    // A checkpoint the caller can't read answers like a missing one, as submit does.
+    for (decision, expected) in [(Decision::Hide, 404), (Decision::Deny, 404)] {
         *w.checkpoint_access.lock().unwrap() = decision;
         let other_project = ProjectId::new();
         let rejected = w
@@ -940,8 +973,19 @@ async fn dry_run_fits_24_gb_and_not_4_gb_and_submit_agrees() {
         assert_eq!(rejected.status, expected, "{}", rejected.text());
     }
     *w.checkpoint_access.lock().unwrap() = Decision::Allow;
-    let v = w.validate(branch).await;
+    let v = w.validate(branch.clone()).await;
     assert!(codes(&v).contains(&"MRL-CAP-281".to_owned()), "{v}");
+    // Submit refuses it the same way, before anything is queued.
+    let r = w
+        .call_with(
+            Method::POST,
+            &format!("/api/v1/projects/{}/runs", w.project),
+            branch,
+            &[("idempotency-key", "branch")],
+        )
+        .await;
+    assert_eq!(r.status, 422, "{}", r.text());
+    assert!(r.text().contains("MRL-CAP-281"), "{}", r.text());
     // Probe mode: a run with no estimate of its config starts; once its first steps measure
     // a peak above the GPU's usable memory it is cancelled. Below it, it goes on.
     let mut unmeasured = sft(&f, &[small.node]);
@@ -1152,6 +1196,7 @@ async fn replayed_or_foreign_answers_change_nothing() {
             node_ids: Vec::new(),
             timeout_seconds: 60,
             max_runtime_seconds: 600,
+            target_device: None,
         },
     )
     .await
@@ -1550,6 +1595,7 @@ async fn a_legacy_probe_and_its_estimate_move_to_the_same_org() {
             node_ids: Vec::new(),
             timeout_seconds: 60,
             max_runtime_seconds: 120,
+            target_device: None,
         },
     )
     .await
@@ -1570,4 +1616,123 @@ async fn a_legacy_probe_and_its_estimate_move_to_the_same_org() {
     .await
     .unwrap();
     assert_eq!(owners, (org.as_uuid(), org.as_uuid()));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn two_cores_apply_their_own_headroom_at_submit() {
+    // 12 GiB GPU, 6–9 GiB: with 10 % kept free (10.8 usable) it fits; with 30 % (8.4) tight.
+    let roomy = World::start(60).await;
+    let strict = World::start_with(SubmissionConfig {
+        headroom: mrl_server::modules::preflight::Headroom {
+            gpu_free_fraction: 0.3,
+            ..mrl_server::modules::preflight::Headroom::default()
+        },
+        ..SubmissionConfig::default()
+    })
+    .await;
+    let mut configs = Vec::new();
+    for w in [&roomy, &strict] {
+        let m = w.machine(12, Answer::Estimate(6.0, 9.0)).await;
+        let v = w.validate(sft(&w.fixture, &[m.node])).await;
+        assert_eq!(v["ok"], true, "{v}");
+        let (run, resolved, _) = submit(w, sft(&w.fixture, &[m.node]), "raw").await;
+        assert_ne!(run["state"], "REJECTED", "{run}");
+        configs.push((v["preflight"]["verdict"].clone(), resolved));
+    }
+    assert_eq!(configs[0].0, "fits");
+    assert_eq!(configs[0].1["engine"]["gradient_checkpointing"], false);
+    assert_eq!(configs[1].0, "tight");
+    assert_eq!(
+        configs[1].1["engine"]["gradient_checkpointing"], true,
+        "the strict core's resolver applied its own headroom"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn a_7_5_gib_run_is_placed_on_the_gpu_that_holds_it() {
+    let w = World::start(60).await;
+    let f = w.fixture;
+    let small = w.machine(4, Answer::Estimate(6.0, 9.0)).await;
+    let big = w.machine(24, Answer::Estimate(6.0, 9.0)).await;
+    // Both machines idle, no pin: the estimate (expected 7.5 GiB) fits only the 24 GiB GPU.
+    let v = w.validate(sft(&f, &[])).await;
+    assert_eq!(v["ok"], true, "{v}");
+    assert_eq!(v["estimate"]["per_gpu_memory_gib"]["expected"], 7.5, "{v}");
+    let (run, _, estimate) = submit(&w, sft(&f, &[]), "unpinned").await;
+    assert_ne!(run["state"], "REJECTED", "{run}");
+    assert!(estimate.is_some());
+    let run = RunId::from_str(run["id"].as_str().unwrap()).unwrap();
+    let asked: Value = sqlx::query_scalar("SELECT resource_request FROM jobs WHERE run_id = $1")
+        .bind(run.as_uuid())
+        .fetch_one(w.pool())
+        .await
+        .unwrap();
+    assert_eq!(
+        asked["roles"][0]["gpu"]["min_vram_bytes"],
+        (7.5 * f64::from(1u32 << 30)).ceil() as u64,
+        "{asked}"
+    );
+    until("the run is placed", || async {
+        w.count(&format!(
+            "SELECT count(*) FROM jobs WHERE run_id = '{}' AND state = 'RUNNING'",
+            run.as_uuid()
+        ))
+        .await
+            == 1
+    })
+    .await;
+    let node: Uuid = sqlx::query_scalar(
+        "SELECT r.node_id FROM resource_reservations r JOIN jobs j ON j.current_attempt_id = r.attempt_id
+          WHERE j.run_id = $1",
+    )
+    .bind(run.as_uuid())
+    .fetch_one(w.pool())
+    .await
+    .unwrap();
+    assert_eq!(node, big.node);
+    assert_ne!(node, small.node);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn validate_and_submit_agree_on_body_rules_and_hidden_inputs() {
+    let w = World::start(60).await;
+    let f = w.fixture;
+    let mut bad_priority = sft(&f, &[]);
+    bad_priority["priority"] = json!(5000);
+    let mut missing_parent = sft(&f, &[]);
+    missing_parent["parent_run_id"] = json!(RunId::new().to_string());
+    let mut missing_checkpoint = sft(&f, &[]);
+    missing_checkpoint["parent_checkpoint_id"] =
+        json!(mrl_domain::ids::CheckpointId::new().to_string());
+    for (i, (body, status)) in [
+        (bad_priority, 422),
+        (missing_parent, 404),
+        (missing_checkpoint, 404),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let checked = w
+            .call(
+                Method::POST,
+                &format!("/api/v1/projects/{}/runs:validate", w.project),
+                body.clone(),
+            )
+            .await;
+        let submitted = w
+            .call_with(
+                Method::POST,
+                &format!("/api/v1/projects/{}/runs", w.project),
+                body,
+                &[("idempotency-key", &format!("agree-{i}"))],
+            )
+            .await;
+        assert_eq!(checked.status, status, "validate: {}", checked.text());
+        assert_eq!(submitted.status, status, "submit: {}", submitted.text());
+        assert_eq!(checked.json()["code"], submitted.json()["code"]);
+    }
+    assert_eq!(w.count("SELECT count(*) FROM runs").await, 0);
 }

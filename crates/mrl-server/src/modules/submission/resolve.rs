@@ -375,18 +375,27 @@ pub async fn resolve(
 pub struct Presets {
     db: Db,
     capability: CapabilityValidator,
+    settings: super::SubmissionConfig,
 }
 
 impl Presets {
-    /// Reads engine methods and registry records from `db`.
-    pub fn new(db: Db) -> Self {
+    /// Reads engine methods and registry records from `db`, with `settings`' headroom.
+    pub fn new(db: Db, settings: super::SubmissionConfig) -> Self {
         let capability = CapabilityValidator::new(db.clone());
-        Self::with_capability(db, capability)
+        Self::with_capability(db, capability, settings)
     }
 
     /// Picks engines with this capability check (the one the validator chain uses).
-    pub fn with_capability(db: Db, capability: CapabilityValidator) -> Self {
-        Self { db, capability }
+    pub fn with_capability(
+        db: Db,
+        capability: CapabilityValidator,
+        settings: super::SubmissionConfig,
+    ) -> Self {
+        Self {
+            db,
+            capability,
+            settings,
+        }
     }
 }
 
@@ -403,15 +412,42 @@ impl SubmissionResolver for Presets {
         resolved: Value,
     ) -> Result<Value, ResolveError> {
         let job = super::policy::scope_job(scope, resolved.clone());
-        let config = resolve(
+        let Resolved { config, method, .. } = resolve(
             &self.db,
             Some(&scope.algorithm_id),
             &resolved,
             Some((&self.capability, &job)),
         )
-        .await?
-        .config;
-        Ok(super::policy::safety_at_submit(&self.db, &self.capability, scope, config).await?)
+        .await?;
+        // A resume the engine can't do is refused before the run is queued (MRL-CAP-281).
+        if let (Some(ckpt), Some(m)) = (scope.parent_checkpoint_id, method.as_ref()) {
+            let problem = super::policy::resume_problem(
+                &self.db,
+                scope.org_id,
+                ckpt,
+                m.engine_version_id,
+                &scope.algorithm_id,
+            )
+            .await
+            .map_err(|e| ResolveError::Seam(SeamError::from(crate::db::DbError::from(e))))?;
+            if let Some(message) = problem {
+                let code = super::codes::RESUME_INCOMPATIBLE.to_string();
+                return Err(ResolveError::Invalid(vec![FieldError {
+                    path: "/parent_checkpoint_id".into(),
+                    hint: hint_for(&code),
+                    code,
+                    message,
+                }]));
+            }
+        }
+        Ok(super::policy::safety_at_submit(
+            &self.db,
+            &self.capability,
+            &self.settings,
+            scope,
+            config,
+        )
+        .await?)
     }
 
     async fn record(

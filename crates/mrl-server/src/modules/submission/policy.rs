@@ -11,10 +11,11 @@
 //!   method (Doc 05 §18 row 19). Checked by `runs:validate` (`parent_checkpoint_id`) and at
 //!   launch for every resumed attempt ([`super::probe::ProbeLaunch`]).
 //!
-//! The submit-time preflight uses `[submission]`'s headroom ([`super::settings`]).
+//! The submit-time preflight uses `[submission]`'s headroom (the members are built from it).
 
 use super::codes;
 use super::resolve::{engine_choice, methods};
+use super::SubmissionConfig;
 use crate::db::Db;
 use crate::modules::engines::validator::{CapabilityValidator, Pick};
 use crate::modules::estimates::{self, EstimateRow, RunEstimate, Verdict};
@@ -24,6 +25,7 @@ use crate::seams::SeamError;
 use async_trait::async_trait;
 use mrl_domain::capability::codes::CapabilityRejection;
 use mrl_domain::ids::WorkspaceId;
+use mrl_domain::resources::{GpuVendor, ResourceRequest, WorkloadRole};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -123,10 +125,11 @@ impl JobValidator for MethodPolicy {
     }
 }
 
-/// The preflight of `spec` with stored estimate `row`, on this process's `[submission]`
-/// headroom: the verdict and the config with any safety settings applied.
+/// The preflight of `spec` with stored estimate `row`, on `settings`' headroom: the verdict
+/// and the config with any safety settings applied.
 async fn judge(
     db: &Db,
+    settings: &SubmissionConfig,
     spec: &JobSpec,
     row: &EstimateRow,
 ) -> Result<(RunPreflight, Value), sqlx::Error> {
@@ -140,7 +143,6 @@ async fn judge(
     )
     .await?;
     let method = found.first();
-    let settings = super::settings();
     let input = PreflightInput {
         resources: &spec.resources,
         estimate: estimate.per_gpu_memory_gib,
@@ -171,11 +173,14 @@ pub fn scope_job(scope: &SubmitScope, resolved: Value) -> JobSpec {
 /// The key of [`safety_at_submit`]'s note in [`SubmitScope::notes`].
 pub const SAFETY_NOTE: &str = "safety-settings";
 
-/// Applies validated safety settings to a tight configuration. Only an estimate of the
-/// final config is pinned to the run, and the source estimate is kept in the audit details.
+/// Submit's half of the Guardian (run by the resolver). With an estimate of these inputs:
+/// the main role's GPUs must hold the expected memory ([`require_vram`]), and a tight
+/// configuration gets the validated safety settings. Only an estimate of the final config is
+/// pinned to the run; the source estimate is kept in the audit details.
 pub async fn safety_at_submit(
     db: &Db,
     capability: &CapabilityValidator,
+    settings: &SubmissionConfig,
     scope: &mut SubmitScope,
     config: Value,
 ) -> Result<Value, SeamError> {
@@ -188,7 +193,13 @@ pub async fn safety_at_submit(
         return Ok(spec.resolved);
     };
     scope.estimate_id = Some(row.id);
-    let (p, adjusted) = judge(db, &spec, &row).await.map_err(seam)?;
+    let (p, adjusted) = judge(db, settings, &spec, &row).await.map_err(seam)?;
+    // Only a run some machine can hold is narrowed; the Guardian refuses one none can.
+    if let (Verdict::Fits | Verdict::Tight, Some(range)) =
+        (p.verdict, RunEstimate::of(&row).per_gpu_memory_gib)
+    {
+        require_vram(&mut scope.resources, range.expected);
+    }
     if p.verdict != Verdict::Tight || p.changes.is_empty() {
         return Ok(spec.resolved);
     }
@@ -219,15 +230,42 @@ pub async fn safety_at_submit(
     Ok(changed.resolved)
 }
 
+/// Asks the main role's discrete GPUs for at least `expected_gib` each (placement enforces
+/// it per GPU), so the run never lands on a GPU it can't fit. A larger ask is kept; Apple
+/// GPUs (unified memory) and roles without a GPU maker are left alone.
+pub fn require_vram(resources: &mut ResourceRequest, expected_gib: f64) {
+    if !(expected_gib.is_finite() && expected_gib > 0.0) {
+        return;
+    }
+    let main = resources
+        .roles
+        .iter()
+        .position(|r| r.role == WorkloadRole::Trainer)
+        .or(if resources.roles.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
+    let Some(role) = main.and_then(|i| resources.roles.get_mut(i)) else {
+        return;
+    };
+    if role.gpu_count == 0 || !matches!(role.gpu.vendor, Some(v) if v != GpuVendor::Apple) {
+        return;
+    }
+    let bytes = (expected_gib * f64::from(1u32 << 30)).ceil() as u64;
+    role.gpu.min_vram_bytes = Some(role.gpu.min_vram_bytes.map_or(bytes, |m| m.max(bytes)));
+}
+
 /// Submit-time preflight from the newest estimate of the same inputs.
 pub struct Guardian {
     db: Db,
+    settings: SubmissionConfig,
 }
 
 impl Guardian {
-    /// Reads estimates and machines from `db`; the headroom is `[submission]`'s.
-    pub fn new(db: Db) -> Self {
-        Self { db }
+    /// Reads estimates and machines from `db`, with `settings`' headroom.
+    pub fn new(db: Db, settings: SubmissionConfig) -> Self {
+        Self { db, settings }
     }
 }
 
@@ -246,7 +284,9 @@ impl JobValidator for Guardian {
             // No estimate: `unknown`, the run starts in probe mode.
             return Ok(Check::Abstain);
         };
-        let (p, _) = judge(&self.db, spec, &row).await.map_err(seam)?;
+        let (p, _) = judge(&self.db, &self.settings, spec, &row)
+            .await
+            .map_err(seam)?;
         if p.verdict != Verdict::DoesNotFit {
             return Ok(Check::Abstain);
         }

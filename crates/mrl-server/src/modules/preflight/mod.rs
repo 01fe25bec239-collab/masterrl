@@ -753,7 +753,8 @@ impl ProbeModeGuard {
                     AND p.step > start.step AND p.step <= start.step + $3
                     AND (s.name = 'resource/host_rss_peak'
                          OR s.name LIKE 'resource/process_peak/%'
-                         OR s.name LIKE 'resource/torch_reserved_peak/%')
+                         OR s.name LIKE 'resource/torch_reserved_peak/%'
+                         OR s.name LIKE 'resource/torch_allocated_peak/%')
                   GROUP BY device HAVING count(DISTINCT p.step) = $3",
             )
             .bind(run)

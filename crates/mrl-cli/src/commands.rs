@@ -511,11 +511,15 @@ pub fn describe_validation(v: &Value) -> String {
     out
 }
 
+/// `mrl runs validate` and `mrl runs submit --dry-run`: waits out the server's settings
+/// check (up to its longest budget), so the answer is always the server's, L0 fallback
+/// included.
 fn validate_run(api: &Api, prj: &str, body: &Value, out: &Output) -> Result<(), String> {
-    let v = api.post(
+    let v = api.post_waiting(
         &format!("/projects/{}/runs:validate", encode(prj)),
         Some(body),
         None,
+        crate::api::DRY_RUN_DEADLINE,
     )?;
     if out.json {
         print_json(&v);

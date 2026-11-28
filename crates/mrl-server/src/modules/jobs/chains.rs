@@ -263,6 +263,7 @@ impl Chains {
                 )),
                 Arc::new(crate::modules::submission::policy::Guardian::new(
                     db.clone(),
+                    config.submission,
                 )),
             ],
             vec![
@@ -281,6 +282,7 @@ impl Chains {
                 // <mrl:submission-resolvers> Resolvers go right below this line.
                 Arc::new(crate::modules::submission::resolve::Presets::new(
                     db.clone(),
+                    config.submission,
                 )),
             ],
         )

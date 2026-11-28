@@ -37,7 +37,8 @@ SELECT i.attempt_id, i.estimate_id, j.org_id, j.project_id, e.estimator_version,
                FILTER (WHERE btrim(g.arch) <> '') AS architecture,
            CASE WHEN e.gpu_mem_lo_gib + e.gpu_mem_hi_gib >= 2.0 / 1073741824.0
                THEN coalesce(max(ra.peak) FILTER (WHERE ra.signal = 'process_peak'),
-                             max(ra.peak) FILTER (WHERE ra.signal = 'torch_reserved_peak'))
+                             max(ra.peak) FILTER (WHERE ra.signal = 'torch_reserved_peak'),
+                             max(ra.peak) FILTER (WHERE ra.signal = 'torch_allocated_peak'))
                     / 1073741824.0 / ((e.gpu_mem_lo_gib + e.gpu_mem_hi_gib) / 2.0)
            END AS ratio
       FROM resource_reservations r
@@ -45,7 +46,7 @@ SELECT i.attempt_id, i.estimate_id, j.org_id, j.project_id, e.estimator_version,
       JOIN gpu_devices g ON g.id = d.gpu_device_id
       LEFT JOIN resource_actuals ra ON ra.attempt_id = i.attempt_id AND ra.device = g.device_uuid
         AND ra.peak >= 1 AND ra.peak < 'Infinity'::float8
-        AND ra.signal IN ('process_peak', 'torch_reserved_peak')
+        AND ra.signal IN ('process_peak', 'torch_reserved_peak', 'torch_allocated_peak')
      WHERE r.attempt_id = i.attempt_id
   ) measured
  WHERE e.state = 'READY' AND e.ok IS TRUE
