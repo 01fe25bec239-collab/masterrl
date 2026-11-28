@@ -271,6 +271,7 @@ impl Chains {
                 // <mrl:completion-verifiers P29> P29 verifiers go right below this line.
             ],
             vec![
+                // <mrl:submission-resolvers P29> P29 resolvers go right below this line.
                 // <mrl:submission-resolvers> Resolvers go right below this line.
             ],
         )

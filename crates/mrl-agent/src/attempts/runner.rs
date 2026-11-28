@@ -2066,6 +2066,8 @@ impl Runner {
             final_committed: self.rec.final_committed(),
             needs_final_checkpoint: self.rec.needs_final_checkpoint(),
             readopted: p.as_ref().is_some_and(|p| p.readopted),
+            // <mrl:sandbox-violation P29> P29 sets this from the job's sandbox profile.
+            sandbox_violation: false,
             agent_stopped: self.agent_stopped,
         };
         self.finish_with(decide(&ev), control).await
