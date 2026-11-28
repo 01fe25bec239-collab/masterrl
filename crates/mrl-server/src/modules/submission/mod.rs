@@ -158,7 +158,7 @@ impl SubmissionModule {
     /// The module for this build: registered chains and project directory, the
     /// process-wide lane router and metric observers.
     pub fn new(db: Db, config: &crate::Config) -> Self {
-        let chains = Chains::registered(&db);
+        let chains = Chains::registered(&db, config);
         let projects = Projects::registered(&db);
         Self::with(
             db,
