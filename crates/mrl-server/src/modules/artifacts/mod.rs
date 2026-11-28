@@ -266,6 +266,20 @@ impl ArtifactStore {
     /// `self.add_lineage_lookup(kind, Arc::new(…))` line below its marker.
     fn with_module_lookups(self) -> Self {
         // <mrl:lineage-lookups P26> P26 lookups go right below this line.
+        self.add_lineage_lookup(
+            "mdl",
+            Arc::new(crate::modules::models::LineageLookup::new(
+                self.db.clone(),
+                false,
+            )),
+        );
+        self.add_lineage_lookup(
+            "mv",
+            Arc::new(crate::modules::models::LineageLookup::new(
+                self.db.clone(),
+                true,
+            )),
+        );
         // <mrl:lineage-lookups P27> P27 lookups go right below this line.
         // <mrl:lineage-lookups P29> P29 lookups go right below this line.
         self

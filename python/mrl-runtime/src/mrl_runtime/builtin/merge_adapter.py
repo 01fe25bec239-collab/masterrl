@@ -34,6 +34,7 @@ from mrl_runtime.builtin.import_model import (
 from mrl_runtime.builtin.tasks import BuiltinTask, TaskContext, TaskEvent
 from mrl_runtime.errors import TASK_INPUT_INVALID, MrlError
 from mrl_runtime.model import inspect_model, read_safetensors_header
+from mrl_runtime.model.inspection import confined_model_file, indexed_safetensors
 
 ADAPTER_BASE = "MRL-MODEL-264"
 UNREADABLE = "MRL-MODEL-150"
@@ -178,19 +179,12 @@ def _deltas(adapter: Path) -> tuple[dict[str, np.ndarray], dict[str, np.ndarray]
     return deltas, replaced
 
 
-def _shards(base: Path) -> list[str]:
-    index = base / "model.safetensors.index.json"
-    if index.is_file():
-        weight_map = json.loads(index.read_text(encoding="utf-8"))["weight_map"]
-        return sorted(set(weight_map.values()))
-    return sorted(p.name for p in base.glob("*.safetensors"))
-
-
 def merge(base: Path, adapter: Path, out: Path, dtype: str) -> None:
     """Writes the merged model folder `out` (see the module docs). Raises ValueError with a
     plain reason for adapters that can't be merged."""
     deltas, replaced = _deltas(adapter)
-    shards = _shards(base)
+    indexed = indexed_safetensors(base)
+    shards = indexed if indexed is not None else sorted(base.glob("*.safetensors"))
     out.mkdir(parents=True, exist_ok=True)
     for p in sorted(base.iterdir()):
         if (
@@ -203,8 +197,9 @@ def merge(base: Path, adapter: Path, out: Path, dtype: str) -> None:
     total = 0
     weight_map: dict[str, str] = {}
     target = DTYPES.get(dtype)
-    for shard in shards:
-        st = SafetensorsFile(base / shard)
+    for path in shards:
+        shard = path.relative_to(base).as_posix()
+        st = SafetensorsFile(confined_model_file(base, shard))
         tensors: list[tuple[str, str, list[int], bytes]] = []
         for name, e in st.entries.items():
             src_dtype, shape = str(e["dtype"]), list(e["shape"])
@@ -218,6 +213,8 @@ def merge(base: Path, adapter: Path, out: Path, dtype: str) -> None:
                 tensors.append((name, src_dtype, shape, data))
             else:
                 values = replaced[name] if name in replaced else st.float32(name)
+                if values.shape != tuple(shape):
+                    raise ValueError(f"The adapter's replacement for {name} has the wrong shape.")
                 if change is not None:
                     if change.shape != values.shape:
                         raise ValueError(f"The adapter's update for {name} has the wrong shape.")
@@ -227,11 +224,13 @@ def merge(base: Path, adapter: Path, out: Path, dtype: str) -> None:
                 tensors.append((name, out_dtype, shape, _encode(values, out_dtype)))
             total += len(tensors[-1][3])
             weight_map[name] = shard
-        write_safetensors(out / shard, tensors, st.metadata or {"format": "pt"})
+        target_path = out / shard
+        target_path.parent.mkdir(parents=True, exist_ok=True)
+        write_safetensors(target_path, tensors, st.metadata or {"format": "pt"})
     missing = (set(deltas) | set(replaced)) - used
     if missing:
         raise ValueError(f"The base model has no weight {sorted(missing)[0]} the adapter changes.")
-    if len(shards) > 1:
+    if indexed is not None or len(shards) > 1:
         (out / "model.safetensors.index.json").write_text(
             json.dumps({"metadata": {"total_size": total}, "weight_map": weight_map}, indent=2),
             encoding="utf-8",

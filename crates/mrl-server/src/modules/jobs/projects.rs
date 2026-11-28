@@ -14,6 +14,7 @@
 use super::error::JobsError;
 use super::scope;
 use crate::db::Db;
+use crate::modules::artifacts::ArtifactStore;
 use crate::seams::{RequestContext, SeamError, StartupStep};
 use async_trait::async_trait;
 use mrl_domain::ids::{OrgId, ProjectId};
@@ -68,12 +69,23 @@ impl Projects {
 pub struct RehomeLocalRows {
     db: Db,
     projects: Projects,
+    artifacts: Option<Arc<ArtifactStore>>,
 }
 
 impl RehomeLocalRows {
     /// The step for `db` and `projects`.
     pub fn new(db: Db, projects: Projects) -> Self {
-        Self { db, projects }
+        Self {
+            db,
+            projects,
+            artifacts: None,
+        }
+    }
+
+    /// Storage used to copy local model objects into the destination org.
+    pub fn with_artifacts(mut self, artifacts: Option<Arc<ArtifactStore>>) -> Self {
+        self.artifacts = artifacts;
+        self
     }
 
     /// Moves every nil-org row of `projects` to `org` in one transaction, so runs linked
@@ -122,6 +134,11 @@ impl RehomeLocalRows {
             "UPDATE model_files SET org_id = $1 WHERE org_id = $3 AND model_version_id IN \
                (SELECT id FROM model_versions WHERE project_id = ANY($2))",
             "UPDATE license_acknowledgements SET org_id = $1 WHERE org_id = $3 AND project_id = ANY($2)",
+            "UPDATE model_submission_keys SET org_id = $1 WHERE org_id = $3 AND project_id = ANY($2)
+               AND NOT EXISTS (SELECT 1 FROM model_submission_keys keep
+                   WHERE keep.org_id = $1 AND keep.project_id = model_submission_keys.project_id
+                     AND keep.principal_id = model_submission_keys.principal_id
+                     AND keep.key = model_submission_keys.key)",
             // <mrl:rehome P27> P27 statements go right below this line.
             // <mrl:rehome P28> P28 statements go right below this line.
             // <mrl:rehome P29> P29 statements go right below this line.
@@ -133,6 +150,13 @@ impl RehomeLocalRows {
                 .execute(&mut *tx)
                 .await?;
         }
+        crate::modules::models::rehome::copy_blobs(
+            &mut tx,
+            self.artifacts.as_deref(),
+            org,
+            projects,
+        )
+        .await?;
         tx.commit().await
     }
 
@@ -222,7 +246,10 @@ impl StartupStep for RehomeLocalRows {
         let projects: Vec<Uuid> = sqlx::query_scalar(
             "SELECT project_id FROM experiments WHERE org_id = $1 \
              UNION SELECT project_id FROM runs WHERE org_id = $1 \
-             UNION SELECT project_id FROM jobs WHERE org_id = $1",
+             UNION SELECT project_id FROM jobs WHERE org_id = $1 \
+             UNION SELECT project_id FROM models WHERE org_id = $1 \
+             UNION SELECT v.project_id FROM model_versions v JOIN model_files f ON f.model_version_id = v.id \
+               WHERE f.object_key LIKE 'orgs/local/blobs/sha256/%'",
         )
         .bind(Uuid::nil())
         .fetch_all(self.db.pool())

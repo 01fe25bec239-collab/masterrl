@@ -15,12 +15,15 @@ use super::store::{self, unhex, FileRow, VersionRow};
 use super::Models;
 use crate::db::{Db, DbError, Tx};
 use crate::modules::events::{ConsumerError, Event, EventConsumer};
+use crate::modules::jobs::chains::{CompletionWrite, PreparedVerification};
 use crate::modules::jobs::{scope, CompletionVerifier, JobRow, Rejection, Verification};
 use crate::modules::lineage::{LineageWriter, NodeRef, Relation};
-use crate::seams::SeamError;
+use crate::seams::{AuditEvent, AuditOutcome, AuditSink, SeamError};
 use mrl_domain::errors::ErrorCode;
+use mrl_domain::ids::{ModelVersionId, ProjectId};
 use serde_json::{json, Value};
 use std::collections::HashMap;
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// The inspection report file in a job's outputs.
@@ -39,8 +42,6 @@ pub struct Produced {
     pub artifact_id: Uuid,
     /// Its `artifact-manifest/v1` document.
     pub manifest: Value,
-    /// Its full object-key prefix (ends with `/`); a file's key is the prefix plus its path.
-    pub prefix: String,
 }
 
 fn seam(e: impl std::fmt::Display) -> SeamError {
@@ -98,41 +99,70 @@ pub async fn record(
     job: Uuid,
     produced: Option<&Produced>,
 ) -> Result<Verification, SeamError> {
+    let (outcome, effect) = prepare_record(models, job, produced).await?;
+    if let Some(effect) = effect {
+        let mut tx = models.db.begin().await.map_err(seam)?;
+        effect.commit(&mut tx).await?;
+        tx.commit().await.map_err(seam)?;
+    }
+    Ok(outcome)
+}
+
+async fn prepare_record(
+    models: &Models,
+    job: Uuid,
+    produced: Option<&Produced>,
+) -> Result<PreparedVerification, SeamError> {
     let Some(version) = store::version_of_job(&models.db, job).await.map_err(seam)? else {
-        return Ok(Verification::Abstain);
+        return Ok((Verification::Abstain, None));
     };
     if let Some(done) = settled(&version) {
-        return Ok(done);
+        return Ok((done, None));
     }
-    let Some(produced) = produced else {
-        return settle(
-            models,
-            &version,
-            Err(invalid(
-                codes::UNREADABLE,
-                "The job finished without writing its results.",
-            )),
-        )
-        .await;
+    let decided = match produced {
+        Some(produced) => match read_report(models, &version, produced).await? {
+            Ok(report) => decide(models, &version, produced, report).await?,
+            Err(why) => Err(why),
+        },
+        None => Err(invalid(
+            codes::UNREADABLE,
+            "The job finished without writing its results.",
+        )),
     };
-    let decided = match read_report(models, &version, produced).await? {
-        Ok(report) => decide(models, &version, produced, report).await?,
-        Err(why) => Err(why),
+    let outcome = match &decided {
+        Ok(_) => Verification::Verified,
+        Err(why) => Verification::Failed(rejection(&failure_reason(why))),
     };
-    settle(models, &version, decided).await
+    Ok((
+        outcome,
+        Some(Arc::new(Settlement {
+            id: version.id,
+            db: models.db.clone(),
+            decided,
+        })),
+    ))
 }
 
 /// Marks the version `job` builds INVALID (in `tx`) because the job ended without results;
 /// a settled version keeps its outcome.
 pub async fn job_ended(tx: &mut Tx, job: Uuid, why: &str) -> Result<(), DbError> {
-    sqlx::query(
+    let row: Option<(Uuid, Uuid, Uuid)> = sqlx::query_as(
         "UPDATE model_versions SET state = 'INVALID', invalid_reason = $2
-          WHERE job_id = $1 AND state = 'IMPORTING'",
+          WHERE job_id = $1 AND state = 'IMPORTING'
+          RETURNING id, org_id, project_id",
     )
     .bind(job)
     .bind(json!({"code": codes::UNREADABLE.to_string(), "message": why}))
-    .execute(&mut **tx)
+    .fetch_optional(&mut **tx)
     .await?;
+    if let Some((id, org, project)) = row {
+        crate::modules::audit::write(
+            tx,
+            &audit_event(id, org, project, "models.invalid"),
+            &json!({}),
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -165,7 +195,7 @@ async fn read_report(
         .org_store(&storage_org(version.org_id))
         .await
         .map_err(seam)?;
-    let Ok(key) = st.keys().join(&produced.prefix, INSPECTION_FILE) else {
+    let Ok(key) = st.keys().blob(sha) else {
         return Ok(Err(invalid(
             codes::UNREADABLE,
             "The job's outputs are not where they were registered.",
@@ -187,6 +217,7 @@ async fn read_report(
 }
 
 /// What the version is, given its report: the READY update, or why it is INVALID.
+#[derive(Debug, Clone)]
 struct Ready {
     files: Vec<FileRow>,
     report: Value,
@@ -230,10 +261,14 @@ async fn decide(
             .map_err(seam)?,
         None => None,
     };
-    if kind == "adapter" && base.is_none() {
+    if kind == "adapter"
+        && !base
+            .as_ref()
+            .is_some_and(|v| v.kind.as_deref() == Some("full_weights") && v.quantization.is_none())
+    {
         return Ok(Err(invalid(
             codes::ADAPTER_BASE,
-            "This is a LoRA adapter: import it with the READY base model version it was trained on.",
+            "This is a LoRA adapter: import it with the READY full-precision base model version it was trained on.",
         )));
     }
     let files = match files_of(models, version, produced, &report).await? {
@@ -268,7 +303,7 @@ async fn decide(
     apply_facts(&mut probe, &report, &kind, &family);
     // Compatibility is about the model; the code approval is a separate gate.
     probe.remote_code_approved_for = probe.revision();
-    let compatibility = gates::compatibility(&models.db, &gates::facts(&probe)).await?;
+    let compatibility = gates::compatibility(&models.db, &probe).await?;
     Ok(Ok(Ready {
         files,
         report,
@@ -310,8 +345,10 @@ async fn files_of(
         let (Some(sha), Some(size), Ok(key)) = (
             f["sha256"].as_str().and_then(unhex),
             f["size"].as_i64(),
-            st.keys()
-                .join(&produced.prefix, &format!("{MODEL_DIR}{path}")),
+            f["sha256"]
+                .as_str()
+                .ok_or(())
+                .and_then(|sha| st.keys().blob(sha).map_err(|_| ())),
         ) else {
             return damaged();
         };
@@ -363,43 +400,74 @@ fn apply_facts(v: &mut VersionRow, report: &Value, kind: &str, family: &str) {
         });
 }
 
-/// Writes the outcome under the version's lock; a version another call settled first keeps
-/// that outcome.
-async fn settle(
-    models: &Models,
-    version: &VersionRow,
+fn failure_reason(why: &Invalid) -> Value {
+    json!({"code": why.code.to_string(), "message": why.message})
+}
+
+struct Settlement {
+    id: Uuid,
+    db: Db,
     decided: Result<Ready, Invalid>,
-) -> Result<Verification, SeamError> {
-    let mut tx = models.db.begin().await.map_err(seam)?;
-    let Some(current) = store::lock_version(&mut tx, version.id)
-        .await
-        .map_err(seam)?
-    else {
-        return Ok(Verification::Abstain);
-    };
-    if let Some(done) = settled(&current) {
-        return Ok(done);
+}
+
+impl std::fmt::Debug for Settlement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Settlement")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
     }
-    let outcome = match decided {
-        Ok(ready) => {
-            write_ready(&mut tx, &current, ready).await.map_err(seam)?;
-            Verification::Verified
-        }
-        Err(why) => {
-            let reason = json!({"code": why.code.to_string(), "message": why.message});
-            sqlx::query(
-                "UPDATE model_versions SET state = 'INVALID', invalid_reason = $2 WHERE id = $1",
-            )
-            .bind(current.id)
-            .bind(&reason)
-            .execute(&mut *tx)
+}
+
+#[async_trait::async_trait]
+impl CompletionWrite for Settlement {
+    async fn commit(&self, tx: &mut Tx) -> Result<(), SeamError> {
+        let current = store::lock_version(tx, self.id)
             .await
-            .map_err(seam)?;
-            Verification::Failed(rejection(&reason))
+            .map_err(seam)?
+            .ok_or_else(|| seam("the model version disappeared"))?;
+        if settled(&current).is_some() {
+            return Ok(());
         }
-    };
-    tx.commit().await.map_err(seam)?;
-    Ok(outcome)
+        match &self.decided {
+            Ok(ready) => write_ready(tx, &current, ready.clone())
+                .await
+                .map_err(seam)?,
+            Err(why) => {
+                sqlx::query(
+                    "UPDATE model_versions SET state = 'INVALID', invalid_reason = $2 WHERE id = $1",
+                )
+                .bind(current.id)
+                .bind(failure_reason(why))
+                .execute(&mut **tx)
+                .await.map_err(seam)?;
+            }
+        };
+        let action = if self.decided.is_ok() {
+            "models.ready"
+        } else {
+            "models.invalid"
+        };
+        crate::modules::audit::PgAuditSink::new(self.db.clone())
+            .record_in(
+                tx,
+                audit_event(current.id, current.org_id, current.project_id, action),
+            )
+            .await?;
+        Ok(())
+    }
+}
+
+fn audit_event(id: Uuid, org: Uuid, project: Uuid, action: &str) -> AuditEvent {
+    AuditEvent {
+        at: time::OffsetDateTime::now_utc(),
+        actor: "system:model-registry".into(),
+        org: scope::org_text(org),
+        project: Some(ProjectId::from_uuid(project).to_string()),
+        action: action.into(),
+        target: ModelVersionId::from_uuid(id).to_string(),
+        outcome: AuditOutcome::Success,
+        trace_id: Uuid::now_v7().simple().to_string(),
+    }
 }
 
 async fn write_ready(tx: &mut Tx, v: &VersionRow, ready: Ready) -> Result<(), DbError> {
@@ -410,6 +478,10 @@ async fn write_ready(tx: &mut Tx, v: &VersionRow, ready: Ready) -> Result<(), Db
         compatibility,
         license,
     } = ready;
+    sqlx::query("SELECT id FROM models WHERE id = $1 FOR UPDATE")
+        .bind(v.model_id)
+        .execute(&mut **tx)
+        .await?;
     store::insert_files(tx, v, &files).await?;
     let mut row = v.clone();
     let kind = report["kind"].as_str().unwrap_or_default().to_owned();
@@ -457,11 +529,16 @@ async fn write_ready(tx: &mut Tx, v: &VersionRow, ready: Ready) -> Result<(), Db
     .bind(&source_ref)
     .execute(&mut **tx)
     .await?;
-    sqlx::query("UPDATE models SET family = $2 WHERE id = $1")
-        .bind(v.model_id)
-        .bind(&family)
-        .execute(&mut **tx)
-        .await?;
+    sqlx::query(
+        "UPDATE models SET family = $2 WHERE id = $1
+         AND NOT EXISTS (SELECT 1 FROM model_versions
+                         WHERE model_id = $1 AND state = 'READY' AND seq > $3)",
+    )
+    .bind(v.model_id)
+    .bind(&family)
+    .bind(v.seq)
+    .execute(&mut **tx)
+    .await?;
     link(tx, v).await
 }
 
@@ -494,15 +571,6 @@ async fn link(tx: &mut Tx, v: &VersionRow) -> Result<(), DbError> {
     Ok(())
 }
 
-// ponytail: chains are built from the database alone, so the verifier reaches storage through
-// the models module of this process (set once at startup by `ModelsModule::new`).
-static MODELS: std::sync::OnceLock<std::sync::Arc<Models>> = std::sync::OnceLock::new();
-
-/// Makes `models` the one [`ModelOutputs::new`] uses (first call wins).
-pub(crate) fn install(models: std::sync::Arc<Models>) {
-    let _ = MODELS.set(models);
-}
-
 /// Completion chain: vouches for model jobs (`import_model`, `merge_adapter`,
 /// `export_model`): waits for their registered outputs (answering an error, never
 /// `RetryLater`, which would retry the whole job), records the version (see the module
@@ -513,9 +581,10 @@ pub struct ModelOutputs {
 }
 
 impl ModelOutputs {
-    /// The verifier of this process's models module.
-    pub fn new(db: Db) -> Self {
-        Self { db, models: None }
+    /// A verifier bound to this app's database and object store.
+    pub fn new(db: Db, config: Option<&crate::Config>) -> Self {
+        let models = config.map(|config| super::ModelsModule::new(db.clone(), config).models());
+        Self { db, models }
     }
 
     /// The verifier for these models (tests).
@@ -537,6 +606,10 @@ impl CompletionVerifier for ModelOutputs {
     }
 
     async fn verify(&self, job: &JobRow) -> Result<Verification, SeamError> {
+        Ok(self.prepare(job).await?.0)
+    }
+
+    async fn prepare(&self, job: &JobRow) -> Result<PreparedVerification, SeamError> {
         let task: Option<String> =
             sqlx::query_scalar("SELECT task FROM builtin_jobs WHERE job_id = $1")
                 .bind(job.id)
@@ -544,9 +617,9 @@ impl CompletionVerifier for ModelOutputs {
                 .await
                 .map_err(seam)?;
         let Some(task) = task.filter(|t| TASKS.contains(&t.as_str())) else {
-            return Ok(Verification::Abstain);
+            return Ok((Verification::Abstain, None));
         };
-        let Some(models) = self.models.as_ref().or_else(|| MODELS.get()) else {
+        let Some(models) = self.models.as_ref() else {
             return Err(seam("the models module has not started"));
         };
         let Some(out) = crate::modules::builtin::outputs(&self.db, job.org_id, job.id)
@@ -558,7 +631,7 @@ impl CompletionVerifier for ModelOutputs {
             return Err(seam("the job's results are still being saved"));
         };
         let org = storage_org(job.org_id);
-        let Some(artifact) = models
+        let Some(_artifact) = models
             .store
             .get(&org, out.artifact_id)
             .await
@@ -567,39 +640,56 @@ impl CompletionVerifier for ModelOutputs {
             return Err(seam("the job's results are not readable yet"));
         };
         if task == "export_model" {
-            return exported(&self.db, job, out.artifact_id).await;
+            return Ok(exported(job, out.artifact_id));
         }
         let produced = Produced {
             artifact_id: out.artifact_id,
             manifest: out.manifest,
-            prefix: artifact.prefix,
         };
-        record(models, job.id, Some(&produced)).await
+        prepare_record(models, job.id, Some(&produced)).await
     }
 }
 
-/// An export job's outputs: the version it exported gets its `exported_as` edge.
-async fn exported(db: &Db, job: &JobRow, artifact: Uuid) -> Result<Verification, SeamError> {
+/// The checked export's lineage edge.
+fn exported(job: &JobRow, artifact: Uuid) -> PreparedVerification {
     let mv = job
         .subject_ref
         .as_ref()
         .and_then(|s| s["model_version_id"].as_str())
         .and_then(|s| NodeRef::parse(s).ok());
     let Some(mv) = mv.filter(|n| n.kind == "mv") else {
-        return Ok(Verification::Abstain);
+        return (Verification::Abstain, None);
     };
-    let mut tx = db.begin().await.map_err(seam)?;
-    LineageWriter::link(
-        &mut tx,
-        &storage_org(job.org_id),
-        mv,
-        Relation::ExportedAs,
-        NodeRef::new("art", artifact),
+    (
+        Verification::Verified,
+        Some(Arc::new(ExportLink {
+            org: job.org_id,
+            mv,
+            artifact,
+        })),
     )
-    .await
-    .map_err(seam)?;
-    tx.commit().await.map_err(seam)?;
-    Ok(Verification::Verified)
+}
+
+#[derive(Debug)]
+struct ExportLink {
+    org: Uuid,
+    mv: NodeRef,
+    artifact: Uuid,
+}
+
+#[async_trait::async_trait]
+impl CompletionWrite for ExportLink {
+    async fn commit(&self, tx: &mut Tx) -> Result<(), SeamError> {
+        LineageWriter::link(
+            tx,
+            &storage_org(self.org),
+            self.mv,
+            Relation::ExportedAs,
+            NodeRef::new("art", self.artifact),
+        )
+        .await
+        .map_err(seam)
+    }
 }
 
 /// Event consumer: a model job that failed, was cancelled or rejected leaves its version

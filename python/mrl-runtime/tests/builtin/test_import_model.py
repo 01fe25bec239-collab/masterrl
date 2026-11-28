@@ -91,6 +91,24 @@ def test_node_path_copies_kept_files_and_drops_pickles(models: Path, tmp_path: P
     assert report(out)["license"]["sha256"] == license_of(src)["sha256"]  # type: ignore[index]
 
 
+def test_inference_only_onnx_import(tmp_path: Path) -> None:
+    source = tmp_path / "src"
+    source.mkdir()
+    (source / "model.onnx").write_bytes(b"onnx")
+    out = tmp_path / "out"
+    run({"source": {"kind": "staged"}}, {"model": source}, out)
+    assert report(out)["kind"] == "inference_only"
+    assert report(out)["format"] == "onnx"
+
+
+def test_license_classification(tmp_path: Path) -> None:
+    assert license_of(tmp_path, "apache-2.0")["kind"] == "spdx"
+    assert license_of(tmp_path, "llama3")["kind"] == "custom"
+    assert license_of(tmp_path, "LicenseRef-proprietary")["spdx"] is None
+    (tmp_path / "LICENSE").write_text("Custom terms")
+    assert license_of(tmp_path)["kind"] == "custom"
+
+
 def test_node_path_refuses_links(models: Path, tmp_path: Path) -> None:
     src = Path(shutil.copytree(models / "tiny-llama", tmp_path / "src"))
     if os.name == "nt":

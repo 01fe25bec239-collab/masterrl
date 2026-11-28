@@ -581,7 +581,7 @@ pub async fn check_inputs(
     for id in &sub.secret_ids {
         grants.push(
             resolver
-                .prepare_grant(&state.seams, ctx, &storage_org, *id, "env")
+                .prepare_grant(&state.seams, ctx, &storage_org, *id, "env", None)
                 .await
                 .map_err(launch_input_error)?,
         );

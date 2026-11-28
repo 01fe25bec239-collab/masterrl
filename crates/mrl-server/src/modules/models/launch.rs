@@ -15,6 +15,8 @@ use serde_json::Value;
 /// Name of the input the worker reads as its model folder.
 pub const MODEL_INPUT: &str = "model";
 
+const ADAPTER_INPUT: &str = "model_adapter";
+
 /// See the module docs.
 pub struct ModelInputs {
     db: Db,
@@ -75,19 +77,41 @@ impl LaunchContributor for ModelInputs {
                 "The model version of this run ships its own code that is not approved for this revision.",
             ));
         }
-        let weights = version
+        let mut inputs = vec![(MODEL_INPUT, &version)];
+        let base = if version.kind.as_deref() == Some("adapter") {
+            let base = super::gates::adapter_base(&self.db, &version)
+                .await
+                .map_err(db)?
+                .filter(super::store::VersionRow::code_approved)
+                .ok_or_else(|| gone("The adapter's original base model is unavailable or requires code approval."))?;
+            Some(base)
+        } else {
+            None
+        };
+        if let Some(base) = &base {
+            if plan.launch.engine_name != "trl" {
+                return Err(gone(
+                    "This engine cannot continue training a staged adapter.",
+                ));
+            }
+            inputs = vec![(MODEL_INPUT, base), (ADAPTER_INPUT, &version)];
+        }
+        let weights = base
+            .as_ref()
+            .unwrap_or(&version)
             .weights_sha256
             .as_deref()
             .ok_or_else(|| gone("The model version of this run has no weights."))?;
-        let files = store::files(&self.db, version.id).await.map_err(db)?;
-        for f in files {
-            plan.inputs.push(InputFile {
-                name: MODEL_INPUT.into(),
-                key: f.object_key,
-                sha256: hex(&f.sha256),
-                size: u64::try_from(f.size_bytes).unwrap_or_default(),
-                local_path: format!("{MODEL_INPUT}/{}", f.path),
-            });
+        for (name, v) in inputs {
+            for f in store::files(&self.db, v.id).await.map_err(db)? {
+                plan.inputs.push(InputFile {
+                    name: name.into(),
+                    key: f.object_key,
+                    sha256: hex(&f.sha256),
+                    size: u64::try_from(f.size_bytes).unwrap_or_default(),
+                    local_path: format!("{name}/{}", f.path),
+                });
+            }
         }
         spec["base_model_sha256"] = Value::from(hex(weights));
         plan.launch.job_spec_json = spec.to_string();

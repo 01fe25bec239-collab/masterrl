@@ -39,6 +39,18 @@ pub async fn ready_in(
         .filter(|v| v.org_id == org && v.project_id == project && v.state == "READY"))
 }
 
+pub(super) async fn adapter_base(
+    db: &Db,
+    adapter: &VersionRow,
+) -> Result<Option<VersionRow>, DbError> {
+    let Some(id) = adapter.base_model_version_id else {
+        return Ok(None);
+    };
+    Ok(ready_in(db, adapter.org_id, adapter.project_id, id)
+        .await?
+        .filter(|base| base.kind.as_deref() == Some("full_weights") && base.quantization.is_none()))
+}
+
 /// The model family from an inspection report: `decoder`, `decoder-moe`, `encoder`,
 /// `encoder-decoder`, `vlm`, or `unknown` (which the capability check refuses).
 pub fn family(inspection: &Value) -> String {
@@ -76,6 +88,18 @@ pub fn facts(v: &VersionRow) -> ModelFacts {
     }
 }
 
+async fn capability_facts(db: &Db, version: &VersionRow) -> Result<ModelFacts, DbError> {
+    if version.kind.as_deref() == Some("adapter") {
+        if let Some(base) = adapter_base(db, version).await? {
+            let mut found = facts(&base);
+            found.requires_remote_code |= version.requires_remote_code;
+            found.remote_code_approved &= version.code_approved();
+            return Ok(found);
+        }
+    }
+    Ok(facts(version))
+}
+
 /// P24's lookups for model versions, from this part's tables.
 pub struct ModelRecords {
     db: Db,
@@ -95,13 +119,15 @@ impl RegistryRecords for ModelRecords {
         scope: &RecordScope,
         id: ModelVersionId,
     ) -> Result<Option<ModelFacts>, SeamError> {
-        Ok(
-            ready_in(&self.db, scope.org_id, scope.project_id, id.as_uuid())
-                .await
-                .map_err(seam)?
-                .as_ref()
-                .map(facts),
-        )
+        let Some(version) = ready_in(&self.db, scope.org_id, scope.project_id, id.as_uuid())
+            .await
+            .map_err(seam)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(
+            capability_facts(&self.db, &version).await.map_err(seam)?,
+        ))
     }
 
     async fn dataset(
@@ -152,6 +178,40 @@ impl ModelGates {
         let Some(v) = ready_in(&self.db, spec.org_id, spec.project_id, id).await? else {
             return Ok(());
         };
+        self.check_version(&v, path, out).await?;
+        if v.kind.as_deref() == Some("adapter") {
+            if let Some(base) = adapter_base(&self.db, &v).await? {
+                self.check_version(&base, path, out).await?;
+            } else {
+                out.push(Rejection::new(
+                    codes::ADAPTER_BASE,
+                    Some(path),
+                    "This adapter needs its original READY full-precision base model.",
+                ));
+            }
+            if path == "/base_model_version_id"
+                && spec
+                    .resolved
+                    .pointer("/common/update/strategy")
+                    .and_then(Value::as_str)
+                    == Some("full")
+            {
+                out.push(Rejection::new(
+                    codes::ADAPTER_BASE,
+                    Some(path),
+                    "Use LoRA or QLoRA to continue training this adapter, or merge it before a full update.",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    async fn check_version(
+        &self,
+        v: &VersionRow,
+        path: &str,
+        out: &mut Vec<Rejection>,
+    ) -> Result<(), DbError> {
         if !v.code_approved() {
             out.push(Rejection::new(
                 codes::REMOTE_CODE,
@@ -170,7 +230,11 @@ impl ModelGates {
             ));
         }
         let acknowledged = store::acknowledged(&self.db, v.project_id, v.model_id).await?;
-        if acknowledged.is_none() || acknowledged != v.license_sha256 {
+        if !v
+            .license_sha256
+            .as_ref()
+            .is_some_and(|hash| acknowledged.contains(hash))
+        {
             out.push(Rejection::new(
                 codes::LICENSE_NOT_ACKNOWLEDGED,
                 Some(path),
@@ -221,7 +285,9 @@ impl JobValidator for ModelGates {
 /// Per live engine version (`name@version`) and method: whether the version's facts fit,
 /// and the model problems when they don't (`{"trl@1.0.0": {"sft": {"ok": true, "problems": []}}}`).
 /// Hardware, datasets and settings are left out: this is about the model alone.
-pub async fn compatibility(db: &Db, facts: &ModelFacts) -> Result<Value, SeamError> {
+pub async fn compatibility(db: &Db, version: &VersionRow) -> Result<Value, SeamError> {
+    let mut facts = capability_facts(db, version).await.map_err(seam)?;
+    facts.remote_code_approved = true;
     let candidates = crate::modules::engines::store::candidates(db, None)
         .await
         .map_err(SeamError::from)?;
@@ -248,7 +314,7 @@ pub async fn compatibility(db: &Db, facts: &ModelFacts) -> Result<Value, SeamErr
                 model_signals: BTreeMap::new(),
                 rollout: false,
             };
-            let problems: Vec<Value> = matcher::check(
+            let mut problems: Vec<Value> = matcher::check(
                 Engine {
                     manifest: &c.manifest,
                     schemas: &c.schemas,
@@ -260,6 +326,18 @@ pub async fn compatibility(db: &Db, facts: &ModelFacts) -> Result<Value, SeamErr
             .filter(|p| p.path.as_deref() == Some("/base_model_version_id"))
             .map(|p| json!({"code": p.code.to_string(), "message": p.message}))
             .collect();
+            if version.kind.as_deref() == Some("adapter") && c.name != "trl" {
+                problems.push(json!({
+                    "code": codes::ADAPTER_BASE.to_string(),
+                    "message": "This engine cannot continue training a staged adapter.",
+                }));
+            }
+            if version.kind.as_deref() == Some("inference_only") {
+                problems.push(json!({
+                    "code": codes::INFERENCE_ONLY.to_string(),
+                    "message": "This model version can be used only for inference, not for training.",
+                }));
+            }
             methods.insert(
                 algo.id.clone(),
                 json!({"ok": problems.is_empty(), "problems": problems}),

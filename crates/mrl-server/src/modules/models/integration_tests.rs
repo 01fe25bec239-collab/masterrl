@@ -14,13 +14,14 @@ use crate::server::{TestResponse, TestServer, TEST_SECRET};
 use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::Method;
-use mrl_domain::ids::{ModelVersionId, ProjectId};
+use mrl_domain::ids::{ModelVersionId, OrgId, ProjectId};
 use mrl_server::config::Mode;
 use mrl_server::modules::artifacts::{ArtifactStore, ArtifactsModule};
 use mrl_server::modules::engines::{RecordScope, RegistryRecords};
 use mrl_server::modules::jobs::CompletionVerifier;
 use mrl_server::modules::jobs::{
-    AttemptRow, JobRow, JobSpec, JobValidator, Projects, Verdict, Verification,
+    AttemptRow, JobRow, JobSpec, JobValidator, ProjectDirectory, Projects, RehomeLocalRows,
+    Verdict, Verification,
 };
 use mrl_server::modules::models::gates::{ModelGates, ModelRecords};
 use mrl_server::modules::models::launch::{ModelInputs, MODEL_INPUT};
@@ -30,10 +31,11 @@ use mrl_server::modules::models::{Models, ModelsModule};
 use mrl_server::modules::scheduler::pipeline::{
     LaunchContributor, LaunchError, LaunchPlan, Placement,
 };
-use mrl_server::seams::{AuditEvent, AuditSink, SeamError, LAUNCH_SECRET_HEADER};
+use mrl_server::seams::{AuditEvent, AuditSink, SeamError, StartupStep, LAUNCH_SECRET_HEADER};
 use mrl_storage::{sha256_hex, BackendConfig};
 use serde_json::{json, Value};
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
 
@@ -44,7 +46,7 @@ const COMMIT: &str = "9fb191250dd56d0ba7ec9785a025ed29c03d5998";
 
 /// Keeps the events recorded inside transactions.
 #[derive(Default)]
-struct Audit(Mutex<Vec<AuditEvent>>);
+struct Audit(Mutex<Vec<AuditEvent>>, AtomicBool);
 
 impl Audit {
     fn actions(&self) -> Vec<(String, String)> {
@@ -68,6 +70,9 @@ impl AuditSink for Audit {
         _: &mut mrl_server::db::Tx,
         event: AuditEvent,
     ) -> Result<(), SeamError> {
+        if event.action == "models.import" && self.1.load(Ordering::Relaxed) {
+            return Err(SeamError::new("audit", "fixture refuses the import audit"));
+        }
         self.record(event).await
     }
 }
@@ -200,6 +205,21 @@ impl Env {
             .await
     }
 
+    async fn post_with_key(&self, path: &str, body: &Value, key: &str) -> TestResponse {
+        self.server
+            .request(
+                Method::POST,
+                &format!("/api/v1{path}"),
+                &[
+                    (LAUNCH_SECRET_HEADER, TEST_SECRET),
+                    ("content-type", "application/json"),
+                    ("idempotency-key", key),
+                ],
+                Body::from(body.to_string()),
+            )
+            .await
+    }
+
     /// The model `name` of the test project, created through the API.
     async fn model(&self, name: &str) -> store::ModelRow {
         let r = self
@@ -252,15 +272,10 @@ impl Env {
     /// Stores `out` and returns what the verifier is handed.
     async fn produce(&self, out: &Outputs) -> Produced {
         let st = self.store.org_store("local").await.unwrap();
-        let prefix = format!(
-            "{}jobs/test-{}/outputs/",
-            st.keys().prefix(),
-            Uuid::now_v7()
-        );
         let mut entries = vec![];
         for (path, bytes) in &out.files {
             let sha = sha256_hex(bytes);
-            st.put(&format!("{prefix}{path}"), bytes.clone().into())
+            st.put(&st.keys().blob(&sha).unwrap(), bytes.clone().into())
                 .await
                 .unwrap();
             entries.push(json!({"path": path, "sha256": sha, "size": bytes.len()}));
@@ -268,7 +283,6 @@ impl Env {
         Produced {
             artifact_id: Uuid::now_v7(),
             manifest: json!({"files": entries}),
-            prefix,
         }
     }
 
@@ -353,6 +367,7 @@ impl Env {
     async fn launch(&self, org: Uuid, mv: Uuid) -> Result<LaunchPlan, LaunchError> {
         let (job, attempt) = self.run_job(org).await;
         let mut plan = LaunchPlan::default();
+        plan.launch.engine_name = "trl".to_owned();
         plan.launch.job_spec_json =
             json!({"base_model_version_id": ModelVersionId::from_uuid(mv).to_string()}).to_string();
         let placement = Placement {
@@ -587,11 +602,7 @@ async fn runs_need_the_license_accepted_and_custom_code_approved() {
         assert_eq!(input.name, MODEL_INPUT);
         let path = input.local_path.strip_prefix("model/").unwrap();
         assert_eq!(input.sha256, out.sha(&format!("model/{path}")), "{path}");
-        assert!(
-            input.key.ends_with(&format!("/outputs/model/{path}")),
-            "{}",
-            input.key
-        );
+        assert!(input.key.ends_with(&input.sha256), "{}", input.key);
     }
     let spec: Value = serde_json::from_str(&plan.launch.job_spec_json).unwrap();
     assert_eq!(
@@ -666,7 +677,9 @@ async fn refused_or_broken_outputs_make_the_version_invalid() {
     let produced = env.produce(&Outputs::tiny(|_| {})).await;
     let st = env.store.org_store("local").await.unwrap();
     st.put(
-        &format!("{}inspection.json", produced.prefix),
+        &st.keys()
+            .blob(produced.manifest["files"][0]["sha256"].as_str().unwrap())
+            .unwrap(),
         br#"{"kind": "full_weights"}"#.to_vec().into(),
     )
     .await
@@ -762,6 +775,22 @@ async fn bad_ids_actions_and_names_are_refused() {
 
 impl Env {
     /// A finished upload of `bytes`.
+    async fn secret(&self, use_: &str) -> String {
+        let id = mrl_domain::ids::SecretId::new();
+        sqlx::query(
+            "INSERT INTO secrets_metadata (id, org_id, project_id, name, backend, ref, kind, allowed_uses, created_by)
+             VALUES ($1, 'local', $2, $3, 'secret_store', 'test', 'hf_token', ARRAY[$4], 'test')",
+        )
+        .bind(id.as_uuid())
+        .bind(self.project.to_string())
+        .bind(use_)
+        .bind(use_)
+        .execute(self.db.pool())
+        .await
+        .unwrap();
+        id.to_string()
+    }
+
     async fn upload(&self, name: &str, bytes: &[u8]) -> String {
         let r = self
             .call(
@@ -824,7 +853,7 @@ impl Env {
         .bind(produced.artifact_id)
         .bind(self.project.to_string())
         .bind(format!("outputs-{job}"))
-        .bind(&produced.prefix)
+        .bind(format!("orgs/local/jobs/{job}/outputs/"))
         .bind(&produced.manifest)
         .bind(size as i64)
         .execute(self.db.pool())
@@ -844,9 +873,15 @@ impl Env {
 
     /// The verifier's answer; `Err` means "wait" (the job stays FINALIZING).
     async fn try_verify(&self, job: Uuid) -> Result<Verification, SeamError> {
-        ModelOutputs::with(self.models.clone())
-            .verify(&self.job_row(job).await)
-            .await
+        let (outcome, write) = ModelOutputs::with(self.models.clone())
+            .prepare(&self.job_row(job).await)
+            .await?;
+        if let Some(write) = write {
+            let mut tx = self.db.db().begin().await.unwrap();
+            write.commit(&mut tx).await?;
+            tx.commit().await.unwrap();
+        }
+        Ok(outcome)
     }
 
     /// POSTs `body` to `path` and expects 202: the new version (or export job).
@@ -933,7 +968,7 @@ async fn imports_run_as_builtin_jobs_and_their_outputs_make_the_version_ready() 
     )));
 
     // A Hub import with a token: the secret is a grant, its id is not in the inputs.
-    let secret = mrl_domain::ids::SecretId::new().to_string();
+    let secret = env.secret("model_download").await;
     let v = env
         .started(
             &prj,
@@ -1117,6 +1152,58 @@ async fn promote_merge_and_export_round_trip() {
         env.edge(("ckpt", ckpt), "promoted_to", ("mv", promoted))
             .await
     );
+    sqlx::query(
+        "UPDATE runs SET engine_version_id = (
+            SELECT ev.id FROM engine_versions ev JOIN training_engines te ON te.id = ev.engine_id
+            WHERE te.name = 'trl' ORDER BY ev.created_at DESC LIMIT 1
+         ) WHERE id = $1",
+    )
+    .bind(run)
+    .execute(env.db.pool())
+    .await
+    .unwrap();
+    let native = env.action(promoted, "export", json!({})).await;
+    assert_eq!(native.status, 202, "{}", native.text());
+    let (_, native_inputs, native_files, _) = env.builtin(uuid_of(&native.json(), "job_id")).await;
+    assert_eq!(native_inputs["engine_export"]["algorithm"], "sft");
+    assert!(native_files
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|f| f["local_path"] == "checkpoint/model.safetensors"));
+
+    // A READY adapter on the base merges into a new full-weights version.
+    let lora = env.model("lora").await;
+    let (adapter, job) = env.version(&lora, Some(base)).await;
+    let mut adapter_outputs = Outputs::tiny(|r| r["kind"] = json!("adapter"));
+    adapter_outputs
+        .files
+        .iter_mut()
+        .find(|(path, _)| path == "model/model.safetensors")
+        .unwrap()
+        .1 = b"adapter weights".to_vec();
+    let produced = env.produce(&adapter_outputs).await;
+    assert_eq!(
+        outputs::record(&env.models, job, Some(&produced))
+            .await
+            .unwrap(),
+        Verification::Verified
+    );
+
+    sqlx::query("UPDATE runs SET base_model_version_id = $1 WHERE id = $2")
+        .bind(adapter)
+        .bind(run)
+        .execute(env.db.pool())
+        .await
+        .unwrap();
+    let continued = env
+        .started(&format!("/checkpoints/{ckpt_id}:promote"), json!({}))
+        .await;
+    assert_eq!(
+        continued["base_model_version_id"],
+        ModelVersionId::from_uuid(base).to_string()
+    );
+
     // A checkpoint whose stored bytes changed since commit is not promoted.
     st.put(
         &format!("{prefix}model.safetensors"),
@@ -1138,17 +1225,19 @@ async fn promote_merge_and_export_round_trip() {
         .await;
     assert!(r.status >= 400, "{}", r.text());
 
-    // A READY adapter on the base merges into a new full-weights version.
-    let lora = env.model("lora").await;
-    let (adapter, job) = env.version(&lora, Some(base)).await;
-    let produced = env
-        .produce(&Outputs::tiny(|r| r["kind"] = json!("adapter")))
-        .await;
+    let plan = env.launch(Uuid::nil(), adapter).await.unwrap();
+    assert!(plan
+        .inputs
+        .iter()
+        .any(|f| f.local_path == "model/model.safetensors"));
+    assert!(plan
+        .inputs
+        .iter()
+        .any(|f| f.local_path == "model_adapter/model.safetensors"));
+    let spec: Value = serde_json::from_str(&plan.launch.job_spec_json).unwrap();
     assert_eq!(
-        outputs::record(&env.models, job, Some(&produced))
-            .await
-            .unwrap(),
-        Verification::Verified
+        spec["base_model_sha256"],
+        env.get_version(base).await["weights_sha256"]
     );
     let adapter_id = ModelVersionId::from_uuid(adapter);
     let refused = env.action(base, "merge-adapter", json!({})).await;
@@ -1197,7 +1286,7 @@ async fn promote_merge_and_export_round_trip() {
         assert_eq!(r.status, 422, "{body}: {}", r.text());
         assert_eq!(r.json()["code"], code, "{body}");
     }
-    let secret = mrl_domain::ids::SecretId::new().to_string();
+    let secret = env.secret("model_export").await;
     let hub = env
         .started(
             &format!(
@@ -1282,4 +1371,174 @@ async fn promote_merge_and_export_round_trip() {
         )
         .await
         .is_err());
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn concurrent_import_and_export_replays_share_one_job() {
+    let env = Env::start().await;
+    let import = format!("/projects/{}/models:import", env.project);
+    let body = json!({"name": "replay", "source": {"kind": "hub", "repo": "org/model"}});
+    let (a, b) = tokio::join!(
+        env.post_with_key(&import, &body, "import-once"),
+        env.post_with_key(&import, &body, "import-once"),
+    );
+    assert_eq!(a.status, 202, "{}", a.text());
+    assert_eq!(b.status, 202, "{}", b.text());
+    assert_eq!(a.json(), b.json());
+    let mismatch = env
+        .post_with_key(
+            &import,
+            &json!({"name": "other", "source": body["source"]}),
+            "import-once",
+        )
+        .await;
+    assert_eq!(mismatch.status, 422, "{}", mismatch.text());
+
+    let (mv, _) = env.ready("export-replay", |_| {}).await;
+    let export = format!("/model-versions/{}:export", ModelVersionId::from_uuid(mv));
+    let body = json!({});
+    let (a, b) = tokio::join!(
+        env.post_with_key(&export, &body, "export-once"),
+        env.post_with_key(&export, &body, "export-once"),
+    );
+    assert_eq!(a.status, 202, "{}", a.text());
+    assert_eq!(b.status, 202, "{}", b.text());
+    assert_eq!(a.json(), b.json());
+    let exports: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE kind = 'EXPORT'")
+        .fetch_one(env.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(exports, 1);
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn model_credentials_must_belong_to_the_project_and_allow_the_use() {
+    let env = Env::start().await;
+    let foreign = env.secret("model_download").await;
+    sqlx::query("UPDATE secrets_metadata SET project_id = $1 WHERE id = $2")
+        .bind(ProjectId::new().to_string())
+        .bind(
+            foreign
+                .parse::<mrl_domain::ids::SecretId>()
+                .unwrap()
+                .as_uuid(),
+        )
+        .execute(env.db.pool())
+        .await
+        .unwrap();
+    let wrong_use = env.secret("model_export").await;
+    let path = format!("/projects/{}/models:import", env.project);
+    for (secret, status) in [(foreign, 404), (wrong_use, 403)] {
+        let body = json!({"name": "hidden", "source": {
+            "kind": "hub", "repo": "org/model", "secret_id": secret
+        }});
+        let res = env.call(Method::POST, &path, Some(body)).await;
+        assert_eq!(res.status, status, "{}", res.text());
+    }
+    let jobs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM builtin_jobs")
+        .fetch_one(env.db.pool())
+        .await
+        .unwrap();
+    assert_eq!(jobs, 0);
+}
+
+struct ModelProjectOwner(ProjectId, OrgId);
+
+#[async_trait]
+impl ProjectDirectory for ModelProjectOwner {
+    async fn owner(&self, project: ProjectId) -> Result<Option<OrgId>, SeamError> {
+        Ok((self.0 == project).then_some(self.1))
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn rehome_moves_empty_models_and_verified_blobs_to_the_team_org() {
+    let env = Env::start().await;
+    let empty = env.model("empty").await;
+    let team = OrgId::new();
+    let step = RehomeLocalRows::new(
+        env.models.db().clone(),
+        Projects::with(Arc::new(ModelProjectOwner(env.project, team))),
+    )
+    .with_artifacts(Some(env.store.clone()));
+    step.run().await.unwrap();
+    let moved = store::model(env.models.db(), empty.id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(moved.org_id, team.as_uuid());
+    let (ready, _) = env.ready("already-moved", |_| {}).await;
+    // An older startup moved this version but left its object keys in solo storage.
+    sqlx::query("UPDATE model_versions SET org_id = $1 WHERE id = $2")
+        .bind(team.as_uuid())
+        .bind(ready)
+        .execute(env.db.pool())
+        .await
+        .unwrap();
+    step.run().await.unwrap();
+    step.run().await.unwrap();
+    let st = env.store.org_store(&team.to_string()).await.unwrap();
+    for file in store::files(env.models.db(), ready).await.unwrap() {
+        assert_eq!(
+            st.sha256(&file.object_key).await.unwrap(),
+            store::hex(&file.sha256)
+        );
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn a_failed_audit_rolls_back_the_job_and_its_replay_key() {
+    let env = Env::start().await;
+    let path = format!("/projects/{}/models:import", env.project);
+    let body = json!({"name": "audited", "source": {"kind": "hub", "repo": "org/model"}});
+    env.audit.1.store(true, Ordering::Relaxed);
+    let rejected = env.post_with_key(&path, &body, "audit-rollback").await;
+    assert_eq!(rejected.status, 503, "{}", rejected.text());
+    let empty: bool = sqlx::query_scalar(
+        "SELECT NOT EXISTS (SELECT FROM models)
+            AND NOT EXISTS (SELECT FROM model_versions)
+            AND NOT EXISTS (SELECT FROM builtin_jobs)
+            AND NOT EXISTS (SELECT FROM model_submission_keys)",
+    )
+    .fetch_one(env.db.pool())
+    .await
+    .unwrap();
+    assert!(empty);
+    env.audit.1.store(false, Ordering::Relaxed);
+    let allowed = env.post_with_key(&path, &body, "audit-rollback").await;
+    assert_eq!(allowed.status, 202, "{}", allowed.text());
+}
+
+#[tokio::test]
+#[ignore = "requires Postgres"]
+async fn a_node_export_targets_only_a_visible_machine() {
+    let env = Env::start().await;
+    let (mv, _) = env.ready("node-export", |_| {}).await;
+    let local = mrl_domain::ids::NodeId::new();
+    let foreign = mrl_domain::ids::NodeId::new();
+    env.db.seed(&format!(
+        "INSERT INTO compute_pools (id, org_id, name) VALUES ('{a}', NULL, 'local'), ('{b}', '{org}', 'foreign');
+         INSERT INTO compute_nodes (id, pool_id, hostname, lifecycle, status)
+         VALUES ('{local}', '{a}', 'local', 'STATIC', 'ONLINE'),
+                ('{foreign}', '{b}', 'foreign', 'STATIC', 'ONLINE');",
+        a = Uuid::now_v7(), b = Uuid::now_v7(), org = Uuid::now_v7(),
+        local = local.as_uuid(), foreign = foreign.as_uuid(),
+    )).await;
+    let target = |node| {
+        json!({"target": {
+            "kind": "node_path", "path": "/models/copied", "node_id": node,
+        }})
+    };
+    assert_eq!(env.action(mv, "export", target(foreign)).await.status, 404);
+    let accepted = env.action(mv, "export", target(local)).await;
+    assert_eq!(accepted.status, 202, "{}", accepted.text());
+    let job = env.job_row(uuid_of(&accepted.json(), "job_id")).await;
+    assert_eq!(
+        job.resource_request["roles"][0]["node_ids"][0],
+        local.to_string()
+    );
 }

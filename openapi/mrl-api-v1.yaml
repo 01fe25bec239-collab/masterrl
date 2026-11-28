@@ -3843,7 +3843,17 @@ components:
           type:
           - string
           - 'null'
-          description: '`artifact` (default: download it from the app), `s3` or `hf_hub`.'
+          description: '`artifact` (default), `node_path`, `s3` or `hf_hub`.'
+        node_id:
+          type:
+          - string
+          - 'null'
+          description: Required machine id (`node_path`).
+        path:
+          type:
+          - string
+          - 'null'
+          description: Absolute destination directory on the selected machine (`node_path`).
         private:
           type:
           - boolean

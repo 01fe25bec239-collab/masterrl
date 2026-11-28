@@ -1002,6 +1002,7 @@ pub async fn sweep_at(store: &ArtifactStore, now: OffsetDateTime) -> Result<Swep
             "SELECT EXISTS (SELECT 1 FROM uploads WHERE org_id = $1 AND blob_key = $2 AND state = 'COMPLETED')
                  OR EXISTS (SELECT 1 FROM artifacts a, jsonb_array_elements(a.manifest -> 'files') f
                             WHERE a.org_id = $1 AND a.state <> 'FAILED' AND f ->> 'sha256' = $3)
+                 OR EXISTS (SELECT 1 FROM model_files WHERE object_key = $2)
                  OR EXISTS (SELECT 1 FROM storage_intents
                             WHERE org_id = $1 AND key = $2 AND created_at >= $4)",
         )

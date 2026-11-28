@@ -527,3 +527,79 @@ async fn refused_outputs_release_the_worker_and_fail_the_job() {
     );
     env.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "needs PostgreSQL (just test-integration)"]
+async fn expired_tickets_are_reissued_and_finished_staging_is_removed() {
+    let env = Env::start().await;
+    let job = env.submit().await;
+    let (at, attempt) = env.start_job(&job).await;
+    let manifest = env.write_outputs();
+    env.relay(&at, manifest.to_string());
+    let command = env.upload_command(job.id).await;
+    sqlx::query("UPDATE agent_commands SET state = 'EXPIRED' WHERE id = $1")
+        .bind(command)
+        .execute(env.db.pool())
+        .await
+        .unwrap();
+    register_pass(&env.outputs).await;
+    let next = env.upload_command(job.id).await;
+    assert_ne!(next, command);
+    sqlx::query("UPDATE agent_commands SET outcome = $2 WHERE id = $1")
+        .bind(next)
+        .bind(json!({"accepted": true, "failure": {"sub_code": "MRL-STORE-008"}}))
+        .execute(env.db.pool())
+        .await
+        .unwrap();
+    register_pass(&env.outputs).await;
+    let renewed = env.upload_command(job.id).await;
+    assert_ne!(renewed, next);
+    assert!(env
+        .uploader
+        .uploads
+        .lock()
+        .unwrap()
+        .contains(&(renewed.to_string(), 0)));
+    env.outcome(renewed).await;
+    register_pass(&env.outputs).await;
+
+    let prefix: String =
+        sqlx::query_scalar("SELECT upload_prefix FROM builtin_jobs WHERE job_id = $1")
+            .bind(job.id)
+            .fetch_one(env.db.pool())
+            .await
+            .unwrap();
+    sqlx::query("UPDATE builtin_output_staging SET last_ticket_at = now() - interval '2 days'")
+        .execute(env.db.pool())
+        .await
+        .unwrap();
+    let store = env
+        .store
+        .org_store(mrl_server::modules::artifacts::LOCAL_ORG)
+        .await
+        .unwrap();
+    let prefix = format!("{}{prefix}", store.keys().prefix());
+    register_pass(&env.outputs).await;
+    assert_eq!(store.list(&prefix).await.unwrap().len(), 1);
+    sqlx::query("UPDATE job_attempts SET state = 'EXITED_OK', ended_at = now() WHERE id = $1")
+        .bind(attempt.id)
+        .execute(env.db.pool())
+        .await
+        .unwrap();
+    sqlx::query("UPDATE jobs SET state = 'COMPLETED', finished_at = now() WHERE id = $1")
+        .bind(job.id)
+        .execute(env.db.pool())
+        .await
+        .unwrap();
+    register_pass(&env.outputs).await;
+    assert!(store.list(&prefix).await.unwrap().is_empty());
+    let sha = manifest["files"][0]["sha256"].as_str().unwrap();
+    assert_eq!(
+        store
+            .sha256(&store.keys().blob(sha).unwrap())
+            .await
+            .unwrap(),
+        sha
+    );
+    env.stop().await;
+}

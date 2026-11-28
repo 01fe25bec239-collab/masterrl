@@ -36,7 +36,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Extension, Json};
-use mrl_domain::ids::{RunId, SecretId};
+use mrl_domain::ids::{ProjectId, RunId, SecretId};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -286,6 +286,7 @@ impl SecretResolver {
         org: &str,
         secret: SecretId,
         mount: &str,
+        job_scope: Option<(ProjectId, &str)>,
     ) -> Result<AuthorizedGrant, Error> {
         let row: Row = sqlx::query_as(concat!(
             "SELECT ",
@@ -297,7 +298,28 @@ impl SecretResolver {
         .fetch_optional(self.db.pool())
         .await?
         .ok_or_else(|| not_found("secret"))?;
+        if let Some((project, _)) = job_scope {
+            if row
+                .project_id
+                .as_deref()
+                .is_some_and(|p| p != project.to_string())
+            {
+                return Err(not_found("secret"));
+            }
+        }
         allow(seams, ctx, MANAGE, &row.resource(org)).await?;
+        if let Some((_, allowed_use)) = job_scope {
+            if row.deleting {
+                return Err(deleting(&row));
+            }
+            if !row.allowed_uses.iter().any(|u| u == allowed_use) {
+                return Err(Error::coded(
+                    codes::SECRET_USE,
+                    StatusCode::FORBIDDEN,
+                    "This secret does not allow the requested use.",
+                ));
+            }
+        }
         Ok(AuthorizedGrant {
             org: org.to_owned(),
             secret,

@@ -314,8 +314,15 @@ impl AttemptSpec {
                     project: None,
                     package: None,
                 };
-                if matches!(rt.kind()?, RuntimeKind::Process { .. }) {
-                    rt.project = Some(state_dir.join("runtimes").join(rt.dir_name()));
+                if let RuntimeKind::Process { lock_sha256 } = rt.kind()? {
+                    let embedded = if launch.engine_name == "builtin" {
+                        crate::envs::builtin::project(state_dir, &lock_sha256)?
+                    } else {
+                        None
+                    };
+                    rt.project = Some(
+                        embedded.unwrap_or_else(|| state_dir.join("runtimes").join(rt.dir_name())),
+                    );
                 }
                 runtimes.push(rt);
             }

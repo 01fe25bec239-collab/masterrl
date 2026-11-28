@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use mrl_storage::{StorageError, TransferTicket};
+use mrl_storage::{ArtifactManifest, StorageError, TransferTicket};
 
 use super::spec::{safe_relative, AttemptSpec};
 use super::AttemptError;
@@ -406,9 +406,163 @@ async fn deliver(
     Ok(())
 }
 
+/// Resolves an export destination through the node's allowlist before writing anything.
+pub(super) fn local_export_path(
+    cfg: &crate::config::AgentConfig,
+    path: &Path,
+) -> Result<PathBuf, AttemptError> {
+    let denied = || {
+        AttemptError::Spec("Choose a new export directory inside the node's allowed paths.".into())
+    };
+    if !path.is_absolute()
+        || path
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+    {
+        return Err(denied());
+    }
+    let parent = path.parent().ok_or_else(denied)?;
+    let target = path.file_name().ok_or_else(denied)?;
+    if !cfg.path_allowed(parent) {
+        return Err(denied());
+    }
+    Ok(parent
+        .canonicalize()
+        .map_err(|e| AgentError::state(parent, e))?
+        .join(target))
+}
+
+/// Publishes checked model files as one directory. Repeating a completed copy verifies it.
+pub(super) async fn publish_local_export(
+    staging: &Path,
+    destination: &Path,
+) -> Result<(), AttemptError> {
+    use std::io::Read;
+    let manifest_file = Path::new("outputs/artifact-manifest.json");
+    let manifest =
+        open_beneath(staging, manifest_file).map_err(|e| AgentError::state(manifest_file, e))?;
+    const MAX_MANIFEST_BYTES: u64 = 8 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    manifest
+        .take(MAX_MANIFEST_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| AgentError::state(manifest_file, e))?;
+    if bytes.len() as u64 > MAX_MANIFEST_BYTES {
+        return Err(AttemptError::Spec("The export has too many files.".into()));
+    }
+    let files = ArtifactManifest::from_json(&bytes)?.files;
+    let files: Vec<_> = files
+        .iter()
+        .filter_map(|f| f.path.strip_prefix("export/").map(|rel| (rel, f)))
+        .collect();
+    if files.is_empty() {
+        return Err(AttemptError::Spec(
+            "The worker produced no model files to export.".into(),
+        ));
+    }
+
+    let parent = destination
+        .parent()
+        .ok_or_else(|| AttemptError::Spec("The export has no parent directory.".into()))?;
+    let temporary = tempfile::Builder::new()
+        .prefix(".mrl-export-")
+        .tempdir_in(parent)
+        .map_err(|e| AgentError::state(parent, e))?;
+    for (rel, f) in &files {
+        let copied = snapshot(staging, &format!("outputs/{}", f.path), f.size, &f.sha256)
+            .await
+            .map_err(|e| AttemptError::Spec(format!("The export could not be copied: {e}")))?;
+        let copied = RemoveFile(copied);
+        let target = temporary.path().join(safe_relative(rel)?);
+        if let Some(dir) = target.parent() {
+            tokio::fs::create_dir_all(dir)
+                .await
+                .map_err(|e| AgentError::state(dir, e))?;
+        }
+        tokio::fs::copy(&copied.0, &target)
+            .await
+            .map_err(|e| AgentError::state(&target, e))?;
+        tokio::fs::OpenOptions::new()
+            .write(true)
+            .open(&target)
+            .await
+            .map_err(|e| AgentError::state(&target, e))?
+            .sync_all()
+            .await
+            .map_err(|e| AgentError::state(&target, e))?;
+    }
+
+    match tokio::fs::symlink_metadata(destination).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            match tokio::fs::rename(temporary.path(), destination).await {
+                Ok(()) => return Ok(()),
+                Err(e) if !destination.is_dir() => {
+                    return Err(AgentError::state(destination, e).into())
+                }
+                Err(_) => {}
+            }
+        }
+        Ok(_) => {}
+        Err(e) => return Err(AgentError::state(destination, e).into()),
+    }
+    for (rel, f) in files {
+        let file = open_beneath(destination, &safe_relative(rel)?).map_err(|_| {
+            AttemptError::Spec("The export directory already exists with other files.".into())
+        })?;
+        use futures::TryStreamExt;
+        let stream = tokio_util::io::ReaderStream::new(tokio::fs::File::from_std(file));
+        let (size, hash) = mrl_storage::sha256_stream(stream.map_err(|source| StorageError::Io {
+            path: destination.join(rel),
+            source,
+        }))
+        .await?;
+        if size != f.size || hash != f.sha256 {
+            return Err(AttemptError::Spec(
+                "The export directory already exists with other files.".into(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_local_model_export_is_atomic_checked_and_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().join("allowed");
+        std::fs::create_dir(&allowed).unwrap();
+        let cfg = crate::config::AgentConfig {
+            allowed_paths: vec![allowed.clone()],
+            ..Default::default()
+        };
+        assert!(local_export_path(&cfg, &dir.path().join("foreign")).is_err());
+        let target = local_export_path(&cfg, &allowed.join("download")).unwrap();
+        let staging = dir.path().join("staging");
+        let outputs = staging.join("outputs");
+        std::fs::create_dir_all(outputs.join("export")).unwrap();
+        let weights = outputs.join("export/model.safetensors");
+        std::fs::write(&weights, b"wrong!").unwrap();
+        let manifest = serde_json::json!({
+            "schema_version": "artifact-manifest/v1", "kind": "export",
+            "created_at": "2026-11-27T00:00:00Z",
+            "files": [{"path": "export/model.safetensors", "size": 6,
+                       "sha256": mrl_storage::sha256_hex(b"actual"), "role": "weights"}],
+        });
+        std::fs::write(outputs.join("artifact-manifest.json"), manifest.to_string()).unwrap();
+        assert!(publish_local_export(&staging, &target).await.is_err());
+        assert!(!target.exists());
+        std::fs::write(&weights, b"actual").unwrap();
+        publish_local_export(&staging, &target).await.unwrap();
+        publish_local_export(&staging, &target).await.unwrap();
+        let existing = target.join("model.safetensors");
+        assert_eq!(std::fs::read(&existing).unwrap(), b"actual");
+        std::fs::write(&existing, b"other").unwrap();
+        assert!(publish_local_export(&staging, &target).await.is_err());
+        assert_eq!(std::fs::read(existing).unwrap(), b"other");
+    }
 
     #[tokio::test]
     async fn snapshots_are_checked_and_never_follow_links() {

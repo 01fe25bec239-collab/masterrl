@@ -80,11 +80,12 @@ impl Outputs {
 
     /// Takes a relayed `OutputsStaged` from the current, running attempt of a built-in job on
     /// `node`; anything else is ignored. Idempotent per attempt.
-    pub async fn on_staged(
+    async fn on_staged(
         &self,
         node: Uuid,
         at: &AttemptRef,
         staged: &OutputsStaged,
+        renewing: bool,
     ) -> Result<(), JobsError> {
         let (Ok(attempt), Ok(job), Ok(epoch)) = (
             at.attempt_id.parse::<AttemptId>(),
@@ -117,26 +118,9 @@ impl Outputs {
             AttemptId::from_uuid(attempt)
         );
         let manifest: Value = serde_json::from_str(&staged.manifest_json).unwrap_or(Value::Null);
-        // Claims the upload for this attempt (a replay whose command went out does nothing).
-        let claimed = sqlx::query(
-            "UPDATE builtin_jobs SET upload_attempt_id = $2, upload_prefix = $3,
-                    upload_manifest = $4, upload_command_id = NULL, artifact_id = NULL,
-                    failure = NULL, updated_at = now()
-             WHERE job_id = $1
-               AND (upload_attempt_id IS DISTINCT FROM $2 OR upload_command_id IS NULL)",
-        )
-        .bind(job)
-        .bind(attempt)
-        .bind(&prefix)
-        .bind(&manifest)
-        .execute(self.db.pool())
-        .await?;
-        if claimed.rows_affected() == 0 {
-            return Ok(());
-        }
         let org_text = scope::org_text(org).unwrap_or_else(|| LOCAL_ORG.to_owned());
         let (items, refused) = match self
-            .items(&org_text, project, &prefix, &staged.manifest_json)
+            .items(&org_text, project, &prefix, &staged.manifest_json, renewing)
             .await?
         {
             Ok(items) => (items, None),
@@ -155,9 +139,49 @@ impl Outputs {
         if refused.is_some() {
             upload.items.clear();
         }
+        let mut tx = self.db.begin().await?;
+        let current = crate::modules::jobs::JobTransitions::lock(&mut tx, org, job).await?;
+        if !current.is_some_and(|j| {
+            j.current_attempt_id == Some(attempt)
+                && j.epoch == epoch
+                && matches!(j.state.as_str(), "PREPARING" | "RUNNING")
+        }) {
+            return Ok(());
+        }
+        // Claims the upload for this attempt (a replay whose command went out does nothing).
+        let claimed = sqlx::query(
+            "UPDATE builtin_jobs SET upload_attempt_id = $2, upload_prefix = $3,
+                    upload_manifest = $4, upload_command_id = NULL, artifact_id = NULL,
+                    failure = NULL, updated_at = now()
+             WHERE job_id = $1
+               AND (upload_attempt_id IS DISTINCT FROM $2 OR upload_command_id IS NULL
+                    OR (upload_manifest = $4 AND EXISTS (SELECT 1 FROM agent_commands c
+                                WHERE c.id = upload_command_id AND (c.state = 'EXPIRED'
+                                  OR c.outcome #>> '{failure,sub_code}' = 'MRL-STORE-008'))))",
+        )
+        .bind(job)
+        .bind(attempt)
+        .bind(&prefix)
+        .bind(&manifest)
+        .execute(&mut *tx)
+        .await?;
+        if claimed.rows_affected() == 0 {
+            return Ok(());
+        }
+        sqlx::query(
+            "INSERT INTO builtin_output_staging (attempt_id, storage_org_id, prefix)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (attempt_id) DO UPDATE SET last_ticket_at = now()",
+        )
+        .bind(attempt)
+        .bind(org)
+        .bind(&prefix)
+        .execute(&mut *tx)
+        .await?;
         let sent = self
             .commands
-            .send(
+            .send_in(
+                &mut tx,
                 NodeId::from_uuid(node),
                 NewCommand::new(Kind::UploadArtifacts(upload))
                     .attempt(AttemptId::from_uuid(attempt), at.fencing_epoch)
@@ -173,8 +197,9 @@ impl Outputs {
         .bind(attempt)
         .bind(sent.id)
         .bind(refused)
-        .execute(self.db.pool())
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await.map_err(crate::db::DbError::from)?;
         Ok(())
     }
 
@@ -186,6 +211,7 @@ impl Outputs {
         project: Uuid,
         prefix: &str,
         manifest_json: &str,
+        renewing: bool,
     ) -> Result<Result<Vec<UploadItem>, String>, JobsError> {
         let manifest = match ArtifactManifest::from_json(manifest_json.as_bytes()) {
             Ok(m) => m,
@@ -202,6 +228,13 @@ impl Outputs {
                 Ok(k) => k,
                 Err(e) => return Ok(Err(format!("{}: {e}", f.path))),
             };
+            if renewing
+                && crate::modules::uploads::blob_intact(&store, &key, f.size, &f.sha256)
+                    .await
+                    .map_err(seam)?
+            {
+                continue;
+            }
             let t = self
                 .store
                 .ticket(seams, &ctx, &key, TicketMethod::Put, f.size)
@@ -249,8 +282,21 @@ impl Outputs {
         .fetch_all(self.db.pool())
         .await?;
         for (job, org, project, attempt, command, prefix, manifest, state, outcome) in rows {
-            let uploaded =
-                state == "COMPLETED" && outcome.as_ref().is_some_and(|o| o["accepted"] == true);
+            let expired = state == "EXPIRED"
+                || outcome
+                    .as_ref()
+                    .is_some_and(|o| o["failure"]["sub_code"] == "MRL-STORE-008");
+            if expired
+                && self
+                    .refresh_expired(job, attempt, command, &manifest)
+                    .await?
+            {
+                continue;
+            }
+            let uploaded = state == "COMPLETED"
+                && outcome
+                    .as_ref()
+                    .is_some_and(|o| o["accepted"] == true && o["failure"].is_null());
             let result = if uploaded {
                 self.register(org, project, job, attempt, prefix, manifest)
                     .await
@@ -280,6 +326,74 @@ impl Outputs {
         Ok(())
     }
 
+    async fn refresh_expired(
+        &self,
+        job: Uuid,
+        attempt: Uuid,
+        command: Uuid,
+        manifest: &Value,
+    ) -> Result<bool, JobsError> {
+        let current: Option<(Uuid, i64)> = sqlx::query_as(
+            "SELECT c.node_id, a.epoch FROM builtin_jobs b
+             JOIN jobs j ON j.id = b.job_id
+             JOIN job_attempts a ON a.id = j.current_attempt_id
+             JOIN agent_commands c ON c.id = b.upload_command_id
+             WHERE j.id = $1 AND a.id = $2 AND c.id = $3
+               AND j.state IN ('PREPARING','RUNNING') AND a.state IN ('LAUNCHING','RUNNING')",
+        )
+        .bind(job)
+        .bind(attempt)
+        .bind(command)
+        .fetch_optional(self.db.pool())
+        .await?;
+        let Some((node, epoch)) = current else {
+            return Ok(false);
+        };
+        self.on_staged(
+            node,
+            &AttemptRef {
+                job_id: JobId::from_uuid(job).to_string(),
+                attempt_id: AttemptId::from_uuid(attempt).to_string(),
+                fencing_epoch: u64::try_from(epoch).map_err(seam)?,
+            },
+            &OutputsStaged {
+                manifest_json: manifest.to_string(),
+            },
+            true,
+        )
+        .await?;
+        Ok(true)
+    }
+
+    /// Removes abandoned staging after all transfer tickets have expired.
+    pub(crate) async fn sweep_staging(&self) -> Result<(), JobsError> {
+        let rows: Vec<(Uuid, Uuid, String)> = sqlx::query_as(
+            "SELECT s.attempt_id, s.storage_org_id, s.prefix
+               FROM builtin_output_staging s
+               JOIN job_attempts a ON a.id = s.attempt_id
+               JOIN jobs j ON j.id = a.job_id
+              WHERE s.last_ticket_at < now() - interval '24 hours'
+                AND a.state IN ('EXITED_OK','EXITED_ERROR','KILLED','LOST')
+                AND (j.current_attempt_id IS DISTINCT FROM a.id OR j.finished_at IS NOT NULL)
+              ORDER BY s.last_ticket_at LIMIT 50",
+        )
+        .fetch_all(self.db.pool())
+        .await?;
+        for (attempt, org, prefix) in rows {
+            let org = scope::org_text(org).unwrap_or_else(|| LOCAL_ORG.to_owned());
+            let store = self.store.org_store(&org).await.map_err(seam)?;
+            let prefix = format!("{}{prefix}", store.keys().prefix());
+            for object in store.list(&prefix).await.map_err(seam)? {
+                store.delete(&object.key).await.map_err(seam)?;
+            }
+            sqlx::query("DELETE FROM builtin_output_staging WHERE attempt_id = $1")
+                .bind(attempt)
+                .execute(self.db.pool())
+                .await?;
+        }
+        Ok(())
+    }
+
     /// `Ok(None)`: try again later.
     async fn register(
         &self,
@@ -293,6 +407,10 @@ impl Outputs {
         let org_text = scope::org_text(org).unwrap_or_else(|| LOCAL_ORG.to_owned());
         let Ok(seams) = self.seams().await else {
             return Ok(None);
+        };
+        let idem = crate::modules::artifacts::Idempotency {
+            key: format!("builtin-output-{job}-{attempt}"),
+            request_sha256: mrl_storage::sha256_hex(manifest.to_string().as_bytes()),
         };
         let new = NewArtifact {
             name: format!(
@@ -308,7 +426,7 @@ impl Outputs {
         };
         match self
             .store
-            .register(seams, &system_ctx(&org_text, project), new, None)
+            .register(seams, &system_ctx(&org_text, project), new, Some(&idem))
             .await
         {
             Ok(a) => Ok(Some(a.uuid())),
@@ -337,6 +455,9 @@ fn system_ctx(org: &str, project: Uuid) -> RequestContext {
 pub async fn register_pass(outputs: &Outputs) {
     if let Err(e) = outputs.register_ready().await {
         tracing::warn!(code = e.code(), error = %e, "built-in outputs could not be registered");
+    }
+    if let Err(e) = outputs.sweep_staging().await {
+        tracing::warn!(code = e.code(), error = %e, "built-in output staging could not be cleaned");
     }
 }
 
@@ -377,7 +498,7 @@ impl LaneSink for OutputsSink {
             return Ok(());
         };
         let at = relay.attempt.clone().unwrap_or_default();
-        match self.outputs.on_staged(item.node_id, &at, s).await {
+        match self.outputs.on_staged(item.node_id, &at, s, false).await {
             Ok(()) => Ok(()),
             Err(e @ (JobsError::Db(_) | JobsError::Seam(_))) => Err(SinkError {
                 sink: "builtin_outputs",

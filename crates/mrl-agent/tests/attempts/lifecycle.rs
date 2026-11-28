@@ -219,7 +219,7 @@ async fn a_builtin_job_uploads_its_outputs_before_it_exits() {
     // What the core's built-in launch step sends (INT-6).
     spec.job_spec = serde_json::json!({
         "job_id": "job_t", "job_kind": "DATA_PREP", "task": "hash_files",
-        "inputs": {"roles": ["dataset.train"]}, "sandbox": "data_prep"
+        "inputs": {"roles": ["dataset.train"]}, "sandbox": "data_prep", "managed_outputs": true
     });
     attempts.launch(spec).unwrap();
     let (base, got) = upload_sink().await;

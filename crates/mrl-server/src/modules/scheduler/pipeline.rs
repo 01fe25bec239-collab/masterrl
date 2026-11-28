@@ -386,6 +386,12 @@ impl Pipeline {
         self
     }
 
+    /// Removes a launch contributor from an explicitly configured test or dev pipeline.
+    pub fn without_launch(mut self, name: &str) -> Self {
+        self.launch.retain(|contributor| contributor.name() != name);
+        self
+    }
+
     /// The strategy `pool` asks for; an unknown name falls back to the default.
     pub fn strategy(&self, pool: &PoolInfo) -> Option<Arc<dyn PlacementStrategy>> {
         let name = pool.scheduling_policy["placement"]

@@ -17,7 +17,9 @@ pub mod gates;
 pub mod jobs;
 pub mod launch;
 pub mod outputs;
+pub(crate) mod rehome;
 pub mod store;
+mod submission;
 
 use crate::app::{AppState, ServerModule};
 use crate::db::Db;
@@ -89,9 +91,7 @@ impl ModelsModule {
         // apart from its lazily opened backend, so a second handle reads the same objects.
         let store = ArtifactsModule::new(db.clone(), config).store();
         let projects = Projects::registered(&db);
-        let module = Self::with_parts(db, store, projects);
-        outputs::install(module.models.clone());
-        module
+        Self::with_parts(db, store, projects)
     }
 
     /// The module with this store and project directory (tests and embedders).
@@ -148,7 +148,71 @@ impl ServerModule for ModelsModule {
             .layer(Extension(self.models.clone()))
     }
 
+    fn handler_idempotency_paths(&self) -> &'static [&'static str] {
+        &[
+            "/projects/{prj}/models:import",
+            "/model-versions/{mv}:merge-adapter",
+            "/model-versions/{mv}:export",
+            "/checkpoints/{ckpt}:promote",
+        ]
+    }
+
     fn openapi(&self) -> utoipa::openapi::OpenApi {
         Doc::openapi()
+    }
+}
+
+/// The model registry's contribution to the lineage API.
+pub struct LineageLookup {
+    db: Db,
+    version: bool,
+}
+
+impl LineageLookup {
+    /// Looks up model versions when `version` is true, or model records otherwise.
+    pub fn new(db: Db, version: bool) -> Self {
+        Self { db, version }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::modules::artifacts::NodeLookup for LineageLookup {
+    async fn find(
+        &self,
+        org: &str,
+        id: uuid::Uuid,
+    ) -> Result<Option<(&'static str, crate::seams::Resource)>, crate::modules::artifacts::Error>
+    {
+        use mrl_domain::ids::{ModelId, ModelVersionId};
+        let scope = if self.version {
+            store::version(&self.db, id).await.map(|row| {
+                row.map(|v| {
+                    (
+                        v.org_id,
+                        v.project_id,
+                        ModelVersionId::from_uuid(id).to_string(),
+                    )
+                })
+            })
+        } else {
+            store::model(&self.db, id).await.map(|row| {
+                row.map(|m| (m.org_id, m.project_id, ModelId::from_uuid(id).to_string()))
+            })
+        }
+        .map_err(|e| {
+            crate::modules::artifacts::Error::coded(
+                "MRL-STORE-005",
+                axum::http::StatusCode::SERVICE_UNAVAILABLE,
+                e.to_string(),
+            )
+        })?;
+        Ok(scope
+            .filter(|(owner, _, _)| outputs::storage_org(*owner) == org)
+            .map(|(owner, project, id)| {
+                (
+                    "models.read",
+                    crate::modules::jobs::scope::resource("model", Some(id), owner, project),
+                )
+            }))
     }
 }

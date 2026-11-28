@@ -824,6 +824,25 @@ impl Runner {
             env.insert(k.clone(), v.expose().to_owned());
         }
         let cfg = &self.sh.ctx.config;
+        if self.rec.spec.job_spec["task"] == "import_model"
+            && self.rec.spec.job_spec["inputs"]["source"]["kind"] == "node_path"
+        {
+            let allowed = self.rec.spec.job_spec["inputs"]["source"]["path"]
+                .as_str()
+                .is_some_and(|p| cfg.path_allowed(std::path::Path::new(p)));
+            if !allowed {
+                return Err(AttemptError::Spec(
+                    "This model folder is outside the node's allowed paths.".into(),
+                ));
+            }
+        }
+        let target = &self.rec.spec.job_spec["inputs"]["target"];
+        if self.rec.spec.job_spec["task"] == "export_model" && target["kind"] == "node_path" {
+            files::local_export_path(
+                cfg,
+                std::path::Path::new(target["path"].as_str().unwrap_or_default()),
+            )?;
+        }
         let (spec, container) = match &mat.worker {
             WorkerCommand::Process { program } => {
                 let program = program.display().to_string();
@@ -1656,20 +1675,35 @@ impl Runner {
             self.deliver_results().await;
             return;
         }
-        if let Some(command_id) = u.command_id {
+        if let Some(command_id) = u.command_id.clone() {
             self.adhoc.remove(&command_id);
-            // Saved together with its result (in `command_done`).
-            self.rec.adhoc_uploads.remove(&command_id);
-            // The worker waits for this before it exits (its job outputs are the only files
-            // uploaded outside a checkpoint).
-            if let Some(role) = self.primary_role() {
-                let body = AgentBody::OutputsUploaded(OutputsUploaded {
-                    ok: failure.is_none(),
-                    reason: failure.clone().unwrap_or_default(),
-                });
-                self.send(&role, body).await;
+            let targets = self.rec.adhoc_uploads.remove(&command_id);
+            let expired = failure.as_deref().is_some_and(expired_upload);
+            let ack = AgentBody::OutputsUploaded(OutputsUploaded {
+                ok: failure.is_none(),
+                reason: failure.clone().unwrap_or_default(),
+            });
+            // One save transfers the upload into both durable result queues.
+            self.rec.results.insert(command_id.clone(), failure);
+            let saved = if expired {
+                self.save()
+            } else {
+                self.remember(&ack).is_ok()
+            };
+            if !saved {
+                self.rec.results.remove(&command_id);
+                if let Some(targets) = targets {
+                    self.rec.adhoc_uploads.insert(command_id.clone(), targets);
+                }
+                self.unsaved.insert(command_id, u);
+                return;
             }
-            self.command_done(command_id, failure).await;
+            if !expired {
+                if let Some(role) = self.primary_role() {
+                    self.send(&role, ack).await;
+                }
+            }
+            self.deliver_results().await;
         }
     }
 
@@ -1704,6 +1738,10 @@ impl Runner {
         let staging = self.staging();
         let tx = self.uploads_tx.clone();
         let id = command_id.clone();
+        let target = &self.rec.spec.job_spec["inputs"]["target"];
+        let local = (self.rec.spec.job_spec["task"] == "export_model"
+            && target["kind"] == "node_path")
+            .then(|| target["path"].as_str().unwrap_or_default().to_owned());
         let task = tokio::spawn(async move {
             let mut result = Ok(());
             for t in targets {
@@ -1724,6 +1762,19 @@ impl Runner {
                 if let Err(e) = sent {
                     result = Err((CommitState::Rejected, e.explain()));
                     break;
+                }
+            }
+            if result.is_ok() {
+                if let Some(path) = local {
+                    let export = async {
+                        let dest =
+                            files::local_export_path(&ctx.config, std::path::Path::new(&path))?;
+                        files::publish_local_export(&staging, &dest).await
+                    }
+                    .await;
+                    if let Err(e) = export {
+                        result = Err((CommitState::Rejected, e.explain()));
+                    }
                 }
             }
             let _ = tx
@@ -1935,14 +1986,22 @@ impl Runner {
                     return true;
                 }
                 if checkpoint_id.is_empty() {
-                    if self.adhoc.contains_key(&command_id) {
-                        return true; // a replay of a running upload: answered when it ends
+                    if self.rec.results.contains_key(&command_id) {
+                        self.deliver_results().await;
+                        return true;
                     }
-                    // Saved before it starts, so a restarted agent knows about it.
+                    if self.adhoc.contains_key(&command_id)
+                        || self.unsaved.contains_key(&command_id)
+                    {
+                        return true;
+                    }
                     self.rec
                         .adhoc_uploads
                         .insert(command_id.clone(), targets.clone());
-                    self.save();
+                    if !self.save() {
+                        self.rec.adhoc_uploads.remove(&command_id);
+                        return false;
+                    }
                     self.start_adhoc(command_id, targets);
                 } else {
                     let active = self
@@ -2169,6 +2228,10 @@ fn request_id(body: &AgentBody) -> Option<&str> {
     }
 }
 
+fn expired_upload(reason: &str) -> bool {
+    reason.starts_with("MRL-STORE-008 ")
+}
+
 /// The `CommandResult` for a finished upload command (`failure`: why it failed).
 pub fn upload_result(command_id: String, failure: Option<String>) -> CommandResult {
     CommandResult {
@@ -2176,7 +2239,12 @@ pub fn upload_result(command_id: String, failure: Option<String>) -> CommandResu
         accepted: true,
         failure: failure.map(|reason| mrl_proto::common::v1::Failure {
             class: mrl_proto::common::v1::FailureClass::InfraTransient as i32,
-            sub_code: "UPLOAD_FAILED".into(),
+            sub_code: if expired_upload(&reason) {
+                "MRL-STORE-008"
+            } else {
+                "UPLOAD_FAILED"
+            }
+            .into(),
             message: reason,
             retryable_hint: true,
             classified_by: mrl_proto::common::v1::ClassifiedBy::Agent as i32,

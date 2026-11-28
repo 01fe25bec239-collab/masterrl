@@ -167,6 +167,7 @@ async fn main() -> Result<(), String> {
     let gateway = NodesModule::from_config(db.clone(), &config).gateway();
     let lanes = LaneRouter::global();
     let pipeline = mrl_server::modules::scheduler::registry::pipeline(&db, &config.scheduler)
+        .without_launch("model_inputs")
         .with_launch(Arc::new(FixtureLaunch {
             model: fixture.model,
         }));

@@ -58,9 +58,18 @@ pub async fn middleware(State(state): State<AppState>, req: Request, next: Next)
         req.extensions().get::<axum::extract::MatchedPath>(),
     ) {
         let path = path.as_str();
-        if owned
-            .0
-            .contains(path.strip_prefix(super::API_PREFIX).unwrap_or(path))
+        let path = path.strip_prefix(super::API_PREFIX).unwrap_or(path);
+        if owned.0.contains(path)
+            || owned.0.iter().any(|route| {
+                route.rsplit_once("}:").is_some_and(|(base, action)| {
+                    path.strip_suffix('}') == Some(base)
+                        && req
+                            .uri()
+                            .path()
+                            .rsplit_once(':')
+                            .is_some_and(|(_, a)| a == action)
+                })
+            })
         {
             return next.run(req).await;
         }

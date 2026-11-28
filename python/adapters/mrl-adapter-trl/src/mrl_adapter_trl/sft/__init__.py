@@ -400,6 +400,14 @@ def _settings_issues(
     settings: Settings, staged: Mapping[str, Path], inspection: ModelInspection | None
 ) -> list[Issue]:
     issues = _hardware_issues(settings, detect_device())
+    if "model_adapter" in staged and settings.strategy == "full":
+        issues.append(
+            Issue(
+                FIELD_INVALID,
+                "Use LoRA or QLoRA to continue training an adapter.",
+                path="/common/update/strategy",
+            )
+        )
     if "resume_from" in staged:
         issues += _resume_issues(staged["resume_from"], settings.strategy != "full")
     context = inspection.context_length if inspection is not None else None
@@ -796,8 +804,31 @@ class TrlSftEngine(BaseEngine):
             sampler=_make_sampler(prompts, sample_tokens) if prompts else None,
             samples_every=e.samples_every,
         )
+        adapter = ctx.staged_paths.get("model_adapter")
+        model: Any = str(model_dir)
+        if adapter is not None:
+            from peft import PeftModel, prepare_model_for_kbit_training  # noqa: PLC0415
+            from transformers import AutoModelForCausalLM  # noqa: PLC0415
+
+            if quantization is not None:
+                model_kwargs["quantization_config"] = quantization
+            base = AutoModelForCausalLM.from_pretrained(
+                model_dir, trust_remote_code=False, local_files_only=True, **model_kwargs
+            )
+            if quantization is not None:
+                base = prepare_model_for_kbit_training(
+                    base,
+                    use_gradient_checkpointing=e.gradient_checkpointing,
+                    gradient_checkpointing_kwargs={"use_reentrant": False},
+                )
+            model = PeftModel.from_pretrained(
+                base, adapter, is_trainable=True, local_files_only=True
+            )
+            args.model_init_kwargs = None
+            peft_config = None
+            quantization = None
         trainer = SftTrainer(
-            model=str(model_dir),
+            model=model,
             args=args,
             train_dataset=train[0],
             eval_dataset=evaluation[0] if evaluation else None,
