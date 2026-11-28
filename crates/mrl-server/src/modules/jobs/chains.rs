@@ -227,6 +227,7 @@ impl Chains {
                 // <mrl:completion-verifiers P27> P27 verifiers go right below this line.
                 // <mrl:completion-verifiers P28> P28 verifiers go right below this line.
                 // <mrl:completion-verifiers P29> P29 verifiers go right below this line.
+                Arc::new(crate::modules::rewards::verifier::ReportVerifier::registered(db.clone())),
             ],
             vec![
                 // <mrl:submission-resolvers> Resolvers go right below this line.

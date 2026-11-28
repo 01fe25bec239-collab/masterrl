@@ -15,12 +15,18 @@
 //!   generated from `mrl-rewards` by `tools/gen/rewards.py` and seeded at startup.
 //! - [`launch::RewardInputs`] stages a run's pinned reward (policy, code files, hashes) into
 //!   its launch and refuses versions a run may not use.
+//! - `:test`, `:preview`, `:regression` and `POST /rewards:compare` start REWARD_PREVIEW
+//!   built-in jobs ([`checks`]); [`verifier::ReportVerifier`] records their reports and
+//!   [`verifier::EndedEarly`] settles the ones whose job ended without one.
 
 pub mod api;
+pub mod check_api;
+pub mod checks;
 pub mod hash;
 pub mod launch;
 pub mod policy;
 pub mod stats;
+pub mod storage;
 pub mod store;
 pub mod verifier;
 
@@ -116,6 +122,8 @@ pub mod codes {
     pub const ILLEGAL_STEP: ErrorCode = code(ErrorFamily::State, 290);
     /// The version's checks haven't passed, so it can't be published.
     pub const NOT_PUBLISHABLE: ErrorCode = code(ErrorFamily::State, 291);
+    /// A test run without test cases, or a comparison without a published earlier version.
+    pub const NOTHING_TO_CHECK: ErrorCode = code(ErrorFamily::State, 292);
     /// A reward with this name exists in the project.
     pub const NAME_TAKEN: ErrorCode = code(ErrorFamily::Conflict, 290);
     /// A test case can't be read.
@@ -349,12 +357,20 @@ impl RewardsModule {
         Self::with_store(db, config.rewards.clone(), store)
     }
 
-    /// The module with an explicit artifact store (tests and embedders).
+    /// The module with an explicit artifact store (tests and embedders). Registers the
+    /// store and settings for the module's chain members ([`storage`]).
     pub fn with_store(
         db: Db,
         config: RewardsConfig,
         store: Arc<crate::modules::artifacts::ArtifactStore>,
     ) -> Self {
+        storage::register(
+            &db,
+            storage::Shared {
+                store: store.clone(),
+                config: config.clone(),
+            },
+        );
         Self {
             db,
             config,
@@ -466,6 +482,7 @@ mod tests {
             codes::REPORT_UNREADABLE,
             codes::ILLEGAL_STEP,
             codes::NOT_PUBLISHABLE,
+            codes::NOTHING_TO_CHECK,
             codes::NAME_TAKEN,
             codes::CASE_INVALID,
             codes::POLICY_INVALID,

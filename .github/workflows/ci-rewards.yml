@@ -56,6 +56,9 @@ jobs:
         run: cargo test -p mrl-server --lib --locked modules::rewards
 
       - name: reward module against PostgreSQL
+        # The checks' tests run the real reward_preview task; fail if Python is missing.
+        env:
+          MRL_TEST_REWARDS_PYTHON_REQUIRED: "1"
         run: cargo test -p mrl-testkit --lib --locked -- --ignored p29_
 
       - name: every route answers by role (team mode)

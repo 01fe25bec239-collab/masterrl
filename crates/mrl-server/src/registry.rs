@@ -31,6 +31,7 @@ pub fn consumers(db: &Db) -> Vec<Arc<dyn EventConsumer>> {
         // <mrl:consumers P27> P27 consumers go right below this line.
         // <mrl:consumers P28> P28 consumers go right below this line.
         // <mrl:consumers P29> P29 consumers go right below this line.
+        Arc::new(crate::modules::rewards::verifier::EndedEarly),
         // <mrl:consumers P30> P30 consumers go right below this line.
         // </mrl:consumers>
     ]

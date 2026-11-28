@@ -14,14 +14,21 @@
 //!
 //! A report that can't be read marks the record INVALID (and a test run FAILED_TESTS) and
 //! fails the job with VERIFICATION_FAILED. Replays after a crash find the record settled and
-//! answer Verified again.
+//! answer Verified again. Until INT-6 has registered the job's outputs the verifier answers an
+//! error, which keeps the job FINALIZING for the next finalize pass (never RetryLater: that
+//! would run the whole job again).
+//!
+//! [`EndedEarly`] settles the record of a job that ended (failed, cancelled, rejected) without
+//! a report: INVALID, and a test run's version goes to FAILED_TESTS, so it never waits forever.
 
 use super::policy::{Expect, Expected};
 use super::stats::{self, Row};
 use super::store::{self, CaseRow, ReportRow, VersionRow};
 use super::RewardsError;
-use crate::db::Db;
-use crate::modules::jobs::{CompletionVerifier, JobRow, Rejection, Verification};
+use crate::db::{Db, Tx};
+use crate::modules::artifacts::{ArtifactStore, LOCAL_ORG};
+use crate::modules::events::{ConsumerError, Event, EventConsumer};
+use crate::modules::jobs::{scope, CompletionVerifier, JobRow, Rejection, Verification};
 use crate::seams::SeamError;
 use async_trait::async_trait;
 use mrl_domain::failure::{FailureClass, FailureCode};
@@ -42,6 +49,9 @@ pub const REPORT_FORMAT: &str = "mrl-reward-report/1";
 /// Largest report or rows file read, in bytes.
 pub const MAX_REPORT_BYTES: usize = 32 << 20;
 
+/// The output files the verifier reads.
+pub const OUTPUT_FILES: [&str; 2] = ["report.json", "rows.jsonl"];
+
 /// A finished job's output files.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobFiles {
@@ -49,6 +59,9 @@ pub struct JobFiles {
     pub artifact_id: Uuid,
     /// `report.json` and, when present, `rows.jsonl`, checked against the artifact manifest.
     pub files: BTreeMap<String, Vec<u8>>,
+    /// Why a listed file wasn't read (too large, changed in storage). Any makes the report
+    /// unusable.
+    pub problems: Vec<String>,
 }
 
 /// Where the verifier reads a job's outputs from.
@@ -290,6 +303,9 @@ fn evaluate(
     baseline_cases: &[CaseRow],
     warn_share: f64,
 ) -> Result<Outcome, String> {
+    if !files.problems.is_empty() {
+        return Err(files.problems.join("; "));
+    }
     let r = read_report(files, report)?;
     match report.mode.as_str() {
         "test" => {
@@ -363,11 +379,100 @@ fn evaluate(
     }
 }
 
+fn seam(e: impl std::fmt::Display) -> SeamError {
+    SeamError::new("rewards", e.to_string())
+}
+
+/// Reads a REWARD_PREVIEW job's outputs from the artifact INT-6 registered for it
+/// (`builtin::outputs`), with each file's size and hash checked against its manifest.
+pub struct BuiltinOutputs {
+    db: Db,
+    store: Option<Arc<ArtifactStore>>,
+}
+
+impl BuiltinOutputs {
+    /// With the store the rewards module registered for `db` ([`super::storage`]).
+    pub fn registered(db: Db) -> Self {
+        Self { db, store: None }
+    }
+
+    /// With an explicit store (tests).
+    pub fn with_store(db: Db, store: Arc<ArtifactStore>) -> Self {
+        Self {
+            db,
+            store: Some(store),
+        }
+    }
+}
+
+#[async_trait]
+impl ReportSource for BuiltinOutputs {
+    async fn outputs(&self, job: &JobRow) -> Result<Option<JobFiles>, SeamError> {
+        let Some(out) = crate::modules::builtin::outputs(&self.db, job.org_id, job.id)
+            .await
+            .map_err(seam)?
+        else {
+            return Ok(None);
+        };
+        let store = self
+            .store
+            .clone()
+            .or_else(|| super::storage::lookup(&self.db).map(|s| s.store))
+            .ok_or_else(|| seam("the rewards module's storage isn't set up yet"))?;
+        let org = scope::org_text(job.org_id).unwrap_or_else(|| LOCAL_ORG.to_owned());
+        let artifact = store
+            .get(&org, out.artifact_id)
+            .await
+            .map_err(seam)?
+            .ok_or_else(|| seam("the job's outputs artifact is missing"))?;
+        let mut found = JobFiles {
+            artifact_id: out.artifact_id,
+            files: BTreeMap::new(),
+            problems: Vec::new(),
+        };
+        let listed = artifact.manifest["files"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        for name in OUTPUT_FILES {
+            let Some(entry) = listed.iter().find(|f| f["path"] == name) else {
+                continue;
+            };
+            if entry["size"]
+                .as_u64()
+                .is_none_or(|n| n > MAX_REPORT_BYTES as u64)
+            {
+                found.problems.push(format!("{name} is larger than 32 MiB"));
+                continue;
+            }
+            let (key, file) = store
+                .download_source(&org, &artifact, name)
+                .await
+                .map_err(seam)?;
+            let bytes = store
+                .org_store(&org)
+                .await
+                .map_err(seam)?
+                .get(&key)
+                .await
+                .map_err(seam)?;
+            if mrl_storage::sha256_hex(&bytes) != file.sha256 {
+                found
+                    .problems
+                    .push(format!("{name} changed in storage after it was saved"));
+                continue;
+            }
+            found.files.insert(name.to_owned(), bytes.to_vec());
+        }
+        Ok(Some(found))
+    }
+}
+
 /// The verifier (registered in `jobs::chains` under the P29 marker).
 pub struct ReportVerifier {
     db: Db,
     source: Arc<dyn ReportSource>,
-    warn_share: f64,
+    warn_share: Option<f64>,
 }
 
 impl ReportVerifier {
@@ -376,24 +481,43 @@ impl ReportVerifier {
         Self {
             db,
             source,
-            warn_share,
+            warn_share: Some(warn_share),
         }
     }
 
+    /// The chain member: outputs from [`BuiltinOutputs`], the learnability threshold from the
+    /// rewards module's settings for `db`.
+    pub fn registered(db: Db) -> Self {
+        Self {
+            source: Arc::new(BuiltinOutputs::registered(db.clone())),
+            db,
+            warn_share: None,
+        }
+    }
+
+    fn warn_share(&self) -> f64 {
+        self.warn_share
+            .or_else(|| super::storage::lookup(&self.db).map(|s| s.config.learnability_warn_share))
+            .unwrap_or_else(|| super::RewardsConfig::default().learnability_warn_share)
+    }
+
     async fn record(&self, job: &JobRow, report: ReportRow) -> Result<Verification, RewardsError> {
-        let files = self.source.outputs(job).await?;
+        // Not registered yet: wait (an error keeps the job FINALIZING). INT-6's verifier
+        // fails a job whose outputs can't be registered.
+        let Some(files) = self.source.outputs(job).await? else {
+            return Err(seam("the reward check's results are still being saved").into());
+        };
         let version = store::version(&self.db, report.version_id).await?;
         let cases = store::cases(&self.db, report.version_id).await?;
         let baseline = match report.other_version_id {
             Some(o) if report.mode == "regression" => store::cases(&self.db, o).await?,
             _ => Vec::new(),
         };
-        let outcome = match (&files, version.as_ref()) {
-            (None, _) => Err("the job registered no outputs".to_owned()),
-            (_, None) => Err("the reward version is gone".to_owned()),
-            (Some(f), Some(_)) => evaluate(&report, f, &cases, &baseline, self.warn_share),
+        let outcome = match version {
+            None => Err("the reward version is gone".to_owned()),
+            Some(_) => evaluate(&report, &files, &cases, &baseline, self.warn_share()),
         };
-        let artifact = files.as_ref().map(|f| f.artifact_id);
+        let artifact = Some(files.artifact_id);
         let mut tx = self.db.begin().await?;
         let Some(locked) = store::lock_report_for_job(&mut tx, job.id).await? else {
             return Ok(Verification::Abstain);
@@ -511,13 +635,45 @@ impl CompletionVerifier for ReportVerifier {
         let Some(report) = report else {
             return Ok(Verification::Abstain);
         };
-        match self.record(job, report).await {
-            Ok(v) => Ok(v),
-            Err(RewardsError::Jobs(crate::modules::jobs::JobsError::Seam(e))) => {
-                Ok(Verification::RetryLater(e.to_string()))
-            }
-            Err(e) => Err(SeamError::new("rewards", e.to_string())),
+        // Errors (storage down, outputs not registered yet) keep the job FINALIZING.
+        self.record(job, report).await.map_err(seam)
+    }
+}
+
+/// Event consumer: a REWARD_PREVIEW job that ended without its report settles the record
+/// INVALID, and a test run's version goes to FAILED_TESTS (so it can be tested again).
+pub struct EndedEarly;
+
+#[async_trait]
+impl EventConsumer for EndedEarly {
+    fn name(&self) -> &'static str {
+        "rewards-report-ended"
+    }
+
+    fn accepts(&self, t: &str) -> bool {
+        matches!(t, "job.failed" | "job.cancelled" | "job.rejected")
+    }
+
+    async fn handle(&self, tx: &mut Tx, event: &Event) -> Result<(), ConsumerError> {
+        let Some(report) = store::lock_report_for_job(tx, event.aggregate_id).await? else {
+            return Ok(());
+        };
+        if report.state != "PENDING" {
+            return Ok(());
         }
+        let why = match event.event_type.as_str() {
+            "job.cancelled" => "the check was cancelled before it finished",
+            "job.rejected" => "the check could not be started",
+            _ => "the check stopped before it wrote its report",
+        };
+        if report.mode == "test" {
+            if let Some(v) = store::lock_version(tx, report.version_id).await? {
+                let summary = json!({"passed": false, "error": why});
+                test_result(tx, &v, event.aggregate_id, &[], &summary, "").await?;
+            }
+        }
+        store::settle_report(tx, report.id, Err(why.to_owned()), None).await?;
+        Ok(())
     }
 }
 
@@ -616,5 +772,48 @@ mod tests {
             [true, false]
         );
         assert_eq!(judged[1].1["failures"][0], "total was 0");
+    }
+
+    fn report_row(mode: &str) -> ReportRow {
+        ReportRow {
+            id: Uuid::nil(),
+            org_id: Uuid::nil(),
+            project_id: Uuid::nil(),
+            version_id: Uuid::nil(),
+            other_version_id: None,
+            mode: mode.into(),
+            job_id: None,
+            state: "PENDING".into(),
+            request: json!({}),
+            results: None,
+            reason: None,
+            artifact_id: None,
+            created_by: "t".into(),
+            created_at: time::OffsetDateTime::UNIX_EPOCH,
+            finished_at: None,
+        }
+    }
+
+    #[test]
+    fn a_damaged_or_oversized_output_file_makes_the_report_unusable() {
+        let files = JobFiles {
+            artifact_id: Uuid::nil(),
+            files: BTreeMap::new(),
+            problems: vec!["report.json changed in storage after it was saved".into()],
+        };
+        let why = evaluate(&report_row("preview"), &files, &[], &[], 0.9)
+            .err()
+            .unwrap();
+        assert!(why.contains("changed in storage"), "{why}");
+    }
+
+    #[test]
+    fn only_jobs_that_ended_without_finishing_reach_the_ended_early_consumer() {
+        for t in ["job.failed", "job.cancelled", "job.rejected"] {
+            assert!(EndedEarly.accepts(t), "{t}");
+        }
+        for t in ["job.completed", "job.finished", "job.queued"] {
+            assert!(!EndedEarly.accepts(t), "{t}");
+        }
     }
 }

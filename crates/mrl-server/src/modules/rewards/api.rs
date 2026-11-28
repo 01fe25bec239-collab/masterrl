@@ -11,6 +11,9 @@
 //! | `POST /reward-versions/{rwdv}:publish` | `rewards.write` |
 //! | `POST /reward-versions/{rwdv}:deprecate` | `rewards.write` |
 //! | `GET /reward-components` | `rewards.read` |
+//!
+//! The checks (`:test`, `:preview`, `:regression`, `POST /rewards:compare` and the reports
+//! list) are in [`super::check_api`].
 
 use super::hash::{bundle_sha256, HashInputs, CONTENT_FORMAT};
 use super::policy::{self, CaseSample, Expect};
@@ -240,9 +243,13 @@ pub struct ComponentList {
 #[derive(OpenApi)]
 #[openapi(
     paths(list_rewards, create_reward, get_reward, create_version, get_version, publish_version,
-          deprecate_version, list_components),
+          deprecate_version, list_components, super::check_api::test_version,
+          super::check_api::preview_version, super::check_api::regression_version,
+          super::check_api::compare_versions, super::check_api::list_reports),
     components(schemas(CreateReward, NewVersionBody, VersionSummary, RewardView, CodeView, CaseView,
-        Publishable, VersionView, ComponentInfo, ComponentList, ComponentRow, CaseSample, Expect)),
+        Publishable, VersionView, ComponentInfo, ComponentList, ComponentRow, CaseSample, Expect,
+        super::check_api::PreviewBody, super::check_api::CompareBody,
+        super::check_api::ReportView)),
     tags((name = "rewards", description = "Reward Studio: reward definitions, versions, tests and publishing."))
 )]
 struct Doc;
@@ -289,6 +296,14 @@ pub fn routes(
             "/reward-versions/{seg}",
             get(get_version).post(version_action),
         )
+        .route(
+            "/reward-versions/{rwdv}/reports",
+            get(super::check_api::list_reports),
+        )
+        .route(
+            "/rewards:compare",
+            axum::routing::post(super::check_api::compare_versions),
+        )
         .route("/reward-components", get(list_components))
         .layer(axum::middleware::from_fn(super::render))
         .layer(axum::middleware::from_fn(
@@ -303,7 +318,8 @@ pub fn routes(
         }))
 }
 
-fn body<T: for<'de> Deserialize<'de>>(bytes: &Bytes) -> Result<T, RewardsError> {
+/// The JSON body (no NUL characters), or 422.
+pub(super) fn body<T: for<'de> Deserialize<'de>>(bytes: &Bytes) -> Result<T, RewardsError> {
     let raw: Value = serde_json::from_slice(bytes)
         .map_err(|e| bad_body(format!("The body is not JSON: {e}.")))?;
     scope::no_nul(&raw)?;
@@ -324,7 +340,8 @@ fn rid(id: Uuid) -> String {
     RewardId::from_uuid(id).to_string()
 }
 
-fn vid(id: Uuid) -> String {
+/// `rwdv_…` of `id`.
+pub(super) fn vid(id: Uuid) -> String {
     RewardVersionId::from_uuid(id).to_string()
 }
 
@@ -441,7 +458,7 @@ async fn read_definition(
 }
 
 /// The version, authorized for `action` on its reward (missing or hidden: 404).
-async fn read_version(
+pub(super) async fn read_version(
     state: &AppState,
     ctx: &RequestContext,
     c: &Ctx,
@@ -838,13 +855,21 @@ async fn version_action(
     Extension(c): Extension<Ctx>,
     ctx: RequestContext,
     Path(seg): Path<String>,
-) -> Result<Json<VersionView>, RewardsError> {
+    raw: Bytes,
+) -> Result<Response, RewardsError> {
+    use super::check_api as checks;
+    let (s, e) = (State(state), Extension(c));
     match seg.split_once(':') {
-        Some((id, "publish")) => {
-            publish_version(State(state), Extension(c), ctx, Path(id.to_owned())).await
-        }
-        Some((id, "deprecate")) => {
-            deprecate_version(State(state), Extension(c), ctx, Path(id.to_owned())).await
+        Some((id, "publish")) => Ok(publish_version(s, e, ctx, Path(id.to_owned()))
+            .await?
+            .into_response()),
+        Some((id, "deprecate")) => Ok(deprecate_version(s, e, ctx, Path(id.to_owned()))
+            .await?
+            .into_response()),
+        Some((id, "test")) => checks::test_version(s, e, ctx, Path(id.to_owned())).await,
+        Some((id, "preview")) => checks::preview_version(s, e, ctx, Path(id.to_owned()), raw).await,
+        Some((id, "regression")) => {
+            checks::regression_version(s, e, ctx, Path(id.to_owned())).await
         }
         _ => Err(ApiError::new(ErrorCode::RouteNotFound, "No endpoint has this path.").into()),
     }

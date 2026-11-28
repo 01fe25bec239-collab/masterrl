@@ -1493,6 +1493,43 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /api/v1/reward-versions/{rwdv}/reports:
+    get:
+      tags:
+      - rewards
+      operationId: list_reward_reports
+      parameters:
+      - name: rwdv
+        in: path
+        description: Reward version id, `rwdv_…`.
+        required: true
+        schema:
+          type: string
+      - name: limit
+        in: query
+        description: Page size, 1–200 (default 50).
+        required: false
+        schema:
+          type: string
+      - name: cursor
+        in: query
+        description: '`next_cursor` from the previous page.'
+        required: false
+        schema:
+          type: string
+      responses:
+        '200':
+          description: Checks of this version (and comparisons naming it), newest first.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Page_RewardReport'
+        '404':
+          description: No such reward version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/reward-versions/{rwdv}:deprecate:
     post:
       tags:
@@ -1524,6 +1561,43 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Problem'
+  /api/v1/reward-versions/{rwdv}:preview:
+    post:
+      tags:
+      - rewards
+      operationId: preview_reward_version
+      parameters:
+      - name: rwdv
+        in: path
+        description: Reward version id, `rwdv_…`.
+        required: true
+        schema:
+          type: string
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RewardPreviewRequest'
+        required: true
+      responses:
+        '202':
+          description: The preview started.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RewardReport'
+        '404':
+          description: No such reward version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: The samples need a change (MRL-VAL-*).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
   /api/v1/reward-versions/{rwdv}:publish:
     post:
       tags:
@@ -1551,6 +1625,68 @@ paths:
                 $ref: '#/components/schemas/Problem'
         '409':
           description: Its checks haven't passed (MRL-STATE-291) or its state doesn't allow it (MRL-STATE-290).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/reward-versions/{rwdv}:regression:
+    post:
+      tags:
+      - rewards
+      operationId: regression_reward_version
+      parameters:
+      - name: rwdv
+        in: path
+        description: Reward version id, `rwdv_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '202':
+          description: The comparison with the published version started; publishing needs it.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RewardReport'
+        '404':
+          description: No such reward version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: It is published (MRL-STATE-290), or no earlier version with test cases is published (MRL-STATE-292).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/reward-versions/{rwdv}:test:
+    post:
+      tags:
+      - rewards
+      operationId: test_reward_version
+      parameters:
+      - name: rwdv
+        in: path
+        description: Reward version id, `rwdv_…`.
+        required: true
+        schema:
+          type: string
+      responses:
+        '202':
+          description: 'The test run started: the version is TESTING until its report is in.'
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RewardReport'
+        '404':
+          description: No such reward version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '409':
+          description: Its tests are running or it is published (MRL-STATE-290), or it has no test cases (MRL-STATE-292).
           content:
             application/json:
               schema:
@@ -1619,6 +1755,36 @@ paths:
                 $ref: '#/components/schemas/Problem'
         '422':
           description: The policy or test cases need a change (MRL-RWD-*, MRL-VAL-290).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+  /api/v1/rewards:compare:
+    post:
+      tags:
+      - rewards
+      operationId: compare_reward_versions
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RewardCompareRequest'
+        required: true
+      responses:
+        '202':
+          description: The comparison started; its report belongs to version a.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RewardReport'
+        '404':
+          description: No such reward version.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: The request needs a change (MRL-VAL-*).
           content:
             application/json:
               schema:
@@ -5246,6 +5412,83 @@ components:
           - string
           - 'null'
           description: Pass as `cursor` for the next page; `null` on the last page.
+    Page_RewardReport:
+      type: object
+      description: One page of results.
+      required:
+      - items
+      properties:
+        items:
+          type: array
+          items:
+            type: object
+            description: A check and, once its job ended, its results.
+            required:
+            - mode
+            - state
+            - version_id
+            - request
+            - created_by
+            - created_at
+            properties:
+              artifact_id:
+                type:
+                - string
+                - 'null'
+                description: The job's outputs artifact (`report.json`, `rows.jsonl`).
+              created_at:
+                type: string
+                format: date-time
+                description: When.
+              created_by:
+                type: string
+                description: Who asked.
+              finished_at:
+                type:
+                - string
+                - 'null'
+                format: date-time
+                description: When it settled.
+              job_id:
+                type:
+                - string
+                - 'null'
+                description: The REWARD_PREVIEW job, `job_…` (also the report's id).
+              mode:
+                type: string
+                description: '`test`, `preview`, `regression` or `compare`.'
+              other_version_id:
+                type:
+                - string
+                - 'null'
+                description: The baseline (regression) or the second version (compare).
+              reason:
+                type:
+                - string
+                - 'null'
+                description: Why it is INVALID.
+              request:
+                type: object
+                description: What was asked.
+              results:
+                type:
+                - object
+                - 'null'
+                description: |-
+                  The server's results once READY: a test summary, the regression comparison, or
+                  statistics (histograms, rates, latency, length correlation, learnability, agreement).
+              state:
+                type: string
+                description: '`PENDING` until the job ends, then `READY` or `INVALID`.'
+              version_id:
+                type: string
+                description: The version checked, `rwdv_…`.
+          description: The items on this page.
+        next_cursor:
+          type:
+          - string
+          - 'null'
+          description: Pass as `cursor` for the next page; `null` on the last page.
     Page_Run:
       type: object
       description: One page of results.
@@ -5849,6 +6092,24 @@ components:
           items:
             type: object
           description: '`[{path, sha256, size}]`.'
+    RewardCompareRequest:
+      type: object
+      description: '`POST /rewards:compare`.'
+      required:
+      - a
+      - b
+      - samples
+      properties:
+        a:
+          type: string
+          description: The first version, `rwdv_…` (the report belongs to it).
+        b:
+          type: string
+          description: The second version, `rwdv_…`, of any reward in the same org.
+        samples:
+          $ref: '#/components/schemas/RewardPreviewRequest'
+          description: The samples both score.
+      additionalProperties: false
     RewardComponent:
       type: object
       description: One component the reward sandbox ships (a row of the generated list).
@@ -5998,6 +6259,57 @@ components:
           items:
             $ref: '#/components/schemas/RewardVersionSummary'
           description: Versions, newest first.
+    RewardPreviewRequest:
+      type: object
+      description: Which samples a preview or comparison scores.
+      required:
+      - dataset_artifact_id
+      properties:
+        completion_field:
+          type: string
+          description: The rows' completion field (for `stored`).
+        completions:
+          type: string
+          description: |-
+            `stored`: score the rows' own completions. `generate`: write `num_generations` answers
+            per prompt with the model (on the CPU).
+        dataset_artifact_id:
+          type: string
+          description: |-
+            A committed artifact of this project (or of the whole org) with the samples: JSON Lines
+            (`.jsonl`) or Parquet files, one sample per row.
+        max_new_tokens:
+          type: integer
+          format: int32
+          description: Most new tokens per written answer (1–1024).
+          minimum: 0
+        model_artifact_id:
+          type:
+          - string
+          - 'null'
+          description: The model's files, to write answers (an artifact, like a model version's files).
+        n:
+          type: integer
+          format: int32
+          description: Rows drawn at random (with `seed`); 1 to `rewards.max_preview_samples` samples in all.
+          minimum: 0
+        num_generations:
+          type: integer
+          format: int32
+          description: Answers per prompt when generating (1–16).
+          minimum: 0
+        prompt_field:
+          type: string
+          description: The rows' prompt field (text, or chat messages).
+        reference_field:
+          type: string
+          description: The rows' reference field (the answer components compare with).
+        seed:
+          type: integer
+          format: int64
+          description: Seed for drawing rows and writing answers.
+          minimum: 0
+      additionalProperties: false
     RewardPublishCheck:
       type: object
       description: Whether `:publish` would work, and why not.
@@ -6013,6 +6325,69 @@ components:
           items:
             type: string
           description: What blocks it.
+    RewardReport:
+      type: object
+      description: A check and, once its job ended, its results.
+      required:
+      - mode
+      - state
+      - version_id
+      - request
+      - created_by
+      - created_at
+      properties:
+        artifact_id:
+          type:
+          - string
+          - 'null'
+          description: The job's outputs artifact (`report.json`, `rows.jsonl`).
+        created_at:
+          type: string
+          format: date-time
+          description: When.
+        created_by:
+          type: string
+          description: Who asked.
+        finished_at:
+          type:
+          - string
+          - 'null'
+          format: date-time
+          description: When it settled.
+        job_id:
+          type:
+          - string
+          - 'null'
+          description: The REWARD_PREVIEW job, `job_…` (also the report's id).
+        mode:
+          type: string
+          description: '`test`, `preview`, `regression` or `compare`.'
+        other_version_id:
+          type:
+          - string
+          - 'null'
+          description: The baseline (regression) or the second version (compare).
+        reason:
+          type:
+          - string
+          - 'null'
+          description: Why it is INVALID.
+        request:
+          type: object
+          description: What was asked.
+        results:
+          type:
+          - object
+          - 'null'
+          description: |-
+            The server's results once READY: a test summary, the regression comparison, or
+            statistics (histograms, rates, latency, length correlation, learnability, agreement).
+        state:
+          type: string
+          description: '`PENDING` until the job ends, then `READY` or `INVALID`.'
+        version_id:
+          type: string
+          description: The version checked, `rwdv_…`.
     RewardTestCase:
       type: object
       description: One test case.

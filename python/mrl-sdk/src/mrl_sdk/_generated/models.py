@@ -1531,6 +1531,19 @@ class RewardCodeBundle(TypedDict):
     """`[{path, sha256, size}]`."""
 
 
+class RewardCompareRequest(TypedDict):
+    """`POST /rewards:compare`."""
+
+    a: str
+    """The first version, `rwdv_…` (the report belongs to it)."""
+
+    b: str
+    """The second version, `rwdv_…`, of any reward in the same org."""
+
+    samples: RewardPreviewRequest
+    """The samples both score."""
+
+
 class RewardComponent(TypedDict):
     """One component the reward sandbox ships (a row of the generated list)."""
 
@@ -1680,6 +1693,40 @@ class RewardDefinitionPage(TypedDict):
     """Pass as `cursor` for the next page; `null` on the last page."""
 
 
+class RewardPreviewRequest(TypedDict):
+    """Which samples a preview or comparison scores."""
+
+    completion_field: NotRequired[str]
+    """The rows' completion field (for `stored`)."""
+
+    completions: NotRequired[str]
+    """`stored`: score the rows' own completions. `generate`: write `num_generations` answers"""
+
+    dataset_artifact_id: str
+    """A committed artifact of this project (or of the whole org) with the samples: JSON Lines"""
+
+    max_new_tokens: NotRequired[int]
+    """Most new tokens per written answer (1-1024)."""
+
+    model_artifact_id: NotRequired[str | None]
+    """The model's files, to write answers (an artifact, like a model version's files)."""
+
+    n: NotRequired[int]
+    """Rows drawn at random (with `seed`); 1 to `rewards.max_preview_samples` samples in all."""
+
+    num_generations: NotRequired[int]
+    """Answers per prompt when generating (1-16)."""
+
+    prompt_field: NotRequired[str]
+    """The rows' prompt field (text, or chat messages)."""
+
+    reference_field: NotRequired[str]
+    """The rows' reference field (the answer components compare with)."""
+
+    seed: NotRequired[int]
+    """Seed for drawing rows and writing answers."""
+
+
 class RewardPublishCheck(TypedDict):
     """Whether `:publish` would work, and why not."""
 
@@ -1688,6 +1735,56 @@ class RewardPublishCheck(TypedDict):
 
     reasons: list[str]
     """What blocks it."""
+
+
+class RewardReport(TypedDict):
+    """A check and, once its job ended, its results."""
+
+    artifact_id: NotRequired[str | None]
+    """The job's outputs artifact (`report.json`, `rows.jsonl`)."""
+
+    created_at: str
+    """When."""
+
+    created_by: str
+    """Who asked."""
+
+    finished_at: NotRequired[str | None]
+    """When it settled."""
+
+    job_id: NotRequired[str | None]
+    """The REWARD_PREVIEW job, `job_…` (also the report's id)."""
+
+    mode: str
+    """`test`, `preview`, `regression` or `compare`."""
+
+    other_version_id: NotRequired[str | None]
+    """The baseline (regression) or the second version (compare)."""
+
+    reason: NotRequired[str | None]
+    """Why it is INVALID."""
+
+    request: dict[str, Any]
+    """What was asked."""
+
+    results: NotRequired[dict[str, Any] | None]
+    """The server's results once READY: a test summary, the regression comparison, or"""
+
+    state: str
+    """`PENDING` until the job ends, then `READY` or `INVALID`."""
+
+    version_id: str
+    """The version checked, `rwdv_…`."""
+
+
+class RewardReportPage(TypedDict):
+    """One page of results."""
+
+    items: list[RewardReport]
+    """The items on this page."""
+
+    next_cursor: NotRequired[str | None]
+    """Pass as `cursor` for the next page; `null` on the last page."""
 
 
 class RewardTestCase(TypedDict):
@@ -2593,13 +2690,17 @@ __all__ = [
     "RewardCaseExpect",
     "RewardCaseSample",
     "RewardCodeBundle",
+    "RewardCompareRequest",
     "RewardComponent",
     "RewardComponentInfo",
     "RewardComponentList",
     "RewardCreateRequest",
     "RewardDefinition",
     "RewardDefinitionPage",
+    "RewardPreviewRequest",
     "RewardPublishCheck",
+    "RewardReport",
+    "RewardReportPage",
     "RewardTestCase",
     "RewardVersion",
     "RewardVersionCreateRequest",

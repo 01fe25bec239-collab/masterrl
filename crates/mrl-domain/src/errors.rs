@@ -794,6 +794,10 @@ pub const REGISTRY: &[(ErrorCode, &str)] = &[
         "This reward version can't be published until its checks pass.",
     ),
     (
+        code(ErrorFamily::State, 292),
+        "This reward version has nothing to check against yet.",
+    ),
+    (
         code(ErrorFamily::Conflict, 290),
         "A reward with this name already exists in this project.",
     ),

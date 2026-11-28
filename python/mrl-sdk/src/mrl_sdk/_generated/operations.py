@@ -66,6 +66,14 @@ OPERATIONS: dict[str, Operation] = {
         (),
         False,
     ),
+    "compare_reward_versions": Operation(
+        "POST",
+        "/api/v1/rewards:compare",
+        (),
+        (),
+        (),
+        True,
+    ),
     "compare_runs": Operation(
         "POST",
         "/api/v1/runs:compare",
@@ -542,6 +550,17 @@ OPERATIONS: dict[str, Operation] = {
         (),
         False,
     ),
+    "list_reward_reports": Operation(
+        "GET",
+        "/api/v1/reward-versions/{rwdv}/reports",
+        ("rwdv",),
+        (
+            "limit",
+            "cursor",
+        ),
+        (),
+        False,
+    ),
     "list_rewards": Operation(
         "GET",
         "/api/v1/projects/{prj}/rewards",
@@ -687,6 +706,14 @@ OPERATIONS: dict[str, Operation] = {
         (),
         True,
     ),
+    "preview_reward_version": Operation(
+        "POST",
+        "/api/v1/reward-versions/{rwdv}:preview",
+        ("rwdv",),
+        (),
+        (),
+        True,
+    ),
     "publish_reward_version": Operation(
         "POST",
         "/api/v1/reward-versions/{rwdv}:publish",
@@ -765,6 +792,14 @@ OPERATIONS: dict[str, Operation] = {
         (),
         True,
     ),
+    "regression_reward_version": Operation(
+        "POST",
+        "/api/v1/reward-versions/{rwdv}:regression",
+        ("rwdv",),
+        (),
+        (),
+        False,
+    ),
     "resolve_alert": Operation(
         "POST",
         "/api/v1/alerts/{alr}:resolve",
@@ -828,6 +863,14 @@ OPERATIONS: dict[str, Operation] = {
         (),
         ("Idempotency-Key",),
         True,
+    ),
+    "test_reward_version": Operation(
+        "POST",
+        "/api/v1/reward-versions/{rwdv}:test",
+        ("rwdv",),
+        (),
+        (),
+        False,
     ),
     "update_experiment": Operation(
         "PATCH",

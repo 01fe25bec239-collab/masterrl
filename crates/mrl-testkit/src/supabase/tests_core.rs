@@ -1192,6 +1192,39 @@ async fn every_route_answers_by_role_in_team_mode() {
             Action::RewardsRead,
             None,
         ),
+        // The checks: the DRAFT version has no test cases and no published baseline (409);
+        // `art_x` is no artifact (422); a version can't be compared with itself (422).
+        row(
+            Method::POST,
+            format!("/api/v1/reward-versions/{p29_rwdv}:test"),
+            Action::RewardsWrite,
+            None,
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/reward-versions/{p29_rwdv}:regression"),
+            Action::RewardsWrite,
+            None,
+        ),
+        row(
+            Method::POST,
+            format!("/api/v1/reward-versions/{p29_rwdv}:preview"),
+            Action::RewardsWrite,
+            Some(json!({"dataset_artifact_id": "art_x"})),
+        ),
+        row(
+            Method::POST,
+            "/api/v1/rewards:compare".into(),
+            Action::RewardsWrite,
+            Some(json!({"a": p29_rwdv, "b": p29_rwdv,
+                "samples": {"dataset_artifact_id": "art_x"}})),
+        ),
+        row(
+            Method::GET,
+            format!("/api/v1/reward-versions/{p29_rwdv}/reports"),
+            Action::RewardsRead,
+            None,
+        ),
         // <mrl:roles-routes P30> P30 role-table rows go right below this line.
     ]);
     // A run submission needs an Idempotency-Key (keys are per person).
@@ -1242,6 +1275,10 @@ async fn every_route_answers_by_role_in_team_mode() {
             // <mrl:roles-expected P27> P27 expected-status arms go right below this line.
             // <mrl:roles-expected P28> P28 expected-status arms go right below this line.
             // <mrl:roles-expected P29> P29 expected-status arms go right below this line.
+            ("POST", p) if p.starts_with("/api/v1/reward-versions/") && p.ends_with(":preview") => {
+                &[422]
+            }
+            ("POST", "/api/v1/rewards:compare") => &[422],
             ("POST", p) if p.ends_with("/rewards") => &[201, 409],
             ("POST", p) if p.starts_with("/api/v1/rewards/") && p.ends_with("/versions") => {
                 &[201, 200]

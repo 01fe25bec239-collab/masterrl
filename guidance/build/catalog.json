@@ -3834,6 +3834,17 @@
       }
     },
     {
+      "code": "MRL-STATE-292",
+      "title": "This reward version has nothing to check against yet.",
+      "why": "A test run needs the version's test cases. A comparison needs an earlier published version of the same reward, with test cases.",
+      "what_to_do": {
+        "steps": [
+          "To run tests, create a version with test cases.",
+          "To compare, publish an earlier version first. A first version needs no comparison."
+        ]
+      }
+    },
+    {
       "code": "MRL-STORE-001",
       "title": "The app refused a storage path.",
       "why": "The path points outside your workspace's storage area, or it has a part the app doesn't allow, like `..`.",

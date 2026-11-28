@@ -30,19 +30,22 @@ pub const CODE_INPUT: &str = "reward.code";
 /// See the module docs.
 pub struct RewardInputs {
     db: Db,
-    store: Arc<ArtifactStore>,
+    store: Option<Arc<ArtifactStore>>,
 }
 
 impl RewardInputs {
-    /// The contributor for this build (its own handle on object storage, like P23's).
-    pub fn new(db: Db, config: &crate::Config) -> Self {
-        let store = crate::modules::artifacts::ArtifactsModule::new(db.clone(), config).store();
-        Self { db, store }
+    /// The chain member: the store the rewards module registered for `db`
+    /// ([`super::storage`]), looked up at each launch.
+    pub fn registered(db: Db) -> Self {
+        Self { db, store: None }
     }
 
     /// With an explicit store (tests).
     pub fn with_store(db: Db, store: Arc<ArtifactStore>) -> Self {
-        Self { db, store }
+        Self {
+            db,
+            store: Some(store),
+        }
     }
 }
 
@@ -50,16 +53,125 @@ fn transient(e: impl std::fmt::Display) -> LaunchError {
     LaunchError::Transient(format!("the reward records could not be read: {e}"))
 }
 
-/// The `reward` object for the job spec.
-pub fn spec_entry(v: &store::VersionRow) -> Value {
+/// The `reward` object for the job spec, with its code staged at `code_dir`.
+pub fn spec_entry_at(v: &store::VersionRow, code_dir: &str) -> Value {
     json!({
         "version_id": RewardVersionId::from_uuid(v.id).to_string(),
         "content_sha256": v.content_sha256,
         "exec_sha256": v.exec_sha256,
         "sandbox_tier": v.sandbox_tier,
         "policy": v.policy,
-        "code_dir": v.code_artifact_id.map(|_| CODE_DIR),
+        "code_dir": v.code_artifact_id.map(|_| code_dir),
     })
+}
+
+/// The `reward` object of a run's job spec (code at [`CODE_DIR`]).
+pub fn spec_entry(v: &store::VersionRow) -> Value {
+    spec_entry_at(v, CODE_DIR)
+}
+
+/// Why stored files can't be staged.
+#[derive(Debug, thiserror::Error)]
+pub enum StageError {
+    /// The artifact is gone or not committed.
+    #[error("{0}")]
+    Gone(String),
+    /// Storage did not answer.
+    #[error("storage did not answer: {0}")]
+    Storage(String),
+}
+
+impl From<StageError> for LaunchError {
+    fn from(e: StageError) -> Self {
+        match e {
+            StageError::Gone(why) => LaunchError::Fail(FailureClass::UserConfig, why),
+            StageError::Storage(_) => LaunchError::Transient(e.to_string()),
+        }
+    }
+}
+
+/// The committed artifact `id` of `org` (storage org name), or [`StageError::Gone`] with
+/// `gone`.
+async fn committed(
+    store: &ArtifactStore,
+    org: &str,
+    id: Uuid,
+    gone: &str,
+) -> Result<crate::modules::artifacts::Artifact, StageError> {
+    store
+        .get(org, id)
+        .await
+        .map_err(|e| StageError::Storage(e.to_string()))?
+        .filter(|a| a.state == "COMMITTED")
+        .ok_or_else(|| StageError::Gone(gone.to_owned()))
+}
+
+/// The version's code files as inputs `<name>/<path>`, staged at `<dir>/<path>` (none
+/// without a code bundle).
+pub async fn code_inputs(
+    store: &ArtifactStore,
+    org: &str,
+    v: &store::VersionRow,
+    name: &str,
+    dir: &str,
+) -> Result<Vec<InputFile>, StageError> {
+    let Some(artifact) = v.code_artifact_id else {
+        return Ok(Vec::new());
+    };
+    let found = committed(
+        store,
+        org,
+        artifact,
+        "The reward's code bundle is no longer stored.",
+    )
+    .await?;
+    let mut out = Vec::new();
+    for f in v.code_files.as_array().cloned().unwrap_or_default() {
+        let path = f.get("path").and_then(Value::as_str).unwrap_or_default();
+        let (key, file) = store
+            .download_source(org, &found, path)
+            .await
+            .map_err(|e| StageError::Storage(e.to_string()))?;
+        out.push(InputFile {
+            name: format!("{name}/{path}"),
+            key,
+            sha256: file.sha256,
+            size: file.size,
+            local_path: format!("{dir}/{path}"),
+        });
+    }
+    Ok(out)
+}
+
+/// Every file of artifact `id` as one folder input `name` (staged at `<name>/<path>`; the
+/// worker sees the folder).
+pub async fn folder_inputs(
+    store: &ArtifactStore,
+    org: &str,
+    id: Uuid,
+    name: &str,
+) -> Result<Vec<InputFile>, StageError> {
+    let found = committed(store, org, id, "The artifact is no longer stored.").await?;
+    let mut out = Vec::new();
+    for f in found.manifest["files"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+    {
+        let path = f.get("path").and_then(Value::as_str).unwrap_or_default();
+        let (key, file) = store
+            .download_source(org, &found, path)
+            .await
+            .map_err(|e| StageError::Storage(e.to_string()))?;
+        out.push(InputFile {
+            name: name.to_owned(),
+            key,
+            sha256: file.sha256,
+            size: file.size,
+            local_path: format!("{name}/{path}"),
+        });
+    }
+    Ok(out)
 }
 
 #[async_trait::async_trait]
@@ -119,39 +231,20 @@ impl LaunchContributor for RewardInputs {
         };
         spec["reward"] = spec_entry(&v);
         plan.launch.job_spec_json = spec.to_string();
-        let Some(artifact) = v.code_artifact_id else {
+        if v.code_artifact_id.is_none() {
             return Ok(());
-        };
+        }
+        let store = self
+            .store
+            .clone()
+            .or_else(|| super::storage::lookup(&self.db).map(|s| s.store))
+            .ok_or_else(|| {
+                LaunchError::Transient("the rewards module's storage isn't set up yet".into())
+            })?;
         let org = crate::modules::jobs::scope::org_text(job.org_id)
             .unwrap_or_else(|| crate::modules::artifacts::LOCAL_ORG.to_owned());
-        let found = self
-            .store
-            .get(&org, artifact)
-            .await
-            .map_err(|e| LaunchError::Transient(format!("storage did not answer: {e}")))?
-            .filter(|a| a.state == "COMMITTED")
-            .ok_or_else(|| {
-                LaunchError::Fail(
-                    FailureClass::UserConfig,
-                    "The reward's code bundle is no longer stored.".into(),
-                )
-            })?;
-        let files = v.code_files.as_array().cloned().unwrap_or_default();
-        for f in files {
-            let path = f.get("path").and_then(Value::as_str).unwrap_or_default();
-            let (key, file) = self
-                .store
-                .download_source(&org, &found, path)
-                .await
-                .map_err(|e| LaunchError::Transient(format!("storage did not answer: {e}")))?;
-            plan.inputs.push(InputFile {
-                name: format!("{CODE_INPUT}/{path}"),
-                key,
-                sha256: file.sha256,
-                size: file.size,
-                local_path: format!("{CODE_DIR}/{path}"),
-            });
-        }
+        plan.inputs
+            .extend(code_inputs(&store, &org, &v, CODE_INPUT, CODE_DIR).await?);
         Ok(())
     }
 }

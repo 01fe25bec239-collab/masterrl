@@ -3893,6 +3893,17 @@ pub static CATALOG: Value = Value::Map(&[
             ])),
         ]),
         Value::Map(&[
+            ("code", Value::Str("MRL-STATE-292")),
+            ("title", Value::Str("This reward version has nothing to check against yet.")),
+            ("why", Value::Str("A test run needs the version's test cases. A comparison needs an earlier published version of the same reward, with test cases.")),
+            ("what_to_do", Value::Map(&[
+                ("steps", Value::List(&[
+                    Value::Str("To run tests, create a version with test cases."),
+                    Value::Str("To compare, publish an earlier version first. A first version needs no comparison."),
+                ])),
+            ])),
+        ]),
+        Value::Map(&[
             ("code", Value::Str("MRL-STORE-001")),
             ("title", Value::Str("The app refused a storage path.")),
             ("why", Value::Str("The path points outside your workspace's storage area, or it has a part the app doesn't allow, like `..`.")),
