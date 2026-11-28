@@ -29,12 +29,12 @@ use crate::db::{Db, Tx};
 use crate::modules::artifacts::{ArtifactStore, LOCAL_ORG};
 use crate::modules::events::{ConsumerError, Event, EventConsumer};
 use crate::modules::jobs::{scope, CompletionVerifier, JobRow, Rejection, Verification};
-use crate::seams::SeamError;
+use crate::seams::{AuditOutcome, AuditSink, SeamError};
 use async_trait::async_trait;
 use mrl_domain::failure::{FailureClass, FailureCode};
-use mrl_domain::ids::RewardVersionId;
+use mrl_domain::ids::{JobId, ProjectId, RewardVersionId};
 use mrl_domain::state::RewardVersionEvent;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -93,12 +93,7 @@ pub struct CaseResult {
     #[serde(default)]
     pub diagnostics: BTreeMap<String, Value>,
     /// Deterministic components scored the same both times.
-    #[serde(default = "yes")]
     pub repeatable: bool,
-}
-
-fn yes() -> bool {
-    true
 }
 
 /// `report.json`.
@@ -124,6 +119,9 @@ pub struct Report {
     /// How the sandbox ran (profile, user code, …), kept for the record.
     #[serde(default)]
     pub sandbox: Value,
+    /// Bounded preview examples available for the first publication snapshot.
+    #[serde(default)]
+    pub golden_samples: Vec<Value>,
 }
 
 fn matches(want: &Expected, got: f64) -> bool {
@@ -235,8 +233,11 @@ fn read_report(files: &JobFiles, report: &ReportRow) -> Result<Report, String> {
     if raw.len() > MAX_REPORT_BYTES {
         return Err("report.json is larger than 32 MiB".into());
     }
-    let r: Report =
+    let document: Value =
         serde_json::from_slice(raw).map_err(|e| format!("report.json can't be read: {e}"))?;
+    scope::no_nul(&document).map_err(|_| "report.json contains a NUL character".to_owned())?;
+    let r: Report =
+        serde_json::from_value(document).map_err(|e| format!("report.json can't be read: {e}"))?;
     if r.format != REPORT_FORMAT {
         return Err(format!("report.json has format {}", r.format));
     }
@@ -258,6 +259,26 @@ fn read_report(files: &JobFiles, report: &ReportRow) -> Result<Report, String> {
         return Err("the report has no content hash from the sandbox".into());
     }
     Ok(r)
+}
+
+fn check_pins(
+    report: &Report,
+    version: &VersionRow,
+    other: Option<&VersionRow>,
+) -> Result<(), String> {
+    if version
+        .exec_sha256
+        .as_ref()
+        .is_some_and(|pin| pin != &report.content_sha256)
+        || other.is_some_and(|v| {
+            report.other_content_sha256.as_deref().is_none_or(|sha| {
+                !is_sha(sha) || v.exec_sha256.as_deref().is_some_and(|pin| pin != sha)
+            })
+        })
+    {
+        return Err("the reward check scored a different bundle than the pinned version".into());
+    }
+    Ok(())
 }
 
 fn is_sha(s: &str) -> bool {
@@ -286,6 +307,7 @@ fn read_rows(files: &JobFiles) -> Result<Vec<Row>, String> {
 }
 
 /// What the verifier decided for one report.
+#[derive(Serialize, Deserialize)]
 enum Outcome {
     Test {
         cases: Vec<(i32, Value, bool)>,
@@ -293,6 +315,10 @@ enum Outcome {
         exec: String,
     },
     Results(Value),
+    Preview {
+        results: Value,
+        golden_samples: Vec<Value>,
+    },
     Regression(Value),
 }
 
@@ -327,9 +353,21 @@ fn evaluate(
         "preview" => {
             let rows = read_rows(files)?;
             let a: Vec<&Row> = rows.iter().collect();
-            Ok(Outcome::Results(
-                json!({"summary": stats::summarize(&a, warn_share)}),
-            ))
+            if r.golden_samples.len() > 16
+                || serde_json::to_vec(&r.golden_samples)
+                    .map_err(|e| e.to_string())?
+                    .len()
+                    > (128 << 10) + 64
+                || r.golden_samples.iter().any(|sample| {
+                    !sample["prompt"].is_string() || !sample["completion"].is_string()
+                })
+            {
+                return Err("the frozen preview samples are invalid".into());
+            }
+            Ok(Outcome::Preview {
+                results: json!({"summary": stats::summarize(&a, warn_share)}),
+                golden_samples: r.golden_samples,
+            })
         }
         "compare" => {
             let rows = read_rows(files)?;
@@ -510,68 +548,52 @@ impl ReportVerifier {
         let version = store::version(&self.db, report.version_id).await?;
         let cases = store::cases(&self.db, report.version_id).await?;
         let baseline = match report.other_version_id {
-            Some(o) if report.mode == "regression" => store::cases(&self.db, o).await?,
+            Some(o) if report.mode == "regression" => store::regression_cases(&self.db, o).await?,
             _ => Vec::new(),
         };
-        let outcome = match version {
-            None => Err("the reward version is gone".to_owned()),
-            Some(_) => evaluate(&report, &files, &cases, &baseline, self.warn_share()),
+        let other = match report.other_version_id {
+            Some(id) => store::version(&self.db, id).await?,
+            None => None,
         };
-        let artifact = Some(files.artifact_id);
+        let outcome = (|| {
+            let version = version.as_ref().ok_or("the reward version is gone")?;
+            let result = read_report(&files, &report)?;
+            check_pins(&result, version, other.as_ref())?;
+            evaluate(&report, &files, &cases, &baseline, self.warn_share())
+        })();
         let mut tx = self.db.begin().await?;
+        let Some(current) =
+            crate::modules::jobs::JobTransitions::lock(&mut tx, job.org_id, job.id).await?
+        else {
+            return Ok(Verification::Abstain);
+        };
+        if current.state_version != job.state_version || current.state != "FINALIZING" {
+            return Err(seam("the reward check's job changed during verification").into());
+        }
         let Some(locked) = store::lock_report_for_job(&mut tx, job.id).await? else {
             return Ok(Verification::Abstain);
         };
         if locked.state != "PENDING" {
-            // Settled by an earlier pass (a replay after a crash): same answer again.
             return Ok(if locked.state == "READY" {
                 Verification::Verified
             } else {
                 Verification::Failed(invalid(locked.reason.as_deref().unwrap_or("")))
             });
         }
-        let verdict = match outcome {
-            Ok(Outcome::Test {
-                cases,
-                summary,
-                exec,
-            }) => {
-                if let Some(v) = store::lock_version(&mut tx, report.version_id).await? {
-                    test_result(&mut tx, &v, job.id, &cases, &summary, &exec).await?;
-                }
-                store::settle_report(&mut tx, report.id, Ok(summary), artifact).await?;
-                Verification::Verified
-            }
-            Ok(Outcome::Results(results)) => {
-                store::settle_report(&mut tx, report.id, Ok(results), artifact).await?;
-                Verification::Verified
-            }
-            Ok(Outcome::Regression(results)) => {
-                if let Some(v) = store::lock_version(&mut tx, report.version_id).await? {
-                    if matches!(v.state.as_str(), "DRAFT" | "TESTING" | "FAILED_TESTS") {
-                        sqlx::query("UPDATE reward_versions SET regression = $2 WHERE id = $1")
-                            .bind(v.id)
-                            .bind(&results)
-                            .execute(&mut *tx)
-                            .await?;
-                    }
-                }
-                store::settle_report(&mut tx, report.id, Ok(results), artifact).await?;
-                Verification::Verified
-            }
-            Err(why) => {
-                if report.mode == "test" {
-                    if let Some(v) = store::lock_version(&mut tx, report.version_id).await? {
-                        let summary = json!({"passed": false, "error": why});
-                        test_result(&mut tx, &v, job.id, &[], &summary, "").await?;
-                    }
-                }
-                store::settle_report(&mut tx, report.id, Err(why.clone()), artifact).await?;
-                Verification::Failed(invalid(&why))
-            }
-        };
+        let prepared = serde_json::to_value(&outcome).map_err(seam)?;
+        sqlx::query(
+            "UPDATE reward_reports SET prepared_result = $2, prepared_artifact_id = $3 WHERE id = $1",
+        )
+        .bind(report.id)
+        .bind(prepared)
+        .bind(files.artifact_id)
+        .execute(&mut *tx)
+        .await?;
         tx.commit().await.map_err(crate::db::DbError::from)?;
-        Ok(verdict)
+        Ok(match outcome {
+            Ok(_) => Verification::Verified,
+            Err(why) => Verification::Failed(invalid(&why)),
+        })
     }
 }
 
@@ -640,9 +662,15 @@ impl CompletionVerifier for ReportVerifier {
     }
 }
 
-/// Event consumer: a REWARD_PREVIEW job that ended without its report settles the record
-/// INVALID, and a test run's version goes to FAILED_TESTS (so it can be tested again).
-pub struct EndedEarly;
+/// Settles a reward report after the check has reached a terminal job state.
+pub struct EndedEarly(Db);
+
+impl EndedEarly {
+    /// Uses the core's audit database.
+    pub fn new(db: Db) -> Self {
+        Self(db)
+    }
+}
 
 #[async_trait]
 impl EventConsumer for EndedEarly {
@@ -651,7 +679,10 @@ impl EventConsumer for EndedEarly {
     }
 
     fn accepts(&self, t: &str) -> bool {
-        matches!(t, "job.failed" | "job.cancelled" | "job.rejected")
+        matches!(
+            t,
+            "job.completed" | "job.failed" | "job.cancelled" | "job.rejected"
+        )
     }
 
     async fn handle(&self, tx: &mut Tx, event: &Event) -> Result<(), ConsumerError> {
@@ -661,18 +692,99 @@ impl EventConsumer for EndedEarly {
         if report.state != "PENDING" {
             return Ok(());
         }
-        let why = match event.event_type.as_str() {
-            "job.cancelled" => "the check was cancelled before it finished",
-            "job.rejected" => "the check could not be started",
-            _ => "the check stopped before it wrote its report",
-        };
-        if report.mode == "test" {
-            if let Some(v) = store::lock_version(tx, report.version_id).await? {
-                let summary = json!({"passed": false, "error": why});
-                test_result(tx, &v, event.aggregate_id, &[], &summary, "").await?;
+        let (prepared, artifact): (Option<Value>, Option<Uuid>) = sqlx::query_as(
+            "SELECT prepared_result, prepared_artifact_id FROM reward_reports WHERE id = $1",
+        )
+        .bind(report.id)
+        .fetch_one(&mut **tx)
+        .await?;
+        let staged: Option<Result<Outcome, String>> =
+            prepared.map(serde_json::from_value).transpose()?;
+        let (result, artifact) = match event.event_type.as_str() {
+            "job.completed" => {
+                let outcome =
+                    staged.ok_or("completed reward check is missing verification evidence")??;
+                let result = match outcome {
+                    Outcome::Test {
+                        cases,
+                        summary,
+                        exec,
+                    } => {
+                        if let Some(v) = store::lock_version(tx, report.version_id).await? {
+                            test_result(tx, &v, event.aggregate_id, &cases, &summary, &exec)
+                                .await?;
+                        }
+                        summary
+                    }
+                    Outcome::Results(results) => results,
+                    Outcome::Preview {
+                        results,
+                        golden_samples,
+                    } => {
+                        sqlx::query("UPDATE reward_reports SET golden_samples = $2 WHERE id = $1")
+                            .bind(report.id)
+                            .bind(json!(golden_samples))
+                            .execute(&mut **tx)
+                            .await?;
+                        results
+                    }
+                    Outcome::Regression(results) => {
+                        let definition: Uuid = sqlx::query_scalar(
+                            "SELECT reward_id FROM reward_versions WHERE id = $1",
+                        )
+                        .bind(report.version_id)
+                        .fetch_one(&mut **tx)
+                        .await?;
+                        store::lock_definition(tx, definition).await?;
+                        if let Some(v) = store::lock_version(tx, report.version_id).await? {
+                            let baseline = store::latest_published(tx, v.reward_id, v.id).await?;
+                            if matches!(v.state.as_str(), "DRAFT" | "TESTING" | "FAILED_TESTS")
+                                && baseline.map(|b| b.id) == report.other_version_id
+                            {
+                                sqlx::query(
+                                    "UPDATE reward_versions SET regression = $2 WHERE id = $1",
+                                )
+                                .bind(v.id)
+                                .bind(&results)
+                                .execute(&mut **tx)
+                                .await?;
+                            }
+                        }
+                        results
+                    }
+                };
+                (Ok(result), artifact)
             }
-        }
-        store::settle_report(tx, report.id, Err(why.to_owned()), None).await?;
+            terminal => {
+                let why = match (terminal, staged) {
+                    ("job.cancelled", _) => "the check was cancelled before it finished".into(),
+                    ("job.rejected", _) => "the check could not be started".into(),
+                    (_, Some(Err(why))) => why,
+                    _ => "the check stopped before it wrote its report".into(),
+                };
+                if report.mode == "test" {
+                    if let Some(v) = store::lock_version(tx, report.version_id).await? {
+                        let summary = json!({"passed": false, "error": why});
+                        test_result(tx, &v, event.aggregate_id, &[], &summary, "").await?;
+                    }
+                }
+                (Err(why), None)
+            }
+        };
+        store::settle_report(tx, report.id, result, artifact).await?;
+        let mut audit = crate::modules::audit::event(
+            event.created_at,
+            "system:rewards",
+            scope::org_text(report.org_id).as_deref(),
+            "rewards.report_settled",
+            &JobId::from_uuid(event.aggregate_id).to_string(),
+            AuditOutcome::Success,
+            "",
+        );
+        audit.project = Some(ProjectId::from_uuid(report.project_id).to_string());
+        crate::modules::audit::PgAuditSink::new(self.0.clone())
+            .record_in(tx, audit)
+            .await?;
         Ok(())
     }
 }
@@ -805,15 +917,5 @@ mod tests {
             .err()
             .unwrap();
         assert!(why.contains("changed in storage"), "{why}");
-    }
-
-    #[test]
-    fn only_jobs_that_ended_without_finishing_reach_the_ended_early_consumer() {
-        for t in ["job.failed", "job.cancelled", "job.rejected"] {
-            assert!(EndedEarly.accepts(t), "{t}");
-        }
-        for t in ["job.completed", "job.finished", "job.queued"] {
-            assert!(!EndedEarly.accepts(t), "{t}");
-        }
     }
 }

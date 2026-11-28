@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
 
 /// Format tag of the hash inputs (bumped if their meaning changes).
-pub const CONTENT_FORMAT: &str = "mrl-reward-content/1";
+pub const CONTENT_FORMAT: &str = "mrl-reward-content/2";
 
 /// The bundle line format the executor hashes code files with (P14's `mrl-reward-bundle/1`).
 pub const BUNDLE_FILE_LINE: &str = "file";
@@ -36,6 +36,8 @@ pub struct HashInputs {
     pub sdk_contract: String,
     /// The policy document.
     pub policy: Value,
+    /// The cases whose results determine whether this version can publish.
+    pub test_cases: Value,
     /// Every distinct component reference, sorted.
     pub components: Vec<ComponentDigest>,
     /// The code bundle, if any.
@@ -94,7 +96,17 @@ fn write_value(out: &mut String, v: &Value) {
     match v {
         Value::Null => out.push_str("null"),
         Value::Bool(b) => out.push_str(if *b { "true" } else { "false" }),
-        Value::Number(n) => out.push_str(&number(n.as_f64().unwrap_or(0.0))),
+        Value::Number(n) => {
+            const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+            if n.as_u64().is_some_and(|i| i > MAX_SAFE_INTEGER)
+                || n.as_i64()
+                    .is_some_and(|i| i.unsigned_abs() > MAX_SAFE_INTEGER)
+            {
+                out.push_str(&n.to_string());
+            } else {
+                out.push_str(&number(n.as_f64().unwrap_or(0.0)));
+            }
+        }
         Value::String(s) => write_string(out, s),
         Value::Array(items) => {
             out.push('[');
@@ -225,6 +237,7 @@ mod tests {
             format: CONTENT_FORMAT.into(),
             sdk_contract: "mrl-rewards/1".into(),
             policy,
+            test_cases: json!([]),
             components: vec![ComponentDigest {
                 reference: "builtin/math.verify@1".into(),
                 code_sha256: "a".repeat(64),
@@ -255,7 +268,10 @@ mod tests {
         bundle.code_bundle_sha256 = Some("c".repeat(64));
         let mut policy = a.clone();
         policy.policy["spec"]["w"] = json!(2.0);
+        let mut cases = a.clone();
+        cases.test_cases = json!([{"name": "case"}]);
         for (what, changed) in [
+            ("test cases", cases),
             ("code digest", code),
             ("executor env", env),
             ("model ref", model),
@@ -268,6 +284,13 @@ mod tests {
                 "{what} must change the hash"
             );
         }
+    }
+
+    #[test]
+    fn distinguishes_large_integer_parameters() {
+        let a = inputs(json!({"n": 9_007_199_254_740_992u64}));
+        let b = inputs(json!({"n": 9_007_199_254_740_993u64}));
+        assert_ne!(a.content_sha256(), b.content_sha256());
     }
 
     #[test]

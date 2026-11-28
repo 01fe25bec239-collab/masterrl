@@ -28,6 +28,7 @@ use crate::sandbox::{SandboxBackend, SandboxProfile};
 pub const NAME: &str = "reward";
 /// Restarts after crashes before the attempt fails REWARD_INFRA.
 pub const MAX_RESTARTS: u32 = 3;
+const STARTUP_LIMIT: Duration = Duration::from_secs(60);
 /// Socket file inside the socket folder.
 pub const SOCKET_FILE: &str = "reward.sock";
 
@@ -219,6 +220,12 @@ pub async fn supervise_with(
     backoff: Duration,
     mut on_event: impl FnMut(Event) + Send,
 ) -> Result<Outcome, ProfileError> {
+    let support = executor.limit_support();
+    if (launch.user_code || launch.tier2) && !(support.cpu && support.memory && support.pids) {
+        return Err(ProfileError::UserCodeRefused(
+            "the reward sandbox needs CPU, memory and process limits".into(),
+        ));
+    }
     let mut crashes = 0u32;
     loop {
         // The socket of a crashed run is removed so the next one can bind it.
@@ -226,18 +233,37 @@ pub async fn supervise_with(
         let spec = spec(backend, launch)?;
         let mut run = executor.spawn(spec).await?;
         on_event(Event::Started(crashes));
+        let socket = launch.socket();
+        let ready = async {
+            while !socket.exists() {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
         let report = tokio::select! {
-            r = run.wait() => r?,
+            r = run.wait() => Some(r?),
             () = cancel.cancelled() => {
                 run.stop(Duration::from_secs(5)).await?;
                 return Ok(Outcome::Stopped);
             }
+            () = ready => tokio::select! {
+                r = run.wait() => Some(r?),
+                () = cancel.cancelled() => {
+                    run.stop(Duration::from_secs(5)).await?;
+                    return Ok(Outcome::Stopped);
+                }
+            },
+            () = tokio::time::sleep(STARTUP_LIMIT) => {
+                run.kill().await?;
+                run.wait().await?;
+                None
+            }
         };
-        let why = match classify(&report) {
-            Ending::Violation(why) => return Ok(Outcome::Violation(why)),
-            Ending::Ok => "it stopped on its own".to_owned(),
-            Ending::OutOfMemory => "it ran out of memory".to_owned(),
-            Ending::Failed(why) => why,
+        let why = match report.as_ref().map(classify) {
+            Some(Ending::Violation(why)) => return Ok(Outcome::Violation(why)),
+            Some(Ending::Ok) => "it stopped on its own".to_owned(),
+            Some(Ending::OutOfMemory) => "it ran out of memory".to_owned(),
+            Some(Ending::Failed(why)) => why,
+            None => "it did not open its socket before the startup deadline".to_owned(),
         };
         crashes += 1;
         if crashes > MAX_RESTARTS {

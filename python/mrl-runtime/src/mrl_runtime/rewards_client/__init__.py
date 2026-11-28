@@ -46,7 +46,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, cast
 
@@ -61,6 +61,9 @@ HASH_MISMATCH = "MRL-RWD-292"
 REWARD_INFRA = "MRL-RWD-293"
 MAX_DIAGNOSTICS_BYTES = 4096
 MAX_FLAGS = 16
+_BATCH_SCOPE = "mrl-batch-scope"
+_NORMALIZER_STATE = "mrl-normalizer-state-bin"
+_MAX_STATE_BYTES = 6000
 _RETRYABLE = frozenset(
     {
         grpc.StatusCode.FAILED_PRECONDITION,
@@ -130,6 +133,7 @@ class RewardDescription:
     components: tuple[ComponentDescription, ...]
     max_batch: int
     max_tier: int
+    batch_scope: str = ""
 
 
 @dataclass(frozen=True)
@@ -143,6 +147,8 @@ class RewardOutcome:
     statuses: Mapping[str, str]
     diagnostics: Mapping[str, Mapping[str, str]]
     flags: tuple[str, ...]
+    chunk_index: int | None = None
+    latency_ms: float | None = None
 
     @property
     def masked(self) -> bool:
@@ -185,6 +191,7 @@ class _Running:
 class _State:
     batches: int = 0
     components: dict[str, _Running] = field(default_factory=dict[str, _Running])
+    normalizer: str = "{}"
 
 
 def _channel(socket: str) -> grpc.Channel:
@@ -246,6 +253,7 @@ class RewardClient:
         )
         self._state = _State()
         self._lock = threading.Lock()
+        self._normalizer_lock = threading.Lock()
         self.description: RewardDescription | None = None
 
     # ---- lifecycle ----
@@ -258,6 +266,7 @@ class RewardClient:
         with self._lock:
             return {
                 "batches": self._state.batches,
+                "normalizer": json.loads(self._state.normalizer),
                 "components": {
                     k: {"n": r.n, "mean": r.mean, "m2": r.m2}
                     for k, r in self._state.components.items()
@@ -269,6 +278,9 @@ class RewardClient:
         with self._lock:
             self._state = _State(
                 batches=int(state.get("batches", 0)),
+                normalizer=json.dumps(
+                    state.get("normalizer", {}), separators=(",", ":"), allow_nan=False
+                ),
                 components={
                     k: _Running(
                         int(v.get("n", 0)), float(v.get("mean", 0.0)), float(v.get("m2", 0.0))
@@ -282,12 +294,13 @@ class RewardClient:
     def describe(self) -> RewardDescription:
         """Asks the service what it loaded and checks it against the pinned hash."""
         try:
-            r = cast(
-                "pb.DescribeResponse",
-                self._stub.Describe(
+            response, call = cast(
+                "tuple[pb.DescribeResponse, grpc.Call]",
+                self._stub.Describe.with_call(
                     pb.DescribeRequest(attempt_nonce=self._nonce), timeout=self.timeout_s
                 ),
             )
+            r = response
         except grpc.RpcError as e:
             raise RewardInfraError(
                 REWARD_INFRA, f"The reward service didn't describe itself: {_rpc(e)}"
@@ -324,6 +337,7 @@ class RewardClient:
             comps,
             int(r.max_batch),
             int(r.max_tier),
+            str(_trailer(call, _BATCH_SCOPE) or ""),
         )
         return self.description
 
@@ -331,16 +345,30 @@ class RewardClient:
 
     def score(self, samples: Sequence[Sample], *, trainer_step: int = 0) -> list[RewardOutcome]:
         """One outcome per sample, in order."""
-        desc = self.description or self.describe()
+        desc = self.describe() if self.expected or self.description is None else self.description
         with self._lock:
             batch_no = self._state.batches
             self._state.batches += 1
         ids = [f"{batch_no}:{i}" for i in range(len(samples))]
         size = desc.max_batch
-        chunks = [
-            (k, list(range(s, min(s + size, len(samples)))))
-            for k, s in enumerate(range(0, len(samples), size))
-        ]
+        if desc.batch_scope and len(samples) > size:
+            raise RewardClientError(
+                UNTRUSTED_ANSWER,
+                f"This reward normalizes the whole batch. Send at most {size} samples.",
+            )
+        groups: dict[str | int, list[int]] = {}
+        for index, sample in enumerate(samples):
+            groups.setdefault(sample.group_id or index, []).append(index)
+        chunks: list[list[int]] = []
+        for group in groups.values():
+            if len(group) > size:
+                raise RewardClientError(
+                    UNTRUSTED_ANSWER,
+                    f"A reward group has {len(group)} samples, above the service limit of {size}.",
+                )
+            if not chunks or len(chunks[-1]) + len(group) > size:
+                chunks.append([])
+            chunks[-1].extend(group)
         start = time.monotonic()
         futures = [
             self._pool.submit(
@@ -352,14 +380,19 @@ class RewardClient:
                 [ids[i] for i in idx],
                 trainer_step,
             )
-            for k, idx in chunks
+            for k, idx in enumerate(chunks)
         ]
-        out: list[RewardOutcome] = []
+        ordered: list[tuple[int, RewardOutcome]] = []
         latencies: list[float] = []
-        for f in futures:
-            got, latency = f.result()
-            out.extend(got)
+        for chunk_index, (indices, future) in enumerate(zip(chunks, futures, strict=True)):
+            got, latency = future.result()
+            ordered.extend(
+                (index, replace(outcome, chunk_index=chunk_index, latency_ms=latency))
+                for index, outcome in zip(indices, got, strict=True)
+            )
             latencies.append(latency)
+        ordered.sort(key=lambda pair: pair[0])
+        out = [outcome for _, outcome in ordered]
         self._observe(desc, samples, out, latencies, time.monotonic() - start)
         return out
 
@@ -384,7 +417,7 @@ class RewardClient:
             samples=[
                 pb.Sample(
                     sample_id=sid,
-                    group_id=s.group_id,
+                    group_id=s.group_id or sid,
                     prompt=s.prompt,
                     completion=s.completion,
                     completion_token_count=max(0, s.completion_token_count),
@@ -396,11 +429,42 @@ class RewardClient:
                 for s, sid in zip(samples, ids, strict=True)
             ],
         )
+        if desc.batch_scope == "running":
+            with self._normalizer_lock:
+                return self._score_rpc(desc, ids, req)
+        return self._score_rpc(desc, ids, req)
+
+    def _score_rpc(
+        self, desc: RewardDescription, ids: Sequence[str], req: pb.ScoreRequest
+    ) -> tuple[list[RewardOutcome], float]:
+        running = desc.batch_scope == "running"
+        metadata = ((_NORMALIZER_STATE, self._state.normalizer.encode()),) if running else ()
         for attempt in (0, 1):
             t0 = time.monotonic()
             try:
-                resp = cast("pb.ScoreResponse", self._stub.Score(req, timeout=self.timeout_s))
-                return check_response(desc, ids, resp), (time.monotonic() - t0) * 1000
+                resp, call = cast(
+                    "tuple[pb.ScoreResponse, grpc.Call]",
+                    self._stub.Score.with_call(req, timeout=self.timeout_s, metadata=metadata),
+                )
+                elapsed = (time.monotonic() - t0) * 1000
+                scores = check_response(desc, ids, resp)
+                if running:
+                    raw = _trailer(call, _NORMALIZER_STATE)
+                    if not isinstance(raw, bytes) or len(raw) > _MAX_STATE_BYTES:
+                        raise RewardClientError(
+                            UNTRUSTED_ANSWER, "The reward sent no valid checkpoint."
+                        )
+                    try:
+                        checkpoint = json.dumps(
+                            json.loads(raw), separators=(",", ":"), allow_nan=False
+                        )
+                    except (ValueError, UnicodeError) as e:
+                        raise RewardClientError(
+                            UNTRUSTED_ANSWER, "The reward checkpoint is invalid."
+                        ) from e
+                    with self._lock:
+                        self._state.normalizer = checkpoint
+                return scores, elapsed
             except grpc.RpcError as e:
                 code = cast("grpc.Call", e).code() if isinstance(e, grpc.Call) else None
                 if code not in _RETRYABLE or attempt == 1:
@@ -408,6 +472,10 @@ class RewardClient:
                         REWARD_INFRA, f"The reward service failed a batch twice: {_rpc(e)}"
                     ) from e
                 self._wait_healthy()
+                if self.describe() != desc:
+                    raise RewardHashMismatchError(
+                        HASH_MISMATCH, "The reward service changed while scoring a batch."
+                    ) from e
         raise RewardInfraError(REWARD_INFRA, "The reward service failed a batch twice.")
 
     def _wait_healthy(self) -> None:
@@ -463,6 +531,10 @@ class RewardClient:
             self.emit(m)
 
 
+def _trailer(call: grpc.Call, name: str) -> str | bytes | None:
+    return next((value for key, value in call.trailing_metadata() or () if key == name), None)
+
+
 def _p95(values: Sequence[float]) -> float:
     if not values:
         return 0.0
@@ -489,7 +561,7 @@ def _invalid(sample_id: str, why: str) -> RewardOutcome:
     )
 
 
-def check_response(  # noqa: PLR0912 (one check per untrusted field)
+def check_response(  # noqa: PLR0912, PLR0915 (one check per untrusted field)
     desc: RewardDescription, ids: Sequence[str], resp: pb.ScoreResponse
 ) -> list[RewardOutcome]:
     """Turns an untrusted reply into outcomes: anything that doesn't hold makes the sample
@@ -517,7 +589,12 @@ def check_response(  # noqa: PLR0912 (one check per untrusted field)
             if value is not None and (not _is_number(value) or not lo <= value <= hi):
                 problem = f"component {c.component_id} value outside [{lo}, {hi}]"
                 break
-            diag_bytes += sum(len(k) + len(v) for k, v in c.diagnostics.items())
+            if c.status not in _STATUS_NAMES or (c.status == pb.SCORE_STATUS_OK) != (
+                value is not None
+            ):
+                problem = f"component {c.component_id} sent an inconsistent status"
+                break
+            diag_bytes += sum(len(k.encode()) + len(v.encode()) for k, v in c.diagnostics.items())
             if diag_bytes > MAX_DIAGNOSTICS_BYTES or len(c.flags) > MAX_FLAGS:
                 problem = f"component {c.component_id} sent oversized diagnostics"
                 break
@@ -526,8 +603,13 @@ def check_response(  # noqa: PLR0912 (one check per untrusted field)
             diags[c.component_id] = dict(c.diagnostics)
         resolution = _RESOLUTION_NAMES.get(s.resolution, "")
         total = s.total if s.HasField("total") else None
+        status = _STATUS_NAMES.get(s.status)
         if not problem:
-            if not resolution:
+            if len(comps) != len(bounds):
+                problem = "the reply is missing component results"
+            elif status is None or (status == "OK") != (resolution == "SCORED"):
+                problem = "the reply has an inconsistent sample status"
+            elif not resolution:
                 problem = "the reply has no resolution"
             elif total is not None and not _is_number(total):
                 problem = "the total is not a finite number"
@@ -538,7 +620,14 @@ def check_response(  # noqa: PLR0912 (one check per untrusted field)
         if problem:
             out.append(_invalid(sid, problem))
             continue
-        out.append(RewardOutcome(sid, total, resolution, comps, statuses, diags, tuple(s.flags)))
+        if status in _FAILED and status not in statuses.values():
+            statuses["_response"] = status
+        flags = tuple(s.flags)
+        if "sandbox_violation" not in flags and any(
+            "sandbox_violation" in c.flags for c in s.components
+        ):
+            flags += ("sandbox_violation",)
+        out.append(RewardOutcome(sid, total, resolution, comps, statuses, diags, flags))
     return out
 
 

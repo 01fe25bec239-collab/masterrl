@@ -33,6 +33,9 @@ def build() -> str:
         "version": project["version"],
         "dependencies": sorted(project.get("dependencies", [])),
         "components_digest": reg.digest(),
+        "lock_sha256": hashlib.sha256(
+            (ROOT / "python/builtin-env/uv.lock").read_bytes()
+        ).hexdigest(),
     }
     canonical = json.dumps(executor, sort_keys=True, separators=(",", ":")).encode()
     rows = []

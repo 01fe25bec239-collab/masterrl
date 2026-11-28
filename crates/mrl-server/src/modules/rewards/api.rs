@@ -25,10 +25,10 @@ use crate::error::{ApiError, ErrorCode, FieldError};
 use crate::http::pagination::{Page, PageQuery};
 use crate::modules::artifacts::ArtifactStore;
 use crate::modules::jobs::{scope, JobsError, Projects};
-use crate::seams::{Decision, RequestContext, Resource};
+use crate::seams::{RequestContext, Resource};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Extension, Json, Router};
@@ -481,6 +481,37 @@ pub(super) async fn read_version(
     Ok(v)
 }
 
+/// Gets an artifact after applying the shared authorization response and project scope.
+pub(super) async fn project_artifact(
+    state: &AppState,
+    ctx: &RequestContext,
+    c: &Ctx,
+    (org, project): (Uuid, Uuid),
+    id: ArtifactId,
+) -> Result<crate::modules::artifacts::Artifact, RewardsError> {
+    let org_id = scope::org_text(org);
+    let storage_org = org_id
+        .as_deref()
+        .unwrap_or(crate::modules::artifacts::LOCAL_ORG);
+    let artifact = c
+        .store
+        .get(storage_org, id.as_uuid())
+        .await
+        .map_err(|e| RewardsError::from(crate::seams::SeamError::new("artifacts", e.to_string())))?
+        .ok_or_else(|| JobsError::not_found("artifact"))?;
+    let mut resource = artifact.resource(storage_org);
+    resource.org = org_id;
+    if artifact
+        .project_id
+        .as_deref()
+        .is_some_and(|p| p != ProjectId::from_uuid(project).to_string())
+    {
+        return Err(JobsError::not_found("artifact").into());
+    }
+    scope::authorize(state, ctx, "lineage.read", &resource).await?;
+    Ok(artifact)
+}
+
 /// Checks the code bundle artifact the caller names: visible to them (P19's `lineage.read`
 /// on it), committed, in the same project (or org-wide), and only top-level `.py` files plus
 /// `components.yaml`, within the size limits. Returns `(id, bundle hash, files)`.
@@ -503,35 +534,12 @@ async fn code_bundle(
     let id: ArtifactId = raw
         .parse()
         .map_err(|_| field("This is not an artifact id (art_…).".into()))?;
-    let store = &c.store;
-    let org_text =
-        scope::org_text(org).unwrap_or_else(|| crate::modules::artifacts::LOCAL_ORG.to_owned());
-    let found = store.get(&org_text, id.as_uuid()).await.map_err(|e| {
-        RewardsError::from(crate::seams::SeamError::new("artifacts", e.to_string()))
-    })?;
-    let visible = match &found {
-        Some(a) => {
-            state
-                .seams
-                .authorizer
-                .authorize(ctx, "lineage.read", &a.resource(&org_text))
-                .await?
-                == Decision::Allow
-        }
-        None => false,
-    };
-    let Some(a) = found.filter(|_| visible) else {
-        return Err(field("No artifact with this id exists.".into()));
-    };
+    let a = project_artifact(state, ctx, c, (org, project), id).await?;
     if a.state != "COMMITTED" {
         return Err(field(format!(
             "The artifact is {}; use a committed one.",
             a.state
         )));
-    }
-    let own_project = ProjectId::from_uuid(project).to_string();
-    if a.project_id.as_deref().is_some_and(|p| p != own_project) {
-        return Err(field("The artifact belongs to another project.".into()));
     }
     let files = a
         .manifest
@@ -620,6 +628,8 @@ async fn new_version(
         format: CONTENT_FORMAT.into(),
         sdk_contract: c.catalog.sdk_contract.clone(),
         policy: b.policy.clone(),
+        test_cases: serde_json::to_value(&cases)
+            .map_err(|e| bad_body(format!("The test cases could not be saved: {e}.")))?,
         components: checked.components.clone(),
         code_bundle_sha256: code.as_ref().map(|(_, h, _)| h.clone()),
         executor_sha256: c.catalog.executor_sha256.clone(),
@@ -855,6 +865,7 @@ async fn version_action(
     Extension(c): Extension<Ctx>,
     ctx: RequestContext,
     Path(seg): Path<String>,
+    headers: HeaderMap,
     raw: Bytes,
 ) -> Result<Response, RewardsError> {
     use super::check_api as checks;
@@ -866,10 +877,12 @@ async fn version_action(
         Some((id, "deprecate")) => Ok(deprecate_version(s, e, ctx, Path(id.to_owned()))
             .await?
             .into_response()),
-        Some((id, "test")) => checks::test_version(s, e, ctx, Path(id.to_owned())).await,
-        Some((id, "preview")) => checks::preview_version(s, e, ctx, Path(id.to_owned()), raw).await,
+        Some((id, "test")) => checks::test_version(s, e, ctx, headers, Path(id.to_owned())).await,
+        Some((id, "preview")) => {
+            checks::preview_version(s, e, ctx, headers, Path(id.to_owned()), raw).await
+        }
         Some((id, "regression")) => {
-            checks::regression_version(s, e, ctx, Path(id.to_owned())).await
+            checks::regression_version(s, e, ctx, headers, Path(id.to_owned())).await
         }
         _ => Err(ApiError::new(ErrorCode::RouteNotFound, "No endpoint has this path.").into()),
     }
@@ -910,6 +923,7 @@ async fn publish_version(
             blockers.join(" "),
         ));
     }
+    store::freeze_golden_samples(&mut tx, &v).await?;
     let v = store::step(&mut tx, &v, RewardVersionEvent::Publish, json!({})).await?;
     scope::audit(
         &mut tx,

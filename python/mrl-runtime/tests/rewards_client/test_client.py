@@ -3,6 +3,7 @@ against a hostile fake service."""
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 import sys
@@ -19,6 +20,7 @@ from mrl_rewards.exec.server import ExecLimits
 from mrl_rewards.exec.testkit import start_local
 from mrl_runtime._generated.mrl.reward.v1 import reward_service_pb2 as pb
 from mrl_runtime._generated.mrl.reward.v1 import reward_service_pb2_grpc as pb_grpc
+from mrl_runtime.builtin.reward_preview import Service
 from mrl_runtime.rewards_client import (
     ComponentDescription,
     RewardClient,
@@ -193,7 +195,12 @@ class Hostile:
             comp = pb.ComponentScore(component_id="c", status=pb.SCORE_STATUS_OK)
             if value is not None:
                 comp.value = value
-            s = pb.SampleScore(sample_id=sid, components=[comp], resolution=pb.RESOLUTION_SCORED)
+            s = pb.SampleScore(
+                sample_id=sid,
+                components=[comp],
+                resolution=pb.RESOLUTION_SCORED,
+                status=pb.SCORE_STATUS_OK,
+            )
             if total is not None:
                 s.total = total
             return s
@@ -203,6 +210,18 @@ class Hostile:
                 return pb.ScoreResponse(scores=[score(i) for i in ids[:-1]])
             case "reordered":
                 return pb.ScoreResponse(scores=[score(i) for i in reversed(ids)])
+            case "missing":
+                return pb.ScoreResponse(
+                    scores=[
+                        pb.SampleScore(
+                            sample_id=i,
+                            total=0.5,
+                            status=pb.SCORE_STATUS_OK,
+                            resolution=pb.RESOLUTION_SCORED,
+                        )
+                        for i in ids
+                    ]
+                )
             case "garbage":
                 return pb.ScoreResponse(
                     scores=[
@@ -228,7 +247,7 @@ def hostile(sock_dir: Path) -> Iterator[tuple[Hostile, Path]]:
     server.stop(None)
 
 
-@pytest.mark.parametrize("mode", ["short", "reordered", "garbage"])
+@pytest.mark.parametrize("mode", ["short", "reordered", "garbage", "missing"])
 def test_untrusted_answers_become_invalid_output_never_a_crash(
     hostile: tuple[Hostile, Path], mode: str
 ) -> None:
@@ -264,12 +283,14 @@ def test_check_response_accepts_masks_and_fallbacks() -> None:
     )
     masked = pb.SampleScore(
         sample_id="0:0",
+        status=pb.SCORE_STATUS_TIMEOUT,
         resolution=pb.RESOLUTION_MASKED,
         components=[pb.ComponentScore(component_id="c", status=pb.SCORE_STATUS_TIMEOUT)],
     )
     fallback = pb.SampleScore(
         sample_id="0:1",
         total=-1.0,
+        status=pb.SCORE_STATUS_ERROR,
         resolution=pb.RESOLUTION_FALLBACK_APPLIED,
         components=[pb.ComponentScore(component_id="c", status=pb.SCORE_STATUS_ERROR)],
     )
@@ -279,3 +300,43 @@ def test_check_response_accepts_masks_and_fallbacks() -> None:
     assert out[1].value == -1.0
     assert out[1].resolution == "FALLBACK_APPLIED"
     assert out[1].failed
+
+
+def test_running_normalizer_scores_match_after_service_restart(sock_dir: Path) -> None:
+    policy = copy.deepcopy(POLICY)
+    policy["spec"]["normalization"] = {"final": "zscore_running"}
+    reward = {"version_id": "rwdv_test", "policy": policy}
+    a = Service(sock_dir, {}, reward, "reward")
+    correct, incorrect = samples(2)
+    try:
+        a.start()
+        a.client.score([correct])
+        checkpoint = a.client.state_dict()
+        uninterrupted = a.client.score([incorrect])[0].value
+        assert uninterrupted == pytest.approx(-0.70710678)
+    finally:
+        a.close()
+    b = Service(sock_dir, {}, reward, "reward")
+    try:
+        b.start()
+        b.client.load_state_dict(checkpoint)
+        assert b.client.score([incorrect])[0].value == uninterrupted
+    finally:
+        b.close()
+
+
+def test_group_members_stay_together_and_results_keep_input_order(
+    real: Any, sock_dir: Path
+) -> None:
+    c = client(sock_dir / "r.sock")
+    try:
+        good, bad = samples(2)
+        separate = Sample("1+1?", "<answer>2</answer>", group_id="b", reference="2")
+        result = c.score([good, separate, bad])
+        assert [row.value for row in result] == [1.0, 1.0, 0.0]
+        assert result[0].chunk_index == result[2].chunk_index
+        assert result[0].chunk_index != result[1].chunk_index
+        with pytest.raises(RewardClientError, match="above the service limit"):
+            c.score([good, bad, good])
+    finally:
+        c.close()

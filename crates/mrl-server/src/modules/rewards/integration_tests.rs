@@ -179,10 +179,33 @@ async fn preview_job(env: &Env, version: Uuid, mode: &str, other: Option<Uuid>) 
         .unwrap()
 }
 
+async fn settle_check(env: &Env, job: &JobRow, outcome: &str) {
+    use mrl_server::modules::events::{Event, EventConsumer};
+    use mrl_server::modules::rewards::verifier::EndedEarly;
+    let db = env.core.db.db().clone();
+    let mut tx = db.begin().await.unwrap();
+    let event = Event {
+        id: 0,
+        event_id: Uuid::now_v7(),
+        org_id: Some(job.org_id),
+        aggregate_kind: "job".into(),
+        aggregate_id: job.id,
+        aggregate_seq: job.state_version + 1,
+        event_type: outcome.to_owned(),
+        schema_version: 1,
+        payload: json!({}),
+        trace_context: None,
+        created_at: time::OffsetDateTime::now_utc(),
+        xid: 0,
+    };
+    EndedEarly::new(db).handle(&mut tx, &event).await.unwrap();
+    tx.commit().await.unwrap();
+}
+
 fn case(position: i32, correct: f64) -> Value {
     json!({"position": position, "total": correct, "resolution": "SCORED",
            "components": {"correct": correct, "format": 1.0}, "flags": [],
-           "statuses": {"correct": "OK", "format": "OK"}})
+           "statuses": {"correct": "OK", "format": "OK"}, "repeatable": true})
 }
 
 fn report(version: &str, mode: &str, cases: Value) -> Value {
@@ -423,6 +446,7 @@ async fn p29_publish_needs_passing_sandbox_tests_and_a_regression_report() {
         None,
     );
     assert_eq!(verifier.verify(&job).await.unwrap(), Verification::Verified);
+    settle_check(&env, &job, "job.completed").await;
     let got = env
         .call(Method::GET, &format!("/api/v1/reward-versions/{v1}"), None)
         .await
@@ -447,6 +471,7 @@ async fn p29_publish_needs_passing_sandbox_tests_and_a_regression_report() {
         verifier.verify(&job).await.unwrap(),
         Verification::Failed(_)
     ));
+    settle_check(&env, &job, "job.failed").await;
     let st: (String, String) = sqlx::query_as("SELECT r.state, v.state FROM reward_reports r JOIN reward_versions v ON v.id = r.version_id WHERE r.job_id = $1")
         .bind(job.id).fetch_one(env.core.db.pool()).await.unwrap();
     assert_eq!(st, ("INVALID".into(), "FAILED_TESTS".into()));
@@ -463,6 +488,8 @@ async fn p29_publish_needs_passing_sandbox_tests_and_a_regression_report() {
         None,
     );
     assert_eq!(verifier.verify(&job).await.unwrap(), Verification::Verified);
+    assert_eq!(publish(v1.clone()).await.status, 409);
+    settle_check(&env, &job, "job.completed").await;
     // A replay after a crash finds the record settled: same answer, nothing written twice.
     let events = |id: Uuid| {
         let db = env.core.db.pool().clone();
@@ -478,6 +505,7 @@ async fn p29_publish_needs_passing_sandbox_tests_and_a_regression_report() {
     };
     let before = events(uuid_of(&v1)).await;
     assert_eq!(verifier.verify(&job).await.unwrap(), Verification::Verified);
+    settle_check(&env, &job, "job.completed").await;
     assert_eq!(events(uuid_of(&v1)).await, before);
     let got = env
         .call(Method::GET, &format!("/api/v1/reward-versions/{v1}"), None)
@@ -520,14 +548,17 @@ async fn p29_publish_needs_passing_sandbox_tests_and_a_regression_report() {
         None,
     );
     assert_eq!(verifier.verify(&job).await.unwrap(), Verification::Verified);
+    settle_check(&env, &job, "job.completed").await;
     let r = publish(v2.clone()).await;
     assert_eq!(r.json()["code"], "MRL-STATE-291", "{}", r.text());
     assert!(r.json()["detail"].as_str().unwrap().contains("regression"));
     let job = preview_job(&env, uuid_of(&v2), "regression", Some(uuid_of(&v1))).await;
     let mut reg = report(&v2, "regression", json!([case(0, 1.0), case(1, 1.0)]));
+    reg["other_content_sha256"] = json!("e".repeat(64));
     reg["baseline_cases"] = json!([case(0, 1.0), case(1, 0.0)]);
     fixtures.put(job.id, reg, None);
     assert_eq!(verifier.verify(&job).await.unwrap(), Verification::Verified);
+    settle_check(&env, &job, "job.completed").await;
     let got = env
         .call(Method::GET, &format!("/api/v1/reward-versions/{v2}"), None)
         .await
@@ -586,6 +617,7 @@ async fn p29_publish_needs_passing_sandbox_tests_and_a_regression_report() {
         .join("\n");
     fixtures.put(job.id, report(&v2, "preview", json!([])), Some(&rows));
     assert_eq!(verifier.verify(&job).await.unwrap(), Verification::Verified);
+    settle_check(&env, &job, "job.completed").await;
     let results: Value = sqlx::query_scalar("SELECT results FROM reward_reports WHERE job_id = $1")
         .bind(job.id)
         .fetch_one(env.core.db.pool())
@@ -1014,7 +1046,14 @@ async fn p29_a_test_run_is_a_reward_preview_job_whose_report_publishes_the_versi
         "{outputs:?}"
     );
     let art = register_outputs(&env, job, &outputs).await;
+    sqlx::query("UPDATE jobs SET state = 'FINALIZING' WHERE id = $1")
+        .bind(job)
+        .execute(env.core.db.pool())
+        .await
+        .unwrap();
+    let row = job_row(&env, job).await;
     assert_eq!(verifier.verify(&row).await.unwrap(), Verification::Verified);
+    settle_check(&env, &row, "job.completed").await;
     let got = env
         .call(Method::GET, &format!("/api/v1/reward-versions/{v1}"), None)
         .await
@@ -1117,7 +1156,7 @@ async fn p29_checks_need_their_inputs_and_a_job_that_ends_early_fails_its_tests(
         Some(json!({"dataset_artifact_id": ArtifactId::new().to_string()})),
     )
     .await;
-    assert_eq!(r.status, 422, "{}", r.text());
+    assert_eq!(r.status, 404, "{}", r.text());
     assert!(r.text().contains("No artifact"), "{}", r.text());
 
     // A preview stages the dataset as the folder input `dataset`.
@@ -1156,8 +1195,14 @@ async fn p29_checks_need_their_inputs_and_a_job_that_ends_early_fails_its_tests(
         let outputs = run_task(&env, &py, preview).await;
         register_outputs(&env, preview, &outputs).await;
         let verifier = ReportVerifier::registered(env.core.db.db().clone());
+        sqlx::query("UPDATE jobs SET state = 'FINALIZING' WHERE id = $1")
+            .bind(preview)
+            .execute(env.core.db.pool())
+            .await
+            .unwrap();
         let row = job_row(&env, preview).await;
         assert_eq!(verifier.verify(&row).await.unwrap(), Verification::Verified);
+        settle_check(&env, &row, "job.completed").await;
         let listed = call(Method::GET, format!("/reward-versions/{v0}/reports"), None)
             .await
             .json();
