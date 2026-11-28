@@ -67,7 +67,7 @@ fn seed_then_submit_returns_a_rejected_run_with_code_and_hint() {
     let (db, srv) = rt.block_on(async {
         let db = TestDb::new().await;
         let users = [test_user("tok", "usr_admin", OrgId::new(), Role::Owner)];
-        let chains = Chains::registered(db.db());
+        let chains = Chains::registered(db.db(), &mrl_server::Config::default());
         let srv = runs_server(&db, chains, &users, vec![Box::new(tenancy.clone())]).await;
         (db, srv)
     });
@@ -188,4 +188,90 @@ fn seed_then_submit_returns_a_rejected_run_with_code_and_hint() {
     rt.block_on(async { srv.shutdown().await.unwrap() });
     drop(db);
     let _ = std::fs::remove_dir_all(dir);
+}
+
+/// A silent worker: the server's settings check waits out a 100 s budget, then answers with
+/// its L0 fallback (MRL-CAP-282). Both dry-run commands wait past the CLI's usual 90 s.
+#[test]
+#[ignore = "waits out the CLI's 90 s default timeout (just test-integration)"]
+fn both_dry_runs_get_the_l0_fallback_after_a_silent_worker_times_out() {
+    use axum::routing::post;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let addr = rt.block_on({
+        let seen = seen.clone();
+        async move {
+            let app = axum::Router::new().route(
+                "/api/v1/projects/{prj}/runs:validate",
+                post(move || {
+                    let seen = seen.clone();
+                    async move {
+                        seen.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(std::time::Duration::from_secs(92)).await;
+                        axum::Json(serde_json::json!({
+                            "ok": true,
+                            "checked": "l0",
+                            "issues": [{"severity": "info", "code": "MRL-CAP-282", "path": null,
+                                "message": "No machine answered within 100 seconds, so the settings were checked by the app alone and the memory is not estimated.",
+                                "hint": ""}],
+                            "estimate": {"verdict": "unknown", "confidence": "low", "assumptions": []},
+                            "resolved_config": {},
+                            "preflight": null
+                        }))
+                    }
+                }),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            addr
+        }
+    });
+    let dir = std::env::temp_dir().join(format!("mrl-cli-test-{}", uuid::Uuid::new_v4()));
+    let cli = Arc::new(Cli {
+        server: format!("http://{addr}"),
+        config: dir.join("cli.toml"),
+    });
+    let base = [
+        "--project",
+        "prj_01M8GDJY74EQK82MRRQB9A0RNF",
+        "--name",
+        "n",
+        "--algorithm",
+        "sft",
+        "--model",
+        "mv_01M8GDH3ZDE4QTWWSTF6SEWCGK",
+        "--dataset",
+        "dsv_01M8GDH3ZDE4QTWWSTF6SEWCGK",
+    ];
+    let runs: Vec<_> = [
+        vec!["runs", "validate"],
+        vec!["runs", "submit", "--dry-run"],
+    ]
+    .into_iter()
+    .map(|mut args| {
+        args.extend(base);
+        let cli = cli.clone();
+        std::thread::spawn(move || {
+            let args: Vec<&str> = args.to_vec();
+            (args.join(" "), cli.ok(&args))
+        })
+    })
+    .collect();
+    for run in runs {
+        let (args, out) = run.join().unwrap();
+        assert!(out.contains("MRL-CAP-282"), "mrl {args}: {out}");
+        assert!(out.contains("Ready"), "mrl {args}: {out}");
+    }
+    assert_eq!(
+        seen.load(Ordering::SeqCst),
+        2,
+        "one dry run each, nothing submitted"
+    );
 }

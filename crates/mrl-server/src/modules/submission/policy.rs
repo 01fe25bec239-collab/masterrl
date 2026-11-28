@@ -3,23 +3,30 @@
 //! - [`MethodPolicy`]: an `experimental` method needs the workspace toggle (Doc 05 §18 row
 //!   21): the org setting `experimental_methods` is `true` (every workspace) or a list of
 //!   `ws_…` ids. Dev-only engines (the FakeEngine) are exempt.
-//! - [`Guardian`]: at submit, a stored estimate of this exact config that does not fit any
+//! - [`safety_at_submit`] (in the resolver): the run gets the newest estimate of its inputs,
+//!   and a `tight` verdict's safety settings.
+//! - [`Guardian`]: at submit, a stored estimate of these exact inputs that does not fit any
 //!   connected machine rejects the run (MRL-CAP-280) with the nearest alternatives.
 //! - [`resume_problem`]: a retry or resume may not change the engine's major version or the
 //!   method (Doc 05 §18 row 19). Checked by `runs:validate` (`parent_checkpoint_id`) and at
 //!   launch for every resumed attempt ([`super::probe::ProbeLaunch`]).
+//!
+//! The submit-time preflight uses `[submission]`'s headroom (the members are built from it).
 
 use super::codes;
-use super::resolve::{engine_choice, methods, sha256};
+use super::resolve::{engine_choice, methods};
+use super::SubmissionConfig;
 use crate::db::Db;
-use crate::modules::estimates::{self, RunEstimate, Verdict};
-use crate::modules::jobs::{JobSpec, JobValidator, Rejection, Verdict as Check};
-use crate::modules::preflight::{self, Headroom, PreflightInput};
+use crate::modules::engines::validator::{CapabilityValidator, Pick};
+use crate::modules::estimates::{self, EstimateRow, RunEstimate, Verdict};
+use crate::modules::jobs::{JobSpec, JobValidator, Rejection, SubmitScope, Verdict as Check};
+use crate::modules::preflight::{self, PreflightInput, RunPreflight};
 use crate::seams::SeamError;
 use async_trait::async_trait;
 use mrl_domain::capability::codes::CapabilityRejection;
 use mrl_domain::ids::WorkspaceId;
-use serde_json::Value;
+use mrl_domain::resources::{GpuVendor, ResourceRequest, WorkloadRole};
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 fn seam(e: sqlx::Error) -> SeamError {
@@ -42,12 +49,19 @@ pub fn experimental_allowed(setting: &Value, workspace: Option<Uuid>) -> bool {
 /// The experimental-method policy.
 pub struct MethodPolicy {
     db: Db,
+    capability: CapabilityValidator,
 }
 
 impl MethodPolicy {
     /// Reads engines, orgs and projects from `db`.
     pub fn new(db: Db) -> Self {
-        Self { db }
+        let capability = CapabilityValidator::new(db.clone());
+        Self::with_capability(db, capability)
+    }
+
+    /// Uses the same registry lookups as the capability validator in a custom chain.
+    pub fn with_capability(db: Db, capability: CapabilityValidator) -> Self {
+        Self { db, capability }
     }
 }
 
@@ -62,13 +76,28 @@ impl JobValidator for MethodPolicy {
         let found = methods(&self.db, Some(&spec.algorithm_id), choice.as_ref(), None)
             .await
             .map_err(seam)?;
-        // ponytail: without a pinned engine (`common.engine`, set by resolution) the method
-        // is refused only when every engine offering it is blocked.
-        if found.is_empty()
-            || found
-                .iter()
-                .any(|m| m.dev_only || m.maturity != "experimental")
+        let mut experimental = found
+            .iter()
+            .filter(|m| !m.dev_only && m.maturity == "experimental");
+        let needs_policy = if found
+            .iter()
+            .all(|m| !m.dev_only && m.maturity == "experimental")
         {
+            !found.is_empty()
+        } else if experimental.clone().next().is_some() {
+            match self
+                .capability
+                .pick(spec)
+                .await
+                .map_err(|e| SeamError::new("engines", e.to_string()))?
+            {
+                Pick::Engine(selected) => experimental.any(|m| m.engine_version_id == selected),
+                Pick::Rejected(_) | Pick::NoEngine => false,
+            }
+        } else {
+            false
+        };
+        if !needs_policy {
             return Ok(Check::Abstain);
         }
         let row: Option<(Option<Value>, Option<Uuid>)> = sqlx::query_as(
@@ -96,21 +125,147 @@ impl JobValidator for MethodPolicy {
     }
 }
 
-/// Submit-time preflight from the newest estimate of the same resolved config.
+/// The preflight of `spec` with stored estimate `row`, on `settings`' headroom: the verdict
+/// and the config with any safety settings applied.
+async fn judge(
+    db: &Db,
+    settings: &SubmissionConfig,
+    spec: &JobSpec,
+    row: &EstimateRow,
+) -> Result<(RunPreflight, Value), sqlx::Error> {
+    let estimate = RunEstimate::of(row);
+    let all = preflight::machines(db, spec.org_id, None).await?;
+    let found = methods(
+        db,
+        Some(&spec.algorithm_id),
+        engine_choice(&spec.resolved).as_ref(),
+        None,
+    )
+    .await?;
+    let method = found.first();
+    let input = PreflightInput {
+        resources: &spec.resources,
+        estimate: estimate.per_gpu_memory_gib,
+        config: &spec.resolved,
+        schema: method.and_then(|m| m.schema.as_ref()),
+        supports_qlora: method.is_some_and(|m| m.supports_qlora()),
+        probe_steps: settings.probe_steps,
+    };
+    Ok(preflight::decide(&input, &all, &settings.headroom))
+}
+
+/// The job as submit's resolvers see it.
+pub fn scope_job(scope: &SubmitScope, resolved: Value) -> JobSpec {
+    JobSpec {
+        org_id: scope.org_id,
+        project_id: scope.project_id,
+        kind: scope.kind.clone(),
+        algorithm_id: scope.algorithm_id.clone(),
+        base_model_version_id: scope.base_model_version_id,
+        reward_version_id: scope.reward_version_id,
+        dataset_version_ids: scope.dataset_version_ids.clone(),
+        resolved,
+        resources: scope.resources.clone(),
+        max_runtime_seconds: None,
+    }
+}
+
+/// The key of [`safety_at_submit`]'s note in [`SubmitScope::notes`].
+pub const SAFETY_NOTE: &str = "safety-settings";
+
+/// Submit's half of the Guardian (run by the resolver). With an estimate of these inputs:
+/// the main role's GPUs must hold the expected memory ([`require_vram`]), and a tight
+/// configuration gets the validated safety settings. Only an estimate of the final config is
+/// pinned to the run; the source estimate is kept in the audit details.
+pub async fn safety_at_submit(
+    db: &Db,
+    capability: &CapabilityValidator,
+    settings: &SubmissionConfig,
+    scope: &mut SubmitScope,
+    config: Value,
+) -> Result<Value, SeamError> {
+    let spec = scope_job(scope, config);
+    let sha = estimates::inputs_sha256(&spec);
+    let Some(row) = estimates::latest(db, spec.org_id, spec.project_id, &sha)
+        .await
+        .map_err(seam)?
+    else {
+        return Ok(spec.resolved);
+    };
+    scope.estimate_id = Some(row.id);
+    let (p, adjusted) = judge(db, settings, &spec, &row).await.map_err(seam)?;
+    // Only a run some machine can hold is narrowed; the Guardian refuses one none can.
+    if let (Verdict::Fits | Verdict::Tight, Some(range)) =
+        (p.verdict, RunEstimate::of(&row).per_gpu_memory_gib)
+    {
+        require_vram(&mut scope.resources, range.expected);
+    }
+    if p.verdict != Verdict::Tight || p.changes.is_empty() {
+        return Ok(spec.resolved);
+    }
+    let mut changed = spec.clone();
+    changed.resolved = adjusted;
+    let picked = capability
+        .pick(&changed)
+        .await
+        .map_err(|e| SeamError::new("engines", e.to_string()))?;
+    if !matches!(picked, Pick::Engine(_)) {
+        return Ok(spec.resolved);
+    }
+    // The probe measured the original inputs. The adjusted run needs its own estimate.
+    scope.estimate_id = estimates::latest(
+        db,
+        changed.org_id,
+        changed.project_id,
+        &estimates::inputs_sha256(&changed),
+    )
+    .await
+    .map_err(seam)?
+    .map(|estimate| estimate.id);
+    scope.notes.insert(
+        SAFETY_NOTE.into(),
+        json!({"source_estimate_id": row.id.to_string(), "verdict": p.verdict,
+               "changes": p.changes, "message": p.message}),
+    );
+    Ok(changed.resolved)
+}
+
+/// Asks the main role's discrete GPUs for at least `expected_gib` each (placement enforces
+/// it per GPU), so the run never lands on a GPU it can't fit. A larger ask is kept; Apple
+/// GPUs (unified memory) and roles without a GPU maker are left alone.
+pub fn require_vram(resources: &mut ResourceRequest, expected_gib: f64) {
+    if !(expected_gib.is_finite() && expected_gib > 0.0) {
+        return;
+    }
+    let main = resources
+        .roles
+        .iter()
+        .position(|r| r.role == WorkloadRole::Trainer)
+        .or(if resources.roles.is_empty() {
+            None
+        } else {
+            Some(0)
+        });
+    let Some(role) = main.and_then(|i| resources.roles.get_mut(i)) else {
+        return;
+    };
+    if role.gpu_count == 0 || !matches!(role.gpu.vendor, Some(v) if v != GpuVendor::Apple) {
+        return;
+    }
+    let bytes = (expected_gib * f64::from(1u32 << 30)).ceil() as u64;
+    role.gpu.min_vram_bytes = Some(role.gpu.min_vram_bytes.map_or(bytes, |m| m.max(bytes)));
+}
+
+/// Submit-time preflight from the newest estimate of the same inputs.
 pub struct Guardian {
     db: Db,
-    headroom: Headroom,
+    settings: SubmissionConfig,
 }
 
 impl Guardian {
-    /// Reads estimates and machines from `db`, with the default headroom.
-    pub fn new(db: Db) -> Self {
-        // ponytail: the validator chain is built from the database alone, so submit uses
-        // the default headroom; `runs:validate` and `runs:preflight` use `[submission]`.
-        Self {
-            db,
-            headroom: Headroom::default(),
-        }
+    /// Reads estimates and machines from `db`, with `settings`' headroom.
+    pub fn new(db: Db, settings: SubmissionConfig) -> Self {
+        Self { db, settings }
     }
 }
 
@@ -121,7 +276,7 @@ impl JobValidator for Guardian {
     }
 
     async fn validate(&self, spec: &JobSpec) -> Result<Check, SeamError> {
-        let sha = sha256(&spec.resolved);
+        let sha = estimates::inputs_sha256(spec);
         let Some(row) = estimates::latest(&self.db, spec.org_id, spec.project_id, &sha)
             .await
             .map_err(seam)?
@@ -129,31 +284,9 @@ impl JobValidator for Guardian {
             // No estimate: `unknown`, the run starts in probe mode.
             return Ok(Check::Abstain);
         };
-        let cal = estimates::calibration(&self.db, &row.calibration_key)
+        let (p, _) = judge(&self.db, &self.settings, spec, &row)
             .await
             .map_err(seam)?;
-        let estimate = RunEstimate::of(&row, cal);
-        let all = preflight::machines(&self.db, spec.org_id, None)
-            .await
-            .map_err(seam)?;
-        let found = methods(
-            &self.db,
-            Some(&spec.algorithm_id),
-            engine_choice(&spec.resolved).as_ref(),
-            None,
-        )
-        .await
-        .map_err(seam)?;
-        let method = found.first();
-        let input = PreflightInput {
-            resources: &spec.resources,
-            estimate: estimate.per_gpu_memory_gib,
-            config: &spec.resolved,
-            schema: method.and_then(|m| m.schema.as_ref()),
-            supports_qlora: method.is_some_and(|m| m.supports_qlora()),
-            probe_steps: 5,
-        };
-        let (p, _) = preflight::decide(&input, &all, &self.headroom);
         if p.verdict != Verdict::DoesNotFit {
             return Ok(Check::Abstain);
         }

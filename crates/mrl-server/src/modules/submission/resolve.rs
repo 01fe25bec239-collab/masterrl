@@ -11,7 +11,10 @@
 
 use crate::db::Db;
 use crate::error::FieldError;
-use crate::modules::jobs::{error::hint_for, ResolveError, SubmissionResolver};
+use crate::modules::engines::{CapabilityValidator, Pick};
+use crate::modules::jobs::{
+    error::hint_for, JobSpec, ResolveError, SubmissionResolver, SubmitScope,
+};
 use crate::seams::SeamError;
 use async_trait::async_trait;
 use serde_json::{json, Map, Value};
@@ -99,30 +102,26 @@ fn fill(root: &Value, schema: &Value, value: &mut Value, depth: u32) {
 
 /// Defaults < preset < submitted settings. `schema` is the method's config schema: for the
 /// whole config (with `common` and `engine` properties, like TRL's) or the engine block.
-///
-/// Only the `engine` block (the method's own settings) gets defaults. A `common` setting left
-/// out means the platform's automatic choice (precision, seed, update strategy), which the
-/// capability check reads as such; writing the engine's default there would change it.
 pub fn layer(submitted: &Value, preset: Option<&Value>, schema: Option<&Value>) -> Value {
     let mut out = json!({});
     if let Some(p) = preset {
         merge_patch(&mut out, p);
     }
     merge_patch(&mut out, submitted);
-    if let (Some(s), Some(o)) = (schema, out.as_object_mut()) {
-        let block = match s.pointer("/properties/engine") {
-            Some(e) => e,
-            None if s.pointer("/properties/common").is_some() => return out,
-            None => s,
-        };
+    let Some(s) = schema else {
+        return out;
+    };
+    if s.pointer("/properties/engine").is_some() || s.pointer("/properties/common").is_some() {
+        fill_defaults(s, s, &mut out);
+    } else if let Some(o) = out.as_object_mut() {
         let engine = o.entry("engine").or_insert_with(|| json!({}));
-        if let Some(d) = block
+        if let Some(d) = s
             .get("default")
             .filter(|_| engine.as_object().is_some_and(|m| m.is_empty()))
         {
             *engine = d.clone();
         }
-        fill_defaults(s, block, engine);
+        fill_defaults(s, s, engine);
     }
     out
 }
@@ -262,12 +261,15 @@ fn invalid(path: &str, message: String) -> ResolveError {
     }])
 }
 
-/// Resolves `config` for `algorithm`. Without the method (the submit chain does not know it)
-/// the preset names it; with neither, the config is kept as submitted.
+/// Resolves `config` for `algorithm`. Without the method the preset names it; with neither,
+/// the config is kept as submitted. When the config names no engine and several offer the
+/// method, `pick` (P24's check, with the job `pick.1` as submitted) chooses the one the run
+/// would get; otherwise the first in P24's order.
 pub async fn resolve(
     db: &Db,
     algorithm: Option<&str>,
     config: &Value,
+    pick: Option<(&CapabilityValidator, &JobSpec)>,
 ) -> Result<Resolved, ResolveError> {
     let kept = |c: &Value| Resolved {
         config: c.clone(),
@@ -305,7 +307,7 @@ pub async fn resolve(
     let found = methods(db, algorithm, choice.as_ref(), preset.as_deref())
         .await
         .map_err(|e| ResolveError::Seam(SeamError::from(crate::db::DbError::from(e))))?;
-    let Some(method) = found.first().cloned() else {
+    let Some(first) = found.first().cloned() else {
         return match &preset {
             Some(p) => Err(invalid(
                 "/config/preset",
@@ -323,7 +325,7 @@ pub async fn resolve(
     if algorithm.is_none()
         && found
             .iter()
-            .any(|m| (&m.engine, &m.algorithm_id) != (&method.engine, &method.algorithm_id))
+            .any(|m| (&m.engine, &m.algorithm_id) != (&first.engine, &first.algorithm_id))
     {
         return Err(invalid(
             "/config/preset",
@@ -333,14 +335,33 @@ pub async fn resolve(
             ),
         ));
     }
-    let patch = preset.as_deref().and_then(|p| method.preset(p));
-    let mut out = layer(&submitted, patch, method.schema.as_ref());
-    if let Some(o) = out.as_object_mut() {
-        let common = o.entry("common").or_insert_with(|| json!({}));
-        if let Some(c) = common.as_object_mut() {
-            c.insert("engine".into(), json!(method.engine_ref()));
+    let effective = |method: &Method| {
+        let patch = preset.as_deref().and_then(|p| method.preset(p));
+        let mut config = layer(&submitted, patch, method.schema.as_ref());
+        if let Some(obj) = config.as_object_mut() {
+            let common = obj.entry("common").or_insert_with(|| json!({}));
+            if let Some(fields) = common.as_object_mut() {
+                fields.insert("engine".into(), json!(method.engine_ref()));
+            }
+        }
+        config
+    };
+    let mut chosen = (effective(&first), first);
+    if let Some((capability, job)) = pick.filter(|_| found.len() > 1) {
+        let mut spec = job.clone();
+        for method in found {
+            spec.resolved = effective(&method);
+            let verdict = capability
+                .pick(&spec)
+                .await
+                .map_err(|e| ResolveError::Seam(SeamError::new("engines", e.to_string())))?;
+            if matches!(verdict, Pick::Engine(id) if id == method.engine_version_id) {
+                chosen = (spec.resolved, method);
+                break;
+            }
         }
     }
+    let (out, method) = chosen;
     Ok(Resolved {
         config: out,
         method: Some(method),
@@ -348,15 +369,33 @@ pub async fn resolve(
     })
 }
 
-/// The submit chain's resolver (`// <mrl:submission-resolvers>`): presets and defaults.
+/// The submit chain's resolver (`// <mrl:submission-resolvers>`): presets and defaults for
+/// the submitted method, then the estimate and any safety settings
+/// ([`super::policy::safety_at_submit`]).
 pub struct Presets {
     db: Db,
+    capability: CapabilityValidator,
+    settings: super::SubmissionConfig,
 }
 
 impl Presets {
-    /// Reads engine methods from `db`.
-    pub fn new(db: Db) -> Self {
-        Self { db }
+    /// Reads engine methods and registry records from `db`, with `settings`' headroom.
+    pub fn new(db: Db, settings: super::SubmissionConfig) -> Self {
+        let capability = CapabilityValidator::new(db.clone());
+        Self::with_capability(db, capability, settings)
+    }
+
+    /// Picks engines with this capability check (the one the validator chain uses).
+    pub fn with_capability(
+        db: Db,
+        capability: CapabilityValidator,
+        settings: super::SubmissionConfig,
+    ) -> Self {
+        Self {
+            db,
+            capability,
+            settings,
+        }
     }
 }
 
@@ -366,11 +405,73 @@ impl SubmissionResolver for Presets {
         "presets"
     }
 
-    async fn resolve(&self, _submitted: &Value, resolved: Value) -> Result<Value, ResolveError> {
-        // ponytail: the chain passes only the config, so at submit the method comes from the
-        // preset; a config without one is kept (the CLI and UI submit what `runs:validate`
-        // resolved). Passing the method to resolvers is an item for A1.
-        Ok(resolve(&self.db, None, &resolved).await?.config)
+    async fn resolve(
+        &self,
+        scope: &mut SubmitScope,
+        _submitted: &Value,
+        resolved: Value,
+    ) -> Result<Value, ResolveError> {
+        let job = super::policy::scope_job(scope, resolved.clone());
+        let Resolved { config, method, .. } = resolve(
+            &self.db,
+            Some(&scope.algorithm_id),
+            &resolved,
+            Some((&self.capability, &job)),
+        )
+        .await?;
+        // A resume the engine can't do is refused before the run is queued (MRL-CAP-281).
+        if let (Some(ckpt), Some(m)) = (scope.parent_checkpoint_id, method.as_ref()) {
+            let problem = super::policy::resume_problem(
+                &self.db,
+                scope.org_id,
+                ckpt,
+                m.engine_version_id,
+                &scope.algorithm_id,
+            )
+            .await
+            .map_err(|e| ResolveError::Seam(SeamError::from(crate::db::DbError::from(e))))?;
+            if let Some(message) = problem {
+                let code = super::codes::RESUME_INCOMPATIBLE.to_string();
+                return Err(ResolveError::Invalid(vec![FieldError {
+                    path: "/parent_checkpoint_id".into(),
+                    hint: hint_for(&code),
+                    code,
+                    message,
+                }]));
+            }
+        }
+        Ok(super::policy::safety_at_submit(
+            &self.db,
+            &self.capability,
+            &self.settings,
+            scope,
+            config,
+        )
+        .await?)
+    }
+
+    async fn record(
+        &self,
+        tx: &mut crate::Tx,
+        run_id: Uuid,
+        scope: &SubmitScope,
+    ) -> Result<(), SeamError> {
+        let Some(details) = scope.notes.get(super::policy::SAFETY_NOTE) else {
+            return Ok(());
+        };
+        let org = crate::modules::jobs::scope::org_text(scope.org_id);
+        let mut event = crate::modules::audit::event(
+            time::OffsetDateTime::now_utc(),
+            "system:guardian",
+            org.as_deref(),
+            "submission.safety_settings",
+            &mrl_domain::ids::RunId::from_uuid(run_id).to_string(),
+            crate::seams::AuditOutcome::Success,
+            &Uuid::now_v7().to_string(),
+        );
+        event.project = Some(mrl_domain::ids::ProjectId::from_uuid(scope.project_id).to_string());
+        crate::modules::audit::write(tx, &event, details).await?;
+        Ok(())
     }
 }
 
@@ -419,14 +520,19 @@ mod tests {
             "null defaults are kept"
         );
         assert_eq!(out["common"]["update"]["lora"]["r"], 8);
-        assert!(
-            out["common"].get("precision").is_none()
-                && out["common"]["update"]["lora"].get("alpha").is_none(),
-            "common settings left out stay the platform's choice: {out}"
+        assert_eq!(
+            out["common"]["update"]["lora"]["alpha"], 32,
+            "nested defaults"
         );
-        // No preset: the schema's defaults, then the submitted values.
+        assert_eq!(out["common"]["precision"], "auto", "common defaults too");
+        assert_eq!(out["common"]["seed"], 0);
+        // No preset: the schema's defaults (a `$ref`'s own default object first), then the
+        // submitted values.
         let out = layer(&submitted, None, Some(&s));
-        assert!(out.get("common").is_none());
+        assert_eq!(
+            out["common"],
+            json!({"precision": "auto", "seed": 0, "update": {"strategy": "lora"}})
+        );
         assert_eq!(out["engine"]["learning_rate"], 0.0001);
         // A submitted null removes the preset's value; the default comes back.
         let out = layer(

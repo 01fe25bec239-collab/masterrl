@@ -62,6 +62,12 @@ def test_completed_run_reports_everything(tmp_path: Path) -> None:
     assert ("train/loss", False, pb.METRIC_KIND_LIVE) in names
     assert ("train/learning_rate", False, pb.METRIC_KIND_SAMPLED) in names  # via namespace "lr"
     assert ("fake/debug/grad_norm", True, pb.METRIC_KIND_LIVE) in names  # via prefix "debug/"
+    peaks = [p for p in r.points() if p.name == "resource/host_rss_peak"]
+    assert peaks
+    assert min(p.value for p in peaks) > 1 << 20  # bytes, from the harness itself
+    assert {p.split for p in peaks} == {"train"}  # the phase label
+    # Sampled on each of the first steps' progress, whatever the engine's log cadence.
+    assert {1, 2, 3, 4} <= {p.step for p in peaks}
     assert len(r.agent.of("samples")) == 2
     assert [m.progress.step for m in r.agent.of("progress")][-1] == 4
     assert r.agent.of("heartbeat")
@@ -358,6 +364,7 @@ def test_export_job_writes_artifact_manifest(tmp_path: Path) -> None:
     doc = json.loads((tmp_path / "export" / "outputs" / "artifact-manifest.json").read_text())
     assert doc["kind"] == "export"
     assert [f["path"] for f in doc["files"]] == ["model.safetensors"]
+    assert r.agent.outputs_manifest == doc
 
 
 def test_protocol_mismatch_exits_without_report(tmp_path: Path) -> None:

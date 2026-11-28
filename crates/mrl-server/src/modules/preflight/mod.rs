@@ -133,11 +133,45 @@ fn vendor_name(v: GpuVendor) -> &'static str {
     }
 }
 
-/// The GPU bucket of a request for calibration keys: its maker, `gpu` (any) or `cpu`.
-pub fn gpu_bucket(r: &ResourceRequest) -> &'static str {
-    match main_role(r) {
-        Some(role) if role.gpu_count > 0 => role.gpu.vendor.map_or("gpu", vendor_name),
-        _ => "cpu",
+/// Architecture bucket of the GPUs on the probe machine that meet the target request.
+pub(crate) async fn gpu_bucket_on_node(
+    conn: &mut sqlx::PgConnection,
+    node: Uuid,
+    request: &ResourceRequest,
+) -> Result<String, sqlx::Error> {
+    let Some(role) = main_role(request).filter(|r| r.gpu_count > 0) else {
+        return Ok("cpu".into());
+    };
+    let arches: Vec<String> = sqlx::query_scalar(
+        "SELECT vendor || ':' || arch FROM gpu_devices
+         WHERE node_id = $1 AND present AND health = 'OK' AND parent_device_id IS NULL
+           AND ($2::text IS NULL OR vendor = $2) AND vram_total_bytes >= $3
+         ORDER BY vram_total_bytes DESC, index_on_node LIMIT $4",
+    )
+    .bind(node)
+    .bind(role.gpu.vendor.map(vendor_name))
+    .bind(i64::try_from(role.gpu.min_vram_bytes.unwrap_or_default()).unwrap_or(i64::MAX))
+    .bind(i64::from(role.gpu_count))
+    .fetch_all(conn)
+    .await?;
+    Ok(if arches.len() == role.gpu_count as usize {
+        architecture_bucket(arches)
+    } else {
+        "unknown".into()
+    })
+}
+
+pub(crate) fn architecture_bucket(mut arches: Vec<String>) -> String {
+    arches.retain(|s| {
+        s.split_once(':')
+            .is_some_and(|(_, arch)| !arch.trim().is_empty())
+    });
+    arches.sort_unstable();
+    arches.dedup();
+    if arches.is_empty() {
+        "unknown".into()
+    } else {
+        arches.join("+")
     }
 }
 
@@ -157,7 +191,12 @@ pub fn capacity(
     let mut fitting: Vec<i64> = m
         .gpus
         .iter()
-        .filter(|(v, _)| want.is_none_or(|w| w == v))
+        .filter(|(vendor, bytes)| {
+            want.is_none_or(|w| w == vendor)
+                && role
+                    .and_then(|r| r.gpu.min_vram_bytes)
+                    .is_none_or(|min| min <= (*bytes).max(0) as u64)
+        })
         .map(|(_, b)| *b)
         .collect();
     if fitting.len() < count {
@@ -210,13 +249,25 @@ pub struct ConfigChange {
     /// JSON Pointer into the config, like `/engine/gradient_checkpointing`.
     pub path: String,
     /// The value before (null when unset).
-    #[schema(value_type = Object)]
-    pub from: Value,
+    #[schema(schema_with = safety_value_schema)]
+    pub before: Value,
     /// The value after.
-    #[schema(value_type = Object)]
-    pub to: Value,
+    #[schema(schema_with = safety_value_schema)]
+    pub after: Value,
     /// Why, in plain words.
     pub why: String,
+}
+
+fn safety_value_schema() -> utoipa::openapi::schema::Object {
+    use utoipa::openapi::schema::{ObjectBuilder, Type};
+    ObjectBuilder::new()
+        .schema_type(utoipa::openapi::schema::SchemaType::from_iter([
+            Type::Boolean,
+            Type::Number,
+            Type::String,
+            Type::Null,
+        ]))
+        .build()
 }
 
 /// A configuration that may fit instead.
@@ -365,9 +416,16 @@ pub fn decide(input: &PreflightInput, all: &[MachineFacts], h: &Headroom) -> (Ru
             );
         }
         Verdict::Tight => {
-            let nvidia = candidates
-                .iter()
-                .any(|m| m.gpus.iter().any(|(v, _)| v == "nvidia"));
+            let nvidia = role.is_some_and(|r| {
+                r.gpu_count > 0
+                    && match r.gpu.vendor {
+                        Some(vendor) => vendor == GpuVendor::Nvidia,
+                        None => candidates.iter().any(|m| {
+                            NodeId::from_uuid(m.node_id).to_string() == best.node_id
+                                && m.gpus.iter().all(|(vendor, _)| vendor == "nvidia")
+                        }),
+                    }
+            });
             out.changes = safety_changes(&config, input.schema, nvidia);
             apply(&mut config, &out.changes);
             out.message = if out.changes.is_empty() {
@@ -480,40 +538,58 @@ pub fn safety_changes(config: &Value, schema: Option<&Value>, nvidia: bool) -> V
     if offered("gradient_checkpointing") && current("gradient_checkpointing") != json!(true) {
         out.push(ConfigChange {
             path: "/engine/gradient_checkpointing".into(),
-            from: current("gradient_checkpointing"),
-            to: json!(true),
+            before: current("gradient_checkpointing"),
+            after: json!(true),
             why: "Gradient checkpointing keeps fewer activations in memory; steps take about 30% longer.".into(),
         });
     }
     if offered("per_device_train_batch_size") && offered("gradient_accumulation_steps") {
         let b = current("per_device_train_batch_size").as_u64().unwrap_or(1);
         let acc = current("gradient_accumulation_steps").as_u64().unwrap_or(1);
-        if b >= 2 {
+        let proposed = acc.checked_mul(2);
+        let min_batch = props
+            .and_then(|p| p["per_device_train_batch_size"]["minimum"].as_u64())
+            .unwrap_or(1);
+        let max_acc = props
+            .and_then(|p| p["gradient_accumulation_steps"]["maximum"].as_u64())
+            .unwrap_or(u64::MAX);
+        if let Some(acc_after) = proposed.filter(|n| b >= 2 && b / 2 >= min_batch && *n <= max_acc)
+        {
             out.push(ConfigChange {
                 path: "/engine/per_device_train_batch_size".into(),
-                from: json!(b),
-                to: json!(b / 2),
+                before: json!(b),
+                after: json!(b / 2),
                 why: "Fewer examples per step need less memory for activations.".into(),
             });
             out.push(ConfigChange {
                 path: "/engine/gradient_accumulation_steps".into(),
-                from: json!(acc),
-                to: json!(acc * 2),
+                before: json!(acc),
+                after: json!(acc_after),
                 why: "Twice the accumulation keeps about the same number of examples per update."
                     .into(),
             });
         }
     }
-    if let Some(u) = config
-        .pointer("/rollout/gpu_memory_utilization")
-        .and_then(Value::as_f64)
-    {
-        let lower = ((u - 0.1).max(0.1) * 100.0).round() / 100.0;
+    let rollout_share = schema.and_then(|schema| {
+        let rollout = crate::modules::submission::resolve::deref(
+            schema,
+            schema.pointer("/properties/rollout")?,
+        );
+        rollout.pointer("/properties/gpu_memory_utilization")
+    });
+    if let (Some(prop), Some(u)) = (
+        rollout_share,
+        config
+            .pointer("/rollout/gpu_memory_utilization")
+            .and_then(Value::as_f64),
+    ) {
+        let lower = (((u - 0.1).max(0.1) * 100.0).round() / 100.0)
+            .max(prop["minimum"].as_f64().unwrap_or(0.1));
         if lower < u {
             out.push(ConfigChange {
                 path: "/rollout/gpu_memory_utilization".into(),
-                from: json!(u),
-                to: json!(lower),
+                before: json!(u),
+                after: json!(lower),
                 why:
                     "A smaller share for the generation engine leaves more GPU memory for training."
                         .into(),
@@ -528,8 +604,8 @@ pub fn safety_changes(config: &Value, schema: Option<&Value>, nvidia: bool) -> V
     if nvidia && eight_bit && current("optim") == json!("adamw_torch") {
         out.push(ConfigChange {
             path: "/engine/optim".into(),
-            from: current("optim"),
-            to: json!("adamw_8bit"),
+            before: current("optim"),
+            after: json!("adamw_8bit"),
             why: "An 8-bit optimizer keeps its state in about a quarter of the memory.".into(),
         });
     }
@@ -550,7 +626,7 @@ pub fn apply(config: &mut Value, changes: &[ConfigChange]) {
             *block = json!({});
         }
         if let Some(b) = block.as_object_mut() {
-            b.insert(key.to_owned(), c.to.clone());
+            b.insert(key.to_owned(), c.after.clone());
         }
     }
 }
@@ -585,6 +661,14 @@ pub async fn verdict_on_last_machine(
         .map_or(Verdict::Unknown, |(_, cap, usable)| fit(range, cap, usable)))
 }
 
+#[derive(sqlx::FromRow)]
+struct GuardDevice {
+    device_uuid: Option<String>,
+    vendor: Option<String>,
+    vram_total_bytes: Option<i64>,
+    inventory: Option<Value>,
+}
+
 /// Probe mode (Doc 24 §3, `unknown`): once a run with no estimate of its config has measured
 /// `steps` steps, a GPU peak above that GPU's memory (less its headroom) cancels the run
 /// with a plain reason; otherwise it goes on.
@@ -604,46 +688,162 @@ impl ProbeModeGuard {
         }
     }
 
-    /// Decides for `run`'s attempt `attempt`. Returns true when it cancelled the job.
+    /// Recovers checks whose sample batch committed before the observer could run.
+    pub async fn reconcile(&self) -> Result<(), JobsError> {
+        let pending: Vec<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT j.run_id, j.current_attempt_id FROM jobs j
+              WHERE j.state IN ('PREPARING', 'RUNNING', 'PAUSING') AND j.run_id IS NOT NULL
+                AND NOT EXISTS (SELECT 1 FROM submission_probe_decisions d
+                                 WHERE d.attempt_id = j.current_attempt_id)
+                AND EXISTS (SELECT 1 FROM metric_batches b WHERE b.attempt_id = j.current_attempt_id
+                             AND b.max_step >= $1)",
+        )
+        .bind(i64::from(self.steps))
+        .fetch_all(self.db.pool())
+        .await?;
+        for (run, attempt) in pending {
+            self.decide(run, attempt).await?;
+        }
+        Ok(())
+    }
+
+    /// Saves the decision after the first measured steps. Returns true on a new cancellation.
     pub async fn decide(&self, run: Uuid, attempt: Uuid) -> Result<bool, JobsError> {
-        let over: Option<(Uuid, Uuid, String, f64, f64)> = sqlx::query_as(
-            "SELECT j.id, j.org_id, g.device_uuid, ra.peak, g.vram_total_bytes::float8
-               FROM runs r JOIN jobs j ON j.run_id = r.id
-               JOIN run_configs rc ON rc.run_id = r.id
-               JOIN resource_actuals ra ON ra.attempt_id = $2 AND ra.run_id = r.id
-               JOIN attempt_placements p ON p.attempt_id = $2
-               JOIN gpu_devices g ON g.node_id = p.node_id AND g.device_uuid = ra.device
-              WHERE r.id = $1 AND j.current_attempt_id = $2
-                AND ra.signal IN ('process_peak', 'torch_reserved_peak')
-                AND NOT EXISTS (SELECT 1 FROM resource_estimates e
-                                 WHERE e.org_id = r.org_id AND e.project_id = r.project_id
-                                   AND e.inputs_sha256 = rc.resolved_sha256
-                                   AND e.state = 'READY' AND e.gpu_mem_hi_gib > 0)
-                AND ra.peak > g.vram_total_bytes * (1 - $3)
-              ORDER BY ra.peak DESC LIMIT 1",
+        let mut tx = self.db.begin().await?;
+        let job: Option<(Uuid, Uuid)> = sqlx::query_as(
+            "SELECT id, org_id FROM jobs WHERE run_id = $1 AND current_attempt_id = $2",
         )
         .bind(run)
         .bind(attempt)
-        .bind(self.headroom.gpu_free_fraction)
-        .fetch_optional(self.db.pool())
+        .fetch_optional(&mut *tx)
         .await?;
-        let Some((job, org, device, peak, vram)) = over else {
+        let Some((job, org)) = job else {
             return Ok(false);
         };
-        let mut tx = self.db.begin().await?;
         let Some(row) = JobTransitions::lock(&mut tx, org, job).await? else {
             return Ok(false);
         };
-        if !matches!(row.state.as_str(), "RUNNING" | "PREPARING" | "PAUSING") {
+        if row.current_attempt_id != Some(attempt)
+            || !matches!(row.state.as_str(), "RUNNING" | "PREPARING" | "PAUSING")
+        {
             return Ok(false);
         }
-        tracing::warn!(
-            job = %job, device = %device, peak_gib = peak / GIB, vram_gib = vram / GIB,
-            "probe mode: the measured peak leaves too little GPU memory free; cancelling"
-        );
-        JobTransitions::request_cancel(&mut tx, &row, "system:guardian").await?;
+        let decided: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM submission_probe_decisions WHERE attempt_id = $1)",
+        )
+        .bind(attempt)
+        .fetch_one(&mut *tx)
+        .await?;
+        if decided {
+            return Ok(false);
+        }
+        let estimate = crate::modules::estimates::estimate_for_run(&mut tx, run).await?;
+        let cancelled = if estimate.is_some() {
+            false
+        } else {
+            let peaks: Vec<(String, f64)> = sqlx::query_as(
+                "WITH starting_step AS (
+                    SELECT coalesce(c.global_step, 0) AS step FROM job_attempts a
+                    LEFT JOIN checkpoints c ON c.id = a.resume_from_checkpoint_id WHERE a.id = $2
+                 )
+                 SELECT split_part(s.name, '/', 3) AS device, max(p.value) AS peak
+                   FROM metric_series s JOIN metric_points p ON p.series_id = s.id
+                   CROSS JOIN starting_step start
+                  WHERE s.run_id = $1 AND p.attempt_id = $2 AND p.value > 0
+                    AND p.step > start.step AND p.step <= start.step + $3
+                    AND (s.name = 'resource/host_rss_peak'
+                         OR s.name LIKE 'resource/process_peak/%'
+                         OR s.name LIKE 'resource/torch_reserved_peak/%'
+                         OR s.name LIKE 'resource/torch_allocated_peak/%')
+                  GROUP BY device HAVING count(DISTINCT p.step) = $3",
+            )
+            .bind(run)
+            .bind(attempt)
+            .bind(i64::from(self.steps))
+            .fetch_all(&mut *tx)
+            .await?;
+            if peaks.is_empty() {
+                return Ok(false);
+            }
+            let devices: Vec<GuardDevice> = sqlx::query_as(
+                "SELECT g.device_uuid, g.vendor, g.vram_total_bytes, n.inventory
+                   FROM resource_reservations r JOIN compute_nodes n ON n.id = r.node_id
+                   LEFT JOIN reservation_devices d ON d.reservation_id = r.id
+                   LEFT JOIN gpu_devices g ON g.id = d.gpu_device_id
+                  WHERE r.attempt_id = $1",
+            )
+            .bind(attempt)
+            .fetch_all(&mut *tx)
+            .await?;
+            let mut compared = false;
+            let mut missing = false;
+            let mut over = false;
+            for device in devices {
+                let ram = device
+                    .inventory
+                    .as_ref()
+                    .and_then(|i| i["ram_bytes"].as_u64());
+                if let Some(bytes) = ram {
+                    if let Some((_, peak)) = peaks.iter().find(|(name, _)| name.is_empty()) {
+                        compared = true;
+                        over |= *peak / GIB > self.headroom.usable_ram(bytes as f64 / GIB);
+                    } else if device.device_uuid.is_none() {
+                        missing = true;
+                    }
+                }
+                if let Some(uuid) = device.device_uuid.as_ref() {
+                    let usable = if device.vendor.as_deref() == Some("apple") {
+                        let unified = device
+                            .inventory
+                            .as_ref()
+                            .and_then(|i| i["unified_memory_bytes"].as_u64())
+                            .or(ram);
+                        unified.map(|bytes| self.headroom.usable_unified(bytes as f64 / GIB))
+                    } else {
+                        device
+                            .vram_total_bytes
+                            .map(|bytes| self.headroom.usable_gpu(bytes as f64 / GIB))
+                    };
+                    if let Some(((_, peak), usable)) =
+                        peaks.iter().find(|(name, _)| name == uuid).zip(usable)
+                    {
+                        compared = true;
+                        over |= *peak / GIB > usable;
+                    } else {
+                        missing = true;
+                    }
+                }
+            }
+            if !over && (!compared || missing) {
+                return Ok(false);
+            }
+            over
+        };
+        if cancelled {
+            JobTransitions::request_cancel(&mut tx, &row, "system:guardian").await?;
+        }
+        sqlx::query(
+            "INSERT INTO submission_probe_decisions (attempt_id, cancelled) VALUES ($1, $2)",
+        )
+        .bind(attempt)
+        .bind(cancelled)
+        .execute(&mut *tx)
+        .await?;
+        crate::modules::submission::audit(
+            &self.db,
+            &mut tx,
+            (org, row.project_id),
+            "system:guardian",
+            if cancelled {
+                "submission.guardian.cancel"
+            } else {
+                "submission.guardian.continue"
+            },
+            mrl_domain::ids::AttemptId::from_uuid(attempt).to_string(),
+        )
+        .await?;
         tx.commit().await?;
-        Ok(true)
+        Ok(cancelled)
     }
 }
 
@@ -668,8 +868,6 @@ impl MetricObserver for ProbeModeGuard {
         ) else {
             return;
         };
-        // ponytail: not durable (P22 observers drop after a restart); the next batch with
-        // resource samples decides again.
         if let Err(e) = self.decide(run.as_uuid(), attempt.as_uuid()).await {
             tracing::warn!(error = %e, "probe mode could not decide; the next batch retries");
         }
@@ -778,11 +976,12 @@ mod tests {
     }
 
     fn schema() -> Value {
-        json!({"properties": {"common": {}, "engine": {"$ref": "#/$defs/E"}}, "$defs": {"E": {
+        json!({"properties": {"common": {}, "engine": {"$ref": "#/$defs/E"},
+            "rollout": {"properties": {"gpu_memory_utilization": {"minimum": 0.1}}}}, "$defs": {"E": {
         "properties": {
             "gradient_checkpointing": {"default": false},
             "per_device_train_batch_size": {"default": 4},
-            "gradient_accumulation_steps": {"default": 1},
+            "gradient_accumulation_steps": {"default": 1, "maximum": 4096},
             "optim": {"default": "adamw_torch", "enum": ["adamw_torch", "adamw_8bit"]}
         }}}})
     }
@@ -817,10 +1016,12 @@ mod tests {
             .all(|c| c.path != "/engine/optim"));
         let safe = json!({"engine": {"gradient_checkpointing": true, "per_device_train_batch_size": 1, "optim": "adamw_8bit"}});
         assert!(safety_changes(&safe, Some(&s), true).is_empty());
-        assert!(
-            safety_changes(&cfg, None, true).len() == 1,
-            "only the rollout share without a schema"
-        );
+        assert!(safety_changes(&cfg, None, true).is_empty());
+        let max = json!({"engine": {"per_device_train_batch_size": 2, "gradient_accumulation_steps": 4096}});
+        assert!(safety_changes(&max, Some(&s), true).iter().all(|c| {
+            c.path != "/engine/gradient_accumulation_steps"
+                && c.path != "/engine/per_device_train_batch_size"
+        }));
     }
 
     #[test]

@@ -499,8 +499,8 @@ pub fn describe_validation(v: &Value) -> String {
             out.push_str(&format!(
                 "\n  changed {}: {} -> {} ({})",
                 text(&c["path"]),
-                c["from"],
-                c["to"],
+                c.get("before").unwrap_or(&c["from"]),
+                c.get("after").unwrap_or(&c["to"]),
                 text(&c["why"])
             ));
         }
@@ -511,11 +511,15 @@ pub fn describe_validation(v: &Value) -> String {
     out
 }
 
+/// `mrl runs validate` and `mrl runs submit --dry-run`: waits out the server's settings
+/// check (up to its longest budget), so the answer is always the server's, L0 fallback
+/// included.
 fn validate_run(api: &Api, prj: &str, body: &Value, out: &Output) -> Result<(), String> {
-    let v = api.post(
+    let v = api.post_waiting(
         &format!("/projects/{}/runs:validate", encode(prj)),
         Some(body),
         None,
+        crate::api::DRY_RUN_DEADLINE,
     )?;
     if out.json {
         print_json(&v);
@@ -645,7 +649,8 @@ mod tests {
              "message": "Too big.", "hint": "Use QLoRA."}],
             "estimate": {"per_gpu_memory_gib": {"lo": 6.0, "expected": 7.5, "hi": 9.0}, "confidence": "low"},
             "preflight": {"verdict": "does_not_fit", "message": "It won't start.",
-              "changes": [], "alternatives": [{"message": "Use QLoRA."}]}});
+              "changes": [{"path": "/engine/gradient_checkpointing", "before": false, "after": true,
+                "why": "Uses less memory."}], "alternatives": [{"message": "Use QLoRA."}]}});
         let text = describe_validation(&v);
         assert!(text.starts_with("Not ready"), "{text}");
         assert!(text.contains("error MRL-CAP-280 at /resources: Too big."));
@@ -653,6 +658,8 @@ mod tests {
         assert!(text.contains("6.0–9.0 GiB (likely 7.5), confidence low"));
         assert!(text.contains("Fit: does not fit. It won't start."));
         assert!(text.contains("instead: Use QLoRA."));
+        assert!(text
+            .contains("changed /engine/gradient_checkpointing: false -> true (Uses less memory.)"));
         let unknown = describe_validation(&json!({"ok": true, "issues": [], "estimate": {}}));
         assert!(unknown.starts_with("Ready") && unknown.contains("unknown"));
     }

@@ -4,7 +4,7 @@ import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from mrl_runtime._generated.mrl.common.v1 import common_pb2 as common
 
@@ -41,10 +41,44 @@ class ProbeReport:
 
 
 @dataclass(frozen=True)
+class TargetDevice:
+    """The machine an estimate is for when the job runs elsewhere (P28's CPU-only dry run
+    estimates for the GPU the run will get). From the job spec's `target_device`."""
+
+    kind: Literal["cuda", "mps", "cpu"]
+    name: str = ""
+    memory_gib: float = 0.0
+    bf16: bool = False
+
+    @classmethod
+    def from_spec(cls, raw: object) -> "TargetDevice | None":
+        if not isinstance(raw, Mapping):
+            return None
+        d = cast("Mapping[str, object]", raw)
+        kinds: dict[object, Literal["cuda", "mps", "cpu"]] = {
+            "cuda": "cuda",
+            "mps": "mps",
+            "cpu": "cpu",
+        }
+        kind = kinds.get(d.get("kind"))
+        if kind is None:
+            return None
+        memory = d.get("memory_gib", 0.0)
+        return cls(
+            kind,
+            str(d.get("name", "")),
+            float(memory) if isinstance(memory, int | float) else 0.0,
+            d.get("bf16") is True,
+        )
+
+
+@dataclass(frozen=True)
 class HardwareProfile:
     gpu_indices: tuple[int, ...] = ()
     world_size: int = 1
     node_rank: int = 0
+    # Estimate for this device instead of the local one (None: the local one).
+    target: TargetDevice | None = None
 
 
 @dataclass(frozen=True)

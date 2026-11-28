@@ -1361,7 +1361,13 @@ paths:
               schema:
                 $ref: '#/components/schemas/Problem'
         '404':
-          description: No such project, or hidden from you.
+          description: No such project or input (parent run or checkpoint, artifact, secret, experiment), or hidden from you; as submit answers.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Problem'
+        '422':
+          description: The body breaks submit's own rules (like the priority range); as submit answers.
           content:
             application/json:
               schema:
@@ -3169,19 +3175,25 @@ components:
       description: One setting the preflight changed, and why.
       required:
       - path
-      - from
-      - to
+      - before
+      - after
       - why
       properties:
-        from:
-          type: object
-          description: The value before (null when unset).
+        after:
+          type:
+          - boolean
+          - number
+          - string
+          - 'null'
+        before:
+          type:
+          - boolean
+          - number
+          - string
+          - 'null'
         path:
           type: string
           description: JSON Pointer into the config, like `/engine/gradient_checkpointing`.
-        to:
-          type: object
-          description: The value after.
         why:
           type: string
           description: Why, in plain words.
